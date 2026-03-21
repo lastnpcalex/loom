@@ -798,6 +798,34 @@ body::after {
 .branch-indicator button:hover { color: var(--cyan); }
 .branch-indicator button:disabled { opacity: 0.3; cursor: default; }
 
+/* ── Generation Status ── */
+#generation-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: 800px;
+    margin: 8px auto;
+    padding: 10px 24px;
+    color: var(--text-secondary);
+    font-size: 13px;
+    animation: fadeIn 200ms ease;
+}
+
+.gen-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--cyan);
+    animation: pulse 1.2s ease-in-out infinite;
+    box-shadow: 0 0 8px rgba(0, 255, 255, 0.6);
+    flex-shrink: 0;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.8); }
+}
+
 /* ── Streaming ── */
 #streaming-indicator {
     max-width: 800px;

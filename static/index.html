@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=14">
+    <link rel="stylesheet" href="/static/style.css?v=15">
 </head>
 <body>
     <div id="blackhole-container"></div>
@@ -83,6 +83,10 @@
         <div id="view-chat" class="view">
             <div id="messages-container">
                 <div id="messages"></div>
+                <div id="generation-status" class="hidden">
+                    <div class="gen-status-dot"></div>
+                    <span id="gen-status-text">Sending...</span>
+                </div>
                 <div id="streaming-indicator" class="hidden">
                     <span class="typing-cursor"></span>
                 </div>
@@ -286,7 +290,7 @@ assistant: *Another example response*"></textarea>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=12"></script>
     <script src="/static/app.js?v=14"></script>
-    <script src="/static/chat.js?v=11"></script>
+    <script src="/static/chat.js?v=15"></script>
     <script src="/static/tree.js?v=11"></script>
 </body>
 </html>

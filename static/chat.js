@@ -42,28 +42,54 @@ function connectWebSocket(convId) {
     State.ws = ws;
 }
 
+// ── Generation Status ──
+let _streamTokenCount = 0;
+let _streamStartTime = 0;
+
+function showGenStatus(text) {
+    const el = document.getElementById('generation-status');
+    document.getElementById('gen-status-text').textContent = text;
+    el.classList.remove('hidden');
+    scrollToBottom();
+}
+
+function hideGenStatus() {
+    document.getElementById('generation-status').classList.add('hidden');
+}
+
 function handleWSMessage(data) {
     switch (data.type) {
         case 'context_info':
             updateContextInfo(data);
+            showGenStatus(`Context: ${data.total_tokens.toLocaleString()} tokens — Waiting for model...`);
             break;
 
         case 'stream_start':
             State.isStreaming = true;
-            // Add placeholder assistant message
+            _streamTokenCount = 0;
+            _streamStartTime = Date.now();
+            hideGenStatus();
             appendStreamingMessage();
             document.getElementById('btn-send').disabled = true;
             break;
 
         case 'stream_chunk':
+            _streamTokenCount++;
             appendStreamChunk(data.content);
+            // Update token rate in status
+            const elapsed = (Date.now() - _streamStartTime) / 1000;
+            if (elapsed > 0.5) {
+                const rate = (_streamTokenCount / elapsed).toFixed(1);
+                document.getElementById('token-count').textContent =
+                    `${_streamTokenCount} tok · ${rate} t/s`;
+            }
             break;
 
         case 'stream_end':
             finalizeStreamingMessage(data.message);
             State.isStreaming = false;
             document.getElementById('btn-send').disabled = false;
-            // Refresh tree
+            hideGenStatus();
             refreshTree();
             break;
 
@@ -71,6 +97,7 @@ function handleWSMessage(data) {
             removeStreamingMessage();
             State.isStreaming = false;
             document.getElementById('btn-send').disabled = false;
+            hideGenStatus();
             showToast('Generation cancelled');
             break;
 
@@ -78,6 +105,7 @@ function handleWSMessage(data) {
             removeStreamingMessage();
             State.isStreaming = false;
             document.getElementById('btn-send').disabled = false;
+            hideGenStatus();
             showToast(data.error || 'Generation error', 'error');
             break;
     }
@@ -86,21 +114,7 @@ function handleWSMessage(data) {
 function updateContextInfo(data) {
     const infoEl = document.getElementById('context-info');
     infoEl.classList.remove('hidden');
-    document.getElementById('token-count').textContent = `${data.total_tokens} tok`;
-
-    // Update the style selector to reflect what was actually used
-    const sel = document.getElementById('style-badge-select');
-    if (data.style_nudge && sel) {
-        sel.value = data.style_nudge;
-    }
-
-    const repBadge = document.getElementById('rep-badge');
-    if (data.repetition_alerts > 0) {
-        repBadge.classList.remove('hidden');
-        repBadge.title = `${data.repetition_alerts} repetition alert(s)`;
-    } else {
-        repBadge.classList.add('hidden');
-    }
+    document.getElementById('token-count').textContent = `${data.total_tokens.toLocaleString()} tok`;
 }
 
 // ── Send Message ──
@@ -138,6 +152,7 @@ async function sendMessage() {
 
         // Request generation via WebSocket
         if (State.ws && State.ws.readyState === WebSocket.OPEN) {
+            showGenStatus('Sending...');
             State.ws.send(JSON.stringify({
                 action: 'generate',
                 parent_id: msg.id,
@@ -157,6 +172,7 @@ async function regenerateMessage(msgId) {
         const result = await API.post(`/api/conversations/${State.currentConvId}/regenerate/${msgId}`);
 
         if (State.ws && State.ws.readyState === WebSocket.OPEN) {
+            showGenStatus('Regenerating...');
             State.ws.send(JSON.stringify({
                 action: 'regenerate',
                 parent_id: result.parent_id,
