@@ -798,6 +798,48 @@ body::after {
 .branch-indicator button:hover { color: var(--cyan); }
 .branch-indicator button:disabled { opacity: 0.3; cursor: default; }
 
+/* ── Retry Bar ── */
+.retry-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    max-width: 800px;
+    margin: 8px auto;
+    padding: 10px 16px;
+    background: rgba(255, 51, 85, 0.1);
+    border: 1px solid rgba(255, 51, 85, 0.3);
+    border-radius: var(--radius);
+    animation: fadeIn 200ms ease;
+}
+
+.retry-error {
+    flex: 1;
+    font-size: 13px;
+    color: var(--danger);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.retry-btn {
+    flex-shrink: 0;
+}
+
+.retry-dismiss {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 4px;
+    flex-shrink: 0;
+    transition: color var(--transition);
+}
+
+.retry-dismiss:hover {
+    color: var(--text-primary);
+}
+
 /* ── Generation Status ── */
 #generation-status {
     display: flex;

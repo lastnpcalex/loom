@@ -57,6 +57,37 @@ function hideGenStatus() {
     document.getElementById('generation-status').classList.add('hidden');
 }
 
+function showRetryBar(errorMsg) {
+    hideRetryBar();
+    const container = document.getElementById('messages');
+    const bar = document.createElement('div');
+    bar.id = 'retry-bar';
+    bar.className = 'retry-bar';
+    bar.innerHTML = `
+        <span class="retry-error">${escapeHtml(errorMsg)}</span>
+        <button class="btn-small retry-btn" id="btn-retry">Retry</button>
+        <button class="retry-dismiss" title="Dismiss">✕</button>
+    `;
+    bar.querySelector('#btn-retry').addEventListener('click', () => {
+        hideRetryBar();
+        // Retry: send generate for the current active leaf
+        if (State.ws && State.ws.readyState === WebSocket.OPEN) {
+            showGenStatus('Retrying...');
+            State.ws.send(JSON.stringify({ action: 'generate' }));
+        }
+    });
+    bar.querySelector('.retry-dismiss').addEventListener('click', () => {
+        hideRetryBar();
+    });
+    container.appendChild(bar);
+    scrollToBottom();
+}
+
+function hideRetryBar() {
+    const existing = document.getElementById('retry-bar');
+    if (existing) existing.remove();
+}
+
 function handleWSMessage(data) {
     switch (data.type) {
         case 'context_info':
@@ -69,6 +100,7 @@ function handleWSMessage(data) {
             _streamTokenCount = 0;
             _streamStartTime = Date.now();
             hideGenStatus();
+            hideRetryBar();
             appendStreamingMessage();
             document.getElementById('btn-send').disabled = true;
             break;
@@ -106,7 +138,7 @@ function handleWSMessage(data) {
             State.isStreaming = false;
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
-            showToast(data.error || 'Generation error', 'error');
+            showRetryBar(data.error || 'Generation error');
             break;
     }
 }
