@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Loom — RP Harness</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css?v=13">
+</head>
+<body>
+    <div id="blackhole-container"></div>
+    <div id="app">
+        <!-- Top bar (always visible) -->
+        <header id="app-header">
+            <div id="header-left">
+                <button id="btn-home" title="Conversations">Loom</button>
+                <span id="header-separator" class="hidden">/</span>
+                <span id="conv-title" class="hidden">—</span>
+                <button id="btn-back-to-tree" class="hidden" title="Back to tree view">Tree</button>
+            </div>
+            <div id="header-right">
+                <div id="context-info" class="hidden">
+                    <span id="token-count" title="Estimated tokens">—</span>
+                </div>
+                <button id="btn-settings" title="Settings">⚙</button>
+            </div>
+        </header>
+
+        <!-- View: Conversation List (home) -->
+        <div id="view-home" class="view active">
+            <div id="home-content">
+                <!-- Characters Section -->
+                <div class="home-section">
+                    <div class="home-section-header">
+                        <span class="home-section-label">Characters</span>
+                        <button class="btn-small" id="btn-create-char">+ Create</button>
+                    </div>
+                    <div id="home-char-grid"></div>
+                </div>
+
+                <!-- Conversations Section -->
+                <div class="home-section">
+                    <div class="home-section-header">
+                        <span class="home-section-label">Conversations</span>
+                        <button class="btn-small" id="btn-new-conv-home">+ New</button>
+                    </div>
+                    <div id="conv-list"></div>
+                    <div id="home-empty" style="display:none;">
+                        <p>No conversations yet. Pick a character above to start.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- View: Tree Canvas -->
+        <div id="view-tree" class="view">
+            <div id="tree-canvas">
+                <div id="tree-nodes"></div>
+            </div>
+        </div>
+
+        <!-- View: Chat -->
+        <div id="view-chat" class="view">
+            <div id="messages-container">
+                <div id="messages"></div>
+                <div id="streaming-indicator" class="hidden">
+                    <span class="typing-cursor"></span>
+                </div>
+            </div>
+            <div id="input-area">
+                <div id="image-preview" class="hidden">
+                    <img id="preview-img" src="" alt="Preview">
+                    <button id="btn-remove-image">✕</button>
+                </div>
+                <div id="input-row">
+                    <label id="btn-attach" title="Attach image">
+                        <input type="file" id="file-input" accept="image/*" hidden>
+                        📎
+                    </label>
+                    <textarea id="user-input" placeholder="Write your message..." rows="1"></textarea>
+                    <button id="btn-send" title="Send">↑</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- New Conversation Modal -->
+    <div id="modal-new-conv" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <h2>New Conversation</h2>
+            <div class="form-group">
+                <label for="new-conv-title">Title</label>
+                <input type="text" id="new-conv-title" placeholder="Untitled">
+            </div>
+            <div class="form-group">
+                <label>Character</label>
+                <div id="character-grid"></div>
+            </div>
+            <div class="form-group">
+                <label>Your Persona <span class="label-hint">(optional — who are you in this RP?)</span></label>
+                <select id="persona-select" class="form-select">
+                    <option value="">None</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Lore / History <span class="label-hint">(optional — background context)</span></label>
+                <div id="lore-checklist"></div>
+            </div>
+            <div class="form-group">
+                <label>Who goes first?</label>
+                <div id="first-turn-toggle" class="toggle-group">
+                    <button class="toggle-btn active" data-value="character">Character</button>
+                    <button class="toggle-btn" data-value="user">You</button>
+                </div>
+            </div>
+            <div class="form-group" id="custom-scene-group">
+                <label for="custom-scene">Custom scene <span class="label-hint">(optional — overrides character's default scenario)</span></label>
+                <textarea id="custom-scene" rows="3" placeholder="Describe the setting, situation, or opening scene..."></textarea>
+            </div>
+            <div class="modal-actions">
+                <button class="btn-secondary" data-close-modal>Cancel</button>
+                <button class="btn-primary" id="btn-create-conv">Create</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="modal-settings" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <h2>Settings</h2>
+            <div class="form-group">
+                <label for="cfg-host">Ollama Host</label>
+                <input type="text" id="cfg-host" placeholder="http://100.64.0.1:11434">
+            </div>
+            <div class="form-group">
+                <label for="cfg-model">Model</label>
+                <input type="text" id="cfg-model" placeholder="qwen3.5:9b">
+            </div>
+            <div class="form-group">
+                <label for="cfg-temp">Temperature</label>
+                <input type="number" id="cfg-temp" step="0.05" min="0" max="2">
+            </div>
+            <div class="form-group">
+                <label for="cfg-top-p">Top P</label>
+                <input type="number" id="cfg-top-p" step="0.01" min="0" max="1">
+            </div>
+            <div class="form-group">
+                <label for="cfg-max-tokens">Max Tokens</label>
+                <input type="number" id="cfg-max-tokens" step="64" min="64" max="8192">
+            </div>
+            <div class="form-group">
+                <label for="cfg-repeat-penalty">Repeat Penalty</label>
+                <input type="number" id="cfg-repeat-penalty" step="0.01" min="1" max="2">
+            </div>
+            <div class="form-group">
+                <label for="cfg-context">Max Context Tokens</label>
+                <input type="number" id="cfg-context" step="4096" min="4096" max="262144">
+            </div>
+            <div class="form-group">
+                <label for="cfg-verbatim">Verbatim Window (turns)</label>
+                <input type="number" id="cfg-verbatim" step="1" min="2" max="50">
+            </div>
+            <div class="modal-actions">
+                <button class="btn-secondary" data-close-modal>Cancel</button>
+                <button class="btn-primary" id="btn-save-settings">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Character Creator/Editor Modal -->
+    <div id="modal-char-edit" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content modal-wide">
+            <h2 id="char-modal-title">Create Character</h2>
+            <input type="hidden" id="char-edit-id" value="">
+            <div class="form-group">
+                <label for="char-name">Name <span class="label-hint">(required)</span></label>
+                <input type="text" id="char-name" placeholder="e.g. Lyra Ashwood">
+            </div>
+            <div class="form-group">
+                <label for="char-tags">Tags <span class="label-hint">(comma-separated)</span></label>
+                <input type="text" id="char-tags" placeholder="e.g. fantasy, rogue, adventurer">
+            </div>
+            <div class="form-group">
+                <label for="char-personality">Personality</label>
+                <textarea id="char-personality" rows="4" placeholder="Describe who this character is, how they speak, their mannerisms..."></textarea>
+            </div>
+            <div class="form-group">
+                <label for="char-scenario">Scenario</label>
+                <textarea id="char-scenario" rows="3" placeholder="The setting and situation where the RP begins..."></textarea>
+            </div>
+            <div class="form-group">
+                <label for="char-greeting">Greeting <span class="label-hint">(character's opening message)</span></label>
+                <textarea id="char-greeting" rows="4" placeholder="The character's first message to the player..."></textarea>
+            </div>
+            <div class="form-group">
+                <label for="char-examples">Example Messages <span class="label-hint">(optional)</span></label>
+                <textarea id="char-examples" rows="5" placeholder="## Example 1
+user: Hello there
+assistant: *Character responds in their style*
+
+## Example 2
+user: What do you think?
+assistant: *Another example response*"></textarea>
+            </div>
+            <div class="modal-actions">
+                <button class="btn-secondary" data-close-modal>Cancel</button>
+                <button class="btn-primary" id="btn-save-char">Save Character</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="/static/acidburn-galaxy.js?v=12"></script>
+    <script src="/static/blackhole.js?v=12"></script>
+    <script src="/static/app.js?v=13"></script>
+    <script src="/static/chat.js?v=11"></script>
+    <script src="/static/tree.js?v=11"></script>
+</body>
+</html>
