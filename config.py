@@ -8,7 +8,7 @@ import json
 @dataclass
 class Config:
     # Ollama connection
-    ollama_host: str = os.getenv("OLLAMA_HOST", "http://100.64.0.1:11434")
+    ollama_host: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
     ollama_model: str = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
 
     # Context budget
@@ -27,7 +27,7 @@ class Config:
 
     # Server
     host: str = "0.0.0.0"
-    port: int = 8080
+    port: int = 3000
 
     # Paths
     db_path: str = "loom.db"

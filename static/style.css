@@ -273,17 +273,20 @@ body::after {
 
 /* ── Home Character Grid ── */
 #home-char-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    display: flex;
+    flex-wrap: wrap;
     gap: 10px;
     overflow-y: auto;
     flex: 1;
     min-height: 0;
     padding-bottom: 8px;
+    align-content: flex-start;
 }
 
 .home-char-card {
     position: relative;
+    width: 140px;
+    flex-shrink: 0;
 }
 
 .home-char-card .char-card-main {
@@ -347,19 +350,20 @@ body::after {
 }
 
 #conv-list {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     overflow-y: auto;
     flex: 1;
     min-height: 0;
     padding-bottom: 8px;
+    align-content: flex-start;
 }
 
 .conv-item {
     display: flex;
     align-items: center;
-    padding: 12px 16px;
+    padding: 10px 14px;
     border-radius: var(--radius);
     cursor: pointer;
     transition: all var(--transition);
@@ -370,6 +374,7 @@ body::after {
     backdrop-filter: var(--glass);
     -webkit-backdrop-filter: var(--glass);
     gap: 8px;
+    flex-shrink: 0;
 }
 
 .conv-item:hover {

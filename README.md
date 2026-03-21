@@ -35,7 +35,7 @@ pip install -r requirements.txt
 python server.py
 ```
 
-Open `http://localhost:8080` in your browser.
+Open `http://localhost:3000` in your browser.
 
 On first launch, the server downloads the Gemma 3 1B GGUF model (~806MB) for local CPU summarization. This happens in the background and doesn't block startup.
 
