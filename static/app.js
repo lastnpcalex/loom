@@ -268,8 +268,16 @@ async function createConversation() {
     if (firstTurn === 'character' && charId) {
         const lastMsg = State.messages[State.messages.length - 1];
         if (!lastMsg || lastMsg.role !== 'assistant') {
+            // WebSocket may still be connecting — wait for it
+            const sendGenerate = () => {
+                if (State.ws && State.ws.readyState === WebSocket.OPEN) {
+                    State.ws.send(JSON.stringify({ action: 'generate' }));
+                }
+            };
             if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-                State.ws.send(JSON.stringify({ action: 'generate' }));
+                sendGenerate();
+            } else if (State.ws) {
+                State.ws.addEventListener('open', sendGenerate, { once: true });
             }
         }
     }
