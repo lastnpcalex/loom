@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=13">
+    <link rel="stylesheet" href="/static/style.css?v=14">
 </head>
 <body>
     <div id="blackhole-container"></div>
@@ -50,6 +50,15 @@
                     <div id="home-empty" style="display:none;">
                         <p>No conversations yet. Pick a character above to start.</p>
                     </div>
+                </div>
+
+                <!-- User Personas Section -->
+                <div class="home-section">
+                    <div class="home-section-header">
+                        <span class="home-section-label">User Personas</span>
+                        <button class="btn-small" id="btn-create-persona">+ Create</button>
+                    </div>
+                    <div id="home-persona-grid"></div>
                 </div>
             </div>
         </div>
@@ -214,10 +223,35 @@ assistant: *Another example response*"></textarea>
         </div>
     </div>
 
+    <!-- Persona Creator/Editor Modal -->
+    <div id="modal-persona-edit" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <h2 id="persona-modal-title">Create Persona</h2>
+            <input type="hidden" id="persona-edit-id" value="">
+            <div class="form-group">
+                <label for="persona-name">Name <span class="label-hint">(required)</span></label>
+                <input type="text" id="persona-name" placeholder="e.g. The Wanderer">
+            </div>
+            <div class="form-group">
+                <label for="persona-tags">Tags <span class="label-hint">(comma-separated)</span></label>
+                <input type="text" id="persona-tags" placeholder="e.g. generic, adaptable">
+            </div>
+            <div class="form-group">
+                <label for="persona-content">Description <span class="label-hint">(who are you in this RP?)</span></label>
+                <textarea id="persona-content" rows="6" placeholder="Your appearance, personality, background, skills, mannerisms..."></textarea>
+            </div>
+            <div class="modal-actions">
+                <button class="btn-secondary" data-close-modal>Cancel</button>
+                <button class="btn-primary" id="btn-save-persona">Save Persona</button>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=12"></script>
-    <script src="/static/app.js?v=13"></script>
+    <script src="/static/app.js?v=14"></script>
     <script src="/static/chat.js?v=11"></script>
     <script src="/static/tree.js?v=11"></script>
 </body>

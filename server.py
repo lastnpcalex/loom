@@ -15,7 +15,7 @@ import database as db
 from config import config
 from character_loader import (
     load_all_characters, load_character, save_character, delete_character,
-    load_all_personas, load_persona,
+    load_all_personas, load_persona, save_persona, delete_persona,
     load_all_lore, load_lore_entry,
 )
 from ollama_client import health_check, stream_chat, describe_image
@@ -145,6 +145,35 @@ async def api_delete_character(char_id: str):
 @app.get("/api/personas")
 async def api_personas():
     return load_all_personas("personas")
+
+
+@app.post("/api/personas")
+async def api_create_persona(data: dict):
+    if not data.get("name", "").strip():
+        raise HTTPException(400, "Persona name is required")
+    persona = save_persona("personas", data)
+    if not persona:
+        raise HTTPException(500, "Failed to save persona")
+    return persona
+
+
+@app.put("/api/personas/{persona_id}")
+async def api_update_persona(persona_id: str, data: dict):
+    if not data.get("name", "").strip():
+        raise HTTPException(400, "Persona name is required")
+    data["id"] = persona_id
+    persona = save_persona("personas", data)
+    if not persona:
+        raise HTTPException(500, "Failed to save persona")
+    return persona
+
+
+@app.delete("/api/personas/{persona_id}")
+async def api_delete_persona(persona_id: str):
+    deleted = delete_persona("personas", persona_id)
+    if not deleted:
+        raise HTTPException(404, "Persona not found")
+    return {"ok": True}
 
 
 # ── Lore ──

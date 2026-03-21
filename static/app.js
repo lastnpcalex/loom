@@ -127,6 +127,7 @@ async function init() {
 
     renderHomeCharacters();
     renderConversationList();
+    renderHomePersonas();
     setupEventListeners();
     switchView('home');
     checkHealth();
@@ -275,6 +276,7 @@ function setupEventListeners() {
     document.getElementById('btn-home').addEventListener('click', () => {
         renderHomeCharacters();
         renderConversationList();
+        renderHomePersonas();
         switchView('home');
     });
 
@@ -314,6 +316,10 @@ function setupEventListeners() {
     // Character creator
     document.getElementById('btn-create-char')?.addEventListener('click', () => openCharacterModal());
     document.getElementById('btn-save-char')?.addEventListener('click', saveCharacter);
+
+    // Persona creator
+    document.getElementById('btn-create-persona')?.addEventListener('click', () => openPersonaModal());
+    document.getElementById('btn-save-persona')?.addEventListener('click', savePersona);
 
     // First-turn toggle
     document.querySelectorAll('#first-turn-toggle .toggle-btn').forEach(btn => {
@@ -589,6 +595,107 @@ async function saveCharacter() {
         showToast(editId ? 'Character updated' : 'Character created');
     } catch (err) {
         showToast('Failed to save character', 'error');
+        console.error(err);
+    }
+}
+
+
+// ── Home Personas Grid ──
+function renderHomePersonas() {
+    const grid = document.getElementById('home-persona-grid');
+    if (!grid) return;
+    grid.innerHTML = '';
+
+    for (const persona of State.personas) {
+        const card = document.createElement('div');
+        card.className = 'char-card home-persona-card';
+        const initial = persona.name ? persona.name[0].toUpperCase() : '?';
+        const tags = Array.isArray(persona.tags) ? persona.tags.join(', ') : '';
+        card.innerHTML = `
+            <div class="char-card-main">
+                <div class="char-avatar persona-avatar">${initial}</div>
+                <div class="char-name">${escapeHtml(persona.name)}</div>
+                <div class="char-tags">${escapeHtml(tags)}</div>
+            </div>
+            <div class="char-card-actions">
+                <button class="char-action-btn char-edit-btn" title="Edit">✎</button>
+                <button class="char-action-btn char-delete-btn" title="Delete">✕</button>
+            </div>
+        `;
+        card.querySelector('.char-edit-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            openPersonaModal(persona.id);
+        });
+        card.querySelector('.char-delete-btn').addEventListener('click', async (e) => {
+            e.stopPropagation();
+            if (!confirm(`Delete persona "${persona.name}"? This cannot be undone.`)) return;
+            try {
+                await API.del(`/api/personas/${persona.id}`);
+                State.personas = State.personas.filter(p => p.id !== persona.id);
+                renderHomePersonas();
+                showToast('Persona deleted');
+            } catch (err) {
+                showToast('Failed to delete persona', 'error');
+            }
+        });
+        grid.appendChild(card);
+    }
+
+    if (State.personas.length === 0) {
+        grid.innerHTML = '<div class="home-empty-hint">No personas yet. Create one to define who you are in the RP.</div>';
+    }
+}
+
+
+// ── Persona Creator/Editor Modal ──
+function openPersonaModal(personaId) {
+    const isEdit = !!personaId;
+    document.getElementById('persona-modal-title').textContent = isEdit ? 'Edit Persona' : 'Create Persona';
+    document.getElementById('persona-edit-id').value = personaId || '';
+
+    if (isEdit) {
+        const persona = State.personas.find(p => p.id === personaId);
+        if (!persona) return;
+        document.getElementById('persona-name').value = persona.name || '';
+        document.getElementById('persona-tags').value = Array.isArray(persona.tags) ? persona.tags.join(', ') : '';
+        document.getElementById('persona-content').value = persona.content || '';
+    } else {
+        document.getElementById('persona-name').value = '';
+        document.getElementById('persona-tags').value = '';
+        document.getElementById('persona-content').value = '';
+    }
+
+    openModal('modal-persona-edit');
+}
+
+
+async function savePersona() {
+    const editId = document.getElementById('persona-edit-id').value;
+    const name = document.getElementById('persona-name').value.trim();
+    if (!name) {
+        showToast('Persona name is required', 'error');
+        return;
+    }
+
+    const data = {
+        name,
+        tags: document.getElementById('persona-tags').value,
+        content: document.getElementById('persona-content').value,
+    };
+
+    try {
+        if (editId) {
+            await API.put(`/api/personas/${editId}`, data);
+        } else {
+            await API.post('/api/personas', data);
+        }
+
+        State.personas = await API.get('/api/personas');
+        renderHomePersonas();
+        closeModal('modal-persona-edit');
+        showToast(editId ? 'Persona updated' : 'Persona created');
+    } catch (err) {
+        showToast('Failed to save persona', 'error');
         console.error(err);
     }
 }

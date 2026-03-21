@@ -200,6 +200,37 @@ def load_all_personas(directory: str = "personas") -> list[dict]:
     return personas
 
 
+def save_persona(directory: str, data: dict) -> dict:
+    """Save a persona as a .md file and return the loaded persona dict."""
+    os.makedirs(directory, exist_ok=True)
+
+    persona_id = data.get("id") or slugify(data["name"])
+    name = data["name"]
+    tags = data.get("tags", [])
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+    tags_str = "[" + ", ".join(tags) + "]" if tags else "[]"
+    content = data.get("content", "").strip()
+
+    text = f"---\nname: {name}\ntags: {tags_str}\n---\n{content}\n"
+
+    filepath = os.path.join(directory, f"{persona_id}.md")
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+    return load_persona(filepath)
+
+
+def delete_persona(directory: str, persona_id: str) -> bool:
+    """Delete a persona .md file. Returns True if deleted."""
+    filepath = os.path.join(directory, f"{persona_id}.md")
+    if os.path.exists(filepath):
+        os.remove(filepath)
+        return True
+    return False
+
+
 # ── Lore/History Files ──
 
 def load_lore_entry(filepath: str) -> Optional[dict]:
