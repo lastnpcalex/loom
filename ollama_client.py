@@ -146,12 +146,20 @@ async def stream_chat(messages: list[dict],
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
             async with client.stream("POST", f"{config.ollama_host}/api/chat",
                                      json=payload) as response:
-                response.raise_for_status()
+                if response.status_code != 200:
+                    body = await response.aread()
+                    try:
+                        err = json.loads(body).get("error", body.decode())
+                    except Exception:
+                        err = f"HTTP {response.status_code}"
+                    raise RuntimeError(f"Ollama error: {err}")
                 async for line in response.aiter_lines():
                     if not line.strip():
                         continue
                     try:
                         chunk = json.loads(line)
+                        if chunk.get("error"):
+                            raise RuntimeError(f"Ollama error: {chunk['error']}")
                         if chunk.get("done"):
                             return
                         token = chunk.get("message", {}).get("content", "")
@@ -159,11 +167,8 @@ async def stream_chat(messages: list[dict],
                             yield token
                     except json.JSONDecodeError:
                         continue
-    except (httpx.ConnectError, httpx.ConnectTimeout, OSError):
-        # Ollama went away — switch to mock mode
-        _mock_mode = True
-        async for token in _mock_stream(messages):
-            yield token
+    except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as e:
+        raise RuntimeError(f"Cannot reach Ollama at {config.ollama_host}: {e}")
 
 
 async def sync_chat(messages: list[dict],
