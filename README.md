@@ -17,7 +17,7 @@ A local RP (roleplay) harness with tree-based conversation branching, a WebGL bl
 ## Requirements
 
 - **Python 3.12+**
-- **Ollama** running and accessible (default: `http://100.64.0.1:11434`)
+- **Ollama** running and accessible (default: `http://localhost:11434`)
 - A model pulled in Ollama (default: `qwen3.5:9b`)
 - ~1GB disk for the Gemma 3 1B summarizer (downloaded automatically on first run)
 
@@ -71,7 +71,7 @@ Settings are adjustable from the UI (gear icon) or by editing `config.py`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `ollama_host` | `http://100.64.0.1:11434` | Ollama server address |
+| `ollama_host` | `http://localhost:11434` | Ollama server address |
 | `ollama_model` | `qwen3.5:9b` | Model for generation |
 | `max_context_tokens` | `32768` | Context window budget |
 | `verbatim_window` | `6` | Recent messages kept verbatim |
