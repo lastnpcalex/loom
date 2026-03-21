@@ -131,6 +131,11 @@ async def stream_chat(messages: list[dict],
         return
 
     try:
+        effective_max = max_tokens or config.max_tokens
+        # Set num_predict high — we enforce the response token limit ourselves
+        # so thinking tokens don't count against the response budget.
+        num_predict = effective_max + 8192
+
         payload = {
             "model": model or config.ollama_model,
             "messages": _build_ollama_messages(messages),
@@ -138,7 +143,7 @@ async def stream_chat(messages: list[dict],
             "options": {
                 "temperature": temperature or config.temperature,
                 "top_p": top_p or config.top_p,
-                "num_predict": max_tokens or config.max_tokens,
+                "num_predict": num_predict,
                 "repeat_penalty": repeat_penalty or config.repeat_penalty,
             },
         }
@@ -153,6 +158,8 @@ async def stream_chat(messages: list[dict],
                     except Exception:
                         err = f"HTTP {response.status_code}"
                     raise RuntimeError(f"Ollama error: {err}")
+                _was_thinking = False
+                _content_tokens = 0
                 async for line in response.aiter_lines():
                     if not line.strip():
                         continue
@@ -162,9 +169,21 @@ async def stream_chat(messages: list[dict],
                             raise RuntimeError(f"Ollama error: {chunk['error']}")
                         if chunk.get("done"):
                             return
-                        token = chunk.get("message", {}).get("content", "")
+                        msg = chunk.get("message", {})
+                        thinking = msg.get("thinking", "")
+                        token = msg.get("content", "")
+                        if thinking and not _was_thinking:
+                            _was_thinking = True
+                            yield {"type": "thinking_start"}
+                        if token and _was_thinking:
+                            _was_thinking = False
+                            yield {"type": "thinking_end"}
                         if token:
+                            _content_tokens += 1
                             yield token
+                            # Enforce response token limit (thinking doesn't count)
+                            if _content_tokens >= effective_max:
+                                return
                     except json.JSONDecodeError:
                         continue
     except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as e:

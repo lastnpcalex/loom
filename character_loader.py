@@ -27,18 +27,25 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 
 def parse_sections(body: str) -> dict[str, str]:
     """Split markdown body into sections by # headers."""
+    SECTION_NAMES = {'personality', 'scenario', 'greeting', 'example messages'}
     sections = {}
     current_key = None
     current_lines = []
 
     for line in body.splitlines():
+        # Only treat # lines as section headers if they match known section names
         if line.startswith('# ') and not line.startswith('## '):
-            if current_key:
-                sections[current_key] = '\n'.join(current_lines).strip()
-            current_key = line[2:].strip().lower()
-            current_lines = []
-        else:
-            current_lines.append(line)
+            header_name = line[2:].strip().lower()
+            if header_name in SECTION_NAMES:
+                if current_key:
+                    sections[current_key] = '\n'.join(current_lines).strip()
+                current_key = header_name
+                current_lines = []
+                continue
+        # Unescape lines that were escaped during save
+        if line.startswith('\\# '):
+            line = line[1:]
+        current_lines.append(line)
 
     if current_key:
         sections[current_key] = '\n'.join(current_lines).strip()
@@ -142,12 +149,17 @@ def save_character(directory: str, data: dict) -> dict:
     greeting = data.get("greeting", "").strip()
     examples_raw = data.get("example_messages_raw", "").strip()
 
+    # Escape any # headers in content so they don't break section parsing
+    def escape_content(text):
+        """Prefix standalone # headers in content with a backslash."""
+        return re.sub(r'^(#{1,3}\s)', r'\\\1', text, flags=re.MULTILINE)
+
     if personality:
-        lines.append(f"\n# Personality\n{personality}")
+        lines.append(f"\n# Personality\n{escape_content(personality)}")
     if scenario:
-        lines.append(f"\n# Scenario\n{scenario}")
+        lines.append(f"\n# Scenario\n{escape_content(scenario)}")
     if greeting:
-        lines.append(f"\n# Greeting\n{greeting}")
+        lines.append(f"\n# Greeting\n{escape_content(greeting)}")
     if examples_raw:
         lines.append(f"\n# Example Messages\n{examples_raw}")
 

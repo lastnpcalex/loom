@@ -105,6 +105,16 @@ function handleWSMessage(data) {
             document.getElementById('btn-send').disabled = true;
             break;
 
+        case 'thinking_start':
+            showThinkingIndicator();
+            break;
+
+        case 'thinking_end':
+            hideThinkingIndicator();
+            _streamStartTime = Date.now();
+            _streamTokenCount = 0;
+            break;
+
         case 'stream_chunk':
             _streamTokenCount++;
             appendStreamChunk(data.content);
@@ -203,6 +213,13 @@ async function regenerateMessage(msgId) {
     try {
         const result = await API.post(`/api/conversations/${State.currentConvId}/regenerate/${msgId}`);
 
+        // Remove the old message and everything after it from the view
+        const idx = State.messages.findIndex(m => m.id === msgId);
+        if (idx !== -1) {
+            State.messages = State.messages.slice(0, idx);
+            renderMessages();
+        }
+
         if (State.ws && State.ws.readyState === WebSocket.OPEN) {
             showGenStatus('Regenerating...');
             State.ws.send(JSON.stringify({
@@ -233,6 +250,35 @@ function renderMessages() {
         if (msg.role === 'system') continue;
         container.appendChild(createMessageElement(msg));
     }
+
+    // Show generate/retry bar if needed
+    const lastMsg = State.messages[State.messages.length - 1];
+    if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.content?.trim()) {
+        showRetryBar('Empty response — try regenerating');
+    } else if (lastMsg && lastMsg.role === 'user') {
+        showGenerateBar();
+    }
+}
+
+function showGenerateBar() {
+    hideRetryBar();
+    const container = document.getElementById('messages');
+    const bar = document.createElement('div');
+    bar.id = 'retry-bar';
+    bar.className = 'retry-bar generate-bar';
+    bar.innerHTML = `
+        <span class="retry-error">No response yet</span>
+        <button class="btn-small retry-btn" id="btn-generate">Generate</button>
+    `;
+    bar.querySelector('#btn-generate').addEventListener('click', () => {
+        hideRetryBar();
+        if (State.ws && State.ws.readyState === WebSocket.OPEN) {
+            showGenStatus('Generating...');
+            State.ws.send(JSON.stringify({ action: 'generate' }));
+        }
+    });
+    container.appendChild(bar);
+    scrollToBottom();
 }
 
 function createMessageElement(msg) {
@@ -246,10 +292,12 @@ function createMessageElement(msg) {
     if (msg.role === 'assistant') {
         actionsHtml = `
             <button onclick="regenerateMessage(${msg.id})" title="Regenerate">↻</button>
+            <button onclick="forkFromMessage(${msg.id})" title="Fork new conversation from here">⌥</button>
             <button onclick="copyMessage(${msg.id})" title="Copy">⊘</button>
         `;
     } else {
         actionsHtml = `
+            <button onclick="forkFromMessage(${msg.id})" title="Fork new conversation from here">⌥</button>
             <button onclick="copyMessage(${msg.id})" title="Copy">⊘</button>
         `;
     }
@@ -347,6 +395,22 @@ function formatContent(text) {
     return html;
 }
 
+// ── Thinking Indicator ──
+
+function showThinkingIndicator() {
+    if (!streamingDiv) return;
+    const contentEl = streamingDiv.querySelector('.message-content');
+    contentEl.innerHTML = '<span class="thinking-indicator"><span class="thinking-dots"></span> Thinking...</span>';
+    scrollToBottom();
+}
+
+function hideThinkingIndicator() {
+    if (!streamingDiv) return;
+    const contentEl = streamingDiv.querySelector('.message-content');
+    contentEl.innerHTML = '';
+    contentEl.dataset.rawContent = '';
+}
+
 // ── Streaming Message ──
 
 let streamingDiv = null;
@@ -394,6 +458,21 @@ function removeStreamingMessage() {
     if (streamingDiv) {
         streamingDiv.remove();
         streamingDiv = null;
+    }
+}
+
+// ── Fork ──
+
+async function forkFromMessage(msgId) {
+    if (!State.currentConvId) return;
+    try {
+        const newConv = await API.post(`/api/conversations/${State.currentConvId}/fork/${msgId}`);
+        State.conversations.unshift(newConv);
+        showToast(`Forked → "${newConv.title}"`);
+        await loadConversation(newConv.id);
+        switchView('chat');
+    } catch (err) {
+        showToast('Fork failed', 'error');
     }
 }
 

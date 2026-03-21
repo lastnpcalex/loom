@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=15">
+    <link rel="stylesheet" href="/static/style.css?v=17">
 </head>
 <body>
     <div id="blackhole-container"></div>
@@ -35,7 +35,10 @@
                 <div class="home-section">
                     <div class="home-section-header">
                         <span class="home-section-label">Characters</span>
-                        <button class="btn-small" id="btn-create-char">+ Create</button>
+                        <div class="home-section-actions">
+                            <button class="btn-small" id="btn-import-char">Import</button>
+                            <button class="btn-small" id="btn-create-char">+ Create</button>
+                        </div>
                     </div>
                     <div id="home-char-grid"></div>
                 </div>
@@ -44,7 +47,10 @@
                 <div class="home-section">
                     <div class="home-section-header">
                         <span class="home-section-label">Conversations</span>
-                        <button class="btn-small" id="btn-new-conv-home">+ New</button>
+                        <div class="home-section-actions">
+                            <button class="btn-small" id="btn-import-conv">Import</button>
+                            <button class="btn-small" id="btn-new-conv-home">+ New</button>
+                        </div>
                     </div>
                     <div id="conv-list"></div>
                     <div id="home-empty" style="display:none;">
@@ -56,7 +62,10 @@
                 <div class="home-section">
                     <div class="home-section-header">
                         <span class="home-section-label">User Personas</span>
-                        <button class="btn-small" id="btn-create-persona">+ Create</button>
+                        <div class="home-section-actions">
+                            <button class="btn-small" id="btn-import-persona">Import</button>
+                            <button class="btn-small" id="btn-create-persona">+ Create</button>
+                        </div>
                     </div>
                     <div id="home-persona-grid"></div>
                 </div>
@@ -65,7 +74,10 @@
                 <div class="home-section">
                     <div class="home-section-header">
                         <span class="home-section-label">Lore / History</span>
-                        <button class="btn-small" id="btn-create-lore">+ Create</button>
+                        <div class="home-section-actions">
+                            <button class="btn-small" id="btn-import-lore">Import</button>
+                            <button class="btn-small" id="btn-create-lore">+ Create</button>
+                        </div>
                     </div>
                     <div id="home-lore-grid"></div>
                 </div>
@@ -289,8 +301,8 @@ assistant: *Another example response*"></textarea>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=12"></script>
-    <script src="/static/app.js?v=14"></script>
-    <script src="/static/chat.js?v=15"></script>
+    <script src="/static/app.js?v=17"></script>
+    <script src="/static/chat.js?v=18"></script>
     <script src="/static/tree.js?v=11"></script>
 </body>
 </html>

@@ -393,6 +393,147 @@ async def api_regenerate(conv_id: int, msg_id: int):
     return {"parent_id": msg["parent_id"], "original_id": msg_id}
 
 
+@app.post("/api/conversations/{conv_id}/fork/{msg_id}")
+async def api_fork_conversation(conv_id: int, msg_id: int):
+    """Fork a conversation from a specific message, creating a new conversation."""
+    new_conv = await db.fork_conversation(conv_id, msg_id)
+    if not new_conv:
+        raise HTTPException(404, "Conversation not found")
+    return new_conv
+
+
+# ── Export / Import ──
+
+@app.get("/api/conversations/{conv_id}/export")
+async def api_export_conversation(conv_id: int):
+    """Export a conversation with all messages as JSON."""
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    tree = await db.get_conversation_tree(conv_id)
+    # Get full message content (tree only has preview)
+    full_db = await db.get_db()
+    rows = await full_db.execute_fetchall(
+        "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at",
+        (conv_id,)
+    )
+    await full_db.close()
+    messages = [dict(r) for r in rows]
+    export = {
+        "type": "loom_conversation",
+        "version": 1,
+        "conversation": dict(conv),
+        "messages": messages,
+    }
+    return JSONResponse(export, headers={
+        "Content-Disposition": f'attachment; filename="{conv["title"] or "conversation"}.json"'
+    })
+
+
+@app.post("/api/conversations/import")
+async def api_import_conversation(file: UploadFile = File(...)):
+    """Import a conversation from JSON."""
+    content = await file.read()
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON")
+
+    if data.get("type") != "loom_conversation":
+        raise HTTPException(400, "Not a Loom conversation export")
+
+    conv_data = data["conversation"]
+    new_conv = await db.create_conversation(
+        conv_data.get("title", "Imported"),
+        conv_data.get("character_id"),
+    )
+    # Update optional fields
+    fields = {}
+    for key in ("persona_id", "lore_ids", "style_nudge", "custom_scene"):
+        if conv_data.get(key):
+            fields[key] = conv_data[key]
+    if fields:
+        await db.update_conversation_fields(new_conv["id"], **fields)
+
+    # Import messages, mapping old IDs to new
+    id_map = {}
+    for msg in data.get("messages", []):
+        new_parent = id_map.get(msg.get("parent_id")) if msg.get("parent_id") else None
+        new_msg = await db.add_message(
+            new_conv["id"], msg["role"], msg.get("content", ""),
+            parent_id=new_parent, image_path=msg.get("image_path"),
+        )
+        id_map[msg["id"]] = new_msg["id"]
+        if msg.get("summary"):
+            await db.update_message_summary(new_msg["id"], msg["summary"])
+        if msg.get("is_active"):
+            await db.set_active_branch(new_conv["id"], new_msg["id"])
+
+    return await db.get_conversation(new_conv["id"])
+
+
+@app.get("/api/characters/{char_id}/export")
+async def api_export_character(char_id: str):
+    """Download a character .md file."""
+    filepath = os.path.join(config.characters_dir, f"{char_id}.md")
+    if not os.path.exists(filepath):
+        raise HTTPException(404, "Character not found")
+    return FileResponse(filepath, filename=f"{char_id}.md", media_type="text/markdown")
+
+
+@app.post("/api/characters/import")
+async def api_import_character(file: UploadFile = File(...)):
+    """Import a character from a .md file."""
+    content = (await file.read()).decode("utf-8")
+    filename = Path(file.filename).stem
+    filepath = os.path.join(config.characters_dir, f"{filename}.md")
+    os.makedirs(config.characters_dir, exist_ok=True)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(content)
+    char = load_character(filepath)
+    return char or {"id": filename, "name": filename}
+
+
+@app.get("/api/personas/{persona_id}/export")
+async def api_export_persona(persona_id: str):
+    filepath = os.path.join("personas", f"{persona_id}.md")
+    if not os.path.exists(filepath):
+        raise HTTPException(404, "Persona not found")
+    return FileResponse(filepath, filename=f"{persona_id}.md", media_type="text/markdown")
+
+
+@app.post("/api/personas/import")
+async def api_import_persona(file: UploadFile = File(...)):
+    content = (await file.read()).decode("utf-8")
+    filename = Path(file.filename).stem
+    filepath = os.path.join("personas", f"{filename}.md")
+    os.makedirs("personas", exist_ok=True)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(content)
+    persona = load_persona(filepath)
+    return persona or {"id": filename, "name": filename}
+
+
+@app.get("/api/lore/{lore_id}/export")
+async def api_export_lore(lore_id: str):
+    filepath = os.path.join("lore", f"{lore_id}.md")
+    if not os.path.exists(filepath):
+        raise HTTPException(404, "Lore not found")
+    return FileResponse(filepath, filename=f"{lore_id}.md", media_type="text/markdown")
+
+
+@app.post("/api/lore/import")
+async def api_import_lore(file: UploadFile = File(...)):
+    content = (await file.read()).decode("utf-8")
+    filename = Path(file.filename).stem
+    filepath = os.path.join("lore", f"{filename}.md")
+    os.makedirs("lore", exist_ok=True)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(content)
+    entry = load_lore_entry(filepath)
+    return entry or {"id": filename, "name": filename}
+
+
 # ── Image Upload ──
 
 @app.post("/api/upload")
@@ -442,6 +583,7 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                     task.cancel()
                 continue
 
+            print(f"[WS] Received action={action} for conv={conv_id}")
             if action in ("generate", "regenerate"):
                 # Cancel any existing generation
                 old_task = _active_generations.pop(conv_id, None)
@@ -465,6 +607,7 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
     try:
         action = data.get("action")
         parent_id = data.get("parent_id")
+        print(f"[GEN] _handle_generation called: action={action} parent_id={parent_id} conv_id={conv_id}")
 
         # For regenerate, parent_id should be provided
         # For generate, use the current active leaf
@@ -507,7 +650,14 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
                     lore_entries.append(entry)
 
         # Get context (with potential compactification)
+        # For regenerate, truncate context to parent_id so we don't include
+        # the old response we're regenerating
         context = await get_context_for_generation(conv_id, character)
+        if action == "regenerate" and parent_id is not None:
+            context["verbatim_messages"] = [
+                m for m in context["verbatim_messages"]
+                if m["id"] <= parent_id
+            ]
 
         # Run repetition analysis on recent assistant messages
         assistant_msgs = [
@@ -552,15 +702,35 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
         })
 
         # Stream the response
+        print(f"[GEN] Starting generation for conv={conv_id} parent={parent_id} model={config.ollama_model}")
         await websocket.send_json({"type": "stream_start"})
 
         full_response = ""
         async for token in stream_chat(messages):
+            if isinstance(token, dict):
+                # Thinking status events
+                await websocket.send_json(token)
+                continue
             full_response += token
             await websocket.send_json({
                 "type": "stream_chunk",
                 "content": token,
             })
+
+        # Strip <think>...</think> blocks (thinking models like qwen3)
+        import re as _re
+        cleaned = _re.sub(r'<think>[\s\S]*?</think>\s*', '', full_response).strip()
+        if cleaned:
+            full_response = cleaned
+
+        # If response is empty, send error instead of saving empty message
+        if not full_response.strip():
+            print(f"[WARN] Empty response. Raw length={len(full_response)} Cleaned length={len(cleaned)}")
+            await websocket.send_json({
+                "type": "error",
+                "error": "Model returned an empty response — try again",
+            })
+            return
 
         # Save the assistant message
         msg = await db.add_message(

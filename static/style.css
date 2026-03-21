@@ -150,6 +150,23 @@ body::after {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    cursor: pointer;
+}
+
+#conv-title:hover {
+    color: var(--text-primary);
+}
+
+.conv-title-input {
+    font-weight: 500;
+    font-size: 14px;
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--cyan);
+    border-radius: var(--radius-sm);
+    padding: 2px 8px;
+    outline: none;
+    font-family: var(--font-body);
 }
 
 #btn-back-to-tree {
@@ -251,6 +268,11 @@ body::after {
     text-transform: uppercase;
     letter-spacing: 2px;
     color: var(--text-secondary);
+}
+
+.home-section-actions {
+    display: flex;
+    gap: 6px;
 }
 
 .btn-small {
@@ -726,6 +748,7 @@ body::after {
 }
 
 .message:hover .message-actions { opacity: 1; }
+.message.streaming .message-actions { opacity: 1; }
 
 .message-actions button {
     background: none;
@@ -806,7 +829,7 @@ body::after {
     max-width: 800px;
     margin: 8px auto;
     padding: 10px 16px;
-    background: rgba(255, 51, 85, 0.1);
+    background: rgba(30, 5, 10, 0.92);
     border: 1px solid rgba(255, 51, 85, 0.3);
     border-radius: var(--radius);
     animation: fadeIn 200ms ease;
@@ -823,6 +846,15 @@ body::after {
 
 .retry-btn {
     flex-shrink: 0;
+}
+
+.generate-bar {
+    background: rgba(0, 20, 30, 0.92);
+    border-color: rgba(0, 255, 255, 0.3);
+}
+
+.generate-bar .retry-error {
+    color: var(--text-secondary);
 }
 
 .retry-dismiss {
@@ -886,6 +918,33 @@ body::after {
 }
 
 @keyframes blink { 50% { opacity: 0; } }
+
+.thinking-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-muted);
+    font-style: italic;
+    font-size: 0.9em;
+}
+
+.thinking-dots {
+    display: inline-block;
+    width: 20px;
+    text-align: left;
+}
+
+.thinking-dots::after {
+    content: '...';
+    animation: thinking-dots 1.5s steps(4, end) infinite;
+}
+
+@keyframes thinking-dots {
+    0% { content: ''; }
+    25% { content: '.'; }
+    50% { content: '..'; }
+    75% { content: '...'; }
+}
 
 /* ── Input Area ── */
 #input-area {

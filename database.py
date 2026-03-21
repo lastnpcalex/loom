@@ -376,6 +376,59 @@ async def delete_branch(msg_id: int) -> dict:
     }
 
 
+async def fork_conversation(conv_id: int, from_msg_id: int, new_title: str = None) -> dict:
+    """Fork a conversation: create a new conversation with messages up to from_msg_id."""
+    db = await get_db()
+
+    # Get original conversation
+    rows = await db.execute_fetchall("SELECT * FROM conversations WHERE id = ?", (conv_id,))
+    if not rows:
+        await db.close()
+        return None
+    orig = dict(rows[0])
+
+    # Walk from from_msg_id up to root to get the branch to copy
+    branch = []
+    current_id = from_msg_id
+    while current_id is not None:
+        msg_rows = await db.execute_fetchall("SELECT * FROM messages WHERE id = ?", (current_id,))
+        if not msg_rows:
+            break
+        msg = dict(msg_rows[0])
+        branch.insert(0, msg)
+        current_id = msg["parent_id"]
+
+    # Create new conversation
+    title = new_title or f"{orig['title']} (fork)"
+    now = time.time()
+    cursor = await db.execute(
+        "INSERT INTO conversations (title, character_id, persona_id, lore_ids, style_nudge, custom_scene, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (title, orig.get("character_id"), orig.get("persona_id"), orig.get("lore_ids"),
+         orig.get("style_nudge"), orig.get("custom_scene"), now, now)
+    )
+    new_conv_id = cursor.lastrowid
+    await db.execute("INSERT INTO style_state (conversation_id) VALUES (?)", (new_conv_id,))
+
+    # Copy messages, mapping old IDs to new IDs
+    id_map = {}
+    for msg in branch:
+        new_parent = id_map.get(msg["parent_id"]) if msg["parent_id"] else None
+        cursor = await db.execute(
+            """INSERT INTO messages (conversation_id, parent_id, role, content,
+               token_estimate, is_active, summary, image_path, image_alt, created_at)
+               VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
+            (new_conv_id, new_parent, msg["role"], msg["content"],
+             msg.get("token_estimate", 0), msg.get("summary"),
+             msg.get("image_path"), msg.get("image_alt"), msg["created_at"])
+        )
+        id_map[msg["id"]] = cursor.lastrowid
+
+    await db.commit()
+    row = await db.execute_fetchall("SELECT * FROM conversations WHERE id = ?", (new_conv_id,))
+    await db.close()
+    return dict(row[0])
+
+
 async def get_conversation_tree(conv_id: int) -> list[dict]:
     """Get all messages for a conversation (for tree visualization)."""
     db = await get_db()

@@ -170,10 +170,15 @@ function renderConversationList() {
         div.innerHTML = `
             <span class="conv-title-text">${escapeHtml(conv.title)}</span>
             <span class="conv-meta">${escapeHtml(charName)}</span>
+            <button class="conv-export" title="Export">↓</button>
             <button class="conv-delete" title="Delete">✕</button>
         `;
         div.querySelector('.conv-title-text').addEventListener('click', () => loadConversation(conv.id));
         div.querySelector('.conv-meta').addEventListener('click', () => loadConversation(conv.id));
+        div.querySelector('.conv-export').addEventListener('click', (e) => {
+            e.stopPropagation();
+            downloadFile(`/api/conversations/${conv.id}/export`, `${conv.title || 'conversation'}.json`);
+        });
         div.querySelector('.conv-delete').addEventListener('click', async (e) => {
             e.stopPropagation();
             if (confirm('Delete this conversation?')) {
@@ -269,18 +274,40 @@ async function createConversation() {
         const lastMsg = State.messages[State.messages.length - 1];
         if (!lastMsg || lastMsg.role !== 'assistant') {
             // WebSocket may still be connecting — wait for it
+            showGenStatus('Generating first response...');
             const sendGenerate = () => {
                 if (State.ws && State.ws.readyState === WebSocket.OPEN) {
                     State.ws.send(JSON.stringify({ action: 'generate' }));
+                } else {
+                    hideGenStatus();
+                    showRetryBar('WebSocket not connected');
                 }
             };
             if (State.ws && State.ws.readyState === WebSocket.OPEN) {
                 sendGenerate();
             } else if (State.ws) {
                 State.ws.addEventListener('open', sendGenerate, { once: true });
+                // Safety timeout — if WS doesn't connect in 10s, show error
+                setTimeout(() => {
+                    if (State.ws && State.ws.readyState !== WebSocket.OPEN) {
+                        hideGenStatus();
+                        showRetryBar('Connection timed out — try again');
+                    }
+                }, 10000);
             }
         }
     }
+}
+
+// ── Open New Conversation Modal ──
+function openNewConvModal() {
+    renderCharacterGrid();
+    renderPersonaSelect();
+    renderLoreChecklist();
+    document.querySelectorAll('#first-turn-toggle .toggle-btn').forEach(b => b.classList.remove('active'));
+    document.querySelector('#first-turn-toggle .toggle-btn[data-value="character"]').classList.add('active');
+    document.getElementById('custom-scene').value = '';
+    openModal('modal-new-conv');
 }
 
 // ── Setup Event Listeners ──
@@ -292,6 +319,49 @@ function setupEventListeners() {
         renderHomePersonas();
         renderHomeLore();
         switchView('home');
+    });
+
+    // Rename conversation (click title in header)
+    document.getElementById('conv-title').addEventListener('click', () => {
+        if (!State.currentConvId || !State.currentConv) return;
+        const titleEl = document.getElementById('conv-title');
+        const currentTitle = State.currentConv.title || '';
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.value = currentTitle;
+        input.className = 'conv-title-input';
+        titleEl.replaceWith(input);
+        input.focus();
+        input.select();
+
+        const save = async () => {
+            const newTitle = input.value.trim() || currentTitle;
+            const span = document.createElement('span');
+            span.id = 'conv-title';
+            span.textContent = newTitle;
+            input.replaceWith(span);
+            // Re-attach click listener
+            span.addEventListener('click', () => document.getElementById('conv-title').click());
+
+            if (newTitle !== currentTitle) {
+                try {
+                    const updated = await API.put(`/api/conversations/${State.currentConvId}`, { title: newTitle });
+                    State.currentConv.title = updated.title;
+                    const convInList = State.conversations.find(c => c.id === State.currentConvId);
+                    if (convInList) convInList.title = updated.title;
+                } catch {
+                    showToast('Failed to rename', 'error');
+                    span.textContent = currentTitle;
+                }
+            }
+        };
+
+        input.addEventListener('blur', save);
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') input.blur();
+            if (e.key === 'Escape') { input.value = currentTitle; input.blur(); }
+        });
     });
 
     // Back to tree
@@ -314,30 +384,47 @@ function setupEventListeners() {
         }
     });
 
-    // New conversation (both header and home button)
-    const openNewConvModal = () => {
-        renderCharacterGrid();
-        renderPersonaSelect();
-        renderLoreChecklist();
-        document.querySelectorAll('#first-turn-toggle .toggle-btn').forEach(b => b.classList.remove('active'));
-        document.querySelector('#first-turn-toggle .toggle-btn[data-value="character"]').classList.add('active');
-        document.getElementById('custom-scene').value = '';
-        openModal('modal-new-conv');
-    };
+    // New conversation
     document.getElementById('btn-new-conv-home')?.addEventListener('click', openNewConvModal);
     document.getElementById('btn-create-conv').addEventListener('click', createConversation);
 
-    // Character creator
+    // Character creator + import
     document.getElementById('btn-create-char')?.addEventListener('click', () => openCharacterModal());
     document.getElementById('btn-save-char')?.addEventListener('click', saveCharacter);
+    document.getElementById('btn-import-char')?.addEventListener('click', () => {
+        importFile('/api/characters/import', '.md', async () => {
+            State.characters = await API.get('/api/characters');
+            renderHomeCharacters();
+        });
+    });
 
-    // Persona creator
+    // Persona creator + import
     document.getElementById('btn-create-persona')?.addEventListener('click', () => openPersonaModal());
     document.getElementById('btn-save-persona')?.addEventListener('click', savePersona);
+    document.getElementById('btn-import-persona')?.addEventListener('click', () => {
+        importFile('/api/personas/import', '.md', async () => {
+            State.personas = await API.get('/api/personas');
+            renderHomePersonas();
+        });
+    });
 
-    // Lore creator
+    // Lore creator + import
     document.getElementById('btn-create-lore')?.addEventListener('click', () => openLoreModal());
     document.getElementById('btn-save-lore')?.addEventListener('click', saveLore);
+    document.getElementById('btn-import-lore')?.addEventListener('click', () => {
+        importFile('/api/lore/import', '.md', async () => {
+            State.lore = await API.get('/api/lore');
+            renderHomeLore();
+        });
+    });
+
+    // Conversation import
+    document.getElementById('btn-import-conv')?.addEventListener('click', () => {
+        importFile('/api/conversations/import', '.json', async () => {
+            State.conversations = await API.get('/api/conversations');
+            renderConversationList();
+        });
+    });
 
     // First-turn toggle
     document.querySelectorAll('#first-turn-toggle .toggle-btn').forEach(btn => {
@@ -506,6 +593,7 @@ function renderHomeCharacters() {
             </div>
             <div class="char-card-actions">
                 <button class="char-action-btn char-edit-btn" title="Edit">✎</button>
+                <button class="char-action-btn char-export-btn" title="Export">↓</button>
                 <button class="char-action-btn char-delete-btn" title="Delete">✕</button>
             </div>
         `;
@@ -518,6 +606,11 @@ function renderHomeCharacters() {
         card.querySelector('.char-edit-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             openCharacterModal(char.id);
+        });
+        // Export button
+        card.querySelector('.char-export-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            downloadFile(`/api/characters/${char.id}/export`, `${char.id}.md`);
         });
         // Delete button
         card.querySelector('.char-delete-btn').addEventListener('click', async (e) => {
@@ -637,12 +730,17 @@ function renderHomePersonas() {
             </div>
             <div class="char-card-actions">
                 <button class="char-action-btn char-edit-btn" title="Edit">✎</button>
+                <button class="char-action-btn char-export-btn" title="Export">↓</button>
                 <button class="char-action-btn char-delete-btn" title="Delete">✕</button>
             </div>
         `;
         card.querySelector('.char-edit-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             openPersonaModal(persona.id);
+        });
+        card.querySelector('.char-export-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            downloadFile(`/api/personas/${persona.id}/export`, `${persona.id}.md`);
         });
         card.querySelector('.char-delete-btn').addEventListener('click', async (e) => {
             e.stopPropagation();
@@ -738,12 +836,17 @@ function renderHomeLore() {
             </div>
             <div class="char-card-actions">
                 <button class="char-action-btn char-edit-btn" title="Edit">✎</button>
+                <button class="char-action-btn char-export-btn" title="Export">↓</button>
                 <button class="char-action-btn char-delete-btn" title="Delete">✕</button>
             </div>
         `;
         card.querySelector('.char-edit-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             openLoreModal(entry.id);
+        });
+        card.querySelector('.char-export-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            downloadFile(`/api/lore/${entry.id}/export`, `${entry.id}.md`);
         });
         card.querySelector('.char-delete-btn').addEventListener('click', async (e) => {
             e.stopPropagation();
@@ -819,6 +922,48 @@ async function saveLore() {
     }
 }
 
+
+// ── Download / Import Helpers ──
+
+async function downloadFile(url, filename) {
+    try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`Download failed: ${res.status}`);
+        const blob = await res.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(a.href);
+    } catch (err) {
+        showToast('Download failed', 'error');
+        console.error(err);
+    }
+}
+
+function importFile(url, accept, refreshFn) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = accept;
+    input.addEventListener('change', async () => {
+        const file = input.files[0];
+        if (!file) return;
+        const form = new FormData();
+        form.append('file', file);
+        try {
+            const res = await fetch(url, { method: 'POST', body: form });
+            if (!res.ok) throw new Error(`Import failed: ${res.status}`);
+            await refreshFn();
+            showToast('Imported successfully');
+        } catch (err) {
+            showToast('Import failed', 'error');
+            console.error(err);
+        }
+    });
+    input.click();
+}
 
 // ── Helpers ──
 function escapeHtml(str) {
