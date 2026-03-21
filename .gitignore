@@ -29,6 +29,18 @@ desktop.ini
 # Claude Code local settings
 .claude/
 
+# User-created characters (keep defaults)
+characters/*
+!characters/example.md
+!characters/detective.md
+!characters/scientist.md
+
+# User-created personas and lore
+personas/*
+!personas/wanderer.md
+lore/*
+!lore/ashenmire.md
+
 # Environment / secrets
 .env
 .env.*
