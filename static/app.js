@@ -128,6 +128,7 @@ async function init() {
     renderHomeCharacters();
     renderConversationList();
     renderHomePersonas();
+    renderHomeLore();
     setupEventListeners();
     switchView('home');
     checkHealth();
@@ -277,6 +278,7 @@ function setupEventListeners() {
         renderHomeCharacters();
         renderConversationList();
         renderHomePersonas();
+        renderHomeLore();
         switchView('home');
     });
 
@@ -320,6 +322,10 @@ function setupEventListeners() {
     // Persona creator
     document.getElementById('btn-create-persona')?.addEventListener('click', () => openPersonaModal());
     document.getElementById('btn-save-persona')?.addEventListener('click', savePersona);
+
+    // Lore creator
+    document.getElementById('btn-create-lore')?.addEventListener('click', () => openLoreModal());
+    document.getElementById('btn-save-lore')?.addEventListener('click', saveLore);
 
     // First-turn toggle
     document.querySelectorAll('#first-turn-toggle .toggle-btn').forEach(btn => {
@@ -696,6 +702,107 @@ async function savePersona() {
         showToast(editId ? 'Persona updated' : 'Persona created');
     } catch (err) {
         showToast('Failed to save persona', 'error');
+        console.error(err);
+    }
+}
+
+
+// ── Home Lore Grid ──
+function renderHomeLore() {
+    const grid = document.getElementById('home-lore-grid');
+    if (!grid) return;
+    grid.innerHTML = '';
+
+    for (const entry of State.lore) {
+        const card = document.createElement('div');
+        card.className = 'char-card home-lore-card';
+        const initial = entry.name ? entry.name[0].toUpperCase() : '?';
+        const tags = Array.isArray(entry.tags) ? entry.tags.join(', ') : '';
+        card.innerHTML = `
+            <div class="char-card-main">
+                <div class="char-avatar lore-avatar">${initial}</div>
+                <div class="char-name">${escapeHtml(entry.name)}</div>
+                <div class="char-tags">${escapeHtml(tags)}</div>
+            </div>
+            <div class="char-card-actions">
+                <button class="char-action-btn char-edit-btn" title="Edit">✎</button>
+                <button class="char-action-btn char-delete-btn" title="Delete">✕</button>
+            </div>
+        `;
+        card.querySelector('.char-edit-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            openLoreModal(entry.id);
+        });
+        card.querySelector('.char-delete-btn').addEventListener('click', async (e) => {
+            e.stopPropagation();
+            if (!confirm(`Delete lore entry "${entry.name}"? This cannot be undone.`)) return;
+            try {
+                await API.del(`/api/lore/${entry.id}`);
+                State.lore = State.lore.filter(l => l.id !== entry.id);
+                renderHomeLore();
+                showToast('Lore entry deleted');
+            } catch (err) {
+                showToast('Failed to delete lore entry', 'error');
+            }
+        });
+        grid.appendChild(card);
+    }
+
+    if (State.lore.length === 0) {
+        grid.innerHTML = '<div class="home-empty-hint">No lore entries yet. Add world history, locations, or factions.</div>';
+    }
+}
+
+
+// ── Lore Creator/Editor Modal ──
+function openLoreModal(loreId) {
+    const isEdit = !!loreId;
+    document.getElementById('lore-modal-title').textContent = isEdit ? 'Edit Lore Entry' : 'Create Lore Entry';
+    document.getElementById('lore-edit-id').value = loreId || '';
+
+    if (isEdit) {
+        const entry = State.lore.find(l => l.id === loreId);
+        if (!entry) return;
+        document.getElementById('lore-name').value = entry.name || '';
+        document.getElementById('lore-tags').value = Array.isArray(entry.tags) ? entry.tags.join(', ') : '';
+        document.getElementById('lore-content').value = entry.content || '';
+    } else {
+        document.getElementById('lore-name').value = '';
+        document.getElementById('lore-tags').value = '';
+        document.getElementById('lore-content').value = '';
+    }
+
+    openModal('modal-lore-edit');
+}
+
+
+async function saveLore() {
+    const editId = document.getElementById('lore-edit-id').value;
+    const name = document.getElementById('lore-name').value.trim();
+    if (!name) {
+        showToast('Lore entry name is required', 'error');
+        return;
+    }
+
+    const data = {
+        name,
+        tags: document.getElementById('lore-tags').value,
+        content: document.getElementById('lore-content').value,
+    };
+
+    try {
+        if (editId) {
+            await API.put(`/api/lore/${editId}`, data);
+        } else {
+            await API.post('/api/lore', data);
+        }
+
+        State.lore = await API.get('/api/lore');
+        renderHomeLore();
+        closeModal('modal-lore-edit');
+        showToast(editId ? 'Lore entry updated' : 'Lore entry created');
+    } catch (err) {
+        showToast('Failed to save lore entry', 'error');
         console.error(err);
     }
 }

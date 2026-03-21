@@ -262,3 +262,34 @@ def load_all_lore(directory: str = "lore") -> list[dict]:
             if entry:
                 entries.append(entry)
     return entries
+
+
+def save_lore(directory: str, data: dict) -> dict:
+    """Save a lore entry as a .md file and return the loaded dict."""
+    os.makedirs(directory, exist_ok=True)
+
+    lore_id = data.get("id") or slugify(data["name"])
+    name = data["name"]
+    tags = data.get("tags", [])
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+    tags_str = "[" + ", ".join(tags) + "]" if tags else "[]"
+    content = data.get("content", "").strip()
+
+    text = f"---\nname: {name}\ntags: {tags_str}\n---\n{content}\n"
+
+    filepath = os.path.join(directory, f"{lore_id}.md")
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+    return load_lore_entry(filepath)
+
+
+def delete_lore(directory: str, lore_id: str) -> bool:
+    """Delete a lore .md file. Returns True if deleted."""
+    filepath = os.path.join(directory, f"{lore_id}.md")
+    if os.path.exists(filepath):
+        os.remove(filepath)
+        return True
+    return False

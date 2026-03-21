@@ -351,6 +351,28 @@ body::after {
     align-content: flex-start;
 }
 
+.home-lore-card {
+    width: 140px;
+    flex-shrink: 0;
+    position: relative;
+}
+
+.lore-avatar {
+    border-color: var(--warning) !important;
+    color: var(--warning) !important;
+}
+
+#home-lore-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+    padding-bottom: 8px;
+    align-content: flex-start;
+}
+
 .home-empty-hint {
     color: var(--text-muted);
     font-size: 13px;

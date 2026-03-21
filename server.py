@@ -16,7 +16,7 @@ from config import config
 from character_loader import (
     load_all_characters, load_character, save_character, delete_character,
     load_all_personas, load_persona, save_persona, delete_persona,
-    load_all_lore, load_lore_entry,
+    load_all_lore, load_lore_entry, save_lore, delete_lore,
 )
 from ollama_client import health_check, stream_chat, describe_image
 from prompt_engine import (
@@ -181,6 +181,35 @@ async def api_delete_persona(persona_id: str):
 @app.get("/api/lore")
 async def api_lore():
     return load_all_lore("lore")
+
+
+@app.post("/api/lore")
+async def api_create_lore(data: dict):
+    if not data.get("name", "").strip():
+        raise HTTPException(400, "Lore entry name is required")
+    entry = save_lore("lore", data)
+    if not entry:
+        raise HTTPException(500, "Failed to save lore entry")
+    return entry
+
+
+@app.put("/api/lore/{lore_id}")
+async def api_update_lore(lore_id: str, data: dict):
+    if not data.get("name", "").strip():
+        raise HTTPException(400, "Lore entry name is required")
+    data["id"] = lore_id
+    entry = save_lore("lore", data)
+    if not entry:
+        raise HTTPException(500, "Failed to save lore entry")
+    return entry
+
+
+@app.delete("/api/lore/{lore_id}")
+async def api_delete_lore(lore_id: str):
+    deleted = delete_lore("lore", lore_id)
+    if not deleted:
+        raise HTTPException(404, "Lore entry not found")
+    return {"ok": True}
 
 
 # ── Conversations ──
