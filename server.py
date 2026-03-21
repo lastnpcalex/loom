@@ -245,10 +245,20 @@ async def api_create_conversation(data: dict = None):
     # Refresh conv data
     conv = await db.get_conversation(conv["id"])
 
-    # If character goes first, add the greeting (unless custom scene is set — that needs generation)
+    # If character goes first:
+    #   - Custom scene → add it as a user message so the model responds to it
+    #   - No custom scene + greeting exists → use the static greeting
+    #   - No custom scene + no greeting → leave empty, client triggers generation
     if first_turn == "character" and character_id:
         char = load_character(os.path.join(config.characters_dir, f"{character_id}.md"))
-        if char and char.get("greeting") and not custom_scene:
+        if custom_scene:
+            # Add custom scene as a user message for the model to respond to
+            scene_msg = await db.add_message(conv["id"], "user", custom_scene)
+            await db.set_active_branch(conv["id"], scene_msg["id"])
+            asyncio.create_task(_background_summarize_message(
+                scene_msg["id"], custom_scene, "user", conv_id=conv["id"]
+            ))
+        elif char and char.get("greeting"):
             greeting_msg = await db.add_message(conv["id"], "assistant", char["greeting"])
             asyncio.create_task(_background_summarize_message(
                 greeting_msg["id"], char["greeting"], "assistant",

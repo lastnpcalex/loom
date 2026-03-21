@@ -264,9 +264,13 @@ async function createConversation() {
     // New conversation has no forks, go to chat
     switchView('chat');
 
-    if (firstTurn === 'character' && charId && customScene) {
-        if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-            State.ws.send(JSON.stringify({ action: 'generate', parent_id: null }));
+    // Trigger generation if character goes first and no static greeting was used
+    if (firstTurn === 'character' && charId) {
+        const lastMsg = State.messages[State.messages.length - 1];
+        if (!lastMsg || lastMsg.role !== 'assistant') {
+            if (State.ws && State.ws.readyState === WebSocket.OPEN) {
+                State.ws.send(JSON.stringify({ action: 'generate' }));
+            }
         }
     }
 }
