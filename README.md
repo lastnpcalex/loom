@@ -7,21 +7,17 @@ A local RP (roleplay) harness with tree-based conversation branching, a WebGL bl
 ## What it does
 
 - **Tree-based conversations** — Every message is a node in a tree. Branch at any point, explore alternate paths, switch between branches. Full conversation history is never lost.
-- **Character system** — Define characters as Markdown files with personality, scenario, greeting, and example messages. Create and edit characters from the UI.
-- **Personas and lore** — Attach a user persona and lore/history files to conversations for richer context.
-- **Incremental context summarization** — As conversations grow past the context budget (default 32K tokens), older messages are summarized in small batches by a local Gemma 3 1B model running on CPU. Recent messages stay verbatim. The LLM never sees stale or truncated context.
-- **WebGL black hole** — A scientifically accurate Schwarzschild raytracer runs as the UI background, with a procedural cyberpunk galaxy texture, glassmorphism panels, and scanline overlay.
-- **Streaming generation** — Real-time token streaming over WebSocket.
+- **Character system** — Define characters as Markdown files with personality, scenario, greeting, and example messages. Create, edit, and delete characters from the UI.
+- **Personas and lore** — Attach a user persona and lore/history files to conversations for richer context. Manage both from the home page.
+- **Fork and branch** — Fork a conversation from any message to create a new conversation. Regenerate creates a new branch, preserving the original response.
+- **Import / export** — Export and import characters (.md), personas (.md), lore (.md), and conversations (.json) for backup or sharing.
+- **Thinking model support** — Handles Ollama thinking models (e.g. qwen3) with a thinking indicator, `<think>` tag stripping, and client-side content token counting so thinking tokens don't eat the response budget.
+- **Incremental context summarization** — As conversations grow past the context budget, older messages are summarized in small batches by a local Gemma 3 1B model running on CPU. Recent messages stay verbatim.
+- **WebGL black hole** — A Schwarzschild raytracer runs as the UI background, with a procedural cyberpunk galaxy texture, glassmorphism panels, and scanline overlay.
+- **Streaming generation** — Real-time token streaming over WebSocket with live token rate display.
 - **Image support** — Attach images to messages; they're described by the vision model and included in context.
 
-## Requirements
-
-- **Python 3.12+**
-- **Ollama** running and accessible (default: `http://localhost:11434`)
-- A model pulled in Ollama (default: `qwen3.5:9b`)
-- ~1GB disk for the Gemma 3 1B summarizer (downloaded automatically on first run)
-
-## Setup
+## Quick start
 
 ```bash
 # Clone
@@ -36,6 +32,15 @@ python server.py
 ```
 
 Open `http://localhost:3000` in your browser.
+
+On Windows, you can create a `loom.bat` in your home folder:
+
+```bat
+@echo off
+cd /d "C:\path\to\loom"
+python server.py
+pause
+```
 
 On first launch, the server downloads the Gemma 3 1B GGUF model (~806MB) for local CPU summarization. This happens in the background and doesn't block startup.
 
@@ -53,8 +58,8 @@ local_summary.py       — Gemma 3 1B via llama-cpp-python for CPU summarization
 
 static/
   index.html           — Single-page app shell
-  app.js               — State management, home view, character CRUD
-  chat.js              — WebSocket chat, message rendering, streaming
+  app.js               — State management, home view, character/persona/lore CRUD
+  chat.js              — WebSocket chat, message rendering, streaming, branching
   tree.js              — Interactive tree visualization (pan/zoom/expand)
   style.css            — Acidburn aesthetic (glassmorphism, cyan/purple palette)
   blackhole.js         — Schwarzschild raytracer (pre-compiled GLSL)
@@ -77,7 +82,7 @@ Settings are adjustable from the UI (gear icon) or by editing `config.py`:
 | `verbatim_window` | `6` | Recent messages kept verbatim |
 | `temperature` | `0.8` | Generation temperature |
 | `top_p` | `0.9` | Nucleus sampling |
-| `max_tokens` | `1536` | Max generation length |
+| `max_tokens` | `1024` | Max generation length |
 | `repeat_penalty` | `1.08` | Repetition penalty |
 
 ## Character file format
@@ -104,6 +109,8 @@ The character's opening message to the player...
 user: Player says something
 assistant: Character responds in their style
 ```
+
+Characters, personas, and lore can also be created, edited, and imported/exported from the home page UI.
 
 ## Credits
 

@@ -425,8 +425,12 @@ async def api_export_conversation(conv_id: int):
         "conversation": dict(conv),
         "messages": messages,
     }
+    # Sanitize filename for HTTP header (ASCII only)
+    import unicodedata
+    safe_title = unicodedata.normalize("NFKD", conv["title"] or "conversation")
+    safe_title = safe_title.encode("ascii", "ignore").decode("ascii").strip() or "conversation"
     return JSONResponse(export, headers={
-        "Content-Disposition": f'attachment; filename="{conv["title"] or "conversation"}.json"'
+        "Content-Disposition": f'attachment; filename="{safe_title}.json"'
     })
 
 
@@ -570,6 +574,7 @@ async def api_update_config(data: dict):
 @app.websocket("/ws/chat/{conv_id}")
 async def ws_chat(websocket: WebSocket, conv_id: int):
     await websocket.accept()
+    print(f"[WS] Connection opened for conv={conv_id}")
 
     try:
         while True:
@@ -596,8 +601,10 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 _active_generations[conv_id] = task
 
     except WebSocketDisconnect:
+        print(f"[WS] Client disconnected conv={conv_id}")
         _active_generations.pop(conv_id, None)
     except Exception as e:
+        print(f"[WS] Error conv={conv_id}: {e}")
         if websocket.client_state == WebSocketState.CONNECTED:
             await websocket.send_json({"type": "error", "error": str(e)})
 

@@ -4,6 +4,8 @@
 
 // ── WebSocket ──
 
+let _wsReconnectDelay = 2000;
+
 function connectWebSocket(convId) {
     if (State.ws) {
         State.ws.close();
@@ -15,6 +17,7 @@ function connectWebSocket(convId) {
 
     ws.onopen = () => {
         console.log('WebSocket connected');
+        _wsReconnectDelay = 2000; // reset backoff on success
     };
 
     ws.onmessage = (event) => {
@@ -24,18 +27,19 @@ function connectWebSocket(convId) {
 
     ws.onerror = (err) => {
         console.error('WebSocket error:', err);
-        showToast('Connection error', 'error');
     };
 
     ws.onclose = () => {
         console.log('WebSocket closed');
-        // Auto-reconnect after 2s if still on same conversation
-        if (State.currentConvId === convId) {
+        // Only reconnect if still on the same conversation and in chat/tree view
+        if (State.currentConvId === convId && State.currentView !== 'home') {
             setTimeout(() => {
-                if (State.currentConvId === convId) {
+                if (State.currentConvId === convId && State.currentView !== 'home') {
                     connectWebSocket(convId);
                 }
-            }, 2000);
+            }, _wsReconnectDelay);
+            // Exponential backoff, cap at 30s
+            _wsReconnectDelay = Math.min(_wsReconnectDelay * 1.5, 30000);
         }
     };
 

@@ -77,6 +77,8 @@ function switchView(view) {
         title.classList.add('hidden');
         backBtn.classList.add('hidden');
         contextInfo.classList.add('hidden');
+        // Close WebSocket when leaving a conversation
+        if (State.ws) { State.ws.close(); State.ws = null; }
     } else if (view === 'tree') {
         sep.classList.remove('hidden');
         title.classList.remove('hidden');
@@ -170,16 +172,18 @@ function renderConversationList() {
         div.innerHTML = `
             <span class="conv-title-text">${escapeHtml(conv.title)}</span>
             <span class="conv-meta">${escapeHtml(charName)}</span>
-            <button class="conv-export" title="Export">↓</button>
-            <button class="conv-delete" title="Delete">✕</button>
+            <div class="conv-actions">
+                <button class="char-action-btn conv-export-btn" title="Export">↓</button>
+                <button class="char-action-btn char-delete-btn conv-delete-btn" title="Delete">✕</button>
+            </div>
         `;
         div.querySelector('.conv-title-text').addEventListener('click', () => loadConversation(conv.id));
         div.querySelector('.conv-meta').addEventListener('click', () => loadConversation(conv.id));
-        div.querySelector('.conv-export').addEventListener('click', (e) => {
+        div.querySelector('.conv-export-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             downloadFile(`/api/conversations/${conv.id}/export`, `${conv.title || 'conversation'}.json`);
         });
-        div.querySelector('.conv-delete').addEventListener('click', async (e) => {
+        div.querySelector('.conv-delete-btn').addEventListener('click', async (e) => {
             e.stopPropagation();
             if (confirm('Delete this conversation?')) {
                 await API.del(`/api/conversations/${conv.id}`);

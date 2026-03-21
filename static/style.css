@@ -263,7 +263,7 @@ body::after {
 
 .home-section-label {
     font-family: var(--font-display);
-    font-size: 11px;
+    font-size: 13px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 2px;
@@ -307,7 +307,7 @@ body::after {
 
 .home-char-card {
     position: relative;
-    width: 140px;
+    width: 160px;
     flex-shrink: 0;
 }
 
@@ -315,27 +315,30 @@ body::after {
     cursor: pointer;
 }
 
-.home-char-card .char-card-actions {
+/* Shared card action buttons (characters, personas, lore, conversations) */
+.char-card-actions {
     position: absolute;
     top: 6px;
     right: 6px;
     display: flex;
-    gap: 2px;
+    gap: 3px;
     opacity: 0;
     transition: opacity var(--transition);
 }
 
-.home-char-card:hover .char-card-actions {
+.home-char-card:hover .char-card-actions,
+.home-persona-card:hover .char-card-actions,
+.home-lore-card:hover .char-card-actions {
     opacity: 1;
 }
 
 .char-action-btn {
-    background: rgba(5, 5, 15, 0.8);
+    background: rgba(5, 5, 15, 0.85);
     border: 1px solid var(--border);
     color: var(--text-muted);
     cursor: pointer;
-    font-size: 11px;
-    padding: 2px 5px;
+    font-size: 13px;
+    padding: 3px 6px;
     border-radius: var(--radius-sm);
     transition: all var(--transition);
     line-height: 1;
@@ -352,7 +355,7 @@ body::after {
 }
 
 .home-persona-card {
-    width: 140px;
+    width: 160px;
     flex-shrink: 0;
     position: relative;
 }
@@ -374,7 +377,7 @@ body::after {
 }
 
 .home-lore-card {
-    width: 140px;
+    width: 160px;
     flex-shrink: 0;
     position: relative;
 }
@@ -460,25 +463,25 @@ body::after {
 }
 
 .conv-item .conv-meta {
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-muted);
     white-space: nowrap;
     flex-shrink: 0;
 }
 
-.conv-item .conv-delete {
+.conv-item .conv-actions {
+    display: flex;
+    gap: 3px;
     opacity: 0;
-    background: none;
-    border: none;
-    color: var(--danger);
-    cursor: pointer;
-    font-size: 14px;
-    padding: 0 4px;
     flex-shrink: 0;
     transition: opacity var(--transition);
 }
 
-.conv-item:hover .conv-delete { opacity: 1; }
+.conv-item:hover .conv-actions { opacity: 1; }
+
+.conv-item .conv-actions .char-action-btn {
+    position: static;
+}
 
 /* ── Tree Canvas View ── */
 #tree-canvas {
@@ -1302,8 +1305,8 @@ body::after {
     box-shadow: 0 0 20px rgba(0, 255, 255, 0.2);
 }
 
-.char-card .char-name { font-size: 13px; font-weight: 500; margin-top: 6px; }
-.char-card .char-tags { font-size: 10px; color: var(--text-muted); margin-top: 4px; }
+.char-card .char-name { font-size: 14px; font-weight: 500; margin-top: 6px; }
+.char-card .char-tags { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
 
 .char-avatar {
     width: 48px;
