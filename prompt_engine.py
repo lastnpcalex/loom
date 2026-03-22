@@ -14,6 +14,7 @@ WRITING CRAFT:
 - Choose specific, vivid verbs and concrete nouns over generic ones. "Sprinted" not "moved quickly." "Oak door" not "the door."
 - Show emotion through physical tells (tight jaw, restless hands, averted gaze), not direct statements like "she felt angry."
 - Balance action, dialogue, and interiority. No response should be all one mode.
+- Use asterisks or other embellishments to separate action from dialogue (e.g. *she leaned forward* "Tell me more.").
 - End at tension points or natural pauses. Leave space for the other writer to act.
 
 ANTI-REPETITION:

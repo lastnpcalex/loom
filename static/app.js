@@ -165,20 +165,60 @@ function renderConversationList() {
         const div = document.createElement('div');
         div.className = 'conv-item';
 
-        const charName = conv.character_id
+        const isCC = conv.mode === 'claude';
+        const charName = isCC ? 'Claude Code'
+            : conv.character_id
             ? (State.characters.find(c => c.id === conv.character_id)?.name || conv.character_id)
             : 'Freeform';
+        const modeBadge = isCC ? '<span class="mode-badge">CC</span>' : '<span class="mode-badge">W</span>';
 
         div.innerHTML = `
+            ${modeBadge}
             <span class="conv-title-text">${escapeHtml(conv.title)}</span>
             <span class="conv-meta">${escapeHtml(charName)}</span>
             <div class="conv-actions">
+                <button class="char-action-btn conv-edit-btn" title="Rename">✎</button>
                 <button class="char-action-btn conv-export-btn" title="Export">↓</button>
                 <button class="char-action-btn char-delete-btn conv-delete-btn" title="Delete">✕</button>
             </div>
         `;
         div.querySelector('.conv-title-text').addEventListener('click', () => loadConversation(conv.id));
         div.querySelector('.conv-meta').addEventListener('click', () => loadConversation(conv.id));
+        div.querySelector('.conv-edit-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            const titleSpan = div.querySelector('.conv-title-text');
+            const currentTitle = conv.title || '';
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.value = currentTitle;
+            input.className = 'conv-title-input';
+            titleSpan.replaceWith(input);
+            input.focus();
+            input.select();
+
+            const save = async () => {
+                const newTitle = input.value.trim() || currentTitle;
+                const span = document.createElement('span');
+                span.className = 'conv-title-text';
+                span.textContent = newTitle;
+                span.addEventListener('click', () => loadConversation(conv.id));
+                input.replaceWith(span);
+                if (newTitle !== currentTitle) {
+                    try {
+                        const updated = await API.put(`/api/conversations/${conv.id}`, { title: newTitle });
+                        conv.title = updated.title;
+                        if (State.currentConv && State.currentConv.id === conv.id) {
+                            State.currentConv.title = updated.title;
+                        }
+                    } catch { showToast('Failed to rename', 'error'); }
+                }
+            };
+            input.addEventListener('blur', save);
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') input.blur();
+                if (e.key === 'Escape') { input.value = currentTitle; input.blur(); }
+            });
+        });
         div.querySelector('.conv-export-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             downloadFile(`/api/conversations/${conv.id}/export`, `${conv.title || 'conversation'}.json`);
@@ -226,6 +266,12 @@ async function loadConversation(convId) {
     renderTree();
     renderMessages();
 
+    // Hide image attach for Claude mode
+    const attachBtn = document.getElementById('btn-attach');
+    if (attachBtn) {
+        attachBtn.style.display = (conv.mode === 'claude') ? 'none' : '';
+    }
+
     // If only a linear conversation (no forks), go straight to chat
     const hasForks = treeData.some(n => {
         const siblings = treeData.filter(s => s.parent_id === n.parent_id);
@@ -241,7 +287,31 @@ async function loadConversation(convId) {
 
 // ── Create Conversation ──
 async function createConversation() {
+    const mode = document.querySelector('#mode-toggle .toggle-btn.active')?.dataset.value || 'weave';
     const title = document.getElementById('new-conv-title').value.trim() || 'New Conversation';
+
+    if (mode === 'claude') {
+        const projectDir = document.getElementById('project-dir').value.trim();
+        if (!projectDir) {
+            showToast('Working directory is required for Claude mode', 'error');
+            return;
+        }
+        const conv = await API.post('/api/conversations', {
+            title,
+            mode: 'claude',
+            project_dir: projectDir,
+        });
+        State.conversations.unshift(conv);
+        closeModal('modal-new-conv');
+        document.getElementById('new-conv-title').value = '';
+        document.getElementById('project-dir').value = '';
+        renderConversationList();
+        await loadConversation(conv.id);
+        switchView('chat');
+        return;
+    }
+
+    // Weave mode (unchanged)
     const charId = State.selectedCharacterId;
     const firstTurn = document.querySelector('#first-turn-toggle .toggle-btn.active')?.dataset.value || 'character';
     const customScene = document.getElementById('custom-scene').value.trim();
@@ -311,7 +381,83 @@ function openNewConvModal() {
     document.querySelectorAll('#first-turn-toggle .toggle-btn').forEach(b => b.classList.remove('active'));
     document.querySelector('#first-turn-toggle .toggle-btn[data-value="character"]').classList.add('active');
     document.getElementById('custom-scene').value = '';
+    // Reset mode toggle to Weave
+    document.querySelectorAll('#mode-toggle .toggle-btn').forEach(b => b.classList.remove('active'));
+    document.querySelector('#mode-toggle .toggle-btn[data-value="weave"]').classList.add('active');
+    document.getElementById('project-dir-group').classList.add('hidden');
+    document.getElementById('project-dir').value = '';
+    showWeaveFields(true);
     openModal('modal-new-conv');
+}
+
+async function loadDirBrowser(path) {
+    const browser = document.getElementById('dir-browser');
+    browser.classList.remove('hidden');
+    browser.innerHTML = '<div class="dir-loading">Loading...</div>';
+
+    try {
+        const data = await API.get(`/api/browse-dirs?path=${encodeURIComponent(path)}`);
+        let html = '';
+
+        // Current path display (clickable to refresh)
+        if (data.current) {
+            html += `<div class="dir-current" data-dir-path="${escapeHtml(data.current)}" title="Click to refresh">${escapeHtml(data.current)}</div>`;
+        }
+
+        // Navigation
+        html += '<div class="dir-list">';
+
+        // Select current directory button (prominent)
+        if (data.current) {
+            html += `<div class="dir-entry dir-select" data-dir-select="${escapeHtml(data.current)}">&#x2714; Use this folder</div>`;
+        }
+
+        // Parent directory link
+        if (data.parent !== null && data.parent !== undefined) {
+            html += `<div class="dir-entry dir-parent" data-dir-path="${escapeHtml(data.parent)}">&#x1F4C1; ..</div>`;
+        }
+
+        // Subdirectories
+        for (const dir of data.dirs) {
+            html += `<div class="dir-entry" data-dir-path="${escapeHtml(dir.path)}">&#x1F4C2; ${escapeHtml(dir.name)}</div>`;
+        }
+
+        if (data.dirs.length === 0 && !data.error) {
+            html += '<div class="dir-empty">No subdirectories</div>';
+        }
+        if (data.error) {
+            html += `<div class="dir-error">${escapeHtml(data.error)}</div>`;
+        }
+
+        html += '</div>';
+        browser.innerHTML = html;
+
+        // Event delegation for directory entries
+        browser.querySelectorAll('[data-dir-path]').forEach(el => {
+            el.addEventListener('click', () => loadDirBrowser(el.dataset.dirPath));
+        });
+        browser.querySelectorAll('[data-dir-select]').forEach(el => {
+            el.addEventListener('click', () => {
+                document.getElementById('project-dir').value = el.dataset.dirSelect;
+                browser.classList.add('hidden');
+            });
+        });
+    } catch (err) {
+        browser.innerHTML = `<div class="dir-error">Failed to browse: ${err.message}</div>`;
+    }
+}
+
+function showWeaveFields(show) {
+    const weaveFields = ['character-grid', 'persona-select', 'lore-checklist',
+                         'first-turn-toggle', 'custom-scene-group'];
+    for (const id of weaveFields) {
+        const el = document.getElementById(id);
+        if (el) {
+            const fg = el.closest('.form-group') || el;
+            if (show) fg.classList.remove('hidden');
+            else fg.classList.add('hidden');
+        }
+    }
 }
 
 // ── Setup Event Listeners ──
@@ -428,6 +574,33 @@ function setupEventListeners() {
             State.conversations = await API.get('/api/conversations');
             renderConversationList();
         });
+    });
+
+    // Mode toggle (Weave / Claude)
+    document.querySelectorAll('#mode-toggle .toggle-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('#mode-toggle .toggle-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            const mode = btn.dataset.value;
+            if (mode === 'claude') {
+                document.getElementById('project-dir-group').classList.remove('hidden');
+                showWeaveFields(false);
+            } else {
+                document.getElementById('project-dir-group').classList.add('hidden');
+                showWeaveFields(true);
+            }
+        });
+    });
+
+    // Browse directory button
+    document.getElementById('btn-browse-dir').addEventListener('click', () => {
+        const browser = document.getElementById('dir-browser');
+        if (!browser.classList.contains('hidden')) {
+            browser.classList.add('hidden');
+            return;
+        }
+        const currentPath = document.getElementById('project-dir').value.trim();
+        loadDirBrowser(currentPath || '');
     });
 
     // First-turn toggle

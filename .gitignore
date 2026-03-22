@@ -41,6 +41,11 @@ personas/*
 lore/*
 !lore/ashenmire.md
 
+# Scratch / test files
+hello_world.md
+CLAUDE_LOOM_SPEC.md
+branches_of_the_loom.md
+
 # Environment / secrets
 .env
 .env.*

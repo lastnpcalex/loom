@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=18">
+    <link rel="stylesheet" href="/static/style.css?v=29">
 </head>
 <body>
     <div id="blackhole-container"></div>
@@ -125,6 +125,21 @@
         <div class="modal-backdrop"></div>
         <div class="modal-content">
             <h2>New Conversation</h2>
+            <div class="form-group">
+                <label>Mode</label>
+                <div id="mode-toggle" class="toggle-group">
+                    <button class="toggle-btn active" data-value="weave">Weave</button>
+                    <button class="toggle-btn" data-value="claude">Claude</button>
+                </div>
+            </div>
+            <div class="form-group hidden" id="project-dir-group">
+                <label for="project-dir">Working Directory</label>
+                <div class="input-with-button">
+                    <input type="text" id="project-dir" placeholder="C:\Users\...">
+                    <button type="button" class="btn-small" id="btn-browse-dir">Browse</button>
+                </div>
+                <div id="dir-browser" class="dir-browser hidden"></div>
+            </div>
             <div class="form-group">
                 <label for="new-conv-title">Title</label>
                 <input type="text" id="new-conv-title" placeholder="Untitled">
@@ -301,8 +316,8 @@ assistant: *Another example response*"></textarea>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=12"></script>
-    <script src="/static/app.js?v=19"></script>
-    <script src="/static/chat.js?v=20"></script>
+    <script src="/static/app.js?v=23"></script>
+    <script src="/static/chat.js?v=29"></script>
     <script src="/static/tree.js?v=11"></script>
 </body>
 </html>

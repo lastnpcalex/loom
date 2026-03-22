@@ -1,12 +1,13 @@
 """Local Gemma 3 1B summarizer — runs on CPU via llama-cpp-python.
 
-Downloads the quantized GGUF model on first use (~806MB).
-Keeps the model loaded in memory as a singleton for fast repeated calls.
+Downloads the quantized GGUF model on first use (~500MB).
+Auto-unloads after idle timeout to free memory.
 Completely independent from Ollama — won't compete for GPU resources.
 """
 
 import asyncio
 import os
+import time
 import logging
 from typing import Optional
 
@@ -17,12 +18,15 @@ _llm = None
 _loading = False
 _load_lock = None
 _inference_lock = None  # prevents concurrent llama.cpp calls (not thread-safe)
+_last_used = 0.0        # timestamp of last inference call
+_idle_task = None        # background task that checks for idle timeout
 
 # Model config — abliterated (no refusals) for RP summarization
 REPO_ID = "mlabonne/gemma-3-1b-it-abliterated-GGUF"
-FILENAME = "gemma-3-1b-it-abliterated.q8_0.gguf"
-N_CTX = 4096
-N_THREADS = None  # None = auto-detect
+FILENAME = "gemma-3-1b-it-abliterated-Q4_K_M.gguf"
+N_CTX = 2048       # 2K is plenty for short summaries
+N_THREADS = None    # None = auto-detect
+IDLE_TIMEOUT = 300  # unload after 5 minutes idle
 
 
 def _get_lock():
@@ -43,7 +47,9 @@ def _get_inference_lock():
 
 async def _ensure_model():
     """Download (if needed) and load the Gemma model. Thread-safe singleton."""
-    global _llm, _loading
+    global _llm, _loading, _last_used, _idle_task
+
+    _last_used = time.monotonic()
 
     if _llm is not None:
         return _llm
@@ -54,12 +60,12 @@ async def _ensure_model():
             return _llm
 
         _loading = True
-        logger.info("Loading local Gemma 3 1B for summarization (first run downloads ~806MB)...")
+        logger.info("Loading local Gemma 3 1B for summarization...")
 
         try:
             # Run the blocking download + load in a thread
             _llm = await asyncio.get_event_loop().run_in_executor(None, _load_model)
-            logger.info("Gemma 3 1B loaded successfully — CPU summarization ready")
+            logger.info("Gemma 3 1B loaded — CPU summarization ready")
         except Exception as e:
             logger.error(f"Failed to load Gemma model: {e}")
             _loading = False
@@ -67,7 +73,25 @@ async def _ensure_model():
         finally:
             _loading = False
 
+        # Start idle monitor
+        if _idle_task is None or _idle_task.done():
+            _idle_task = asyncio.create_task(_idle_monitor())
+
         return _llm
+
+
+async def _idle_monitor():
+    """Periodically check if the model has been idle and unload it."""
+    global _llm
+    while True:
+        await asyncio.sleep(60)  # check every minute
+        if _llm is None:
+            return  # already unloaded, stop monitoring
+        elapsed = time.monotonic() - _last_used
+        if elapsed >= IDLE_TIMEOUT:
+            logger.info(f"Gemma idle for {int(elapsed)}s — unloading to free memory")
+            unload()
+            return
 
 
 def _load_model():
@@ -126,8 +150,10 @@ async def summarize(text: str, max_tokens: int = 400, temperature: float = 0.3) 
     )
 
     try:
+        global _last_used
         # Serialize inference calls — llama.cpp is not thread-safe
         async with _get_inference_lock():
+            _last_used = time.monotonic()
             result = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: llm(
@@ -138,6 +164,7 @@ async def summarize(text: str, max_tokens: int = 400, temperature: float = 0.3) 
                     stop=["<end_of_turn>"],
                 )
             )
+            _last_used = time.monotonic()
         return result["choices"][0]["text"].strip()
     except Exception as e:
         logger.error(f"Gemma inference failed: {e}")
@@ -177,8 +204,10 @@ async def summarize_message(content: str, role: str = "user") -> str:
     )
 
     try:
+        global _last_used
         # Serialize inference calls — llama.cpp is not thread-safe
         async with _get_inference_lock():
+            _last_used = time.monotonic()
             result = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: llm(
@@ -189,6 +218,7 @@ async def summarize_message(content: str, role: str = "user") -> str:
                     stop=["<end_of_turn>", "\n\n"],
                 )
             )
+            _last_used = time.monotonic()
         summary = result["choices"][0]["text"].strip()
         # Clean up: remove quotes, trailing periods from fragments
         summary = summary.strip('"\'')
@@ -240,4 +270,7 @@ def unload():
     if _llm is not None:
         del _llm
         _llm = None
+        # Force garbage collection to actually free the memory
+        import gc
+        gc.collect()
         logger.info("Gemma model unloaded from memory")

@@ -25,6 +25,7 @@ from prompt_engine import (
 )
 from context_manager import get_context_for_generation, update_rolling_summary
 import local_summary
+import claude_client
 
 from contextlib import asynccontextmanager
 
@@ -51,6 +52,14 @@ os.makedirs(config.upload_dir, exist_ok=True)
 
 # Active WebSocket generation tasks (for cancellation)
 _active_generations: dict[int, asyncio.Task] = {}
+# Active Claude Code subprocesses (for cancellation)
+_active_claude_procs: dict[int, asyncio.subprocess.Process] = {}
+# Active WebSocket connections per conversation (for permission prompts)
+_active_websockets: dict[int, WebSocket] = {}
+# Pending hook-based permission requests: request_id -> {event, response, conv_id}
+_pending_hook_permissions: dict[str, dict] = {}
+# Sessions where user clicked "Allow All" — auto-approve for rest of generation
+_auto_approve_sessions: set[int] = set()
 
 
 async def _background_summarize_message(msg_id: int, content: str, role: str,
@@ -227,11 +236,13 @@ async def api_create_conversation(data: dict = None):
     persona_id = data.get("persona_id")
     lore_ids = data.get("lore_ids", [])
     style_nudge = data.get("style_nudge", "Natural")
+    mode = data.get("mode", "weave")
+    project_dir = data.get("project_dir")
 
     first_turn = data.get("first_turn", "character")  # "character" or "user"
     custom_scene = data.get("custom_scene")
 
-    conv = await db.create_conversation(title, character_id)
+    conv = await db.create_conversation(title, character_id, mode=mode, project_dir=project_dir)
 
     # Store additional fields
     import json as _json
@@ -569,12 +580,124 @@ async def api_update_config(data: dict):
     return config.to_dict()
 
 
+# ── Directory Browser (for Claude mode project picker) ──
+
+@app.get("/api/browse-dirs")
+async def api_browse_dirs(path: str = ""):
+    """List subdirectories of a given path for the folder picker UI."""
+    import string
+
+    if not path:
+        # Return drive roots on Windows, or / on Unix
+        if os.name == "nt":
+            drives = []
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if os.path.isdir(drive):
+                    drives.append({"name": f"{letter}:", "path": drive})
+            return {"parent": None, "dirs": drives, "current": ""}
+        else:
+            path = "/"
+
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        raise HTTPException(400, "Not a directory")
+
+    parent = os.path.dirname(path) if path != os.path.dirname(path) else None
+
+    try:
+        entries = []
+        for entry in sorted(os.scandir(path), key=lambda e: e.name.lower()):
+            if entry.is_dir() and not entry.name.startswith("."):
+                entries.append({"name": entry.name, "path": entry.path})
+        return {"parent": parent, "dirs": entries, "current": path}
+    except PermissionError:
+        return {"parent": parent, "dirs": [], "current": path, "error": "Permission denied"}
+
+
+# ── Claude Code Permission Hook Endpoint ──
+
+@app.post("/api/cc-permission")
+async def handle_cc_permission(data: dict):
+    """Receive permission request from CC hook script, forward to UI, wait for response.
+
+    The hook script (cc_permission_hook.py) POSTs here when CC needs tool approval.
+    This endpoint long-polls until the user responds in the browser UI (up to 5 min).
+    """
+    conv_id = int(data.get("loom_conv_id", 0))
+    request_id = str(uuid.uuid4())
+
+    tool_name = data.get("tool_name", "Unknown")
+    tool_input = data.get("tool_input", {})
+
+    print(f"[PERM] Hook request: conv={conv_id} tool={tool_name} request_id={request_id}")
+
+    # Auto-approve if user previously clicked "Allow All" for this session
+    if conv_id in _auto_approve_sessions:
+        print(f"[PERM] Auto-approved (Allow All active)")
+        return {"allow": True}
+
+    # Build a human-readable summary
+    input_summary = ""
+    if isinstance(tool_input, dict):
+        if "command" in tool_input:
+            input_summary = tool_input["command"]
+        elif "file_path" in tool_input:
+            input_summary = tool_input["file_path"]
+        elif "description" in tool_input:
+            input_summary = tool_input["description"]
+        else:
+            input_summary = json.dumps(tool_input)[:500]
+    elif isinstance(tool_input, str):
+        input_summary = tool_input[:500]
+
+    # Send to UI via WebSocket
+    ws = _active_websockets.get(conv_id)
+    if ws and ws.client_state == WebSocketState.CONNECTED:
+        await ws.send_json({
+            "type": "permission_request",
+            "request_id": request_id,
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "input_summary": input_summary,
+        })
+    else:
+        print(f"[PERM] No active WebSocket for conv={conv_id} — denying")
+        return {"allow": False, "message": "No active Loom UI session"}
+
+    # Wait for user response
+    event = asyncio.Event()
+    _pending_hook_permissions[request_id] = {
+        "event": event,
+        "response": None,
+        "conv_id": conv_id,
+    }
+
+    try:
+        await asyncio.wait_for(event.wait(), timeout=300)
+        user_response = _pending_hook_permissions.pop(request_id, {}).get("response", {})
+
+        allowed = user_response.get("allow", False)
+        print(f"[PERM] User decision: {'allow' if allowed else 'deny'}")
+
+        if allowed:
+            return {"allow": True}
+        else:
+            return {"allow": False, "message": "Denied by user in Loom UI"}
+
+    except asyncio.TimeoutError:
+        _pending_hook_permissions.pop(request_id, None)
+        print(f"[PERM] Timeout for request_id={request_id}")
+        return {"allow": False, "message": "Permission timeout (5min)"}
+
+
 # ── WebSocket Chat ──
 
 @app.websocket("/ws/chat/{conv_id}")
 async def ws_chat(websocket: WebSocket, conv_id: int):
     await websocket.accept()
     print(f"[WS] Connection opened for conv={conv_id}")
+    _active_websockets[conv_id] = websocket
 
     try:
         while True:
@@ -586,6 +709,24 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 task = _active_generations.pop(conv_id, None)
                 if task:
                     task.cancel()
+                proc = _active_claude_procs.pop(conv_id, None)
+                if proc:
+                    await claude_client.cancel_claude(proc)
+                _pending_permissions.pop(conv_id, None)
+                continue
+
+            if action == "permission_response":
+                request_id = data.get("request_id", "")
+                if data.get("always"):
+                    _auto_approve_sessions.add(conv_id)
+                # Resolve the hook-based pending permission
+                pending = _pending_hook_permissions.get(request_id)
+                if pending:
+                    pending["response"] = {
+                        "allow": data.get("allow", False),
+                        "always": data.get("always", False),
+                    }
+                    pending["event"].set()
                 continue
 
             print(f"[WS] Received action={action} for conv={conv_id}")
@@ -603,6 +744,7 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
     except WebSocketDisconnect:
         print(f"[WS] Client disconnected conv={conv_id}")
         _active_generations.pop(conv_id, None)
+        _active_websockets.pop(conv_id, None)
     except Exception as e:
         print(f"[WS] Error conv={conv_id}: {e}")
         if websocket.client_state == WebSocketState.CONNECTED:
@@ -610,7 +752,235 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
 
 
 async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
-    """Handle a generation request over WebSocket."""
+    """Handle a generation request over WebSocket — routes by conversation mode."""
+    conv = await db.get_conversation(conv_id)
+    mode = conv.get("mode", "weave") if conv else "weave"
+
+    if mode == "claude":
+        await _handle_claude_generation(websocket, conv_id, conv, data)
+        return
+
+    await _handle_weave_generation(websocket, conv_id, conv, data)
+
+
+async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: dict, data: dict):
+    """Handle Claude Code CLI generation."""
+    try:
+        action = data.get("action")
+        parent_id = data.get("parent_id")
+
+        if action == "generate" and parent_id is None:
+            leaf = await db.get_active_leaf(conv_id)
+            parent_id = leaf["id"] if leaf else None
+
+        # Build conversation history from Loom's active branch
+        branch = await db.get_branch_to_root(parent_id) if parent_id else []
+
+        # Build a prompt with conversation history including tool calls
+        history_parts = []
+        for msg in branch:
+            if msg["role"] == "system":
+                continue
+            if msg["role"] == "user":
+                history_parts.append(f"Human: {msg['content']}")
+            elif msg["role"] == "assistant":
+                # Include tool call info from content_blocks if available
+                blocks = None
+                if msg.get("content_blocks"):
+                    try:
+                        blocks = json.loads(msg["content_blocks"]) if isinstance(msg["content_blocks"], str) else msg["content_blocks"]
+                    except (json.JSONDecodeError, TypeError):
+                        blocks = None
+
+                if blocks:
+                    parts = []
+                    for block in blocks:
+                        if block.get("type") == "text" and block.get("text"):
+                            parts.append(block["text"])
+                        elif block.get("type") == "tool_use":
+                            tool_summary = f"[Used tool: {block.get('name', 'unknown')}]"
+                            if block.get("input"):
+                                # Truncate long inputs
+                                inp = block["input"][:500] if len(block.get("input", "")) > 500 else block.get("input", "")
+                                tool_summary += f"\nInput: {inp}"
+                            if block.get("result"):
+                                res = block["result"][:500] if len(block.get("result", "")) > 500 else block.get("result", "")
+                                tool_summary += f"\nResult: {res}"
+                            parts.append(tool_summary)
+                    history_parts.append(f"Assistant: {chr(10).join(parts)}")
+                else:
+                    history_parts.append(f"Assistant: {msg['content']}")
+
+        if not history_parts:
+            await websocket.send_json({"type": "error", "error": "No message to send to Claude"})
+            return
+
+        # If there's prior conversation, include it as context
+        if len(history_parts) > 1:
+            history = "\n\n".join(history_parts[:-1])
+            latest = history_parts[-1].removeprefix("Human: ")
+            prompt = f"<conversation_history>\n{history}\n</conversation_history>\n\n{latest}"
+        else:
+            prompt = history_parts[0].removeprefix("Human: ")
+
+        project_dir = conv.get("project_dir") or "."
+
+        await websocket.send_json({"type": "stream_start"})
+
+        proc, event_stream = await claude_client.run_claude(
+            prompt, project_dir, conv_id=conv_id, server_port=config.port
+        )
+        _active_claude_procs[conv_id] = proc
+
+        full_text = ""
+        content_blocks = []
+        current_block = None
+        result_info = {}
+        new_session_id = ""
+        total_input_tokens = 0
+        total_output_tokens = 0
+
+        async for evt in event_stream:
+            etype = evt["type"]
+
+            if etype == "session_info":
+                new_session_id = evt.get("session_id", "") or new_session_id
+
+            elif etype == "text_delta":
+                full_text += evt["text"]
+                if current_block and current_block["type"] == "text":
+                    current_block["text"] += evt["text"]
+                else:
+                    current_block = {"type": "text", "text": evt["text"]}
+                    content_blocks.append(current_block)
+                await websocket.send_json({"type": "stream_chunk", "content": evt["text"]})
+
+            elif etype == "tool_start":
+                current_block = {
+                    "type": "tool_use",
+                    "name": evt["name"],
+                    "tool_id": evt.get("tool_id", ""),
+                    "input": "",
+                    "result": "",
+                }
+                content_blocks.append(current_block)
+                await websocket.send_json({
+                    "type": "tool_start",
+                    "name": evt["name"],
+                    "tool_id": evt.get("tool_id", ""),
+                })
+
+            elif etype == "tool_input_delta":
+                if current_block and current_block["type"] == "tool_use":
+                    current_block["input"] += evt["json"]
+                await websocket.send_json({
+                    "type": "tool_input_chunk",
+                    "content": evt["json"],
+                    "tool_id": evt.get("tool_id", ""),
+                })
+
+            elif etype == "tool_result":
+                result_content = evt.get("content", "")
+                tool_id = evt.get("tool_id", "")
+                for block in reversed(content_blocks):
+                    if block["type"] == "tool_use" and block.get("tool_id") == tool_id:
+                        block["result"] = result_content
+                        break
+                current_block = None
+                await websocket.send_json({
+                    "type": "tool_result",
+                    "content": result_content,
+                    "tool_id": tool_id,
+                })
+
+            elif etype == "thinking_delta":
+                if current_block and current_block["type"] == "thinking":
+                    current_block["text"] += evt["text"]
+                else:
+                    current_block = {"type": "thinking", "text": evt["text"]}
+                    content_blocks.append(current_block)
+                await websocket.send_json({"type": "thinking_chunk", "content": evt["text"]})
+
+            elif etype == "usage":
+                total_input_tokens += evt.get("input_tokens", 0)
+                total_output_tokens += evt.get("output_tokens", 0)
+
+            elif etype == "cc_raw_event":
+                # Forward unknown events to UI for debugging
+                raw_data = evt.get("data", {})
+                raw_type = evt.get("event_type", "")
+                print(f"[CC] Unknown event type={raw_type}: {json.dumps(raw_data, default=str)[:300]}")
+                await websocket.send_json({
+                    "type": "cc_debug_event",
+                    "event_type": raw_type,
+                    "data": raw_data,
+                })
+
+            elif etype == "result":
+                result_info = evt
+                # Use result text as fallback if no text came from assistant events
+                if not full_text and evt.get("result_text"):
+                    full_text = evt["result_text"]
+                    content_blocks.append({"type": "text", "text": full_text})
+
+        _active_claude_procs.pop(conv_id, None)
+
+        # Extract cost info
+        cost_usd = result_info.get("cost_usd", 0)
+        input_tokens = total_input_tokens
+        output_tokens = total_output_tokens
+        new_session_id = result_info.get("session_id", "") or new_session_id
+        duration_ms = result_info.get("duration_ms", 0)
+
+        # Save assistant message
+        msg = await db.add_message(
+            conv_id, "assistant", full_text, parent_id=parent_id,
+            content_blocks=json.dumps(content_blocks),
+            turn_cost_usd=cost_usd,
+            turn_input_tokens=input_tokens,
+            turn_output_tokens=output_tokens,
+        )
+        await db.set_active_branch(conv_id, msg["id"])
+
+        # Update conversation with session_id and cumulative cost
+        old_cost = conv.get("total_cost_usd") or 0
+        await db.update_conversation_fields(
+            conv_id,
+            claude_session_id=new_session_id,
+            total_cost_usd=old_cost + cost_usd,
+        )
+
+        cost_info = {
+            "cost_usd": cost_usd,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "duration_ms": duration_ms,
+        }
+
+        await websocket.send_json({
+            "type": "stream_end",
+            "message": dict(msg),
+            "cost": cost_info,
+        })
+
+    except asyncio.CancelledError:
+        _active_claude_procs.pop(conv_id, None)
+        await websocket.send_json({"type": "cancelled"})
+    except Exception as e:
+        _active_claude_procs.pop(conv_id, None)
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.send_json({"type": "error", "error": str(e)})
+    finally:
+        _active_generations.pop(conv_id, None)
+        _auto_approve_sessions.discard(conv_id)
+        # Clean up any pending hook permissions for this conversation
+        for rid in list(_pending_hook_permissions):
+            if _pending_hook_permissions[rid].get("conv_id") == conv_id:
+                _pending_hook_permissions.pop(rid, None)
+
+
+async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dict, data: dict):
+    """Handle Weave (Ollama) generation — original logic."""
     try:
         action = data.get("action")
         parent_id = data.get("parent_id")
@@ -621,9 +991,6 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
         if action == "generate" and parent_id is None:
             leaf = await db.get_active_leaf(conv_id)
             parent_id = leaf["id"] if leaf else None
-
-        # Load character
-        conv = await db.get_conversation(conv_id)
         character = None
         if conv and conv.get("character_id"):
             character = load_character(

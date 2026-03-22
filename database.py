@@ -72,18 +72,41 @@ async def get_db() -> aiosqlite.Connection:
 async def init_db():
     db = await get_db()
     await db.executescript(SCHEMA)
+    await _run_migrations(db)
     await db.commit()
     await db.close()
 
 
+async def _run_migrations(db):
+    """Add new columns idempotently via ALTER TABLE."""
+    migrations = [
+        # Conversations: Claude mode fields
+        "ALTER TABLE conversations ADD COLUMN mode TEXT NOT NULL DEFAULT 'weave'",
+        "ALTER TABLE conversations ADD COLUMN project_dir TEXT",
+        "ALTER TABLE conversations ADD COLUMN claude_session_id TEXT",
+        "ALTER TABLE conversations ADD COLUMN total_cost_usd REAL DEFAULT 0",
+        # Messages: Claude content blocks + cost tracking
+        "ALTER TABLE messages ADD COLUMN content_blocks TEXT",
+        "ALTER TABLE messages ADD COLUMN turn_cost_usd REAL",
+        "ALTER TABLE messages ADD COLUMN turn_input_tokens INTEGER",
+        "ALTER TABLE messages ADD COLUMN turn_output_tokens INTEGER",
+    ]
+    for sql in migrations:
+        try:
+            await db.execute(sql)
+        except Exception:
+            pass  # Column already exists
+
+
 # ── Conversations ──
 
-async def create_conversation(title: str, character_id: str = None) -> dict:
+async def create_conversation(title: str, character_id: str = None,
+                              mode: str = "weave", project_dir: str = None) -> dict:
     db = await get_db()
     now = time.time()
     cursor = await db.execute(
-        "INSERT INTO conversations (title, character_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        (title, character_id, now, now)
+        "INSERT INTO conversations (title, character_id, mode, project_dir, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (title, character_id, mode, project_dir, now, now)
     )
     conv_id = cursor.lastrowid
     # Init style state
@@ -146,7 +169,8 @@ async def save_custom_scene(conv_id: int, scene: str):
 async def update_conversation_fields(conv_id: int, **fields):
     """Update arbitrary fields on a conversation."""
     db = await get_db()
-    allowed = {"persona_id", "lore_ids", "style_nudge", "custom_scene", "title"}
+    allowed = {"persona_id", "lore_ids", "style_nudge", "custom_scene", "title",
+                "claude_session_id", "total_cost_usd"}
     updates = []
     params = []
     for key, val in fields.items():
@@ -167,15 +191,19 @@ async def update_conversation_fields(conv_id: int, **fields):
 
 async def add_message(conversation_id: int, role: str, content: str,
                       parent_id: int = None, image_path: str = None,
-                      is_active: bool = True) -> dict:
+                      is_active: bool = True, content_blocks: str = None,
+                      turn_cost_usd: float = None, turn_input_tokens: int = None,
+                      turn_output_tokens: int = None) -> dict:
     db = await get_db()
     token_est = len(content) // 3
     now = time.time()
     cursor = await db.execute(
         """INSERT INTO messages
-           (conversation_id, parent_id, role, content, image_path, token_estimate, is_active, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (conversation_id, parent_id, role, content, image_path, token_est, int(is_active), now)
+           (conversation_id, parent_id, role, content, image_path, token_estimate,
+            is_active, content_blocks, turn_cost_usd, turn_input_tokens, turn_output_tokens, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (conversation_id, parent_id, role, content, image_path, token_est,
+         int(is_active), content_blocks, turn_cost_usd, turn_input_tokens, turn_output_tokens, now)
     )
     msg_id = cursor.lastrowid
     await db.execute(
