@@ -473,18 +473,22 @@ function createMessageElement(msg, cost) {
         const allText = (msg.content || '') + ' ' + (typeof msg.content_blocks === 'string' ? msg.content_blocks : JSON.stringify(msg.content_blocks || ''));
         const imgRegex = /[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)/gi;
         const matches = allText.match(imgRegex) || [];
-        const seen = new Set();
-        const imgEntries = [];
+        // Dedup by filename — keep the longest path (most likely to resolve)
+        const byFilename = new Map();
         for (const m of matches) {
             const norm = m.replace(/\\/g, '/');
-            if (!seen.has(norm)) {
-                seen.add(norm);
-                const filename = norm.split('/').pop();
-                imgEntries.push({
-                    url: `/api/conversations/${State.currentConvId}/file?path=${encodeURIComponent(m)}`,
-                    name: filename,
-                });
+            const filename = norm.split('/').pop();
+            const existing = byFilename.get(filename);
+            if (!existing || norm.length > existing.length) {
+                byFilename.set(filename, norm);
             }
+        }
+        const imgEntries = [];
+        for (const [filename, norm] of byFilename) {
+            imgEntries.push({
+                url: `/api/conversations/${State.currentConvId}/file?path=${encodeURIComponent(norm)}`,
+                name: filename,
+            });
         }
         if (imgEntries.length > 0) {
             projectImgHtml = '<div class="detected-images">' +
