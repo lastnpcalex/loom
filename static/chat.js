@@ -480,7 +480,7 @@ function createMessageElement(msg, cost) {
         if (imgUrls.length > 0) {
             projectImgHtml = '<div class="detected-images">' +
                 imgUrls.map(url =>
-                    `<img class="generated-image" src="${url}" alt="Generated image" onerror="this.parentElement.remove()">`
+                    `<img class="generated-image" src="${url}" alt="Generated image" loading="lazy">`
                 ).join('') + '</div>';
         }
     }
