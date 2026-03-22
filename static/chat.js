@@ -141,7 +141,7 @@ function handleWSMessage(data) {
             // Don't hide gen-status yet — keep showing until first content arrives
             hideRetryBar();
             appendStreamingMessage();
-            document.getElementById('btn-send').disabled = true;
+            // Keep send button enabled so user can queue next message
             break;
 
         case 'thinking_start':
@@ -232,6 +232,7 @@ function handleWSMessage(data) {
                 loadMessages(State.currentConvId);
             }
             refreshTree();
+            _flushQueuedGeneration();
             break;
 
         case 'cancelled':
@@ -240,6 +241,7 @@ function handleWSMessage(data) {
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
             showRetryBar('Generation cancelled');
+            _flushQueuedGeneration();
             break;
 
         case 'error':
@@ -248,6 +250,7 @@ function handleWSMessage(data) {
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
             showRetryBar(data.error || 'Generation error');
+            _flushQueuedGeneration();
             break;
 
         case 'generation_active':
@@ -255,7 +258,6 @@ function handleWSMessage(data) {
             removeStreamingMessage();
             showGenStatus('Generation in progress...');
             State.isStreaming = true;
-            document.getElementById('btn-send').disabled = true;
             appendStreamingMessage();
             break;
 
@@ -280,8 +282,9 @@ function updateContextInfo(data) {
 
 // ── Send Message ──
 
+let _queuedGeneration = null;  // queued message to generate after current stream ends
+
 async function sendMessage() {
-    if (State.isStreaming) return;
     if (!State.currentConvId) {
         showToast('Create or select a conversation first', 'error');
         return;
@@ -303,25 +306,48 @@ async function sendMessage() {
 
     try {
         const msg = await API.post(`/api/conversations/${State.currentConvId}/messages`, msgData);
-        State.messages.push(msg);
-        renderMessages();
-        scrollToBottom();
 
-        // Clear input
+        // Clear input immediately so user can keep typing
         input.value = '';
         autoResizeTextarea();
         clearPendingImages();
 
-        // Request generation via WebSocket
-        if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-            showGenStatus('Sending...');
-            State.ws.send(JSON.stringify({
-                action: 'generate',
-                parent_id: msg.id,
-            }));
+        if (State.isStreaming) {
+            // Queue it — will fire when current stream ends
+            _queuedGeneration = msg;
+            showToast('Message queued — will send after current turn');
+        } else {
+            State.messages.push(msg);
+            renderMessages();
+            scrollToBottom();
+
+            // Request generation via WebSocket
+            if (State.ws && State.ws.readyState === WebSocket.OPEN) {
+                showGenStatus('Sending...');
+                State.ws.send(JSON.stringify({
+                    action: 'generate',
+                    parent_id: msg.id,
+                }));
+            }
         }
     } catch (err) {
         showToast('Failed to send message', 'error');
+    }
+}
+
+function _flushQueuedGeneration() {
+    if (!_queuedGeneration) return;
+    const msg = _queuedGeneration;
+    _queuedGeneration = null;
+    State.messages.push(msg);
+    renderMessages();
+    scrollToBottom();
+    if (State.ws && State.ws.readyState === WebSocket.OPEN) {
+        showGenStatus('Sending queued message...');
+        State.ws.send(JSON.stringify({
+            action: 'generate',
+            parent_id: msg.id,
+        }));
     }
 }
 
