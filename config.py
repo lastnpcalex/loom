@@ -29,6 +29,10 @@ class Config:
     host: str = "0.0.0.0"
     port: int = 3000
 
+    # SSL
+    ssl_certfile: str = os.getenv("LOOM_SSL_CERT", "certs/cert.pem")
+    ssl_keyfile: str = os.getenv("LOOM_SSL_KEY", "certs/key.pem")
+
     # Paths
     db_path: str = "loom.db"
     upload_dir: str = "uploads"

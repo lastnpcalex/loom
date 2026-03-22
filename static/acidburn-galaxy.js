@@ -65,6 +65,17 @@ var AcidburnGalaxy = (function() {
       enabled: true,
       count: 400,
       opacity: 0.5
+    },
+
+    // Loom strings — flow toward equator, get braided by gravitational lensing
+    strings: {
+      enabled: true,
+      count: 18,
+      opacity: 0.35,
+      width: 1.5,
+      speed: 0.4,
+      waveAmplitude: 30,
+      waveFrequency: 3
     }
   };
 
@@ -79,6 +90,7 @@ var AcidburnGalaxy = (function() {
   
   const nodes = [];
   const glows = [];
+  const strings = [];
   
   let seed = 12345;
   function seededRandom() {
@@ -105,6 +117,7 @@ var AcidburnGalaxy = (function() {
     // Clear arrays
     nodes.length = 0;
     glows.length = 0;
+    strings.length = 0;
     time = 0;
     
     // Initialize nodes
@@ -135,7 +148,23 @@ var AcidburnGalaxy = (function() {
         });
       }
     }
-    
+
+    // Initialize loom strings — vertical fibers flowing toward the equator
+    if (config.strings.enabled) {
+      for (let i = 0; i < config.strings.count; i++) {
+        // Spread strings across the width with some randomness
+        const baseX = (i / config.strings.count) * config.width;
+        strings.push({
+          x: baseX + (seededRandom() - 0.5) * (config.width / config.strings.count) * 0.6,
+          phase: seededRandom() * Math.PI * 2,
+          speed: 0.5 + seededRandom() * 1.0,
+          color: seededRandom() > 0.6 ? 'cyan' : seededRandom() > 0.3 ? 'purple' : 'magenta',
+          width: 0.5 + seededRandom() * config.strings.width,
+          wavePhase: seededRandom() * Math.PI * 2,
+        });
+      }
+    }
+
     draw();
     
     console.log('[AcidburnGalaxy] Generated ' + config.width + 'x' + config.height + ' texture');
@@ -178,7 +207,12 @@ var AcidburnGalaxy = (function() {
     if (config.nodes.enabled) {
       drawNodes();
     }
-    
+
+    // Loom strings
+    if (config.strings.enabled) {
+      drawStrings();
+    }
+
     // Callback for texture update
     if (onUpdate) {
       onUpdate(canvas);
@@ -290,6 +324,71 @@ var AcidburnGalaxy = (function() {
     ctx.globalAlpha = 1;
   }
   
+  function drawStrings() {
+    const { width, height } = config;
+    const { opacity, speed, waveAmplitude, waveFrequency } = config.strings;
+
+    // In sphere-map space: y=0 is north pole, y=height/2 is equator (where the
+    // black hole sits), y=height is south pole. Strings flow from poles toward
+    // the equator — gravitational lensing near the BH braids them naturally.
+
+    ctx.lineCap = 'round';
+
+    for (const s of strings) {
+      const color = config.colors[s.color];
+      const r = parseInt(color.slice(1, 3), 16);
+      const g = parseInt(color.slice(3, 5), 16);
+      const b = parseInt(color.slice(5, 7), 16);
+
+      // Animate: strings drift slowly downward (toward equator)
+      const drift = config.animated ? time * speed * s.speed : 0;
+
+      // Draw string as a series of connected segments from top to bottom
+      const segments = 64;
+
+      ctx.beginPath();
+      ctx.lineWidth = s.width;
+
+      for (let i = 0; i <= segments; i++) {
+        const t = i / segments;
+        const y = t * height;
+
+        // Distance from equator (0 at equator, 1 at poles)
+        const eqDist = Math.abs(t - 0.5) * 2.0;
+
+        // Wave gets tighter near equator (strings converging)
+        const wave = Math.sin(
+          t * Math.PI * waveFrequency + s.wavePhase + drift * 0.03
+        ) * waveAmplitude * eqDist;
+
+        // Strings converge toward center-x near the equator
+        const centerPull = (s.x - width / 2) * (1.0 - eqDist) * 0.3;
+        const x = s.x + wave - centerPull;
+
+        if (i === 0) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+
+      // Fade: bright at poles, dimmer near equator (the BH eats the light)
+      ctx.globalAlpha = opacity;
+      ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, 1)`;
+      ctx.stroke();
+
+      // Glow layer
+      ctx.globalAlpha = opacity * 0.25;
+      ctx.lineWidth = s.width * 4;
+      ctx.stroke();
+
+      // Reset line width
+      ctx.lineWidth = s.width;
+    }
+
+    ctx.globalAlpha = 1;
+  }
+
   function drawNodes() {
     for (const node of nodes) {
       // Update position

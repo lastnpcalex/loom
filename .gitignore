@@ -46,6 +46,9 @@ hello_world.md
 CLAUDE_LOOM_SPEC.md
 branches_of_the_loom.md
 
+# SSL certificates
+certs/
+
 # Environment / secrets
 .env
 .env.*

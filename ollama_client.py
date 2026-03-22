@@ -44,18 +44,36 @@ async def health_check() -> dict:
         }
 
 
+def _parse_image_paths(image_path) -> list[str]:
+    """Parse image_path: handles single string, JSON array string, or list."""
+    if not image_path:
+        return []
+    if isinstance(image_path, list):
+        return image_path
+    try:
+        parsed = json.loads(image_path)
+        if isinstance(parsed, list):
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return [image_path]
+
+
 def _build_ollama_messages(messages: list[dict]) -> list[dict]:
     """Convert internal message format to Ollama API format."""
     ollama_msgs = []
     for msg in messages:
         entry = {"role": msg["role"], "content": msg["content"]}
         if msg.get("image_path"):
-            try:
-                with open(msg["image_path"], "rb") as f:
-                    img_data = base64.b64encode(f.read()).decode("utf-8")
-                entry["images"] = [img_data]
-            except (IOError, OSError):
-                pass
+            images = []
+            for p in _parse_image_paths(msg["image_path"]):
+                try:
+                    with open(p, "rb") as f:
+                        images.append(base64.b64encode(f.read()).decode("utf-8"))
+                except (IOError, OSError):
+                    pass
+            if images:
+                entry["images"] = images
         elif msg.get("images"):
             entry["images"] = msg["images"]
         ollama_msgs.append(entry)
@@ -126,9 +144,12 @@ async def stream_chat(messages: list[dict],
 
     # Try real Ollama first, fall back to mock
     if _mock_mode:
+        print(f"[OLLAMA] WARNING: Running in MOCK MODE — not sending to Ollama!")
         async for token in _mock_stream(messages):
             yield token
         return
+
+    print(f"[OLLAMA] Sending {len(messages)} messages to {model or config.ollama_model}")
 
     try:
         effective_max = max_tokens or config.max_tokens

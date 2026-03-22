@@ -2,6 +2,20 @@
  * Loom — Chat rendering, WebSocket, image upload, streaming, branch nav
  */
 
+// ── Image Path Helper ──
+
+function parseImagePaths(imagePath) {
+    if (!imagePath) return [];
+    if (typeof imagePath === 'object' && Array.isArray(imagePath)) return imagePath;
+    // Try JSON array
+    try {
+        const parsed = JSON.parse(imagePath);
+        if (Array.isArray(parsed)) return parsed;
+    } catch {}
+    // Single path string
+    return [imagePath];
+}
+
 // ── WebSocket ──
 
 let _wsReconnectDelay = 2000;
@@ -18,6 +32,13 @@ function connectWebSocket(convId) {
     ws.onopen = () => {
         console.log('WebSocket connected');
         _wsReconnectDelay = 2000; // reset backoff on success
+        // Reload messages on reconnect to pick up any responses that completed while away.
+        // Delay slightly so generation_active message can arrive first and set isStreaming.
+        setTimeout(() => {
+            if (State.currentConvId === convId && !State.isStreaming) {
+                loadMessages(convId);
+            }
+        }, 200);
     };
 
     ws.onmessage = (event) => {
@@ -31,6 +52,14 @@ function connectWebSocket(convId) {
 
     ws.onclose = () => {
         console.log('WebSocket closed');
+        // Reset streaming UI — server will keep generating and save the result.
+        // On reconnect, loadMessages() will pick up the completed response.
+        if (State.isStreaming) {
+            State.isStreaming = false;
+            document.getElementById('btn-send').disabled = false;
+            removeStreamingMessage();
+            showGenStatus('Reconnecting... generation continues on server');
+        }
         // Only reconnect if still on the same conversation and in chat/tree view
         if (State.currentConvId === convId && State.currentView !== 'home') {
             setTimeout(() => {
@@ -142,7 +171,7 @@ function handleWSMessage(data) {
             break;
 
         case 'tool_result':
-            finalizeToolBlock(data.content, data.tool_id);
+            finalizeToolBlock(data.content, data.tool_id, data.image_url);
             break;
 
         case 'thinking_chunk':
@@ -162,10 +191,15 @@ function handleWSMessage(data) {
             break;
 
         case 'stream_end':
-            finalizeStreamingMessage(data.message, data.cost);
             State.isStreaming = false;
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
+            if (streamingDiv) {
+                finalizeStreamingMessage(data.message, data.cost);
+            } else {
+                // Streaming div was lost (disconnect/reconnect race) — reload from DB
+                loadMessages(State.currentConvId);
+            }
             refreshTree();
             break;
 
@@ -183,6 +217,26 @@ function handleWSMessage(data) {
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
             showRetryBar(data.error || 'Generation error');
+            break;
+
+        case 'generation_active':
+            // Reconnected while a generation is still running
+            removeStreamingMessage();
+            showGenStatus('Generation in progress...');
+            State.isStreaming = true;
+            document.getElementById('btn-send').disabled = true;
+            appendStreamingMessage();
+            break;
+
+        case 'generation_idle':
+            // Server confirms no generation running — reset any stuck streaming state
+            if (State.isStreaming) {
+                State.isStreaming = false;
+                document.getElementById('btn-send').disabled = false;
+                removeStreamingMessage();
+                hideGenStatus();
+                loadMessages(State.currentConvId);
+            }
             break;
     }
 }
@@ -205,13 +259,15 @@ async function sendMessage() {
     const input = document.getElementById('user-input');
     const content = input.value.trim();
     const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
-    if (!content && !(State.pendingImagePath && !isClaudeMode)) return;
+    const hasImages = State.pendingImages.length > 0;
+    if (!content && !(hasImages && !isClaudeMode)) return;
 
-    // Add user message via REST
+    // Add user message via REST — send image paths as JSON array
+    const imagePaths = hasImages ? State.pendingImages.map(img => img.path) : null;
     const msgData = {
         role: 'user',
         content: content,
-        image_path: State.pendingImagePath || null,
+        image_path: imagePaths,
     };
 
     try {
@@ -223,9 +279,7 @@ async function sendMessage() {
         // Clear input
         input.value = '';
         autoResizeTextarea();
-        State.pendingImagePath = null;
-        State.pendingImageUrl = null;
-        document.getElementById('image-preview').classList.add('hidden');
+        clearPendingImages();
 
         // Request generation via WebSocket
         if (State.ws && State.ws.readyState === WebSocket.OPEN) {
@@ -322,7 +376,11 @@ function createMessageElement(msg, cost) {
     div.dataset.msgId = msg.id;
 
     const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
-    const roleLabel = msg.role === 'user' ? 'You' : (isClaudeMode ? 'Claude' : getCharacterName());
+    const isLocalMode = State.currentConv && State.currentConv.mode === 'local';
+    const roleLabel = msg.role === 'user' ? 'You'
+        : isClaudeMode ? 'Claude'
+        : isLocalMode ? (State.currentConv.local_model || 'Local')
+        : getCharacterName();
 
     let actionsHtml = '';
     if (msg.role === 'assistant') {
@@ -368,7 +426,15 @@ function createMessageElement(msg, cost) {
         if (parts.length) costHtml = `<div class="cost-footer">${parts.join(' · ')}</div>`;
     }
 
-    const imgHtml = msg.image_path ? '<img class="message-image" src="/uploads/' + msg.image_path.split(/[\\/]/).pop() + '" alt="Attached image">' : '';
+    let imgHtml = '';
+    if (msg.image_path) {
+        const paths = parseImagePaths(msg.image_path);
+        if (paths.length > 0) {
+            imgHtml = '<div class="message-images">' +
+                paths.map(p => '<img class="message-image" src="/uploads/' + p.split(/[\\/]/).pop() + '" alt="Attached image">').join('') +
+                '</div>';
+        }
+    }
     div.innerHTML = '<div class="message-header">' +
         '<span class="message-role">' + escapeHtml(roleLabel) + '</span>' +
         '<div class="message-actions">' + branchPlaceholder + actionsHtml + '</div>' +
@@ -405,35 +471,92 @@ function renderEditDiff(inputJson) {
     }
 }
 
+function detectLangFromPath(filePath) {
+    if (!filePath) return '';
+    const ext = filePath.split('.').pop().toLowerCase();
+    const map = {
+        js:'javascript', ts:'typescript', jsx:'jsx', tsx:'tsx',
+        py:'python', rb:'ruby', rs:'rust', go:'go', java:'java',
+        c:'c', cpp:'cpp', h:'c', hpp:'cpp', cs:'csharp', php:'php',
+        html:'html', htm:'html', css:'css', scss:'scss',
+        json:'json', yaml:'yaml', yml:'yaml', toml:'toml', xml:'xml', svg:'svg',
+        md:'markdown', sh:'bash', bash:'bash', sql:'sql',
+    };
+    return map[ext] || ext;
+}
+
+function renderToolBody(toolName, input, resultDisplay) {
+    let inputHtml = '', resultHtml = '';
+    try {
+        const p = input ? JSON.parse(input) : {};
+        switch (toolName) {
+            case 'Write': {
+                const fp = p.file_path || '';
+                const content = p.content || '';
+                const lang = detectLangFromPath(fp);
+                inputHtml = '<div class="tool-file-path">' + escapeHtml(fp) + '</div>';
+                if (content) inputHtml += '<div class="tool-code-content">' + formatContent('```' + lang + '\n' + content + '\n```') + '</div>';
+                break;
+            }
+            case 'Read': {
+                const fp = p.file_path || '';
+                inputHtml = '<div class="tool-file-path">' + escapeHtml(fp) + '</div>';
+                if (resultDisplay) {
+                    const lang = detectLangFromPath(fp);
+                    resultHtml = '<div class="tool-code-content">' + formatContent('```' + lang + '\n' + resultDisplay + '\n```') + '</div>';
+                }
+                break;
+            }
+            case 'Bash': {
+                const cmd = p.command || '';
+                if (cmd) inputHtml = '<div class="tool-code-content">' + formatContent('```bash\n' + cmd + '\n```') + '</div>';
+                if (resultDisplay) resultHtml = '<div class="tool-block-result"><pre class="tool-output">' + escapeHtml(resultDisplay) + '</pre></div>';
+                break;
+            }
+            default: {
+                if (input) inputHtml = '<div class="tool-block-input">' + escapeHtml(input) + '</div>';
+                if (resultDisplay) resultHtml = '<div class="tool-block-result">' + escapeHtml(resultDisplay) + '</div>';
+            }
+        }
+    } catch {
+        if (input) inputHtml = '<div class="tool-block-input">' + escapeHtml(input) + '</div>';
+        if (resultDisplay) resultHtml = '<div class="tool-block-result">' + escapeHtml(resultDisplay) + '</div>';
+    }
+    return inputHtml + resultHtml;
+}
+
 function renderContentBlocks(blocks) {
     let html = '';
     for (const block of blocks) {
         if (block.type === 'text') {
-            // Skip empty/whitespace-only text blocks
             if (!block.text || !block.text.trim()) continue;
             html += formatContent(block.text);
         } else if (block.type === 'tool_use') {
-            const name = escapeHtml(block.name || 'Tool');
+            const name = block.name || 'Tool';
             const input = (block.input || '').trim();
             const result = (block.result || '').trim();
             const resultDisplay = result.length > 2000 ? result.substring(0, 2000) + '\n... (truncated)' : result;
 
             // Special rendering for Edit tool
-            const isEdit = (block.name === 'Edit');
+            const isEdit = (name === 'Edit');
             const diffHtml = isEdit ? renderEditDiff(input) : null;
-            const expanded = isEdit ? ' expanded' : '';
-            const toggleChar = isEdit ? '&#9662;' : '&#9656;';
+            const autoExpand = isEdit || ['Write', 'Bash'].includes(name);
+            const expanded = autoExpand ? ' expanded' : '';
+            const toggleChar = autoExpand ? '&#9662;' : '&#9656;';
 
-            // No template indentation — avoids whitespace text nodes
+            let bodyHtml;
+            if (diffHtml) {
+                bodyHtml = diffHtml;
+            } else {
+                bodyHtml = renderToolBody(name, input, resultDisplay);
+            }
+
             html += '<div class="tool-block' + expanded + '">' +
                 '<div class="tool-block-header" data-tool-toggle>' +
                     '<span class="tool-name">' + escapeHtml(name) + '</span>' +
                     '<span class="tool-toggle">' + toggleChar + '</span>' +
                 '</div>' +
-                '<div class="tool-block-body">' +
-                    (diffHtml ? diffHtml : (input ? '<div class="tool-block-input">' + escapeHtml(input) + '</div>' : '')) +
-                    (resultDisplay ? '<div class="tool-block-result">' + escapeHtml(resultDisplay) + '</div>' : '') +
-                '</div>' +
+                '<div class="tool-block-body">' + bodyHtml + '</div>' +
             '</div>';
         } else if (block.type === 'thinking') {
             const text = (block.text || '').trim();
@@ -500,21 +623,50 @@ async function switchToBranch(leafId) {
 function getCharacterName() {
     if (!State.currentConvId) return 'Assistant';
     const conv = State.conversations.find(c => c.id === State.currentConvId);
-    if (!conv || !conv.character_id) return 'Assistant';
+    if (!conv) return 'Assistant';
+    if (conv.mode === 'local') return conv.local_model || 'Local';
+    if (!conv.character_id) return 'Assistant';
     const char = State.characters.find(c => c.id === conv.character_id);
     return char ? char.name : 'Assistant';
 }
 
 // Configure marked for chat rendering
 if (typeof marked !== 'undefined') {
-    marked.setOptions({ breaks: true, gfm: true });
+    const renderer = new marked.Renderer();
+    const origLink = renderer.link.bind(renderer);
+    renderer.link = function(href, title, text) {
+        const html = origLink(href, title, text);
+        return html.replace('<a ', '<a target="_blank" rel="noopener" ');
+    };
+    // Override code renderer to add toolbar with copy/preview buttons
+    renderer.code = function({ text, lang, escaped }) {
+        const safeLang = lang ? escapeHtml(lang.match(/^\S*/)?.[0] || '') : '';
+        const langClass = safeLang ? ' class="language-' + safeLang + '"' : '';
+        const isPreviewable = safeLang && ['html', 'svg', 'htm'].includes(safeLang.toLowerCase());
+        const code = text.replace(/\n$/, '') + '\n';
+        const codeHtml = escaped ? code : escapeHtml(code);
+
+        let toolbar = '<div class="code-toolbar">';
+        if (safeLang) toolbar += '<span class="code-lang-label">' + safeLang + '</span>';
+        else toolbar += '<span class="code-lang-label"></span>';
+        toolbar += '<div class="code-toolbar-actions">';
+        if (isPreviewable) toolbar += '<button class="code-action-btn" data-code-action="preview" title="Preview">Preview</button>';
+        toolbar += '<button class="code-action-btn" data-code-action="copy" title="Copy code">Copy</button>';
+        toolbar += '</div></div>';
+
+        return '<div class="code-block-wrapper">' + toolbar +
+            '<pre><code' + langClass + '>' + codeHtml + '</code></pre></div>\n';
+    };
+    marked.setOptions({ breaks: true, gfm: true, renderer });
 }
 
 function formatContent(text) {
     if (!text) return '';
     if (typeof marked !== 'undefined') {
         const raw = marked.parse(text);
-        return typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(raw) : raw;
+        return typeof DOMPurify !== 'undefined'
+            ? DOMPurify.sanitize(raw, { ADD_TAGS: ['button'], ADD_ATTR: ['data-code-action'] })
+            : raw;
     }
     // Fallback if marked not loaded
     let html = escapeHtml(text);
@@ -550,7 +702,10 @@ function appendStreamingMessage() {
     streamingDiv = document.createElement('div');
     streamingDiv.className = 'message assistant streaming';
     const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
-    const label = isClaudeMode ? 'Claude' : getCharacterName();
+    const isLocalMode = State.currentConv && State.currentConv.mode === 'local';
+    const label = isClaudeMode ? 'Claude'
+        : isLocalMode ? (State.currentConv.local_model || 'Local')
+        : getCharacterName();
     streamingDiv.innerHTML = '<div class="message-header">' +
         '<span class="message-role">' + escapeHtml(label) + '</span>' +
         '<div class="message-actions">' +
@@ -651,7 +806,7 @@ function appendToolInput(json, toolId) {
     }
 }
 
-function finalizeToolBlock(result, toolId) {
+function finalizeToolBlock(result, toolId, imageUrl) {
     if (!streamingDiv) return;
     const block = streamingDiv.querySelector(`.tool-block[data-tool-id="${toolId}"]`)
                 || streamingDiv.querySelector('.tool-block:last-child');
@@ -660,6 +815,26 @@ function finalizeToolBlock(result, toolId) {
     // Truncate long results for display
     const display = result.length > 2000 ? result.substring(0, 2000) + '\n... (truncated)' : result;
     resultEl.textContent = display;
+
+    // If this tool produced an image, display it inline
+    if (imageUrl) {
+        const imgContainer = document.createElement('div');
+        imgContainer.className = 'tool-image-result';
+        const img = document.createElement('img');
+        img.src = imageUrl;
+        img.alt = 'Generated image';
+        img.className = 'generated-image';
+        img.addEventListener('click', () => {
+            const body = document.getElementById('preview-modal-body');
+            body.innerHTML = '<img src="' + imageUrl + '" style="max-width:100%;max-height:80vh;">';
+            document.getElementById('modal-preview').classList.remove('hidden');
+        });
+        imgContainer.appendChild(img);
+        block.querySelector('.tool-block-body').appendChild(imgContainer);
+        block.classList.add('expanded');
+        scrollToBottom();
+        return;
+    }
     // Auto-collapse after result arrives
     block.classList.remove('expanded');
     block.querySelector('.tool-toggle').textContent = '▸';
@@ -862,8 +1037,108 @@ function resolvePermissionPrompt(requestId, allowed) {
     }
 }
 
-// ── Event Delegation for Tool Blocks + Thinking ──
+// ── Code Block Preview ──
+
+function toggleCodePreview(wrapper, btn) {
+    const existing = wrapper.querySelector('.code-preview-panel');
+    if (existing) { existing.remove(); btn.textContent = 'Preview'; return; }
+    btn.textContent = 'Close';
+    const codeEl = wrapper.querySelector('pre code');
+    if (!codeEl) return;
+    const rawCode = codeEl.textContent;
+    const isSvg = (codeEl.className || '').includes('language-svg');
+
+    const panel = document.createElement('div');
+    panel.className = 'code-preview-panel';
+    const toolbar = document.createElement('div');
+    toolbar.className = 'code-preview-toolbar';
+    toolbar.innerHTML = '<span class="code-preview-label">Preview</span>' +
+        '<button class="code-action-btn" data-code-action="popout" title="Open larger">Popout</button>';
+    panel.appendChild(toolbar);
+
+    const iframe = document.createElement('iframe');
+    iframe.className = 'code-preview-iframe';
+    iframe.sandbox = 'allow-scripts';
+    panel.appendChild(iframe);
+    wrapper.appendChild(panel);
+
+    const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+    if (!doc) return;
+    doc.open();
+    if (isSvg) {
+        doc.write('<!DOCTYPE html><html><head><style>body{margin:0;background:#1a1a2e;display:flex;align-items:center;justify-content:center;min-height:100vh;}</style></head><body>' + rawCode + '</body></html>');
+    } else {
+        doc.write(rawCode);
+    }
+    doc.close();
+    scrollToBottom();
+}
+
+function openPreviewModal(wrapper) {
+    const codeEl = wrapper.querySelector('pre code');
+    if (!codeEl) return;
+    const rawCode = codeEl.textContent;
+    const isSvg = (codeEl.className || '').includes('language-svg');
+
+    const modal = document.getElementById('modal-preview');
+    const body = document.getElementById('preview-modal-body');
+    modal.classList.remove('hidden');
+    body.innerHTML = '';
+
+    const iframe = document.createElement('iframe');
+    iframe.className = 'preview-modal-iframe';
+    iframe.sandbox = 'allow-scripts';
+    body.appendChild(iframe);
+
+    const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+    if (!doc) { modal.classList.add('hidden'); return; }
+    doc.open();
+    if (isSvg) {
+        doc.write('<!DOCTYPE html><html><head><style>body{margin:0;background:#1a1a2e;display:flex;align-items:center;justify-content:center;min-height:100vh;}</style></head><body>' + rawCode + '</body></html>');
+    } else {
+        doc.write(rawCode);
+    }
+    doc.close();
+}
+
+// ── Event Delegation for Tool Blocks + Thinking + Code Actions ──
 document.addEventListener('click', (e) => {
+    // Code block: Copy
+    const copyBtn = e.target.closest('[data-code-action="copy"]');
+    if (copyBtn) {
+        e.stopPropagation();
+        const wrapper = copyBtn.closest('.code-block-wrapper');
+        const codeEl = wrapper && wrapper.querySelector('pre code');
+        if (codeEl) {
+            navigator.clipboard.writeText(codeEl.textContent).then(
+                () => { copyBtn.textContent = 'Copied!'; setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500); },
+                () => { copyBtn.textContent = 'Failed'; }
+            );
+        }
+        return;
+    }
+    // Code block: Preview toggle
+    const previewBtn = e.target.closest('[data-code-action="preview"]');
+    if (previewBtn) {
+        e.stopPropagation();
+        const wrapper = previewBtn.closest('.code-block-wrapper');
+        if (wrapper) toggleCodePreview(wrapper, previewBtn);
+        return;
+    }
+    // Code block: Popout to modal
+    const popoutBtn = e.target.closest('[data-code-action="popout"]');
+    if (popoutBtn) {
+        e.stopPropagation();
+        const wrapper = popoutBtn.closest('.code-block-wrapper');
+        if (wrapper) openPreviewModal(wrapper);
+        return;
+    }
+    // Close preview modal
+    if (e.target.closest('[data-close-modal-preview]')) {
+        document.getElementById('modal-preview').classList.add('hidden');
+        document.getElementById('preview-modal-body').innerHTML = '';
+        return;
+    }
     // Tool block expand/collapse
     const header = e.target.closest('[data-tool-toggle]');
     if (header) {

@@ -92,6 +92,64 @@ function initCanvas() {
 
     // Prevent context menu on canvas
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    // ── Touch: pan (1 finger) + pinch zoom (2 fingers) ──
+    let _lastPinchDist = 0;
+    TREE._touchMoved = false;
+
+    canvas.addEventListener('touchstart', (e) => {
+        if (e.touches.length === 1) {
+            const t = e.touches[0];
+            TREE._touchMoved = false;
+            if (e.target === canvas || e.target.id === 'tree-nodes') {
+                TREE.isPanning = true;
+                TREE.panStartX = t.clientX - TREE.panX;
+                TREE.panStartY = t.clientY - TREE.panY;
+            }
+        } else if (e.touches.length === 2) {
+            e.preventDefault();
+            TREE.isPanning = false;
+            const dx = e.touches[0].clientX - e.touches[1].clientX;
+            const dy = e.touches[0].clientY - e.touches[1].clientY;
+            _lastPinchDist = Math.hypot(dx, dy);
+        }
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', (e) => {
+        if (e.touches.length === 1 && TREE.isPanning) {
+            e.preventDefault();
+            TREE._touchMoved = true;
+            const t = e.touches[0];
+            TREE.panX = t.clientX - TREE.panStartX;
+            TREE.panY = t.clientY - TREE.panStartY;
+            applyTransform();
+        } else if (e.touches.length === 2) {
+            e.preventDefault();
+            TREE._touchMoved = true;
+            const dx = e.touches[0].clientX - e.touches[1].clientX;
+            const dy = e.touches[0].clientY - e.touches[1].clientY;
+            const dist = Math.hypot(dx, dy);
+            if (_lastPinchDist > 0) {
+                const scale = dist / _lastPinchDist;
+                const newZoom = Math.max(0.2, Math.min(3, TREE.zoom * scale));
+                const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+                const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                const rect = canvas.getBoundingClientRect();
+                const mx = cx - rect.left;
+                const my = cy - rect.top;
+                TREE.panX = mx - (mx - TREE.panX) * (newZoom / TREE.zoom);
+                TREE.panY = my - (my - TREE.panY) * (newZoom / TREE.zoom);
+                TREE.zoom = newZoom;
+                applyTransform();
+            }
+            _lastPinchDist = dist;
+        }
+    }, { passive: false });
+
+    canvas.addEventListener('touchend', (e) => {
+        if (e.touches.length < 2) _lastPinchDist = 0;
+        if (e.touches.length === 0) TREE.isPanning = false;
+    });
 }
 
 function applyTransform() {
@@ -341,7 +399,7 @@ function createNode(node, branchNames) {
 
     // Click card body: navigate to this branch in chat
     el.addEventListener('click', async (e) => {
-        if (TREE.isPanning) return;
+        if (TREE.isPanning || TREE._touchMoved) return;
         if (e.target.closest('.tree-node-expand-btn')) return;
         if (e.target.closest('.tree-node-delete-btn')) return;
         e.stopPropagation();

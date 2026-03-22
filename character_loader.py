@@ -42,8 +42,8 @@ def parse_sections(body: str) -> dict[str, str]:
                 current_key = header_name
                 current_lines = []
                 continue
-        # Unescape lines that were escaped during save
-        if line.startswith('\\# '):
+        # Unescape lines that were escaped during save (handles \#, \##, \###)
+        if line.startswith('\\#'):
             line = line[1:]
         current_lines.append(line)
 

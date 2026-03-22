@@ -189,11 +189,13 @@ def _configure_permission_hook(cwd: str):
 
 
 async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
-                     model: str = "sonnet", effort: str = "high"):
+                     model: str = "sonnet", effort: str = "high",
+                     resume_session_id: str = None, fork_session: bool = False):
     """Run Claude Code CLI and yield parsed events as an async generator.
 
     Returns (process, generator) so the caller can cancel via process.terminate().
-    Each call is standalone — conversation history is passed in the prompt.
+    When resume_session_id is provided, uses --resume to continue an existing session.
+    When fork_session is True (with --resume), creates a new branch from that session.
     Permission hooks route tool approvals through Loom's HTTP API.
     """
     # Configure the permission hook in the project directory
@@ -204,6 +206,11 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
            "--verbose",
            "--model", model,
            "--effort", effort]
+
+    if resume_session_id:
+        cmd.extend(["--resume", resume_session_id])
+        if fork_session:
+            cmd.append("--fork-session")
 
     # Pass Loom connection info to the hook script via env vars
     env = {**os.environ}
@@ -221,6 +228,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=16 * 1024 * 1024,  # 16 MB line buffer (CC can emit large base64/tool results)
     )
 
     print(f"[CC] Process started, pid={proc.pid}")
@@ -251,8 +259,24 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             for evt in _process_event(raw):
                 yield evt
 
-        rc = await proc.wait()
-        print(f"[CC] Process exited with code {rc}")
+            # `result` is the final event — stop reading so we don't hang
+            # if a background process (e.g. a server) inherited stdout
+            if rtype == "result":
+                print("[CC] Got result event, stopping stream reader")
+                break
+
+        # Wait for process exit with timeout — if a spawned server holds
+        # the process tree open, don't block forever
+        try:
+            rc = await asyncio.wait_for(proc.wait(), timeout=10)
+            print(f"[CC] Process exited with code {rc}")
+        except asyncio.TimeoutError:
+            print("[CC] Process didn't exit within 10s (likely spawned background server), terminating")
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
 
     return proc, _event_stream()
 

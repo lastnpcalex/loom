@@ -93,6 +93,13 @@ async def _run_migrations(db):
         # Phase 2: model & effort selection
         "ALTER TABLE conversations ADD COLUMN cc_model TEXT DEFAULT 'sonnet'",
         "ALTER TABLE conversations ADD COLUMN cc_effort TEXT DEFAULT 'high'",
+        # Phase 3: starred & folders
+        "ALTER TABLE conversations ADD COLUMN starred INTEGER DEFAULT 0",
+        "ALTER TABLE conversations ADD COLUMN folder TEXT DEFAULT ''",
+        # Phase 4: session resume — store CC session_id per message node
+        "ALTER TABLE messages ADD COLUMN cc_session_id TEXT",
+        # Local mode: store selected Ollama model per conversation
+        "ALTER TABLE conversations ADD COLUMN local_model TEXT",
     ]
     for sql in migrations:
         try:
@@ -127,7 +134,7 @@ async def create_conversation(title: str, character_id: str = None,
 async def list_conversations() -> list[dict]:
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT * FROM conversations ORDER BY updated_at DESC"
+        "SELECT * FROM conversations ORDER BY starred DESC, updated_at DESC"
     )
     await db.close()
     return [dict(r) for r in rows]
@@ -173,7 +180,8 @@ async def update_conversation_fields(conv_id: int, **fields):
     """Update arbitrary fields on a conversation."""
     db = await get_db()
     allowed = {"persona_id", "lore_ids", "style_nudge", "custom_scene", "title",
-                "claude_session_id", "total_cost_usd", "cc_model", "cc_effort"}
+                "claude_session_id", "total_cost_usd", "cc_model", "cc_effort",
+                "starred", "folder", "local_model"}
     updates = []
     params = []
     for key, val in fields.items():
@@ -196,17 +204,20 @@ async def add_message(conversation_id: int, role: str, content: str,
                       parent_id: int = None, image_path: str = None,
                       is_active: bool = True, content_blocks: str = None,
                       turn_cost_usd: float = None, turn_input_tokens: int = None,
-                      turn_output_tokens: int = None) -> dict:
+                      turn_output_tokens: int = None,
+                      cc_session_id: str = None) -> dict:
     db = await get_db()
     token_est = len(content) // 3
     now = time.time()
     cursor = await db.execute(
         """INSERT INTO messages
            (conversation_id, parent_id, role, content, image_path, token_estimate,
-            is_active, content_blocks, turn_cost_usd, turn_input_tokens, turn_output_tokens, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            is_active, content_blocks, turn_cost_usd, turn_input_tokens, turn_output_tokens,
+            cc_session_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (conversation_id, parent_id, role, content, image_path, token_est,
-         int(is_active), content_blocks, turn_cost_usd, turn_input_tokens, turn_output_tokens, now)
+         int(is_active), content_blocks, turn_cost_usd, turn_input_tokens, turn_output_tokens,
+         cc_session_id, now)
     )
     msg_id = cursor.lastrowid
     await db.execute(

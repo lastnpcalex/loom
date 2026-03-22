@@ -1,62 +1,67 @@
-# Loom
+<p align="center">
+  <img src="static/img/loom-ico.png" alt="Ex Astris Umbra" width="128">
+</p>
 
-A local RP (roleplay) harness with tree-based conversation branching, a WebGL black hole background, and dual Ollama/Claude Code generation modes.
+# Ex Astris Umbra: A Loom Interface
+
+A multi-modal conversation interface with tree-based branching, local and cloud AI backends, tool-calling agents, and a WebGL black hole.
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
-## What it does
+## Three modes, one loom
 
-- **Tree-based conversations** — Every message is a node in a tree. Branch at any point, explore alternate paths, switch between branches. Full conversation history is never lost.
-- **Character system** — Define characters as Markdown files with personality, scenario, greeting, and example messages. Create, edit, and delete characters from the UI.
-- **Personas and lore** — Attach a user persona and lore/history files to conversations for richer context. Manage both from the home page.
-- **Fork and branch** — Fork a conversation from any message to create a new conversation. Regenerate creates a new branch, preserving the original response.
-- **Import / export** — Export and import characters (.md), personas (.md), lore (.md), and conversations (.json) for backup or sharing.
-- **Thinking model support** — Handles Ollama thinking models (e.g. qwen3) with a thinking indicator, `<think>` tag stripping, and client-side content token counting so thinking tokens don't eat the response budget.
-- **Incremental context summarization** — As conversations grow past the context budget, older messages are summarized in small batches by a local Gemma 3 1B model running on CPU. Recent messages stay verbatim.
-- **WebGL black hole** — A Schwarzschild raytracer runs as the UI background, with a procedural cyberpunk galaxy texture, glassmorphism panels, and scanline overlay.
-- **Streaming generation** — Real-time token streaming over WebSocket with live token rate display.
-- **Image support** — Attach images to messages; they're described by the vision model and included in context.
+The Loom weaves conversations across three modes — pick the thread that fits the task.
 
-## Dual mode: Weave + Claude Code
+### Weave — structured roleplay and creative writing
 
-Loom supports two generation backends:
+Character cards, personas, lore files, style nudges, and incremental summarization. A full RP harness built on local Ollama models with context window management that scales beyond what the model natively supports.
 
-- **Weave mode** — Uses a local Ollama model with character cards, personas, lore, style nudges, and incremental summarization. Full RP harness features.
-- **Claude mode** — Connects to the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) as a subprocess. Turns Loom into a coding assistant UI with all of Claude Code's capabilities.
+- Character system with personality, scenario, greeting, and example messages
+- Personas and lore for richer world-building context
+- Style nudge rotation and repetition detection
+- Thinking model support (`<think>` stripping, content token counting)
+- Incremental context summarization via Gemma 3 1B on CPU
 
-### Claude mode features
+### Local — agent mode with any Ollama model
 
-- Real-time streaming of Claude's responses over WebSocket
-- Tool call blocks — see every tool Claude uses (Read, Edit, Bash, Grep, etc.) with expandable input/output
-- Edit tool diff rendering — red/green inline diff for file edits
-- Thinking blocks — collapsible extended thinking display
-- Permission proxying — tool approval prompts appear in the browser UI (Allow / Deny / Allow All)
-- Model selection — choose between Sonnet, Opus, and Haiku
-- Thinking effort — Low, Medium, High, or Max (Opus only)
-- Cost tracking — per-turn and cumulative cost display (input/output tokens, USD)
-- Image attachments — attach images and Claude will read them via the Read tool
-- Markdown rendering — full GitHub Flavored Markdown in responses (code blocks, tables, lists, etc.)
+Point any local model at a working directory and it becomes a tool-calling agent. Reads files, searches code, writes changes — with permission prompts in the browser for every action.
 
-### Prerequisites for Claude mode
+- Tool calling: `read_file`, `list_directory`, `write_file`, `search_files`
+- Directory-aware system prompt with project tree
+- Permission prompts for all tool calls (Allow / Deny / Allow All)
+- Generated image display inline in tool results
+- Works with any Ollama model that supports tool calling
 
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and available on PATH (`claude` command)
-- An active Anthropic API key configured in Claude Code
+### Claude — Claude Code in the browser
 
-### Creating a Claude conversation
+Connects to the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) as a subprocess. Full access to Claude's tool suite with streaming responses, thinking blocks, and permission proxying.
 
-1. Click **+ New** on the home page
-2. Toggle the mode to **Claude**
-3. Enter a **Working Directory** (the project folder Claude will work in)
-4. Optionally choose a **Model** and **Thinking Effort** level
-5. Give it a title and click **Create**
-6. Type your message and Claude will respond with full tool access to the working directory
+- Tool call blocks with expandable input/output
+- Edit tool diff rendering (red/green inline diffs)
+- Collapsible extended thinking display
+- Permission proxying — tool approvals appear in the browser UI
+- Model selection (Sonnet, Opus, Haiku) and thinking effort control
+- Per-turn and cumulative cost tracking
+- Image attachments via the Read tool
+
+## Common features
+
+All three modes share the same conversation infrastructure:
+
+- **Tree-based conversations** — Every message is a node. Branch at any point, explore alternate paths, switch between branches. Nothing is lost.
+- **Fork and branch** — Fork from any message to create a new conversation. Regenerate creates a sibling branch, preserving the original.
+- **Import / export** — Characters, personas, lore (.md) and conversations (.json).
+- **Streaming generation** — Real-time token streaming over WebSocket with live token rate.
+- **Image support** — Attach images to messages; generated images display inline.
+- **HTTPS / Tailscale** — Serves over HTTPS with auto-detected SSL certs for secure access across your network.
+- **WebGL black hole** — Schwarzschild raytracer background with procedural galaxy texture and glassmorphism UI.
 
 ## Quick start
 
 ```bash
 # Clone
-git clone https://github.com/lastnpcalex/loom.git
-cd loom
+git clone https://github.com/lastnpcalex/a-shadow-loom.git
+cd a-shadow-loom
 
 # Install dependencies
 pip install -r requirements.txt
@@ -65,31 +70,23 @@ pip install -r requirements.txt
 python server.py
 ```
 
-Open `http://localhost:3000` in your browser.
+Open `https://localhost:3000` in your browser.
 
-On Windows, you can create a `loom.bat` in your home folder:
-
-```bat
-@echo off
-cd /d "C:\path\to\loom"
-python server.py
-pause
-```
-
-On first launch, the server downloads the Gemma 3 1B GGUF model (~806MB) for local CPU summarization. This happens in the background and doesn't block startup.
+For Claude mode, ensure the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) is installed and on PATH with an active API key.
 
 ## Project structure
 
 ```
 server.py              — FastAPI server, WebSocket streaming, REST endpoints
 database.py            — SQLite schema, message tree CRUD, branch management
-config.py              — All configuration (model, context budget, generation params)
+config.py              — Configuration (model, context budget, SSL, generation params)
 prompt_engine.py       — System prompt assembly, repetition detection, style nudges
 context_manager.py     — Token counting, rolling summary, context window management
 character_loader.py    — Parse/save character, persona, and lore .md files
 ollama_client.py       — Ollama API client (chat streaming, image description)
 claude_client.py       — Claude Code CLI subprocess wrapper, NDJSON stream parser
 cc_permission_hook.py  — PreToolUse hook script for browser-based permission prompts
+local_tools.py         — File system tools for Local mode agent (read, write, search)
 local_summary.py       — Gemma 3 1B via llama-cpp-python for CPU summarization
 
 static/
@@ -104,6 +101,7 @@ static/
 characters/            — Character definition files (.md)
 personas/              — User persona files (.md)
 lore/                  — Lore/history context files (.md)
+certs/                 — SSL certificates (auto-detected, gitignored)
 ```
 
 ## Configuration
@@ -120,6 +118,8 @@ Settings are adjustable from the UI (gear icon) or by editing `config.py`:
 | `top_p` | `0.9` | Nucleus sampling |
 | `max_tokens` | `1024` | Max generation length |
 | `repeat_penalty` | `1.08` | Repetition penalty |
+| `ssl_certfile` | `certs/cert.pem` | SSL certificate path |
+| `ssl_keyfile` | `certs/key.pem` | SSL key path |
 
 ## Character file format
 

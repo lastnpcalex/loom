@@ -55,9 +55,10 @@ const State = {
     treeData: [],
     ws: null,
     isStreaming: false,
-    pendingImagePath: null,
-    pendingImageUrl: null,
+    pendingImages: [],  // [{path, url}, ...] — max 5
     config: {},
+    convFilter: 'all',
+    convFolderCollapsed: {},
 };
 
 // ── View Switching ──
@@ -127,8 +128,8 @@ async function init() {
         console.error(e);
     }
 
-    renderHomeCharacters();
     renderConversationList();
+    renderHomeCharacters();
     renderHomePersonas();
     renderHomeLore();
     setupEventListeners();
@@ -155,90 +156,247 @@ function renderConversationList() {
     const empty = document.getElementById('home-empty');
     list.innerHTML = '';
 
-    if (State.conversations.length === 0) {
+    // Filter by mode
+    let convs = State.conversations;
+    if (State.convFilter === 'weave') {
+        convs = convs.filter(c => c.mode === 'weave' || !c.mode);
+    } else if (State.convFilter === 'local') {
+        convs = convs.filter(c => c.mode === 'local');
+    } else if (State.convFilter === 'claude') {
+        convs = convs.filter(c => c.mode === 'claude');
+    }
+
+    if (convs.length === 0) {
         empty.style.display = '';
         return;
     }
     empty.style.display = 'none';
 
-    for (const conv of State.conversations) {
-        const div = document.createElement('div');
-        div.className = 'conv-item';
-
-        const isCC = conv.mode === 'claude';
-        const charName = isCC ? 'Claude Code'
-            : conv.character_id
-            ? (State.characters.find(c => c.id === conv.character_id)?.name || conv.character_id)
-            : 'Freeform';
-        const modeBadge = isCC ? '<span class="mode-badge">CC</span>' : '<span class="mode-badge">W</span>';
-
-        div.innerHTML = `
-            ${modeBadge}
-            <span class="conv-title-text">${escapeHtml(conv.title)}</span>
-            <span class="conv-meta">${escapeHtml(charName)}</span>
-            <div class="conv-actions">
-                <button class="char-action-btn conv-edit-btn" title="Rename">✎</button>
-                <button class="char-action-btn conv-export-btn" title="Export">↓</button>
-                <button class="char-action-btn char-delete-btn conv-delete-btn" title="Delete">✕</button>
-            </div>
-        `;
-        div.querySelector('.conv-title-text').addEventListener('click', () => loadConversation(conv.id));
-        div.querySelector('.conv-meta').addEventListener('click', () => loadConversation(conv.id));
-        div.querySelector('.conv-edit-btn').addEventListener('click', (e) => {
-            e.stopPropagation();
-            const titleSpan = div.querySelector('.conv-title-text');
-            const currentTitle = conv.title || '';
-            const input = document.createElement('input');
-            input.type = 'text';
-            input.value = currentTitle;
-            input.className = 'conv-title-input';
-            titleSpan.replaceWith(input);
-            input.focus();
-            input.select();
-
-            const save = async () => {
-                const newTitle = input.value.trim() || currentTitle;
-                const span = document.createElement('span');
-                span.className = 'conv-title-text';
-                span.textContent = newTitle;
-                span.addEventListener('click', () => loadConversation(conv.id));
-                input.replaceWith(span);
-                if (newTitle !== currentTitle) {
-                    try {
-                        const updated = await API.put(`/api/conversations/${conv.id}`, { title: newTitle });
-                        conv.title = updated.title;
-                        if (State.currentConv && State.currentConv.id === conv.id) {
-                            State.currentConv.title = updated.title;
-                        }
-                    } catch { showToast('Failed to rename', 'error'); }
-                }
-            };
-            input.addEventListener('blur', save);
-            input.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') input.blur();
-                if (e.key === 'Escape') { input.value = currentTitle; input.blur(); }
-            });
-        });
-        div.querySelector('.conv-export-btn').addEventListener('click', (e) => {
-            e.stopPropagation();
-            downloadFile(`/api/conversations/${conv.id}/export`, `${conv.title || 'conversation'}.json`);
-        });
-        div.querySelector('.conv-delete-btn').addEventListener('click', async (e) => {
-            e.stopPropagation();
-            if (confirm('Delete this conversation?')) {
-                await API.del(`/api/conversations/${conv.id}`);
-                State.conversations = State.conversations.filter(c => c.id !== conv.id);
-                if (State.currentConvId === conv.id) {
-                    State.currentConvId = null;
-                    State.currentConv = null;
-                    State.messages = [];
-                    switchView('home');
-                }
-                renderConversationList();
-            }
-        });
-        list.appendChild(div);
+    // Group by folder
+    const folders = {};  // folder name -> [conv, ...]
+    const unfiled = [];
+    for (const conv of convs) {
+        const folder = conv.folder || '';
+        if (folder) {
+            if (!folders[folder]) folders[folder] = [];
+            folders[folder].push(conv);
+        } else {
+            unfiled.push(conv);
+        }
     }
+
+    // Render folder groups first
+    const folderNames = Object.keys(folders).sort();
+    for (const folderName of folderNames) {
+        const group = document.createElement('div');
+        group.className = 'conv-folder-group';
+
+        const collapsed = !!State.convFolderCollapsed[folderName];
+        const header = document.createElement('div');
+        header.className = 'conv-folder-header';
+        header.innerHTML = `
+            <span class="conv-folder-arrow">${collapsed ? '▸' : '▾'}</span>
+            <span class="conv-folder-name">${escapeHtml(folderName)}</span>
+            <span class="conv-folder-count">(${folders[folderName].length})</span>
+        `;
+        header.addEventListener('click', () => {
+            State.convFolderCollapsed[folderName] = !State.convFolderCollapsed[folderName];
+            renderConversationList();
+        });
+        group.appendChild(header);
+
+        if (!collapsed) {
+            for (const conv of folders[folderName]) {
+                group.appendChild(buildConvItem(conv));
+            }
+        }
+        list.appendChild(group);
+    }
+
+    // Render unfiled conversations
+    for (const conv of unfiled) {
+        list.appendChild(buildConvItem(conv));
+    }
+}
+
+function buildConvItem(conv) {
+    const div = document.createElement('div');
+    div.className = 'conv-item';
+
+    const isCC = conv.mode === 'claude';
+    const isLocal = conv.mode === 'local';
+    const charName = isCC ? 'Claude Code'
+        : isLocal ? (conv.local_model || 'Local')
+        : conv.character_id
+        ? (State.characters.find(c => c.id === conv.character_id)?.name || conv.character_id)
+        : 'Freeform';
+    const modeBadge = isCC ? '<span class="mode-badge">CC</span>'
+        : isLocal ? '<span class="mode-badge">L</span>'
+        : '<span class="mode-badge">W</span>';
+    const starred = conv.starred ? 1 : 0;
+    const starChar = starred ? '★' : '☆';
+    const starClass = starred ? 'conv-star-btn active' : 'conv-star-btn';
+
+    div.innerHTML = `
+        <button class="${starClass}" title="Star">${starChar}</button>
+        ${modeBadge}
+        <span class="conv-title-text">${escapeHtml(conv.title)}</span>
+        <span class="conv-meta">${escapeHtml(charName)}</span>
+        <div class="conv-actions">
+            <button class="char-action-btn conv-folder-btn" title="Move to folder"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
+            <button class="char-action-btn conv-edit-btn" title="Rename">✎</button>
+            <button class="char-action-btn conv-export-btn" title="Export">↓</button>
+            <button class="char-action-btn char-delete-btn conv-delete-btn" title="Delete">✕</button>
+        </div>
+    `;
+
+    // Star toggle
+    div.querySelector('.conv-star-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const newStarred = conv.starred ? 0 : 1;
+        try {
+            await API.put(`/api/conversations/${conv.id}`, { starred: newStarred });
+            conv.starred = newStarred;
+            // Re-sort: starred first, then by updated_at
+            State.conversations.sort((a, b) => {
+                if ((b.starred || 0) !== (a.starred || 0)) return (b.starred || 0) - (a.starred || 0);
+                return (b.updated_at || 0) - (a.updated_at || 0);
+            });
+            renderConversationList();
+        } catch { showToast('Failed to update star', 'error'); }
+    });
+
+    // Click title/meta to open
+    div.querySelector('.conv-title-text').addEventListener('click', () => loadConversation(conv.id));
+    div.querySelector('.conv-meta').addEventListener('click', () => loadConversation(conv.id));
+
+    // Folder move button
+    div.querySelector('.conv-folder-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        showFolderDropdown(e.currentTarget, conv);
+    });
+
+    // Rename
+    div.querySelector('.conv-edit-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        const titleSpan = div.querySelector('.conv-title-text');
+        const currentTitle = conv.title || '';
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.value = currentTitle;
+        input.className = 'conv-title-input';
+        titleSpan.replaceWith(input);
+        input.focus();
+        input.select();
+
+        const save = async () => {
+            const newTitle = input.value.trim() || currentTitle;
+            const span = document.createElement('span');
+            span.className = 'conv-title-text';
+            span.textContent = newTitle;
+            span.addEventListener('click', () => loadConversation(conv.id));
+            input.replaceWith(span);
+            if (newTitle !== currentTitle) {
+                try {
+                    const updated = await API.put(`/api/conversations/${conv.id}`, { title: newTitle });
+                    conv.title = updated.title;
+                    if (State.currentConv && State.currentConv.id === conv.id) {
+                        State.currentConv.title = updated.title;
+                    }
+                } catch { showToast('Failed to rename', 'error'); }
+            }
+        };
+        input.addEventListener('blur', save);
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') input.blur();
+            if (e.key === 'Escape') { input.value = currentTitle; input.blur(); }
+        });
+    });
+
+    // Export
+    div.querySelector('.conv-export-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        downloadFile(`/api/conversations/${conv.id}/export`, `${conv.title || 'conversation'}.json`);
+    });
+
+    // Delete
+    div.querySelector('.conv-delete-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (confirm('Delete this conversation?')) {
+            await API.del(`/api/conversations/${conv.id}`);
+            State.conversations = State.conversations.filter(c => c.id !== conv.id);
+            if (State.currentConvId === conv.id) {
+                State.currentConvId = null;
+                State.currentConv = null;
+                State.messages = [];
+                switchView('home');
+            }
+            renderConversationList();
+        }
+    });
+
+    return div;
+}
+
+function showFolderDropdown(anchorBtn, conv) {
+    // Remove any existing dropdown
+    document.querySelectorAll('.conv-move-dropdown').forEach(d => d.remove());
+
+    const dropdown = document.createElement('div');
+    dropdown.className = 'conv-move-dropdown';
+
+    // Collect existing folder names
+    const existingFolders = [...new Set(
+        State.conversations.map(c => c.folder).filter(f => f)
+    )].sort();
+
+    // "No folder" option
+    let html = `<div class="conv-move-option" data-folder="">— No folder —</div>`;
+    for (const f of existingFolders) {
+        const active = conv.folder === f ? ' active' : '';
+        html += `<div class="conv-move-option${active}" data-folder="${escapeHtml(f)}">${escapeHtml(f)}</div>`;
+    }
+    html += `<div class="conv-move-option conv-move-new">+ New folder...</div>`;
+    dropdown.innerHTML = html;
+
+    // Position relative to anchor
+    anchorBtn.appendChild(dropdown);
+
+    // Handle clicks
+    dropdown.querySelectorAll('.conv-move-option:not(.conv-move-new)').forEach(opt => {
+        opt.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const folder = opt.dataset.folder;
+            try {
+                await API.put(`/api/conversations/${conv.id}`, { folder });
+                conv.folder = folder;
+                renderConversationList();
+            } catch { showToast('Failed to move', 'error'); }
+            dropdown.remove();
+        });
+    });
+
+    dropdown.querySelector('.conv-move-new').addEventListener('click', (e) => {
+        e.stopPropagation();
+        const name = prompt('Folder name:');
+        if (name && name.trim()) {
+            const folder = name.trim();
+            API.put(`/api/conversations/${conv.id}`, { folder }).then(() => {
+                conv.folder = folder;
+                renderConversationList();
+            }).catch(() => showToast('Failed to move', 'error'));
+        }
+        dropdown.remove();
+    });
+
+    // Close on outside click
+    const closeDropdown = (e) => {
+        if (!dropdown.contains(e.target)) {
+            dropdown.remove();
+            document.removeEventListener('click', closeDropdown);
+        }
+    };
+    setTimeout(() => document.addEventListener('click', closeDropdown), 0);
 }
 
 // ── Load Conversation → Tree View ──
@@ -303,6 +461,28 @@ async function createConversation() {
         closeModal('modal-new-conv');
         document.getElementById('new-conv-title').value = '';
         document.getElementById('project-dir').value = '';
+        renderConversationList();
+        await loadConversation(conv.id);
+        switchView('chat');
+        return;
+    }
+
+    if (mode === 'local') {
+        const localModel = document.getElementById('local-model').value;
+        if (!localModel) {
+            showToast('Select an Ollama model', 'error');
+            return;
+        }
+        const localProjectDir = document.getElementById('project-dir').value.trim();
+        const conv = await API.post('/api/conversations', {
+            title,
+            mode: 'local',
+            local_model: localModel,
+            project_dir: localProjectDir || undefined,
+        });
+        State.conversations.unshift(conv);
+        closeModal('modal-new-conv');
+        document.getElementById('new-conv-title').value = '';
         renderConversationList();
         await loadConversation(conv.id);
         switchView('chat');
@@ -388,6 +568,7 @@ function openNewConvModal() {
     document.getElementById('cc-effort-group').classList.add('hidden');
     document.getElementById('cc-model').value = 'sonnet';
     document.getElementById('cc-effort').value = 'high';
+    document.getElementById('local-model-group').classList.add('hidden');
     showWeaveFields(true);
     openModal('modal-new-conv');
 }
@@ -416,12 +597,12 @@ async function loadDirBrowser(path) {
 
         // Parent directory link
         if (data.parent !== null && data.parent !== undefined) {
-            html += `<div class="dir-entry dir-parent" data-dir-path="${escapeHtml(data.parent)}">&#x1F4C1; ..</div>`;
+            html += `<div class="dir-entry dir-parent" data-dir-path="${escapeHtml(data.parent)}"><svg class="dir-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg> ..</div>`;
         }
 
         // Subdirectories
         for (const dir of data.dirs) {
-            html += `<div class="dir-entry" data-dir-path="${escapeHtml(dir.path)}">&#x1F4C2; ${escapeHtml(dir.name)}</div>`;
+            html += `<div class="dir-entry" data-dir-path="${escapeHtml(dir.path)}"><svg class="dir-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/><path d="M3 9h18"/></svg> ${escapeHtml(dir.name)}</div>`;
         }
 
         if (data.dirs.length === 0 && !data.error) {
@@ -462,12 +643,33 @@ function showWeaveFields(show) {
     }
 }
 
+async function fetchOllamaModels() {
+    const select = document.getElementById('local-model');
+    select.innerHTML = '<option value="">Loading models...</option>';
+    try {
+        const data = await API.get('/api/ollama/models');
+        select.innerHTML = '';
+        if (data.models && data.models.length > 0) {
+            for (const model of data.models) {
+                const opt = document.createElement('option');
+                opt.value = model;
+                opt.textContent = model;
+                select.appendChild(opt);
+            }
+        } else {
+            select.innerHTML = '<option value="">No models found</option>';
+        }
+    } catch {
+        select.innerHTML = '<option value="">Failed to load models</option>';
+    }
+}
+
 // ── Setup Event Listeners ──
 function setupEventListeners() {
     // Home button
     document.getElementById('btn-home').addEventListener('click', () => {
-        renderHomeCharacters();
         renderConversationList();
+        renderHomeCharacters();
         renderHomePersonas();
         renderHomeLore();
         switchView('home');
@@ -536,6 +738,16 @@ function setupEventListeners() {
         }
     });
 
+    // Conversation filter tabs
+    document.querySelectorAll('.conv-filter-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.conv-filter-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            State.convFilter = btn.dataset.filter;
+            renderConversationList();
+        });
+    });
+
     // New conversation
     document.getElementById('btn-new-conv-home')?.addEventListener('click', openNewConvModal);
     document.getElementById('btn-create-conv').addEventListener('click', createConversation);
@@ -578,21 +790,28 @@ function setupEventListeners() {
         });
     });
 
-    // Mode toggle (Weave / Claude)
+    // Mode toggle (Weave / Local / Claude)
     document.querySelectorAll('#mode-toggle .toggle-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             document.querySelectorAll('#mode-toggle .toggle-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             const mode = btn.dataset.value;
+            // Hide all mode-specific fields first
+            document.getElementById('project-dir-group').classList.add('hidden');
+            document.getElementById('cc-model-group').classList.add('hidden');
+            document.getElementById('cc-effort-group').classList.add('hidden');
+            document.getElementById('local-model-group').classList.add('hidden');
             if (mode === 'claude') {
                 document.getElementById('project-dir-group').classList.remove('hidden');
                 document.getElementById('cc-model-group').classList.remove('hidden');
                 document.getElementById('cc-effort-group').classList.remove('hidden');
                 showWeaveFields(false);
+            } else if (mode === 'local') {
+                document.getElementById('local-model-group').classList.remove('hidden');
+                document.getElementById('project-dir-group').classList.remove('hidden');
+                showWeaveFields(false);
+                fetchOllamaModels();
             } else {
-                document.getElementById('project-dir-group').classList.add('hidden');
-                document.getElementById('cc-model-group').classList.add('hidden');
-                document.getElementById('cc-effort-group').classList.add('hidden');
                 showWeaveFields(true);
             }
         });
@@ -685,11 +904,9 @@ function setupEventListeners() {
 
     // Image upload
     document.getElementById('file-input').addEventListener('change', handleImageSelect);
-    document.getElementById('btn-remove-image').addEventListener('click', () => {
-        State.pendingImagePath = null;
-        State.pendingImageUrl = null;
-        document.getElementById('image-preview').classList.add('hidden');
-    });
+
+    // Paste image from clipboard
+    document.getElementById('user-input').addEventListener('paste', handleImagePaste);
 }
 
 function autoResizeTextarea() {
@@ -728,20 +945,77 @@ function renderCharacterGrid() {
     }
 }
 
-// ── Image Upload ──
-async function handleImageSelect(e) {
-    const file = e.target.files[0];
-    if (!file) return;
+// ── Image Upload (multi-image, max 5) ──
+const MAX_PENDING_IMAGES = 5;
+
+function clearPendingImages() {
+    State.pendingImages = [];
+    document.getElementById('file-input').value = '';
+    renderImagePreviews();
+}
+
+function removePendingImage(index) {
+    State.pendingImages.splice(index, 1);
+    renderImagePreviews();
+}
+
+function renderImagePreviews() {
+    const container = document.getElementById('image-preview');
+    if (State.pendingImages.length === 0) {
+        container.classList.add('hidden');
+        container.innerHTML = '';
+        return;
+    }
+    container.classList.remove('hidden');
+    container.innerHTML = State.pendingImages.map((img, i) => `
+        <div class="preview-thumb">
+            <img src="${img.url}" alt="Preview ${i + 1}">
+            <button class="btn-remove-thumb" data-idx="${i}">✕</button>
+        </div>
+    `).join('') + `<span class="preview-count">${State.pendingImages.length}/${MAX_PENDING_IMAGES}</span>`;
+
+    container.querySelectorAll('.btn-remove-thumb').forEach(btn => {
+        btn.addEventListener('click', () => removePendingImage(parseInt(btn.dataset.idx)));
+    });
+}
+
+async function attachImage(file) {
+    if (State.pendingImages.length >= MAX_PENDING_IMAGES) {
+        showToast(`Max ${MAX_PENDING_IMAGES} images allowed`, 'error');
+        return;
+    }
     try {
         const result = await API.upload(file);
-        State.pendingImagePath = result.path;
-        State.pendingImageUrl = result.url;
-        document.getElementById('preview-img').src = result.url;
-        document.getElementById('image-preview').classList.remove('hidden');
+        State.pendingImages.push({ path: result.path, url: result.url });
+        renderImagePreviews();
     } catch (err) {
         showToast('Image upload failed', 'error');
     }
+}
+
+async function handleImageSelect(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    await attachImage(file);
     e.target.value = '';
+}
+
+async function handleImagePaste(e) {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    const imageFiles = [];
+    for (const item of items) {
+        if (item.type.startsWith('image/')) {
+            const file = item.getAsFile();
+            if (file) imageFiles.push(file);
+        }
+    }
+    if (imageFiles.length > 0) {
+        e.preventDefault();
+        for (const file of imageFiles) {
+            await attachImage(file);
+        }
+    }
 }
 
 // ── Persona Select ──

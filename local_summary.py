@@ -21,8 +21,10 @@ _inference_lock = None  # prevents concurrent llama.cpp calls (not thread-safe)
 _last_used = 0.0        # timestamp of last inference call
 _idle_task = None        # background task that checks for idle timeout
 
-# Model config — abliterated (no refusals) for RP summarization
-REPO_ID = "mlabonne/gemma-3-1b-it-abliterated-GGUF"
+# Model config — abliterated (no refusals) needed because this summarizes RP content
+# Set LOCAL_SUMMARIZER_PATH to a .gguf file to skip HuggingFace entirely
+LOCAL_MODEL_PATH = os.getenv("LOCAL_SUMMARIZER_PATH", "")
+REPO_ID = "bartowski/huihui-ai_gemma-3-1b-it-abliterated-GGUF"
 FILENAME = "gemma-3-1b-it-abliterated-Q4_K_M.gguf"
 N_CTX = 2048       # 2K is plenty for short summaries
 N_THREADS = None    # None = auto-detect
@@ -95,12 +97,32 @@ async def _idle_monitor():
 
 
 def _load_model():
-    """Synchronous model download + initialization."""
-    from huggingface_hub import hf_hub_download
+    """Synchronous model download + initialization.
+
+    Priority: LOCAL_SUMMARIZER_PATH env var → HF local cache → HF download (once).
+    """
     from llama_cpp import Llama
 
-    # Download model (cached after first download)
-    model_path = hf_hub_download(repo_id=REPO_ID, filename=FILENAME)
+    # 1) Explicit local path — no HF dependency at all
+    if LOCAL_MODEL_PATH and os.path.isfile(LOCAL_MODEL_PATH):
+        model_path = LOCAL_MODEL_PATH
+        logger.info(f"Using local summarizer model: {model_path}")
+    else:
+        from huggingface_hub import hf_hub_download
+        if LOCAL_MODEL_PATH:
+            logger.warning(f"LOCAL_SUMMARIZER_PATH set but file not found: {LOCAL_MODEL_PATH}")
+        # 2) Try HF local cache — no network request
+        try:
+            model_path = hf_hub_download(
+                repo_id=REPO_ID, filename=FILENAME, local_files_only=True
+            )
+            logger.info("Summarizer model found in local HF cache")
+        except Exception:
+            # 3) First run — download once, then it's cached forever
+            logger.info("Summarizer model not cached, downloading (one-time ~800MB)...")
+            model_path = hf_hub_download(repo_id=REPO_ID, filename=FILENAME)
+            logger.info(f"Summarizer model downloaded to {model_path}")
+            logger.info("Tip: set LOCAL_SUMMARIZER_PATH=%s to bypass HF in the future", model_path)
 
     # Determine thread count
     n_threads = N_THREADS

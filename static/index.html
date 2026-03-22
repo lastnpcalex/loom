@@ -2,12 +2,13 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Loom — RP Harness</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Ex Astris Umbra</title>
+    <link rel="icon" type="image/png" href="/static/img/loom-ico.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=30">
+    <link rel="stylesheet" href="/static/style.css?v=36">
 </head>
 <body>
     <div id="blackhole-container"></div>
@@ -15,7 +16,7 @@
         <!-- Top bar (always visible) -->
         <header id="app-header">
             <div id="header-left">
-                <button id="btn-home" title="Conversations">Loom</button>
+                <button id="btn-home" title="Conversations">Loom ◈</button>
                 <span id="header-separator" class="hidden">/</span>
                 <span id="conv-title" class="hidden">—</span>
                 <button id="btn-back-to-tree" class="hidden" title="Back to tree view">Tree</button>
@@ -31,6 +32,27 @@
         <!-- View: Conversation List (home) -->
         <div id="view-home" class="view active">
             <div id="home-content">
+                <!-- Conversations Section -->
+                <div class="home-section">
+                    <div class="home-section-header">
+                        <span class="home-section-label">Conversations</span>
+                        <div class="home-section-actions">
+                            <button class="btn-small" id="btn-import-conv">Import</button>
+                            <button class="btn-small" id="btn-new-conv-home">+ New</button>
+                        </div>
+                    </div>
+                    <div id="conv-filter-bar">
+                        <button class="conv-filter-btn active" data-filter="all">All</button>
+                        <button class="conv-filter-btn" data-filter="weave">Weave</button>
+                        <button class="conv-filter-btn" data-filter="local">Local</button>
+                        <button class="conv-filter-btn" data-filter="claude">Claude</button>
+                    </div>
+                    <div id="conv-list"></div>
+                    <div id="home-empty" style="display:none;">
+                        <p>No conversations yet. Pick a character below to start.</p>
+                    </div>
+                </div>
+
                 <!-- Characters Section -->
                 <div class="home-section">
                     <div class="home-section-header">
@@ -41,21 +63,6 @@
                         </div>
                     </div>
                     <div id="home-char-grid"></div>
-                </div>
-
-                <!-- Conversations Section -->
-                <div class="home-section">
-                    <div class="home-section-header">
-                        <span class="home-section-label">Conversations</span>
-                        <div class="home-section-actions">
-                            <button class="btn-small" id="btn-import-conv">Import</button>
-                            <button class="btn-small" id="btn-new-conv-home">+ New</button>
-                        </div>
-                    </div>
-                    <div id="conv-list"></div>
-                    <div id="home-empty" style="display:none;">
-                        <p>No conversations yet. Pick a character above to start.</p>
-                    </div>
                 </div>
 
                 <!-- User Personas Section -->
@@ -104,10 +111,7 @@
                 </div>
             </div>
             <div id="input-area">
-                <div id="image-preview" class="hidden">
-                    <img id="preview-img" src="" alt="Preview">
-                    <button id="btn-remove-image">✕</button>
-                </div>
+                <div id="image-preview" class="hidden"></div>
                 <div id="input-row">
                     <label id="btn-attach" title="Attach image">
                         <input type="file" id="file-input" accept="image/*" hidden>
@@ -129,8 +133,15 @@
                 <label>Mode</label>
                 <div id="mode-toggle" class="toggle-group">
                     <button class="toggle-btn active" data-value="weave">Weave</button>
+                    <button class="toggle-btn" data-value="local">Local</button>
                     <button class="toggle-btn" data-value="claude">Claude</button>
                 </div>
+            </div>
+            <div class="form-group hidden" id="local-model-group">
+                <label for="local-model">Ollama Model</label>
+                <select id="local-model" class="form-select">
+                    <option value="">Loading models...</option>
+                </select>
             </div>
             <div class="form-group hidden" id="project-dir-group">
                 <label for="project-dir">Working Directory</label>
@@ -330,13 +341,25 @@ assistant: *Another example response*"></textarea>
         </div>
     </div>
 
+    <!-- Artifact Preview Modal -->
+    <div id="modal-preview" class="modal hidden">
+        <div class="modal-backdrop" data-close-modal-preview></div>
+        <div class="modal-content" style="max-width:85vw;width:85vw;max-height:90vh;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                <h2 style="margin-bottom:0;">Preview</h2>
+                <button class="btn-secondary" data-close-modal-preview>Close</button>
+            </div>
+            <div id="preview-modal-body"></div>
+        </div>
+    </div>
+
     <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/15.0.7/marked.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.2.4/purify.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=12"></script>
-    <script src="/static/app.js?v=24"></script>
-    <script src="/static/chat.js?v=30"></script>
-    <script src="/static/tree.js?v=11"></script>
+    <script src="/static/app.js?v=28"></script>
+    <script src="/static/chat.js?v=37"></script>
+    <script src="/static/tree.js?v=12"></script>
 </body>
 </html>
