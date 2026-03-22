@@ -486,7 +486,7 @@ function createMessageElement(msg, cost) {
         const imgEntries = [];
         for (const [filename, norm] of byFilename) {
             imgEntries.push({
-                url: `/api/conversations/${State.currentConvId}/file?path=${encodeURIComponent(norm)}`,
+                url: `/api/conversations/${State.currentConvId}/file?path=${norm}`,
                 name: filename,
             });
         }
