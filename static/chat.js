@@ -177,7 +177,7 @@ function handleWSMessage(data) {
             break;
 
         case 'tool_result':
-            finalizeToolBlock(data.content, data.tool_id, data.image_url);
+            finalizeToolBlock(data.content, data.tool_id, data.image_url, data.is_error);
             break;
 
         case 'thinking_chunk':
@@ -523,7 +523,7 @@ function createMessageElement(msg, cost) {
             projectImgHtml = '<div class="detected-images">' +
                 imgEntries.map(e =>
                     `<figure class="detected-image-figure">` +
-                    `<img class="generated-image" src="${e.url}" alt="${escapeHtml(e.name)}" loading="lazy">` +
+                    `<img class="generated-image" src="${e.url}" alt="${escapeHtml(e.name)}" loading="lazy" onerror="this.closest('figure').remove()">` +
                     `<figcaption>${escapeHtml(e.name)}</figcaption></figure>`
                 ).join('') + '</div>';
         }
@@ -913,7 +913,7 @@ function appendToolInput(json, toolId) {
     }
 }
 
-function finalizeToolBlock(result, toolId, imageUrl) {
+function finalizeToolBlock(result, toolId, imageUrl, isError) {
     if (!streamingDiv) return;
     const block = streamingDiv.querySelector(`.tool-block[data-tool-id="${toolId}"]`)
                 || streamingDiv.querySelector('.tool-block:last-child');
@@ -922,6 +922,17 @@ function finalizeToolBlock(result, toolId, imageUrl) {
     // Truncate long results for display
     const display = result.length > 2000 ? result.substring(0, 2000) + '\n... (truncated)' : result;
     resultEl.textContent = display;
+
+    // Show success/error indicator on the header
+    const header = block.querySelector('.tool-block-header');
+    if (header) {
+        const indicator = document.createElement('span');
+        indicator.className = isError ? 'tool-status tool-error' : 'tool-status tool-success';
+        indicator.textContent = isError ? '✗' : '✓';
+        indicator.title = isError ? 'Failed' : 'Success';
+        header.appendChild(indicator);
+    }
+    if (isError) block.classList.add('tool-errored');
 
     // If this tool produced an image, display it inline
     if (imageUrl) {

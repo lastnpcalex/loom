@@ -1226,6 +1226,8 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                                     break
 
                     tool_result_msg = {"type": "tool_result", "content": result_content, "tool_id": tool_id}
+                    if evt.get("is_error"):
+                        tool_result_msg["is_error"] = True
                     if image_url:
                         tool_result_msg["image_url"] = image_url
                     await _ws_send(conv_id, tool_result_msg)

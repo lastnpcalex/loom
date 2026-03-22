@@ -1625,6 +1625,16 @@ body::after {
 .tool-block-header .tool-name { color: var(--text-secondary); font-size: 12px; }
 .tool-block-header .tool-toggle { color: var(--text-muted); font-size: 11px; }
 
+.tool-status {
+    margin-left: auto;
+    font-size: 13px;
+    font-weight: bold;
+}
+.tool-success { color: #3fb950; }
+.tool-error { color: #f85149; }
+.tool-errored { border-color: rgba(248, 81, 73, 0.3); }
+.tool-errored .tool-block-result { color: #f85149; }
+
 .tool-block-body { display: none; padding: 4px 10px 6px; }
 .tool-block.expanded .tool-block-body { display: block; }
 

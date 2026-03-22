@@ -114,6 +114,7 @@ def _process_event(raw: dict) -> list[dict]:
                         "type": "tool_result",
                         "content": str(result_content),
                         "tool_id": block.get("tool_use_id", ""),
+                        "is_error": block.get("is_error", False),
                     })
 
     elif etype == "result":
