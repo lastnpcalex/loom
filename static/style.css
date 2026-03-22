@@ -474,6 +474,34 @@ body::after {
 }
 
 /* ── Tree Canvas View ── */
+#tree-layout-toggle {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    z-index: 20;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-secondary);
+    font-size: 18px;
+    width: 36px;
+    height: 36px;
+    cursor: pointer;
+    transition: var(--transition);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+#tree-layout-toggle:hover {
+    color: var(--cyan);
+    border-color: var(--cyan);
+    box-shadow: 0 0 8px rgba(0, 255, 255, 0.2);
+}
+
+#view-tree {
+    position: relative;
+}
+
 #tree-canvas {
     flex: 1;
     overflow: hidden;
@@ -1125,6 +1153,30 @@ body::after {
     padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
 }
 
+#cc-inline-controls {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+#cc-inline-controls select {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    font-size: 12px;
+    padding: 4px 8px;
+    cursor: pointer;
+    transition: var(--transition);
+}
+#cc-inline-controls select:hover {
+    border-color: var(--cyan);
+}
+#cc-inline-controls select:focus {
+    outline: none;
+    border-color: var(--cyan);
+    box-shadow: 0 0 6px rgba(0, 255, 255, 0.2);
+}
+
 #image-preview {
     display: flex;
     align-items: center;
@@ -1633,6 +1685,12 @@ pre.tool-output {
     padding: 4px;
 }
 
+.detected-images {
+    padding: 8px 24px 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
 .generated-image {
     max-width: 100%;
     max-height: 400px;

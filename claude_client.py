@@ -219,8 +219,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             cc_args.append("--fork-session")
 
     if use_ollama:
-        # Launch via: ollama launch claude --model <model> --yes -- <cc_args>
-        cmd = ["ollama", "launch", "claude", "--model", model, "--yes", "--"] + cc_args
+        # Launch via: ollama launch claude --model <model> -- <cc_args>
+        cmd = ["ollama", "launch", "claude", "--model", model, "--"] + cc_args
     else:
         cmd = ["claude"] + cc_args
 

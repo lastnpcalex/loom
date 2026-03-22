@@ -128,13 +128,17 @@ function handleWSMessage(data) {
             showGenStatus(`Context: ${data.total_tokens.toLocaleString()} tokens — Waiting for model...`);
             break;
 
+        case 'status':
+            showGenStatus(data.text || 'Working...');
+            break;
+
         case 'stream_start':
             State.isStreaming = true;
             _streamTokenCount = 0;
             _streamStartTime = Date.now();
             _streamBuffer = '';
             _streamFlushTimer = null;
-            hideGenStatus();
+            // Don't hide gen-status yet — keep showing until first content arrives
             hideRetryBar();
             appendStreamingMessage();
             document.getElementById('btn-send').disabled = true;
@@ -151,6 +155,7 @@ function handleWSMessage(data) {
             break;
 
         case 'stream_chunk':
+            hideGenStatus();
             _streamTokenCount++;
             appendStreamChunk(data.content);
             // Update token rate in status
@@ -163,6 +168,7 @@ function handleWSMessage(data) {
             break;
 
         case 'tool_start':
+            hideGenStatus();
             appendToolBlock(data.name, data.tool_id);
             break;
 
@@ -196,8 +202,27 @@ function handleWSMessage(data) {
             hideGenStatus();
             if (streamingDiv) {
                 finalizeStreamingMessage(data.message, data.cost);
+                // Display detected images inline after the message
+                if (data.images && data.images.length > 0) {
+                    const imgContainer = document.createElement('div');
+                    imgContainer.className = 'detected-images';
+                    for (const url of data.images) {
+                        const img = document.createElement('img');
+                        img.src = url;
+                        img.alt = 'Generated image';
+                        img.className = 'generated-image';
+                        img.addEventListener('click', () => {
+                            const body = document.getElementById('preview-modal-body');
+                            body.innerHTML = '<img src="' + url + '" style="max-width:100%;max-height:80vh;">';
+                            document.getElementById('modal-preview').classList.remove('hidden');
+                        });
+                        imgContainer.appendChild(img);
+                    }
+                    // Append to the finalized message div
+                    const msgDiv = document.querySelector(`.message[data-msg-id="${data.message.id}"]`);
+                    if (msgDiv) msgDiv.appendChild(imgContainer);
+                }
             } else {
-                // Streaming div was lost (disconnect/reconnect race) — reload from DB
                 loadMessages(State.currentConvId);
             }
             refreshTree();
@@ -435,12 +460,46 @@ function createMessageElement(msg, cost) {
                 '</div>';
         }
     }
+
+    // Detect project-relative image paths in assistant CC/local messages
+    let projectImgHtml = '';
+    if (msg.role === 'assistant' && (isClaudeMode || isLocalMode) && State.currentConv) {
+        const allText = (msg.content || '') + ' ' + (typeof msg.content_blocks === 'string' ? msg.content_blocks : JSON.stringify(msg.content_blocks || ''));
+        const imgRegex = /[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)/gi;
+        const matches = allText.match(imgRegex) || [];
+        const seen = new Set();
+        const imgUrls = [];
+        for (const m of matches) {
+            // Normalize path separators and skip duplicates
+            const norm = m.replace(/\\/g, '/');
+            if (!seen.has(norm)) {
+                seen.add(norm);
+                imgUrls.push(`/api/conversations/${State.currentConvId}/file?path=${encodeURIComponent(m)}`);
+            }
+        }
+        if (imgUrls.length > 0) {
+            projectImgHtml = '<div class="detected-images">' +
+                imgUrls.map(url =>
+                    `<img class="generated-image" src="${url}" alt="Generated image" onerror="this.parentElement.remove()">`
+                ).join('') + '</div>';
+        }
+    }
+
     div.innerHTML = '<div class="message-header">' +
         '<span class="message-role">' + escapeHtml(roleLabel) + '</span>' +
         '<div class="message-actions">' + branchPlaceholder + actionsHtml + '</div>' +
         '</div>' +
         '<div class="message-content">' + contentHtml + '</div>' +
-        imgHtml + costHtml;
+        imgHtml + projectImgHtml + costHtml;
+
+    // Click-to-preview for detected project images
+    div.querySelectorAll('.detected-images .generated-image').forEach(img => {
+        img.addEventListener('click', () => {
+            const body = document.getElementById('preview-modal-body');
+            body.innerHTML = '<img src="' + img.src + '" style="max-width:100%;max-height:80vh;">';
+            document.getElementById('modal-preview').classList.remove('hidden');
+        });
+    });
 
     // Load sibling info for branch indicator
     loadBranchIndicator(msg.id, div.querySelector('.branch-slot'));
@@ -633,11 +692,15 @@ function getCharacterName() {
 // Configure marked for chat rendering
 if (typeof marked !== 'undefined') {
     const renderer = new marked.Renderer();
-    const origLink = renderer.link.bind(renderer);
-    renderer.link = function(href, title, text) {
-        const html = origLink(href, title, text);
-        return html.replace('<a ', '<a target="_blank" rel="noopener" ');
-    };
+    // Force all links to open in new tab via DOMPurify hook (works with any marked version)
+    if (typeof DOMPurify !== 'undefined') {
+        DOMPurify.addHook('afterSanitizeAttributes', function(node) {
+            if (node.tagName === 'A' && node.getAttribute('href')) {
+                node.setAttribute('target', '_blank');
+                node.setAttribute('rel', 'noopener noreferrer');
+            }
+        });
+    }
     // Override code renderer to add toolbar with copy/preview buttons
     renderer.code = function({ text, lang, escaped }) {
         const safeLang = lang ? escapeHtml(lang.match(/^\S*/)?.[0] || '') : '';

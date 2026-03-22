@@ -339,6 +339,10 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["custom_scene"] = data["custom_scene"]
     if "starred" in data:
         fields["starred"] = int(data["starred"])
+    if "cc_model" in data:
+        fields["cc_model"] = data["cc_model"]
+    if "cc_effort" in data:
+        fields["cc_effort"] = data["cc_effort"]
     if fields:
         await db.update_conversation_fields(conv_id, **fields)
     return await db.get_conversation(conv_id)
@@ -745,8 +749,8 @@ async def handle_cc_permission(data: dict):
             "input_summary": input_summary,
         })
     else:
-        print(f"[PERM] No active WebSocket for conv={conv_id} — denying")
-        return {"allow": False, "message": "No active Loom UI session"}
+        print(f"[PERM] No active WebSocket for conv={conv_id} — denying (UI not connected)")
+        return {"allow": False, "message": "Loom UI not connected — open the conversation to approve tools"}
 
     # Wait for user response
     event = asyncio.Event()
@@ -907,9 +911,18 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                         resume_session_id = msg["cc_session_id"]
                         fork_session = True
                         break
-            elif parent_msg and parent_msg["role"] == "assistant" and parent_msg.get("cc_session_id"):
-                # Linear continue: parent is an assistant message with a session
-                resume_session_id = parent_msg["cc_session_id"]
+            else:
+                # Linear continue: parent_id is the new user message.
+                # Check if the message just before it (the prior assistant reply)
+                # has a session we can resume. Only resume if that assistant msg
+                # is the direct parent of the user msg (no editing/branching).
+                if len(branch) >= 2:
+                    prior_msg = branch[-2]
+                    if (parent_msg["role"] == "user"
+                            and prior_msg["role"] == "assistant"
+                            and prior_msg.get("cc_session_id")
+                            and parent_msg.get("parent_id") == prior_msg["id"]):
+                        resume_session_id = prior_msg["cc_session_id"]
 
         if resume_session_id:
             use_resume = True
@@ -981,6 +994,9 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                         files_str = ", ".join(file_notes)
                         prompt += f"\n\n[User attached {len(file_notes)} file(s): {files_str}. Use the Read tool to view them.]"
 
+        # Let the client know we're launching
+        launch_label = f"Launching {cc_model} via Ollama..." if use_ollama else f"Launching Claude Code ({cc_model})..."
+        await _ws_send(conv_id, {"type": "status", "text": launch_label})
         await _ws_send(conv_id, {"type": "stream_start"})
 
         # Launch CC — with resume if available, with fallback on failure
@@ -1152,6 +1168,8 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 etype = evt["type"]
                 if etype == "session_info":
                     new_session_id = evt.get("session_id", "") or new_session_id
+                    model_name = evt.get("model", cc_model)
+                    await _ws_send(conv_id, {"type": "status", "text": f"Connected — {model_name} is thinking..."})
                 elif etype == "text_delta":
                     full_text += evt["text"]
                     if current_block and current_block["type"] == "text":
@@ -1171,12 +1189,39 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 elif etype == "tool_result":
                     result_content = evt.get("content", "")
                     tool_id = evt.get("tool_id", "")
+                    # Find the matching tool_use block to get tool name + input
+                    matched_block = None
                     for block in reversed(content_blocks):
                         if block["type"] == "tool_use" and block.get("tool_id") == tool_id:
                             block["result"] = result_content
+                            matched_block = block
                             break
                     current_block = None
-                    await _ws_send(conv_id, {"type": "tool_result", "content": result_content, "tool_id": tool_id})
+
+                    # Check if this tool created/referenced an image file
+                    image_url = None
+                    if matched_block:
+                        tool_input_str = matched_block.get("input", "")
+                        tool_name = matched_block.get("name", "")
+                        # Scan tool input for image paths
+                        import re as _re
+                        for candidate in _re.findall(r'[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)', tool_input_str, _re.IGNORECASE):
+                            candidate_path = (Path(project_dir) / candidate).resolve()
+                            if candidate_path.exists() and candidate_path.is_file():
+                                image_url = f"/api/conversations/{conv_id}/file?path={candidate}"
+                                break
+                        # Also check the result text for image paths
+                        if not image_url:
+                            for candidate in _re.findall(r'[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)', result_content, _re.IGNORECASE):
+                                candidate_path = (Path(project_dir) / candidate).resolve()
+                                if candidate_path.exists() and candidate_path.is_file():
+                                    image_url = f"/api/conversations/{conv_id}/file?path={candidate}"
+                                    break
+
+                    tool_result_msg = {"type": "tool_result", "content": result_content, "tool_id": tool_id}
+                    if image_url:
+                        tool_result_msg["image_url"] = image_url
+                    await _ws_send(conv_id, tool_result_msg)
                 elif etype == "thinking_delta":
                     if current_block and current_block["type"] == "thinking":
                         current_block["text"] += evt["text"]
@@ -1194,6 +1239,14 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                         content_blocks.append({"type": "text", "text": full_text})
 
             _active_claude_procs.pop(conv_id, None)
+
+        # If CC produced no output at all, report error instead of saving blank
+        if not full_text and not any(b["type"] == "tool_use" for b in content_blocks):
+            error_msg = result_info.get("error") or "Claude Code exited with no response"
+            if use_ollama:
+                error_msg += f" — check that '{cc_model}' is available in Ollama"
+            await _ws_send(conv_id, {"type": "error", "error": error_msg})
+            return
 
         # Extract cost info
         cost_usd = result_info.get("cost_usd", 0)
@@ -1228,11 +1281,30 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
             "duration_ms": duration_ms,
         }
 
-        await _ws_send(conv_id, {
+        # Detect image paths in the response text and tool blocks
+        import re as _re
+        detected_images = []
+        seen_paths = set()
+        all_text = full_text + " " + " ".join(
+            b.get("input", "") + " " + b.get("result", "")
+            for b in content_blocks if b.get("type") == "tool_use"
+        )
+        base_path = Path(project_dir).resolve()
+        for candidate in _re.findall(r'[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)', all_text, _re.IGNORECASE):
+            candidate_path = (base_path / candidate).resolve()
+            if str(candidate_path).startswith(str(base_path)) and candidate_path.exists() and candidate_path.is_file():
+                if candidate_path not in seen_paths:
+                    seen_paths.add(candidate_path)
+                    detected_images.append(f"/api/conversations/{conv_id}/file?path={candidate}")
+
+        end_msg = {
             "type": "stream_end",
             "message": dict(msg),
             "cost": cost_info,
-        })
+        }
+        if detected_images:
+            end_msg["images"] = detected_images
+        await _ws_send(conv_id, end_msg)
 
     except asyncio.CancelledError:
         _active_claude_procs.pop(conv_id, None)
@@ -1303,279 +1375,6 @@ async def _handle_local_generation(websocket: WebSocket, conv_id: int, conv: dic
     conv["cc_model"] = conv.get("local_model") or config.ollama_model
     conv["_use_ollama"] = True
     await _handle_claude_generation(websocket, conv_id, conv, data)
-
-
-async def _local_request_permission(conv_id: int, tool_name: str, tool_input: dict) -> bool:
-    """Request permission from the user — same UI flow as CC permission hooks."""
-    # Respect "Allow All" if user already clicked it for this session
-    if conv_id in _auto_approve_sessions:
-        return True
-
-    request_id = str(uuid.uuid4())
-
-    # Build human-readable summary (same logic as CC hook handler)
-    if isinstance(tool_input, dict):
-        if "path" in tool_input:
-            input_summary = tool_input["path"]
-        elif "pattern" in tool_input:
-            input_summary = tool_input["pattern"]
-        else:
-            input_summary = json.dumps(tool_input)[:500]
-    else:
-        input_summary = str(tool_input)[:500]
-
-    ws = _active_websockets.get(conv_id)
-    if not ws or ws.client_state != WebSocketState.CONNECTED:
-        print(f"[PERM-LOCAL] No active WebSocket for conv={conv_id} — denying")
-        return False
-
-    await ws.send_json({
-        "type": "permission_request",
-        "request_id": request_id,
-        "tool_name": tool_name,
-        "tool_input": tool_input,
-        "input_summary": input_summary,
-    })
-
-    event = asyncio.Event()
-    _pending_hook_permissions[request_id] = {
-        "event": event,
-        "response": None,
-        "conv_id": conv_id,
-    }
-
-    try:
-        await asyncio.wait_for(event.wait(), timeout=300)
-        user_response = _pending_hook_permissions.pop(request_id, {}).get("response", {})
-        return user_response.get("allow", False)
-    except asyncio.TimeoutError:
-        _pending_hook_permissions.pop(request_id, None)
-        return False
-
-
-async def _local_agent_loop(websocket: WebSocket, conv_id: int,
-                            messages: list[dict], model: str,
-                            project_dir: str, parent_id: int | None):
-    """Run a tool-calling agent loop with the local Ollama model."""
-    import local_tools
-
-    system_prompt = local_tools.build_system_prompt(project_dir)
-    agent_messages = [{"role": "system", "content": system_prompt}] + messages
-
-    await _ws_send(conv_id, {"type": "stream_start"})
-
-    max_tool_rounds = 15
-    full_response = ""
-
-    for round_num in range(max_tool_rounds):
-        # Make a non-streaming request to check for tool calls
-        tool_calls = await _ollama_tool_request(agent_messages, model, local_tools.TOOL_DEFINITIONS)
-
-        if tool_calls:
-            # Model wants to use tools — process each call
-            # Add the assistant message with tool calls to context
-            agent_messages.append({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": tool_calls,
-            })
-
-            for tc in tool_calls:
-                func_name = tc["function"]["name"]
-                try:
-                    func_args = json.loads(tc["function"]["arguments"]) if isinstance(tc["function"]["arguments"], str) else tc["function"]["arguments"]
-                except json.JSONDecodeError:
-                    func_args = {}
-
-                tool_id = tc.get("id", str(uuid.uuid4())[:8])
-
-                # Send tool_start to UI
-                await _ws_send(conv_id, {
-                    "type": "tool_start",
-                    "name": func_name,
-                    "tool_id": tool_id,
-                })
-
-                # Send tool input to UI
-                input_display = json.dumps(func_args, indent=2)
-                await _ws_send(conv_id, {
-                    "type": "tool_input_chunk",
-                    "content": input_display,
-                    "tool_id": tool_id,
-                })
-
-                # Known tools that are safe to auto-approve (read-only)
-                read_only_tools = {"read_file", "list_directory", "search_files"}
-                known_tools = read_only_tools | {"write_file"}
-
-                if func_name not in known_tools:
-                    # Unknown tool (model hallucinated) — reject without prompting
-                    result = f"Unknown tool '{func_name}'. Available tools: read_file, list_directory, write_file, search_files"
-                    await _ws_send(conv_id, {
-                        "type": "tool_result",
-                        "content": result,
-                        "tool_id": tool_id,
-                    })
-                    agent_messages.append({"role": "tool", "content": result})
-                    continue
-
-                # Read-only tools auto-approve; write operations need permission
-                if func_name in read_only_tools:
-                    allowed = True
-                else:
-                    allowed = await _local_request_permission(conv_id, func_name, func_args)
-
-                if allowed:
-                    result = local_tools.execute_tool(project_dir, func_name, func_args)
-                    await _ws_send(conv_id, {
-                        "type": "permission_resolved",
-                        "request_id": "",
-                        "allowed": True,
-                    })
-                else:
-                    result = f"Permission denied by user for {func_name}"
-                    await _ws_send(conv_id, {
-                        "type": "permission_resolved",
-                        "request_id": "",
-                        "allowed": False,
-                    })
-
-                # Truncate very large results for display
-                display_result = result[:2000] + "..." if len(result) > 2000 else result
-
-                # Check if this tool produced an image
-                image_url = None
-                if func_name == "write_file" and allowed:
-                    written_path = func_args.get("path", "")
-                    suffix = Path(written_path).suffix.lower()
-                    if suffix in _IMAGE_EXTENSIONS:
-                        image_url = f"/api/conversations/{conv_id}/file?path={written_path}"
-
-                # Send tool result to UI
-                tool_result_msg = {
-                    "type": "tool_result",
-                    "content": display_result,
-                    "tool_id": tool_id,
-                }
-                if image_url:
-                    tool_result_msg["image_url"] = image_url
-                await _ws_send(conv_id, tool_result_msg)
-
-                # Add tool result to context for next round
-                agent_messages.append({
-                    "role": "tool",
-                    "content": result,
-                })
-
-            print(f"[GEN] Local agent round {round_num + 1}: {len(tool_calls)} tool call(s)")
-            continue  # Next round — let model process tool results
-
-        # No tool calls — model is giving a final text response, stream it
-        full_response = ""
-        async for token in stream_chat(agent_messages, model=model):
-            if isinstance(token, dict):
-                await _ws_send(conv_id, token)
-                continue
-            full_response += token
-            await _ws_send(conv_id, {"type": "stream_chunk", "content": token})
-        break  # Done
-
-    # Strip <think>...</think> blocks
-    import re as _re
-    cleaned = _re.sub(r'<think>[\s\S]*?</think>\s*', '', full_response).strip()
-    if cleaned:
-        full_response = cleaned
-
-    if not full_response.strip():
-        await _ws_send(conv_id, {
-            "type": "error",
-            "error": "Model returned an empty response — try again",
-        })
-        return
-
-    msg = await db.add_message(conv_id, "assistant", full_response, parent_id=parent_id)
-    await db.set_active_branch(conv_id, msg["id"])
-    asyncio.create_task(_background_summarize_message(
-        msg["id"], full_response, "assistant", conv_id=conv_id
-    ))
-
-    await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
-
-
-async def _ollama_tool_request(messages: list[dict], model: str, tools: list[dict]) -> list[dict] | None:
-    """Make a non-streaming Ollama request with tools. Returns tool_calls or None."""
-    import httpx
-    from ollama_client import _build_ollama_messages
-
-    # Build messages, filtering out tool_calls metadata for the API
-    ollama_msgs = []
-    for msg in messages:
-        entry = {"role": msg["role"], "content": msg.get("content", "")}
-        if msg.get("images"):
-            entry["images"] = msg["images"]
-        ollama_msgs.append(entry)
-
-    payload = {
-        "model": model,
-        "messages": ollama_msgs,
-        "stream": False,
-        "tools": tools,
-        "options": {
-            "temperature": config.temperature,
-            "num_predict": config.max_tokens,
-        },
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
-            resp = await client.post(f"{config.ollama_host}/api/chat", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-
-            msg = data.get("message", {})
-            tool_calls = msg.get("tool_calls")
-
-            if tool_calls and len(tool_calls) > 0:
-                return tool_calls
-            return None
-    except Exception as e:
-        print(f"[OLLAMA-TOOLS] Error: {e}")
-        return None
-
-
-async def _local_plain_chat(conv_id: int, messages: list[dict],
-                            model: str, parent_id: int | None):
-    """Plain streaming chat with no tool calling (original local mode behavior)."""
-    await _ws_send(conv_id, {"type": "stream_start"})
-
-    full_response = ""
-    async for token in stream_chat(messages, model=model):
-        if isinstance(token, dict):
-            await _ws_send(conv_id, token)
-            continue
-        full_response += token
-        await _ws_send(conv_id, {"type": "stream_chunk", "content": token})
-
-    # Strip <think>...</think> blocks
-    import re as _re
-    cleaned = _re.sub(r'<think>[\s\S]*?</think>\s*', '', full_response).strip()
-    if cleaned:
-        full_response = cleaned
-
-    if not full_response.strip():
-        await _ws_send(conv_id, {
-            "type": "error",
-            "error": "Model returned an empty response — try again",
-        })
-        return
-
-    msg = await db.add_message(conv_id, "assistant", full_response, parent_id=parent_id)
-    await db.set_active_branch(conv_id, msg["id"])
-    asyncio.create_task(_background_summarize_message(
-        msg["id"], full_response, "assistant", conv_id=conv_id
-    ))
-
-    await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
 
 
 async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dict, data: dict):

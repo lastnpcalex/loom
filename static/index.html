@@ -93,6 +93,7 @@
 
         <!-- View: Tree Canvas -->
         <div id="view-tree" class="view">
+            <button id="tree-layout-toggle" title="Toggle horizontal/vertical layout">⇄</button>
             <div id="tree-canvas">
                 <div id="tree-nodes"></div>
             </div>
@@ -112,6 +113,19 @@
             </div>
             <div id="input-area">
                 <div id="image-preview" class="hidden"></div>
+                <div id="cc-inline-controls" class="hidden">
+                    <select id="cc-model-inline" title="Model">
+                        <option value="sonnet">Sonnet</option>
+                        <option value="opus">Opus</option>
+                        <option value="haiku">Haiku</option>
+                    </select>
+                    <select id="cc-effort-inline" title="Thinking effort">
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="max">Max</option>
+                    </select>
+                </div>
                 <div id="input-row">
                     <label id="btn-attach" title="Attach image">
                         <input type="file" id="file-input" accept="image/*" hidden>

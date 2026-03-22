@@ -13,6 +13,7 @@ const TREE = {
     rootNodeWidth: 300,
     gapX: 40,
     gapY: 80,
+    vertical: false,  // false = horizontal chains, true = vertical chains
     connectorColor: '#30363d',
     connectorActiveColor: '#58a6ff',
     // Canvas state
@@ -30,6 +31,22 @@ const TREE = {
 };
 
 // ── Canvas Pan/Zoom ──
+
+function initLayoutToggle() {
+    const btn = document.getElementById('tree-layout-toggle');
+    if (!btn) return;
+    const updateLabel = () => {
+        btn.textContent = TREE.vertical ? '⇅' : '⇄';
+        btn.title = TREE.vertical ? 'Switch to horizontal layout' : 'Switch to vertical layout';
+    };
+    updateLabel();
+    btn.addEventListener('click', () => {
+        TREE.vertical = !TREE.vertical;
+        TREE.manualPositions = {};  // reset manual drags on layout change
+        updateLabel();
+        renderTree();
+    });
+}
 
 function initCanvas() {
     const canvas = document.getElementById('tree-canvas');
@@ -308,6 +325,7 @@ async function renderTree() {
     // Initialize canvas if first render
     if (!TREE._initialized) {
         initCanvas();
+        initLayoutToggle();
         resetCanvasView();
         TREE._initialized = true;
     }
@@ -412,23 +430,37 @@ function createNode(node, branchNames) {
 
 function drawConnectors(svg, nodes, positions) {
     svg.innerHTML = '';
+    const vertical = TREE.vertical;
     for (const node of nodes) {
         if (node.parentId && positions[node.parentId] && positions[node.data.id]) {
             const parent = positions[node.parentId];
             const child = positions[node.data.id];
             const isActive = node.isActive && nodes.find(n => n.data.id === node.parentId)?.isActive;
 
-            const x1 = parent.x + parent.width;
-            const y1 = parent.y + (parent.height || 32) / 2;
-            const x2 = child.x;
-            const y2 = child.y + (child.height || 32) / 2;
-            const midX = x1 + (x2 - x1) / 2;
-
             const color = isActive ? TREE.connectorActiveColor : TREE.connectorColor;
             const width = isActive ? 2.5 : 1.5;
 
+            let d;
+            if (vertical) {
+                // Connect bottom-center of parent to top-center of child
+                const x1 = parent.x + parent.width / 2;
+                const y1 = parent.y + (parent.height || 32);
+                const x2 = child.x + child.width / 2;
+                const y2 = child.y;
+                const midY = y1 + (y2 - y1) / 2;
+                d = `M${x1},${y1} C${x1},${midY} ${x2},${midY} ${x2},${y2}`;
+            } else {
+                // Connect right-center of parent to left-center of child
+                const x1 = parent.x + parent.width;
+                const y1 = parent.y + (parent.height || 32) / 2;
+                const x2 = child.x;
+                const y2 = child.y + (child.height || 32) / 2;
+                const midX = x1 + (x2 - x1) / 2;
+                d = `M${x1},${y1} C${midX},${y1} ${midX},${y2} ${x2},${y2}`;
+            }
+
             const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-            path.setAttribute('d', `M${x1},${y1} C${midX},${y1} ${midX},${y2} ${x2},${y2}`);
+            path.setAttribute('d', d);
             path.setAttribute('fill', 'none');
             path.setAttribute('stroke', color);
             path.setAttribute('stroke-width', width);
@@ -448,67 +480,118 @@ function computeLayout(roots, nodeMap, childrenMap, branchNames) {
     const GAP_Y = TREE.gapY;
     const NODE_H = TREE.nodeMinHeight;
     const ROOT_H = 64;
+    const vertical = TREE.vertical;
 
     const nodes = [];
     let maxX = 0;
     let maxY = 0;
 
-    function layoutChain(nodeId, startX, startY, parentId) {
-        let x = startX;
-        let y = startY;
-        let currentId = nodeId;
-        let currentParent = parentId;
+    if (vertical) {
+        // Vertical: chain goes down, forks spread right
+        function layoutChainV(nodeId, startX, startY, parentId) {
+            let x = startX;
+            let y = startY;
+            let currentId = nodeId;
+            let currentParent = parentId;
 
-        while (currentId) {
-            const data = nodeMap[currentId];
-            const children = childrenMap[currentId] || [];
-            const isActive = !!data.is_active;
-            const isRoot = !data.parent_id;
-            const w = isRoot ? ROOT_W : NODE_W;
-            const h = isRoot ? ROOT_H : NODE_H;
+            while (currentId) {
+                const data = nodeMap[currentId];
+                const children = childrenMap[currentId] || [];
+                const isActive = !!data.is_active;
+                const isRoot = !data.parent_id;
+                const w = isRoot ? ROOT_W : NODE_W;
+                const h = isRoot ? ROOT_H : NODE_H;
 
-            nodes.push({
-                data,
-                x, y,
-                width: w,
-                height: h,
-                isActive,
-                parentId: currentParent,
-                childCount: children.length,
-            });
+                nodes.push({
+                    data, x, y, width: w, height: h,
+                    isActive, parentId: currentParent, childCount: children.length,
+                });
 
-            maxX = Math.max(maxX, x + w);
-            maxY = Math.max(maxY, y + h);
+                maxX = Math.max(maxX, x + w);
+                maxY = Math.max(maxY, y + h);
 
-            if (children.length === 0) {
-                return y + h;
-            } else if (children.length === 1) {
-                currentParent = currentId;
-                currentId = children[0];
-                x += w + GAP_X;
-            } else {
-                // Fork
-                const forkX = x + w + GAP_X;
-                let forkY = y;
-                let maxBottom = forkY;
+                if (children.length === 0) {
+                    return x + w;
+                } else if (children.length === 1) {
+                    currentParent = currentId;
+                    currentId = children[0];
+                    y += h + GAP_Y;
+                } else {
+                    const forkY = y + h + GAP_Y;
+                    let forkX = x;
+                    let maxRight = forkX;
 
-                for (let i = 0; i < children.length; i++) {
-                    const bottom = layoutChain(children[i], forkX, forkY, currentId);
-                    maxBottom = Math.max(maxBottom, bottom);
-                    if (i < children.length - 1) {
-                        forkY = bottom + GAP_Y;
+                    for (let i = 0; i < children.length; i++) {
+                        const right = layoutChainV(children[i], forkX, forkY, currentId);
+                        maxRight = Math.max(maxRight, right);
+                        if (i < children.length - 1) {
+                            forkX = right + GAP_X;
+                        }
                     }
+                    return maxRight;
                 }
-                return maxBottom;
             }
+            return x + NODE_W;
         }
-        return y + NODE_H;
-    }
 
-    let currentY = 0;
-    for (const rootId of roots) {
-        const bottom = layoutChain(rootId, 0, currentY, null);
-        currentY = bottom + GAP_Y * 3;
+        let currentX = 0;
+        for (const rootId of roots) {
+            const right = layoutChainV(rootId, currentX, 0, null);
+            currentX = right + GAP_X * 3;
+        }
+    } else {
+        // Horizontal: chain goes right, forks spread down (original)
+        function layoutChain(nodeId, startX, startY, parentId) {
+            let x = startX;
+            let y = startY;
+            let currentId = nodeId;
+            let currentParent = parentId;
+
+            while (currentId) {
+                const data = nodeMap[currentId];
+                const children = childrenMap[currentId] || [];
+                const isActive = !!data.is_active;
+                const isRoot = !data.parent_id;
+                const w = isRoot ? ROOT_W : NODE_W;
+                const h = isRoot ? ROOT_H : NODE_H;
+
+                nodes.push({
+                    data, x, y, width: w, height: h,
+                    isActive, parentId: currentParent, childCount: children.length,
+                });
+
+                maxX = Math.max(maxX, x + w);
+                maxY = Math.max(maxY, y + h);
+
+                if (children.length === 0) {
+                    return y + h;
+                } else if (children.length === 1) {
+                    currentParent = currentId;
+                    currentId = children[0];
+                    x += w + GAP_X;
+                } else {
+                    const forkX = x + w + GAP_X;
+                    let forkY = y;
+                    let maxBottom = forkY;
+
+                    for (let i = 0; i < children.length; i++) {
+                        const bottom = layoutChain(children[i], forkX, forkY, currentId);
+                        maxBottom = Math.max(maxBottom, bottom);
+                        if (i < children.length - 1) {
+                            forkY = bottom + GAP_Y;
+                        }
+                    }
+                    return maxBottom;
+                }
+            }
+            return y + NODE_H;
+        }
+
+        let currentY = 0;
+        for (const rootId of roots) {
+            const bottom = layoutChain(rootId, 0, currentY, null);
+            currentY = bottom + GAP_Y * 3;
+        }
     }
 
     return { nodes, totalWidth: maxX, totalHeight: maxY };

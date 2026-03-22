@@ -23,10 +23,12 @@ import urllib.request
 import urllib.error
 
 
-# Read-only tools that don't need user permission
+# Tools that don't need user permission (read-only or low-risk)
 READ_ONLY = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "Task",
-             "TaskGet", "TaskList", "TaskUpdate", "AskUserQuestion",
-             "EnterPlanMode", "ExitPlanMode", "Explore"}
+             "TaskGet", "TaskList", "TaskUpdate", "TaskCreate", "TaskStop",
+             "TaskOutput", "AskUserQuestion", "TodoWrite", "Skill",
+             "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+             "Explore", "CronList", "ToolSearch", "Agent"}
 
 
 def allow(reason="Auto-approved"):
@@ -99,7 +101,7 @@ def main():
             else:
                 deny(response.get("message", "Denied by user in Loom UI"))
     except urllib.error.URLError as e:
-        deny(f"Loom unreachable: {e}")
+        deny(f"Loom server unreachable: {e}")
     except Exception as e:
         deny(f"Hook error: {e}")
 

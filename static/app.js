@@ -133,6 +133,7 @@ async function init() {
     renderHomePersonas();
     renderHomeLore();
     setupEventListeners();
+    initInlineCCControls();
     switchView('home');
     checkHealth();
 }
@@ -423,6 +424,7 @@ async function loadConversation(convId) {
     connectWebSocket(convId);
     renderTree();
     renderMessages();
+    updateInlineCCControls(conv);
 
     // If only a linear conversation (no forks), go straight to chat
     const hasForks = treeData.some(n => {
@@ -628,6 +630,40 @@ async function loadDirBrowser(path) {
     } catch (err) {
         browser.innerHTML = `<div class="dir-error">Failed to browse: ${err.message}</div>`;
     }
+}
+
+// ── Inline CC Model/Effort Controls ──
+
+function updateInlineCCControls(conv) {
+    const controls = document.getElementById('cc-inline-controls');
+    if (!controls) return;
+
+    if (conv && conv.mode === 'claude') {
+        controls.classList.remove('hidden');
+        const modelSel = document.getElementById('cc-model-inline');
+        const effortSel = document.getElementById('cc-effort-inline');
+        modelSel.value = conv.cc_model || 'sonnet';
+        effortSel.value = conv.cc_effort || 'high';
+    } else {
+        controls.classList.add('hidden');
+    }
+}
+
+function initInlineCCControls() {
+    const modelSel = document.getElementById('cc-model-inline');
+    const effortSel = document.getElementById('cc-effort-inline');
+    if (!modelSel || !effortSel) return;
+
+    async function saveCC(field, value) {
+        if (!State.currentConvId || !State.currentConv) return;
+        try {
+            await API.put(`/api/conversations/${State.currentConvId}`, { [field]: value });
+            State.currentConv[field] = value;
+        } catch { showToast('Failed to update', 'error'); }
+    }
+
+    modelSel.addEventListener('change', () => saveCC('cc_model', modelSel.value));
+    effortSel.addEventListener('change', () => saveCC('cc_effort', effortSel.value));
 }
 
 function showWeaveFields(show) {
