@@ -207,18 +207,24 @@ function handleWSMessage(data) {
                     const imgContainer = document.createElement('div');
                     imgContainer.className = 'detected-images';
                     for (const url of data.images) {
+                        const filename = decodeURIComponent(url.split('path=').pop() || '').split(/[/\\]/).pop() || 'image';
+                        const figure = document.createElement('figure');
+                        figure.className = 'detected-image-figure';
                         const img = document.createElement('img');
                         img.src = url;
-                        img.alt = 'Generated image';
+                        img.alt = filename;
                         img.className = 'generated-image';
                         img.addEventListener('click', () => {
                             const body = document.getElementById('preview-modal-body');
                             body.innerHTML = '<img src="' + url + '" style="max-width:100%;max-height:80vh;">';
                             document.getElementById('modal-preview').classList.remove('hidden');
                         });
-                        imgContainer.appendChild(img);
+                        const caption = document.createElement('figcaption');
+                        caption.textContent = filename;
+                        figure.appendChild(img);
+                        figure.appendChild(caption);
+                        imgContainer.appendChild(figure);
                     }
-                    // Append to the finalized message div
                     const msgDiv = document.querySelector(`.message[data-msg-id="${data.message.id}"]`);
                     if (msgDiv) msgDiv.appendChild(imgContainer);
                 }
@@ -468,19 +474,24 @@ function createMessageElement(msg, cost) {
         const imgRegex = /[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)/gi;
         const matches = allText.match(imgRegex) || [];
         const seen = new Set();
-        const imgUrls = [];
+        const imgEntries = [];
         for (const m of matches) {
-            // Normalize path separators and skip duplicates
             const norm = m.replace(/\\/g, '/');
             if (!seen.has(norm)) {
                 seen.add(norm);
-                imgUrls.push(`/api/conversations/${State.currentConvId}/file?path=${encodeURIComponent(m)}`);
+                const filename = norm.split('/').pop();
+                imgEntries.push({
+                    url: `/api/conversations/${State.currentConvId}/file?path=${encodeURIComponent(m)}`,
+                    name: filename,
+                });
             }
         }
-        if (imgUrls.length > 0) {
+        if (imgEntries.length > 0) {
             projectImgHtml = '<div class="detected-images">' +
-                imgUrls.map(url =>
-                    `<img class="generated-image" src="${url}" alt="Generated image" loading="lazy">`
+                imgEntries.map(e =>
+                    `<figure class="detected-image-figure">` +
+                    `<img class="generated-image" src="${e.url}" alt="${escapeHtml(e.name)}" loading="lazy">` +
+                    `<figcaption>${escapeHtml(e.name)}</figcaption></figure>`
                 ).join('') + '</div>';
         }
     }
@@ -881,18 +892,25 @@ function finalizeToolBlock(result, toolId, imageUrl) {
 
     // If this tool produced an image, display it inline
     if (imageUrl) {
+        const filename = decodeURIComponent(imageUrl.split('path=').pop() || '').split(/[/\\]/).pop() || 'image';
         const imgContainer = document.createElement('div');
         imgContainer.className = 'tool-image-result';
+        const figure = document.createElement('figure');
+        figure.className = 'detected-image-figure';
         const img = document.createElement('img');
         img.src = imageUrl;
-        img.alt = 'Generated image';
+        img.alt = filename;
         img.className = 'generated-image';
         img.addEventListener('click', () => {
             const body = document.getElementById('preview-modal-body');
             body.innerHTML = '<img src="' + imageUrl + '" style="max-width:100%;max-height:80vh;">';
             document.getElementById('modal-preview').classList.remove('hidden');
         });
-        imgContainer.appendChild(img);
+        const caption = document.createElement('figcaption');
+        caption.textContent = filename;
+        figure.appendChild(img);
+        figure.appendChild(caption);
+        imgContainer.appendChild(figure);
         block.querySelector('.tool-block-body').appendChild(imgContainer);
         block.classList.add('expanded');
         scrollToBottom();

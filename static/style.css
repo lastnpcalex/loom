@@ -1647,6 +1647,18 @@ body::after {
     color: rgba(255, 255, 255, 0.5);
 }
 
+.detected-image-figure {
+    margin: 0;
+    display: inline-block;
+}
+.detected-image-figure figcaption {
+    font-size: 11px;
+    color: var(--text-secondary);
+    padding: 4px 0 0;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    word-break: break-all;
+}
+
 /* ── Enhanced Tool Rendering ── */
 .tool-file-path {
     font-family: 'Cascadia Code', 'Fira Code', monospace;
