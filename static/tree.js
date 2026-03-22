@@ -242,6 +242,10 @@ async function renderTree() {
     const container = document.getElementById('tree-nodes');
     if (!container) return;
 
+    // Restore layout preference before computing layout
+    const savedVertical = localStorage.getItem('loom-tree-vertical');
+    if (savedVertical !== null) TREE.vertical = savedVertical === 'true';
+
     // Always re-fetch tree data to pick up new Gemma summaries
     if (State.currentConvId) {
         try {
