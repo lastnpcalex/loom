@@ -337,6 +337,8 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["title"] = data["title"]
     if "custom_scene" in data:
         fields["custom_scene"] = data["custom_scene"]
+    if "starred" in data:
+        fields["starred"] = int(data["starred"])
     if fields:
         await db.update_conversation_fields(conv_id, **fields)
     return await db.get_conversation(conv_id)
@@ -884,22 +886,29 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
         cc_effort = conv.get("cc_effort") or "high"
 
         # --- Session resume logic ---
-        # Walk ancestors to find the nearest assistant node with a cc_session_id
+        # Walk ancestors to find the nearest assistant node with a cc_session_id.
+        # Only resume if the parent message itself has a session (linear continue)
+        # or we're regenerating.  When the user edits a message and branches,
+        # parent_id is the NEW user message whose ancestor session is stale —
+        # resuming it would leak the old branch's context.
         resume_session_id = None
         fork_session = False
         use_resume = False
 
         if parent_id:
             branch = await db.get_branch_to_root(parent_id)
-            # Find the nearest ancestor (walking from leaf toward root) with a session_id
-            for msg in reversed(branch):
-                if msg["role"] == "assistant" and msg.get("cc_session_id"):
-                    resume_session_id = msg["cc_session_id"]
-                    # Regenerate = same parent as the original → fork the session
-                    # Generate = continuing from an assistant node → linear resume
-                    if action == "regenerate":
+            parent_msg = branch[-1] if branch else None
+
+            if action == "regenerate":
+                # Regenerate: find nearest ancestor session and fork it
+                for msg in reversed(branch):
+                    if msg["role"] == "assistant" and msg.get("cc_session_id"):
+                        resume_session_id = msg["cc_session_id"]
                         fork_session = True
-                    break
+                        break
+            elif parent_msg and parent_msg["role"] == "assistant" and parent_msg.get("cc_session_id"):
+                # Linear continue: parent is an assistant message with a session
+                resume_session_id = parent_msg["cc_session_id"]
 
         if resume_session_id:
             use_resume = True

@@ -444,9 +444,15 @@ async def fork_conversation(conv_id: int, from_msg_id: int, new_title: str = Non
     title = new_title or f"{orig['title']} (fork)"
     now = time.time()
     cursor = await db.execute(
-        "INSERT INTO conversations (title, character_id, persona_id, lore_ids, style_nudge, custom_scene, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        """INSERT INTO conversations (title, character_id, persona_id, lore_ids,
+           style_nudge, custom_scene, mode, project_dir, cc_model, cc_effort,
+           local_model, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (title, orig.get("character_id"), orig.get("persona_id"), orig.get("lore_ids"),
-         orig.get("style_nudge"), orig.get("custom_scene"), now, now)
+         orig.get("style_nudge"), orig.get("custom_scene"),
+         orig.get("mode", "weave"), orig.get("project_dir"),
+         orig.get("cc_model"), orig.get("cc_effort"), orig.get("local_model"),
+         now, now)
     )
     new_conv_id = cursor.lastrowid
     await db.execute("INSERT INTO style_state (conversation_id) VALUES (?)", (new_conv_id,))
@@ -457,11 +463,14 @@ async def fork_conversation(conv_id: int, from_msg_id: int, new_title: str = Non
         new_parent = id_map.get(msg["parent_id"]) if msg["parent_id"] else None
         cursor = await db.execute(
             """INSERT INTO messages (conversation_id, parent_id, role, content,
-               token_estimate, is_active, summary, image_path, image_alt, created_at)
-               VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
+               token_estimate, is_active, summary, image_path, image_alt,
+               cc_session_id, content_blocks, created_at)
+               VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)""",
             (new_conv_id, new_parent, msg["role"], msg["content"],
              msg.get("token_estimate", 0), msg.get("summary"),
-             msg.get("image_path"), msg.get("image_alt"), msg["created_at"])
+             msg.get("image_path"), msg.get("image_alt"),
+             msg.get("cc_session_id"), msg.get("content_blocks"),
+             msg["created_at"])
         )
         id_map[msg["id"]] = cursor.lastrowid
 
