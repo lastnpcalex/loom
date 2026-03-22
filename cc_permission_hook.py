@@ -18,6 +18,7 @@ Environment variables (set by Loom when launching CC):
 import sys
 import json
 import os
+import ssl
 import urllib.request
 import urllib.error
 
@@ -55,7 +56,7 @@ def deny(reason="Blocked"):
 
 
 def main():
-    port = os.environ.get("LOOM_PORT", "8000")
+    port = os.environ.get("LOOM_PORT", "3000")
     conv_id = os.environ.get("LOOM_CONV_ID", "")
 
     if not conv_id:
@@ -78,15 +79,20 @@ def main():
     request["loom_conv_id"] = conv_id
 
     # POST to Loom server — blocks until user responds (up to 5 min)
-    url = f"http://127.0.0.1:{port}/api/cc-permission"
+    url = f"https://127.0.0.1:{port}/api/cc-permission"
     data = json.dumps(request).encode("utf-8")
     req = urllib.request.Request(
         url, data=data,
         headers={"Content-Type": "application/json"}
     )
 
+    # Skip cert verification for localhost (self-signed)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=300, context=ctx) as resp:
             response = json.loads(resp.read().decode("utf-8"))
             if response.get("allow"):
                 allow("Approved by user in Loom UI")
