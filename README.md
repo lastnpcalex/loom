@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="static/img/loom-ico.png" alt="Ex Astris Umbra" width="128">
+  <img src="static/img/banner.png" alt="Ex Astris Umbra">
 </p>
 
 # Ex Astris Umbra: A Loom Interface
