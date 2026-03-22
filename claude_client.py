@@ -229,19 +229,46 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     env["LOOM_CONV_ID"] = str(conv_id)
     env["LOOM_PORT"] = str(server_port)
 
+    # If the prompt is too long for a command-line arg (Windows ~32K limit),
+    # pipe it via stdin instead of -p
+    use_stdin = len(prompt) > 20000
+    if use_stdin:
+        # Replace -p <prompt> with just -p and pipe via stdin
+        # Claude Code reads from stdin when -p is given without a value,
+        # but safer to use --pipe mode: remove -p and its arg, add -p -
+        try:
+            p_idx = cc_args.index("-p")
+            cc_args.pop(p_idx)      # remove -p
+            cc_args.pop(p_idx)      # remove the prompt value
+            cc_args.insert(0, "-p")
+            cc_args.insert(1, "-")  # read from stdin
+        except (ValueError, IndexError):
+            use_stdin = False
+
+        # Rebuild cmd with updated cc_args
+        if use_ollama:
+            cmd = ["ollama", "launch", "claude", "--model", model, "--"] + cc_args
+        else:
+            cmd = ["claude"] + cc_args
+
     print(f"[CC] Starting subprocess in {cwd}")
-    print(f"[CC] Prompt length: {len(prompt)} chars")
+    print(f"[CC] Prompt length: {len(prompt)} chars (stdin={use_stdin})")
     print(f"[CC] Hook env: LOOM_CONV_ID={conv_id} LOOM_PORT={server_port}")
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
         env=env,
-        stdin=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.PIPE if use_stdin else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=16 * 1024 * 1024,  # 16 MB line buffer (CC can emit large base64/tool results)
     )
+
+    # Feed prompt via stdin if needed
+    if use_stdin and proc.stdin:
+        proc.stdin.write(prompt.encode("utf-8"))
+        proc.stdin.close()
 
     print(f"[CC] Process started, pid={proc.pid}")
 
