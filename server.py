@@ -884,6 +884,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
         project_dir = conv.get("project_dir") or "."
         cc_model = conv.get("cc_model") or "sonnet"
         cc_effort = conv.get("cc_effort") or "high"
+        use_ollama = conv.get("_use_ollama", False)
 
         # --- Session resume logic ---
         # Walk ancestors to find the nearest assistant node with a cc_session_id.
@@ -989,6 +990,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 model=cc_model, effort=cc_effort,
                 resume_session_id=resume_session_id if use_resume else None,
                 fork_session=fork_session,
+                use_ollama=use_ollama,
             )
         except Exception as e:
             if use_resume:
@@ -999,6 +1001,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 proc, event_stream = await claude_client.run_claude(
                     prompt, project_dir, conv_id=conv_id, server_port=config.port,
                     model=cc_model, effort=cc_effort,
+                    use_ollama=use_ollama,
                 )
                 use_resume = False
             else:
@@ -1133,6 +1136,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
             proc, event_stream = await claude_client.run_claude(
                 fallback_prompt, project_dir, conv_id=conv_id, server_port=config.port,
                 model=cc_model, effort=cc_effort,
+                use_ollama=use_ollama,
             )
             _active_claude_procs[conv_id] = proc
 
@@ -1291,44 +1295,14 @@ def _build_claude_history_prompt(branch: list[dict]) -> str:
 
 
 async def _handle_local_generation(websocket: WebSocket, conv_id: int, conv: dict, data: dict):
-    """Handle Local mode generation with optional tool calling for file access."""
-    try:
-        action = data.get("action")
-        parent_id = data.get("parent_id")
-
-        if action == "generate" and parent_id is None:
-            leaf = await db.get_active_leaf(conv_id)
-            parent_id = leaf["id"] if leaf else None
-
-        model = conv.get("local_model") or config.ollama_model
-        project_dir = conv.get("project_dir")
-
-        # Build plain message list from active branch
-        branch = await db.get_branch_to_root(parent_id) if parent_id else []
-        if action == "regenerate" and parent_id is not None:
-            branch = [m for m in branch if m["id"] <= parent_id]
-
-        messages = []
-        for m in branch:
-            if m["role"] == "system":
-                continue
-            messages.append({"role": m["role"], "content": m["content"]})
-
-        # If a project directory is set, use tool-calling agent loop
-        if project_dir and os.path.isdir(project_dir):
-            await _local_agent_loop(websocket, conv_id, messages, model,
-                                    project_dir, parent_id)
-        else:
-            # Plain chat (no tools)
-            await _local_plain_chat(conv_id, messages, model, parent_id)
-
-    except asyncio.CancelledError:
-        await _ws_send(conv_id, {"type": "cancelled"})
-    except Exception as e:
-        print(f"[GEN] Local generation error conv={conv_id}: {e}")
-        await _ws_send(conv_id, {"type": "error", "error": str(e)})
-    finally:
-        _active_generations.pop(conv_id, None)
+    """Handle Local mode: Claude Code launched via 'ollama launch claude'."""
+    # Local mode = Claude Code powered by a local Ollama model.
+    # Reuse the full CC handler but with use_ollama=True.
+    conv = dict(conv)  # mutable copy
+    # Map local_model into cc_model so _handle_claude_generation uses it
+    conv["cc_model"] = conv.get("local_model") or config.ollama_model
+    conv["_use_ollama"] = True
+    await _handle_claude_generation(websocket, conv_id, conv, data)
 
 
 async def _local_request_permission(conv_id: int, tool_name: str, tool_input: dict) -> bool:
@@ -1430,12 +1404,29 @@ async def _local_agent_loop(websocket: WebSocket, conv_id: int,
                     "tool_id": tool_id,
                 })
 
-                # Request permission for write operations
-                allowed = await _local_request_permission(conv_id, func_name, func_args)
+                # Known tools that are safe to auto-approve (read-only)
+                read_only_tools = {"read_file", "list_directory", "search_files"}
+                known_tools = read_only_tools | {"write_file"}
+
+                if func_name not in known_tools:
+                    # Unknown tool (model hallucinated) — reject without prompting
+                    result = f"Unknown tool '{func_name}'. Available tools: read_file, list_directory, write_file, search_files"
+                    await _ws_send(conv_id, {
+                        "type": "tool_result",
+                        "content": result,
+                        "tool_id": tool_id,
+                    })
+                    agent_messages.append({"role": "tool", "content": result})
+                    continue
+
+                # Read-only tools auto-approve; write operations need permission
+                if func_name in read_only_tools:
+                    allowed = True
+                else:
+                    allowed = await _local_request_permission(conv_id, func_name, func_args)
 
                 if allowed:
                     result = local_tools.execute_tool(project_dir, func_name, func_args)
-                    # Notify UI permission was resolved
                     await _ws_send(conv_id, {
                         "type": "permission_resolved",
                         "request_id": "",

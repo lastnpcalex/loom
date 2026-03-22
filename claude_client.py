@@ -190,27 +190,39 @@ def _configure_permission_hook(cwd: str):
 
 async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
                      model: str = "sonnet", effort: str = "high",
-                     resume_session_id: str = None, fork_session: bool = False):
+                     resume_session_id: str = None, fork_session: bool = False,
+                     use_ollama: bool = False):
     """Run Claude Code CLI and yield parsed events as an async generator.
 
     Returns (process, generator) so the caller can cancel via process.terminate().
     When resume_session_id is provided, uses --resume to continue an existing session.
     When fork_session is True (with --resume), creates a new branch from that session.
+    When use_ollama is True, launches via 'ollama launch claude --model <model> --yes --'
+    so that Claude Code runs against a local Ollama model.
     Permission hooks route tool approvals through Loom's HTTP API.
     """
     # Configure the permission hook in the project directory
     _configure_permission_hook(cwd)
 
-    cmd = ["claude", "-p", prompt,
-           "--output-format", "stream-json",
-           "--verbose",
-           "--model", model,
-           "--effort", effort]
+    # Build the Claude Code arguments (common to both launch methods)
+    cc_args = ["-p", prompt,
+               "--output-format", "stream-json",
+               "--verbose"]
+
+    if not use_ollama:
+        # Direct claude launch — model and effort are CC flags
+        cc_args.extend(["--model", model, "--effort", effort])
 
     if resume_session_id:
-        cmd.extend(["--resume", resume_session_id])
+        cc_args.extend(["--resume", resume_session_id])
         if fork_session:
-            cmd.append("--fork-session")
+            cc_args.append("--fork-session")
+
+    if use_ollama:
+        # Launch via: ollama launch claude --model <model> --yes -- <cc_args>
+        cmd = ["ollama", "launch", "claude", "--model", model, "--yes", "--"] + cc_args
+    else:
+        cmd = ["claude"] + cc_args
 
     # Pass Loom connection info to the hook script via env vars
     env = {**os.environ}

@@ -49,6 +49,9 @@ branches_of_the_loom.md
 # SSL certificates
 certs/
 
+# Startup script (machine-specific paths)
+start_loom.bat
+
 # Environment / secrets
 .env
 .env.*

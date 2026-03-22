@@ -192,7 +192,7 @@ You have tools to interact with the file system:
 - **write_file**: Write/create files
 - **search_files**: Search for text patterns across files
 
-Use these tools to examine the codebase before answering questions. When asked to make changes, read the relevant files first, then write the updated versions.
+These are the ONLY tools available to you. Do NOT attempt to call any other tools (no bash, no shell, no terminal commands). Use these tools to examine the codebase before answering questions. When asked to make changes, read the relevant files first, then write the updated versions.
 
 ## Project structure
 ```
