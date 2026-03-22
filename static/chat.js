@@ -473,10 +473,13 @@ function createMessageElement(msg, cost) {
         const allText = (msg.content || '') + ' ' + (typeof msg.content_blocks === 'string' ? msg.content_blocks : JSON.stringify(msg.content_blocks || ''));
         const imgRegex = /[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)/gi;
         const matches = allText.match(imgRegex) || [];
-        // Dedup by filename — keep the longest path (most likely to resolve)
+        // Dedup by filename — keep the shortest relative path
+        // (absolute paths from content_blocks get blocked by path traversal)
         const byFilename = new Map();
         for (const m of matches) {
             const norm = m.replace(/\\/g, '/');
+            // Skip absolute paths (start with / or X:/)
+            if (norm.startsWith('/') || /^[A-Za-z]:/.test(norm)) continue;
             const filename = norm.split('/').pop();
             const existing = byFilename.get(filename);
             if (!existing || norm.length > existing.length) {
