@@ -35,6 +35,9 @@ const TREE = {
 function initLayoutToggle() {
     const btn = document.getElementById('tree-layout-toggle');
     if (!btn) return;
+    // Restore saved preference
+    const saved = localStorage.getItem('loom-tree-vertical');
+    if (saved !== null) TREE.vertical = saved === 'true';
     const updateLabel = () => {
         btn.textContent = TREE.vertical ? '⇅' : '⇄';
         btn.title = TREE.vertical ? 'Switch to horizontal layout' : 'Switch to vertical layout';
@@ -42,7 +45,8 @@ function initLayoutToggle() {
     updateLabel();
     btn.addEventListener('click', () => {
         TREE.vertical = !TREE.vertical;
-        TREE.manualPositions = {};  // reset manual drags on layout change
+        TREE.manualPositions = {};
+        localStorage.setItem('loom-tree-vertical', TREE.vertical);
         updateLabel();
         renderTree();
     });
