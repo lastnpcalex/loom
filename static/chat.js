@@ -211,7 +211,7 @@ async function sendMessage() {
     const msgData = {
         role: 'user',
         content: content,
-        image_path: isClaudeMode ? null : (State.pendingImagePath || null),
+        image_path: State.pendingImagePath || null,
     };
 
     try {
@@ -382,6 +382,29 @@ function createMessageElement(msg, cost) {
     return div;
 }
 
+function renderEditDiff(inputJson) {
+    try {
+        const data = typeof inputJson === 'string' ? JSON.parse(inputJson) : inputJson;
+        const filePath = data.file_path || 'unknown file';
+        const oldStr = data.old_string || '';
+        const newStr = data.new_string || '';
+        const oldLines = oldStr.split('\n');
+        const newLines = newStr.split('\n');
+        let diffHtml = '<div class="diff-header">' + escapeHtml(filePath) + '</div>';
+        diffHtml += '<div class="diff-body">';
+        for (const line of oldLines) {
+            diffHtml += '<div class="diff-remove">- ' + escapeHtml(line) + '</div>';
+        }
+        for (const line of newLines) {
+            diffHtml += '<div class="diff-add">+ ' + escapeHtml(line) + '</div>';
+        }
+        diffHtml += '</div>';
+        return diffHtml;
+    } catch {
+        return null;
+    }
+}
+
 function renderContentBlocks(blocks) {
     let html = '';
     for (const block of blocks) {
@@ -394,14 +417,21 @@ function renderContentBlocks(blocks) {
             const input = (block.input || '').trim();
             const result = (block.result || '').trim();
             const resultDisplay = result.length > 2000 ? result.substring(0, 2000) + '\n... (truncated)' : result;
+
+            // Special rendering for Edit tool
+            const isEdit = (block.name === 'Edit');
+            const diffHtml = isEdit ? renderEditDiff(input) : null;
+            const expanded = isEdit ? ' expanded' : '';
+            const toggleChar = isEdit ? '&#9662;' : '&#9656;';
+
             // No template indentation — avoids whitespace text nodes
-            html += '<div class="tool-block">' +
+            html += '<div class="tool-block' + expanded + '">' +
                 '<div class="tool-block-header" data-tool-toggle>' +
                     '<span class="tool-name">' + escapeHtml(name) + '</span>' +
-                    '<span class="tool-toggle">&#9656;</span>' +
+                    '<span class="tool-toggle">' + toggleChar + '</span>' +
                 '</div>' +
                 '<div class="tool-block-body">' +
-                    (input ? '<div class="tool-block-input">' + escapeHtml(input) + '</div>' : '') +
+                    (diffHtml ? diffHtml : (input ? '<div class="tool-block-input">' + escapeHtml(input) + '</div>' : '')) +
                     (resultDisplay ? '<div class="tool-block-result">' + escapeHtml(resultDisplay) + '</div>' : '') +
                 '</div>' +
             '</div>';
@@ -475,18 +505,23 @@ function getCharacterName() {
     return char ? char.name : 'Assistant';
 }
 
+// Configure marked for chat rendering
+if (typeof marked !== 'undefined') {
+    marked.setOptions({ breaks: true, gfm: true });
+}
+
 function formatContent(text) {
     if (!text) return '';
-    // Basic markdown-like formatting
+    if (typeof marked !== 'undefined') {
+        const raw = marked.parse(text);
+        return typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(raw) : raw;
+    }
+    // Fallback if marked not loaded
     let html = escapeHtml(text);
-    // Bold: **text**
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    // Italic: *text* (but not inside bold)
     html = html.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em>$1</em>');
-    // Split into paragraphs, filtering out empty ones
     const paras = html.split(/\n\n+/).filter(p => p.trim());
     if (paras.length === 0) return '';
-    // Single newlines become <br>
     return paras.map(p => '<p>' + p.replace(/\n/g, '<br>') + '</p>').join('');
 }
 

@@ -266,12 +266,6 @@ async function loadConversation(convId) {
     renderTree();
     renderMessages();
 
-    // Hide image attach for Claude mode
-    const attachBtn = document.getElementById('btn-attach');
-    if (attachBtn) {
-        attachBtn.style.display = (conv.mode === 'claude') ? 'none' : '';
-    }
-
     // If only a linear conversation (no forks), go straight to chat
     const hasForks = treeData.some(n => {
         const siblings = treeData.filter(s => s.parent_id === n.parent_id);
@@ -296,10 +290,14 @@ async function createConversation() {
             showToast('Working directory is required for Claude mode', 'error');
             return;
         }
+        const ccModel = document.getElementById('cc-model').value;
+        const ccEffort = document.getElementById('cc-effort').value;
         const conv = await API.post('/api/conversations', {
             title,
             mode: 'claude',
             project_dir: projectDir,
+            cc_model: ccModel,
+            cc_effort: ccEffort,
         });
         State.conversations.unshift(conv);
         closeModal('modal-new-conv');
@@ -386,6 +384,10 @@ function openNewConvModal() {
     document.querySelector('#mode-toggle .toggle-btn[data-value="weave"]').classList.add('active');
     document.getElementById('project-dir-group').classList.add('hidden');
     document.getElementById('project-dir').value = '';
+    document.getElementById('cc-model-group').classList.add('hidden');
+    document.getElementById('cc-effort-group').classList.add('hidden');
+    document.getElementById('cc-model').value = 'sonnet';
+    document.getElementById('cc-effort').value = 'high';
     showWeaveFields(true);
     openModal('modal-new-conv');
 }
@@ -584,12 +586,30 @@ function setupEventListeners() {
             const mode = btn.dataset.value;
             if (mode === 'claude') {
                 document.getElementById('project-dir-group').classList.remove('hidden');
+                document.getElementById('cc-model-group').classList.remove('hidden');
+                document.getElementById('cc-effort-group').classList.remove('hidden');
                 showWeaveFields(false);
             } else {
                 document.getElementById('project-dir-group').classList.add('hidden');
+                document.getElementById('cc-model-group').classList.add('hidden');
+                document.getElementById('cc-effort-group').classList.add('hidden');
                 showWeaveFields(true);
             }
         });
+    });
+
+    // Model selection — disable "max" effort when not opus
+    document.getElementById('cc-model').addEventListener('change', () => {
+        const model = document.getElementById('cc-model').value;
+        const maxOpt = document.querySelector('#cc-effort option[value="max"]');
+        if (model !== 'opus') {
+            maxOpt.disabled = true;
+            if (document.getElementById('cc-effort').value === 'max') {
+                document.getElementById('cc-effort').value = 'high';
+            }
+        } else {
+            maxOpt.disabled = false;
+        }
     });
 
     // Browse directory button

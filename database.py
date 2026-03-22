@@ -90,6 +90,9 @@ async def _run_migrations(db):
         "ALTER TABLE messages ADD COLUMN turn_cost_usd REAL",
         "ALTER TABLE messages ADD COLUMN turn_input_tokens INTEGER",
         "ALTER TABLE messages ADD COLUMN turn_output_tokens INTEGER",
+        # Phase 2: model & effort selection
+        "ALTER TABLE conversations ADD COLUMN cc_model TEXT DEFAULT 'sonnet'",
+        "ALTER TABLE conversations ADD COLUMN cc_effort TEXT DEFAULT 'high'",
     ]
     for sql in migrations:
         try:
@@ -170,7 +173,7 @@ async def update_conversation_fields(conv_id: int, **fields):
     """Update arbitrary fields on a conversation."""
     db = await get_db()
     allowed = {"persona_id", "lore_ids", "style_nudge", "custom_scene", "title",
-                "claude_session_id", "total_cost_usd"}
+                "claude_session_id", "total_cost_usd", "cc_model", "cc_effort"}
     updates = []
     params = []
     for key, val in fields.items():

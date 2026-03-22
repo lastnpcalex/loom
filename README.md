@@ -1,6 +1,6 @@
 # Loom
 
-A local RP (roleplay) harness with tree-based conversation branching, a WebGL black hole background, and Ollama-powered text generation.
+A local RP (roleplay) harness with tree-based conversation branching, a WebGL black hole background, and dual Ollama/Claude Code generation modes.
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -16,6 +16,40 @@ A local RP (roleplay) harness with tree-based conversation branching, a WebGL bl
 - **WebGL black hole** — A Schwarzschild raytracer runs as the UI background, with a procedural cyberpunk galaxy texture, glassmorphism panels, and scanline overlay.
 - **Streaming generation** — Real-time token streaming over WebSocket with live token rate display.
 - **Image support** — Attach images to messages; they're described by the vision model and included in context.
+
+## Dual mode: Weave + Claude Code
+
+Loom supports two generation backends:
+
+- **Weave mode** — Uses a local Ollama model with character cards, personas, lore, style nudges, and incremental summarization. Full RP harness features.
+- **Claude mode** — Connects to the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) as a subprocess. Turns Loom into a coding assistant UI with all of Claude Code's capabilities.
+
+### Claude mode features
+
+- Real-time streaming of Claude's responses over WebSocket
+- Tool call blocks — see every tool Claude uses (Read, Edit, Bash, Grep, etc.) with expandable input/output
+- Edit tool diff rendering — red/green inline diff for file edits
+- Thinking blocks — collapsible extended thinking display
+- Permission proxying — tool approval prompts appear in the browser UI (Allow / Deny / Allow All)
+- Model selection — choose between Sonnet, Opus, and Haiku
+- Thinking effort — Low, Medium, High, or Max (Opus only)
+- Cost tracking — per-turn and cumulative cost display (input/output tokens, USD)
+- Image attachments — attach images and Claude will read them via the Read tool
+- Markdown rendering — full GitHub Flavored Markdown in responses (code blocks, tables, lists, etc.)
+
+### Prerequisites for Claude mode
+
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and available on PATH (`claude` command)
+- An active Anthropic API key configured in Claude Code
+
+### Creating a Claude conversation
+
+1. Click **+ New** on the home page
+2. Toggle the mode to **Claude**
+3. Enter a **Working Directory** (the project folder Claude will work in)
+4. Optionally choose a **Model** and **Thinking Effort** level
+5. Give it a title and click **Create**
+6. Type your message and Claude will respond with full tool access to the working directory
 
 ## Quick start
 
@@ -54,6 +88,8 @@ prompt_engine.py       — System prompt assembly, repetition detection, style n
 context_manager.py     — Token counting, rolling summary, context window management
 character_loader.py    — Parse/save character, persona, and lore .md files
 ollama_client.py       — Ollama API client (chat streaming, image description)
+claude_client.py       — Claude Code CLI subprocess wrapper, NDJSON stream parser
+cc_permission_hook.py  — PreToolUse hook script for browser-based permission prompts
 local_summary.py       — Gemma 3 1B via llama-cpp-python for CPU summarization
 
 static/

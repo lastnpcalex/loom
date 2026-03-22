@@ -242,6 +242,9 @@ async def api_create_conversation(data: dict = None):
     first_turn = data.get("first_turn", "character")  # "character" or "user"
     custom_scene = data.get("custom_scene")
 
+    cc_model = data.get("cc_model", "sonnet")
+    cc_effort = data.get("cc_effort", "high")
+
     conv = await db.create_conversation(title, character_id, mode=mode, project_dir=project_dir)
 
     # Store additional fields
@@ -252,6 +255,8 @@ async def api_create_conversation(data: dict = None):
         lore_ids=_json.dumps(lore_ids),
         style_nudge=style_nudge,
         custom_scene=custom_scene,
+        cc_model=cc_model,
+        cc_effort=cc_effort,
     )
     # Refresh conv data
     conv = await db.get_conversation(conv["id"])
@@ -825,10 +830,33 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
 
         project_dir = conv.get("project_dir") or "."
 
+        # If the latest user message has an image, inject the path into the prompt
+        if branch:
+            last_user_msg = None
+            for msg in reversed(branch):
+                if msg["role"] == "user":
+                    last_user_msg = msg
+                    break
+            if last_user_msg and last_user_msg.get("image_path"):
+                src = Path(last_user_msg["image_path"]).resolve()
+                dest = Path(project_dir) / src.name
+                try:
+                    import shutil
+                    shutil.copy2(str(src), str(dest))
+                    prompt += f"\n\n[User attached a file: {src.name} — it has been placed in your working directory. Use the Read tool to view it.]"
+                except Exception as cp_err:
+                    # Fallback to absolute path if copy fails
+                    abs_path = str(src).replace("\\", "/")
+                    prompt += f"\n\n[User attached an image at: {abs_path}. Use the Read tool to view it.]"
+
         await websocket.send_json({"type": "stream_start"})
 
+        cc_model = conv.get("cc_model") or "sonnet"
+        cc_effort = conv.get("cc_effort") or "high"
+
         proc, event_stream = await claude_client.run_claude(
-            prompt, project_dir, conv_id=conv_id, server_port=config.port
+            prompt, project_dir, conv_id=conv_id, server_port=config.port,
+            model=cc_model, effort=cc_effort
         )
         _active_claude_procs[conv_id] = proc
 

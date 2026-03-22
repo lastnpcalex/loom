@@ -233,7 +233,7 @@ body::after {
 
 /* ── Home View ── */
 #view-home {
-    overflow: hidden;
+    overflow-y: auto;
 }
 
 #home-content {
@@ -773,6 +773,66 @@ body::after {
 .message-content > .tool-block:last-child { margin-bottom: 0; }
 .message-content em { font-style: italic; color: var(--text-secondary); }
 .message-content strong { font-weight: 600; }
+
+/* ── Markdown Rendering ── */
+.message-content { white-space: normal; }
+.message-content h1 { font-size: 16px; font-weight: 600; margin: 8px 0 4px; }
+.message-content h2 { font-size: 15px; font-weight: 600; margin: 8px 0 4px; }
+.message-content h3 { font-size: 14px; font-weight: 600; margin: 6px 0 3px; }
+.message-content h4, .message-content h5, .message-content h6 { font-size: 13px; font-weight: 600; margin: 4px 0 2px; }
+.message-content pre {
+    background: rgba(0, 0, 0, 0.4);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    margin: 6px 0;
+    overflow-x: auto;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre;
+}
+.message-content pre code {
+    background: none;
+    padding: 0;
+    border-radius: 0;
+    font-size: inherit;
+    color: var(--text-primary);
+}
+.message-content code {
+    background: rgba(255, 255, 255, 0.08);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 12px;
+    color: var(--cyan);
+}
+.message-content ul, .message-content ol {
+    padding-left: 20px;
+    margin: 4px 0;
+}
+.message-content li { margin: 2px 0; }
+.message-content blockquote {
+    border-left: 3px solid var(--border);
+    padding-left: 12px;
+    margin: 6px 0;
+    color: var(--text-secondary);
+}
+.message-content a { color: var(--accent); text-decoration: none; }
+.message-content a:hover { text-decoration: underline; }
+.message-content table {
+    border-collapse: collapse;
+    margin: 6px 0;
+    font-size: 13px;
+    width: 100%;
+}
+.message-content th, .message-content td {
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 4px 8px;
+    text-align: left;
+}
+.message-content th { background: rgba(255, 255, 255, 0.05); font-weight: 600; }
+.message-content hr { border: none; border-top: 1px solid var(--border); margin: 8px 0; }
 
 .edit-message-input {
     width: 100%;
@@ -1413,6 +1473,12 @@ body::after {
     padding-top: 4px;
     color: rgba(255, 255, 255, 0.5);
 }
+
+/* ── Diff Rendering (Edit Tool) ── */
+.diff-header { font-family: monospace; font-size: 11px; color: var(--accent); padding: 4px 0 2px; }
+.diff-body { font-family: monospace; font-size: 11px; line-height: 1.4; max-height: 300px; overflow-y: auto; }
+.diff-remove { color: #ff3355; background: rgba(255,51,85,0.06); padding: 0 4px; white-space: pre-wrap; }
+.diff-add { color: #00ffaa; background: rgba(0,255,170,0.06); padding: 0 4px; white-space: pre-wrap; }
 
 /* ── Claude Code: Thinking Block ── */
 .cc-thinking {

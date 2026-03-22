@@ -188,7 +188,8 @@ def _configure_permission_hook(cwd: str):
     print(f"[CC] Configured permission hook in {settings_path}")
 
 
-async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000):
+async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
+                     model: str = "sonnet", effort: str = "high"):
     """Run Claude Code CLI and yield parsed events as an async generator.
 
     Returns (process, generator) so the caller can cancel via process.terminate().
@@ -200,7 +201,9 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
 
     cmd = ["claude", "-p", prompt,
            "--output-format", "stream-json",
-           "--verbose"]
+           "--verbose",
+           "--model", model,
+           "--effort", effort]
 
     # Pass Loom connection info to the hook script via env vars
     env = {**os.environ}
