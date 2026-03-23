@@ -910,22 +910,20 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                         fork_session = True
                         break
             else:
-                # Linear continue: parent_id is the new user message.
-                # Only resume if the prior assistant msg has a session AND
-                # this user message is the ONLY child of that assistant
-                # (i.e., no branching/editing — a true linear continuation).
+                # Find nearest ancestor assistant with a session ID
                 if len(branch) >= 2:
                     prior_msg = branch[-2]
                     if (parent_msg["role"] == "user"
                             and prior_msg["role"] == "assistant"
                             and prior_msg.get("cc_session_id")
                             and parent_msg.get("parent_id") == prior_msg["id"]):
-                        # Check if this user msg is the only child of the assistant
+                        resume_session_id = prior_msg["cc_session_id"]
+                        # If the user msg has siblings, this is a branch/edit —
+                        # fork the session so CC has context but starts fresh
                         siblings = await db.get_children(prior_msg["id"])
-                        if len(siblings) == 1:
-                            resume_session_id = prior_msg["cc_session_id"]
-                        else:
-                            print(f"[CC] Skipping resume — user msg has {len(siblings)} siblings (branch detected)")
+                        if len(siblings) > 1:
+                            fork_session = True
+                            print(f"[CC] Branch detected ({len(siblings)} siblings) — forking session")
 
         if resume_session_id:
             use_resume = True
