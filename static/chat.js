@@ -37,7 +37,7 @@ function connectWebSocket(convId) {
             if (ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ action: 'ping' }));
             }
-        }, 30000);
+        }, 15000);
         // Reload messages on reconnect to pick up any responses that completed while away.
         // Delay slightly so generation_active message can arrive first and set isStreaming.
         setTimeout(() => {

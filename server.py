@@ -1519,4 +1519,6 @@ if __name__ == "__main__":
         print(f"[SSL] HTTPS enabled — cert={config.ssl_certfile}")
     else:
         print("[SSL] No certs found — running plain HTTP")
-    uvicorn.run(app, host=config.host, port=config.port, **ssl_kwargs)
+    uvicorn.run(app, host=config.host, port=config.port,
+                ws_ping_interval=60, ws_ping_timeout=60,
+                **ssl_kwargs)
