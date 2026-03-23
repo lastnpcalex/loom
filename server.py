@@ -1536,6 +1536,20 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
 
 if __name__ == "__main__":
     import uvicorn
+
+    # Suppress Windows ProactorEventLoop pipe errors from CC subprocess cleanup.
+    # These ConnectionResetError exceptions in callbacks destabilize the event loop
+    # and cause all WebSocket connections to drop simultaneously.
+    loop = asyncio.new_event_loop()
+    _original_handler = loop.call_exception_handler
+    def _quiet_exception_handler(context):
+        exc = context.get("exception")
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, OSError)):
+            return  # suppress pipe cleanup noise
+        _original_handler(context)
+    loop.set_exception_handler(_quiet_exception_handler)
+    asyncio.set_event_loop(loop)
+
     ssl_kwargs = {}
     if os.path.exists(config.ssl_certfile) and os.path.exists(config.ssl_keyfile):
         ssl_kwargs["ssl_certfile"] = config.ssl_certfile
@@ -1545,4 +1559,5 @@ if __name__ == "__main__":
         print("[SSL] No certs found — running plain HTTP")
     uvicorn.run(app, host=config.host, port=config.port,
                 ws_ping_interval=None, ws_ping_timeout=None,
+                loop="none",  # use our pre-configured event loop
                 **ssl_kwargs)
