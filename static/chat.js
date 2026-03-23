@@ -93,6 +93,27 @@ document.addEventListener('visibilitychange', () => {
     }
 });
 
+async function loadMessages(convId) {
+    try {
+        const prevCount = State.messages.length;
+        const treeData = await API.get(`/api/conversations/${convId}/tree`);
+        const activeNodes = treeData.filter(n => n.is_active);
+        if (activeNodes.length > 0) {
+            const leafId = activeNodes[activeNodes.length - 1].id;
+            State.messages = await API.get(`/api/conversations/${convId}/branch/${leafId}`);
+        } else {
+            State.messages = [];
+        }
+        renderMessages();
+        scrollToBottom();
+        if (State.messages.length > prevCount && prevCount > 0) {
+            showToast('Response loaded');
+        }
+    } catch (err) {
+        console.error('loadMessages failed:', err);
+    }
+}
+
 function showGenStatus(text) {
     const el = document.getElementById('generation-status');
     document.getElementById('gen-status-text').textContent = text;

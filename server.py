@@ -1418,7 +1418,11 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
         # Load persona if set
         persona = None
         if conv and conv.get("persona_id"):
-            persona = load_persona(os.path.join("personas", f"{conv['persona_id']}.md"))
+            persona_path = os.path.join("personas", f"{conv['persona_id']}.md")
+            persona = load_persona(persona_path)
+            print(f"[GEN] Persona: id={conv['persona_id']} path={persona_path} loaded={'yes' if persona else 'NO'}")
+        else:
+            print(f"[GEN] No persona_id set on conversation")
 
         # Load lore entries if set
         lore_entries = []
@@ -1471,11 +1475,12 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
         for i, m in enumerate(messages):
             print(f"[GEN]   msg[{i}] role={m['role']} len={len(m['content'])}")
 
-        # Send context info
+        # Send context info — use actual assembled prompt token count
+        actual_tokens = sum(len(m["content"]) // 3 for m in messages)
         active_nudge = get_style_nudge(nudge_index)
         await _ws_send(conv_id, {
             "type": "context_info",
-            "total_tokens": context["total_tokens"],
+            "total_tokens": actual_tokens,
             "was_compactified": context["was_compactified"],
             "style_nudge": active_nudge["name"],
         })
