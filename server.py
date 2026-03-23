@@ -738,18 +738,15 @@ async def handle_cc_permission(data: dict):
     elif isinstance(tool_input, str):
         input_summary = tool_input[:500]
 
-    # Wait for a WebSocket connection (retry with heartbeat)
-    max_wait = 30  # seconds to wait for a UI connection
-    for attempt in range(max_wait * 2):  # check every 0.5s
+    # Wait indefinitely for a WebSocket connection (user may need to navigate to this conversation)
+    ws = _active_websockets.get(conv_id)
+    if not ws or ws.client_state != WebSocketState.CONNECTED:
+        print(f"[PERM] No WebSocket for conv={conv_id} — waiting for UI to connect...")
+    while True:
         ws = _active_websockets.get(conv_id)
         if ws and ws.client_state == WebSocketState.CONNECTED:
             break
-        if attempt == 0:
-            print(f"[PERM] No WebSocket for conv={conv_id} — waiting for UI to connect...")
-        await asyncio.sleep(0.5)
-    else:
-        print(f"[PERM] No WebSocket after {max_wait}s — denying")
-        return {"allow": False, "message": f"Loom UI not connected after {max_wait}s — open the conversation to approve tools"}
+        await asyncio.sleep(1)
 
     await ws.send_json({
         "type": "permission_request",
