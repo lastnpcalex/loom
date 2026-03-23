@@ -298,8 +298,9 @@ function handleWSMessage(data) {
 
         case 'generation_active':
             // Reconnected while a generation is still running
+            hideRetryBar();
             removeStreamingMessage();
-            showGenStatus('Generation in progress...');
+            showGenStatus('Generating in background...');
             State.isStreaming = true;
             appendStreamingMessage();
             break;
@@ -440,11 +441,11 @@ function renderMessages() {
         container.appendChild(createMessageElement(msg));
     }
 
-    // Show generate/retry bar if needed
+    // Show generate/retry bar if needed (but not if generation is active)
     const lastMsg = State.messages[State.messages.length - 1];
     if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.content?.trim()) {
         showRetryBar('Empty response — try regenerating');
-    } else if (lastMsg && lastMsg.role === 'user') {
+    } else if (lastMsg && lastMsg.role === 'user' && !State.isStreaming) {
         showGenerateBar();
     }
 }

@@ -770,6 +770,7 @@ body::after {
 
 .message:hover .message-actions { opacity: 1; }
 .message.streaming .message-actions { opacity: 1; }
+.message.streaming .message-content { min-height: 28px; }
 
 .message-actions button {
     background: none;
