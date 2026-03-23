@@ -410,6 +410,8 @@ async def api_add_message(conv_id: int, data: dict):
     role = data.get("role", "user")
     content = data.get("content", "")
     raw_image_path = data.get("image_path")
+    # Distinguish between "parent_id not provided" (auto-detect) and "parent_id: null" (root)
+    parent_id_provided = "parent_id" in data
     parent_id = data.get("parent_id")
 
     # Normalize image_path: accept string, list, or null → store as JSON array or null
@@ -423,8 +425,9 @@ async def api_add_message(conv_id: int, data: dict):
     if not content.strip() and not image_path:
         raise HTTPException(400, "Message content required")
 
-    # If no parent_id, use the current active leaf
-    if parent_id is None:
+    # If parent_id was not provided at all, use the current active leaf.
+    # If parent_id was explicitly null, create a root message.
+    if not parent_id_provided:
         leaf = await db.get_active_leaf(conv_id)
         parent_id = leaf["id"] if leaf else None
 
