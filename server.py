@@ -889,42 +889,21 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
         use_ollama = conv.get("_use_ollama", False)
 
         # --- Session resume logic ---
-        # Walk ancestors to find the nearest assistant node with a cc_session_id.
-        # Only resume if the parent message itself has a session (linear continue)
-        # or we're regenerating.  When the user edits a message and branches,
-        # parent_id is the NEW user message whose ancestor session is stale —
-        # resuming it would leak the old branch's context.
+        # Every turn uses --resume + --fork-session. Each assistant message
+        # gets its own immutable session snapshot. This means branches, edits,
+        # regenerates, and linear continuations all use the same operation.
+        # If no ancestor session exists (first message), fall through to
+        # full history rebuild.
         resume_session_id = None
-        fork_session = False
-        use_resume = False
+        fork_session = True  # always fork — every turn creates a new snapshot
 
         if parent_id:
             branch = await db.get_branch_to_root(parent_id)
-            parent_msg = branch[-1] if branch else None
-
-            if action == "regenerate":
-                # Regenerate: find nearest ancestor session and fork it
-                for msg in reversed(branch):
-                    if msg["role"] == "assistant" and msg.get("cc_session_id"):
-                        resume_session_id = msg["cc_session_id"]
-                        fork_session = True
-                        break
-            else:
-                # Linear continue: only resume if this is a true linear
-                # continuation (user msg is the only child of the prior assistant).
-                # For branches/edits, NEVER resume — CC sessions accumulate
-                # context beyond the branch point, causing cross-branch leaks.
-                if len(branch) >= 2:
-                    prior_msg = branch[-2]
-                    if (parent_msg["role"] == "user"
-                            and prior_msg["role"] == "assistant"
-                            and prior_msg.get("cc_session_id")
-                            and parent_msg.get("parent_id") == prior_msg["id"]):
-                        siblings = await db.get_children(prior_msg["id"])
-                        if len(siblings) == 1:
-                            resume_session_id = prior_msg["cc_session_id"]
-                        else:
-                            print(f"[CC] Branch detected ({len(siblings)} siblings) — using full history rebuild")
+            # Find nearest ancestor assistant with a session ID
+            for msg in reversed(branch):
+                if msg["role"] == "assistant" and msg.get("cc_session_id"):
+                    resume_session_id = msg["cc_session_id"]
+                    break
 
         if resume_session_id:
             use_resume = True

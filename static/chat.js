@@ -32,6 +32,12 @@ function connectWebSocket(convId) {
     ws.onopen = () => {
         console.log('WebSocket connected');
         _wsReconnectDelay = 2000; // reset backoff on success
+        // Keepalive ping to prevent browser from killing idle WebSocket in background tabs
+        ws._pingInterval = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ action: 'ping' }));
+            }
+        }, 30000);
         // Reload messages on reconnect to pick up any responses that completed while away.
         // Delay slightly so generation_active message can arrive first and set isStreaming.
         setTimeout(() => {
@@ -52,6 +58,7 @@ function connectWebSocket(convId) {
 
     ws.onclose = () => {
         console.log('WebSocket closed');
+        if (ws._pingInterval) clearInterval(ws._pingInterval);
         // Reset streaming UI — server will keep generating and save the result.
         // On reconnect, loadMessages() will pick up the completed response.
         if (State.isStreaming) {
