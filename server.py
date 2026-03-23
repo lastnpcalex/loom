@@ -1538,17 +1538,15 @@ if __name__ == "__main__":
     import uvicorn
 
     # Suppress Windows ProactorEventLoop pipe errors from CC subprocess cleanup.
-    # These ConnectionResetError exceptions in callbacks destabilize the event loop
-    # and cause all WebSocket connections to drop simultaneously.
-    loop = asyncio.new_event_loop()
-    _original_handler = loop.call_exception_handler
-    def _quiet_exception_handler(context):
-        exc = context.get("exception")
-        if isinstance(exc, (ConnectionResetError, BrokenPipeError, OSError)):
-            return  # suppress pipe cleanup noise
-        _original_handler(context)
-    loop.set_exception_handler(_quiet_exception_handler)
-    asyncio.set_event_loop(loop)
+    # Patch at startup so it applies to whatever event loop uvicorn creates.
+    import asyncio.proactor_events as _pe
+    _orig_call_connection_lost = _pe._ProactorBasePipeTransport._call_connection_lost
+    def _safe_call_connection_lost(self, exc=None):
+        try:
+            _orig_call_connection_lost(self, exc)
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            pass
+    _pe._ProactorBasePipeTransport._call_connection_lost = _safe_call_connection_lost
 
     ssl_kwargs = {}
     if os.path.exists(config.ssl_certfile) and os.path.exists(config.ssl_keyfile):
@@ -1559,5 +1557,4 @@ if __name__ == "__main__":
         print("[SSL] No certs found — running plain HTTP")
     uvicorn.run(app, host=config.host, port=config.port,
                 ws_ping_interval=None, ws_ping_timeout=None,
-                loop="none",  # use our pre-configured event loop
                 **ssl_kwargs)
