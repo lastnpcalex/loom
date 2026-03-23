@@ -896,6 +896,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
         # full history rebuild.
         resume_session_id = None
         fork_session = True  # always fork — every turn creates a new snapshot
+        use_resume = False
 
         if parent_id:
             branch = await db.get_branch_to_root(parent_id)
