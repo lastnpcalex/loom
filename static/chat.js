@@ -456,21 +456,13 @@ function createMessageElement(msg, cost) {
 
     let actionsHtml = '';
     if (msg.role === 'assistant') {
-        actionsHtml = '<div class="msg-menu">' +
-            '<button class="msg-menu-toggle" title="Actions">&hellip;</button>' +
-            '<div class="msg-menu-dropdown">' +
-            '<button onclick="regenerateMessage(' + msg.id + ')">Regenerate</button>' +
-            '<button onclick="forkFromMessage(' + msg.id + ')">Fork</button>' +
-            '<button onclick="copyMessage(' + msg.id + ')">Copy</button>' +
-            '</div></div>';
+        actionsHtml = '<button onclick="regenerateMessage(' + msg.id + ')" title="Regenerate">&#x21BB;</button>' +
+            '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
+            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x2298;</button>';
     } else {
-        actionsHtml = '<div class="msg-menu">' +
-            '<button class="msg-menu-toggle" title="Actions">&hellip;</button>' +
-            '<div class="msg-menu-dropdown">' +
-            '<button onclick="editMessage(' + msg.id + ')">Edit</button>' +
-            '<button onclick="forkFromMessage(' + msg.id + ')">Fork</button>' +
-            '<button onclick="copyMessage(' + msg.id + ')">Copy</button>' +
-            '</div></div>';
+        actionsHtml = '<button onclick="editMessage(' + msg.id + ')" title="Edit">&#x270E;</button>' +
+            '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
+            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x2298;</button>';
     }
 
     // Branch indicator (async - will fill in after render)
@@ -558,19 +550,6 @@ function createMessageElement(msg, cost) {
         '</div>' +
         '<div class="message-content">' + contentHtml + '</div>' +
         imgHtml + projectImgHtml + costHtml;
-
-    // Ellipsis menu toggle
-    const menuToggle = div.querySelector('.msg-menu-toggle');
-    if (menuToggle) {
-        menuToggle.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const dropdown = menuToggle.nextElementSibling;
-            const wasOpen = dropdown.classList.contains('open');
-            // Close all other open menus
-            document.querySelectorAll('.msg-menu-dropdown.open').forEach(d => d.classList.remove('open'));
-            if (!wasOpen) dropdown.classList.add('open');
-        });
-    }
 
     // Click-to-preview for detected project images
     div.querySelectorAll('.detected-images .generated-image').forEach(img => {
@@ -1325,11 +1304,6 @@ function openPreviewModal(wrapper) {
 
 // ── Event Delegation for Tool Blocks + Thinking + Code Actions ──
 document.addEventListener('click', (e) => {
-    // Close any open message action menus
-    if (!e.target.closest('.msg-menu')) {
-        document.querySelectorAll('.msg-menu-dropdown.open').forEach(d => d.classList.remove('open'));
-    }
-
     // Code block: Copy
     const copyBtn = e.target.closest('[data-code-action="copy"]');
     if (copyBtn) {
