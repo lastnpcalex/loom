@@ -767,22 +767,16 @@ async def handle_cc_permission(data: dict):
         "conv_id": conv_id,
     }
 
-    try:
-        await asyncio.wait_for(event.wait(), timeout=300)
-        user_response = _pending_hook_permissions.pop(request_id, {}).get("response", {})
+    await event.wait()
+    user_response = _pending_hook_permissions.pop(request_id, {}).get("response", {})
 
-        allowed = user_response.get("allow", False)
-        print(f"[PERM] User decision: {'allow' if allowed else 'deny'}")
+    allowed = user_response.get("allow", False)
+    print(f"[PERM] User decision: {'allow' if allowed else 'deny'}")
 
-        if allowed:
-            return {"allow": True}
-        else:
-            return {"allow": False, "message": "Denied by user in Loom UI"}
-
-    except asyncio.TimeoutError:
-        _pending_hook_permissions.pop(request_id, None)
-        print(f"[PERM] Timeout for request_id={request_id}")
-        return {"allow": False, "message": "Permission timeout (5min)"}
+    if allowed:
+        return {"allow": True}
+    else:
+        return {"allow": False, "message": "Denied by user in Loom UI"}
 
 
 # ── WebSocket Chat ──

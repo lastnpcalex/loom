@@ -94,7 +94,7 @@ def main():
     ctx.verify_mode = ssl.CERT_NONE
 
     try:
-        with urllib.request.urlopen(req, timeout=300, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=None, context=ctx) as resp:
             response = json.loads(resp.read().decode("utf-8"))
             if response.get("allow"):
                 allow("Approved by user in Loom UI")
