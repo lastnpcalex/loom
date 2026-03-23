@@ -22,15 +22,14 @@ Character cards, personas, lore files, style nudges, and incremental summarizati
 - Thinking model support (`<think>` stripping, content token counting)
 - Incremental context summarization via Gemma 3 1B on CPU
 
-### Local — agent mode with any Ollama model
+### Local — Claude Code powered by any Ollama model
 
-Point any local model at a working directory and it becomes a tool-calling agent. Reads files, searches code, writes changes — with permission prompts in the browser for every action.
+The full Claude Code harness running on a local model via [`ollama launch claude`](https://docs.ollama.com/integrations/claude-code). Same tools, same permissions, same UI — just running on your hardware.
 
-- Tool calling: `read_file`, `list_directory`, `write_file`, `search_files`
-- Directory-aware system prompt with project tree
-- Permission prompts for all tool calls (Allow / Deny / Allow All)
-- Generated image display inline in tool results
-- Works with any Ollama model that supports tool calling
+- Full Claude Code tool suite (Bash, Read, Write, Edit, Grep, WebSearch, etc.)
+- Permission prompts proxied through the browser UI
+- Generated image display inline in responses
+- Works with any Ollama model with sufficient context (64k+ recommended)
 
 ### Claude — Claude Code in the browser
 
@@ -40,7 +39,8 @@ Connects to the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code
 - Edit tool diff rendering (red/green inline diffs)
 - Collapsible extended thinking display
 - Permission proxying — tool approvals appear in the browser UI
-- Model selection (Sonnet, Opus, Haiku) and thinking effort control
+- Model selection (Sonnet, Opus, Haiku) and thinking effort control — changeable mid-conversation
+- Immutable session snapshots — every turn forks the CC session, enabling clean branching at any point
 - Per-turn and cumulative cost tracking
 - Image attachments via the Read tool
 
@@ -50,9 +50,11 @@ All three modes share the same conversation infrastructure:
 
 - **Tree-based conversations** — Every message is a node. Branch at any point, explore alternate paths, switch between branches. Nothing is lost.
 - **Fork and branch** — Fork from any message to create a new conversation. Regenerate creates a sibling branch, preserving the original.
+- **Tree visualization** — Interactive pan/zoom canvas with horizontal or vertical layout toggle.
 - **Import / export** — Characters, personas, lore (.md) and conversations (.json).
-- **Streaming generation** — Real-time token streaming over WebSocket with live token rate.
-- **Image support** — Attach images to messages; generated images display inline.
+- **Streaming generation** — Real-time token streaming over WebSocket with live token rate and tool success/error indicators.
+- **Image detection** — Images referenced in responses are detected and displayed inline with click-to-preview.
+- **Message queuing** — Send your next message while the model is still responding.
 - **HTTPS / Tailscale** — Serves over HTTPS with auto-detected SSL certs for secure access across your network.
 - **WebGL black hole** — Schwarzschild raytracer background with procedural galaxy texture and glassmorphism UI.
 
@@ -74,6 +76,8 @@ Open `https://localhost:3000` in your browser.
 
 For Claude mode, ensure the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) is installed and on PATH with an active API key.
 
+For Local mode, ensure [Ollama](https://ollama.com) is installed with a model pulled (e.g. `ollama pull qwen3.5:9b`).
+
 ## Project structure
 
 ```
@@ -86,7 +90,6 @@ character_loader.py    — Parse/save character, persona, and lore .md files
 ollama_client.py       — Ollama API client (chat streaming, image description)
 claude_client.py       — Claude Code CLI subprocess wrapper, NDJSON stream parser
 cc_permission_hook.py  — PreToolUse hook script for browser-based permission prompts
-local_tools.py         — File system tools for Local mode agent (read, write, search)
 local_summary.py       — Gemma 3 1B via llama-cpp-python for CPU summarization
 
 static/
