@@ -32,12 +32,15 @@ function connectWebSocket(convId) {
     ws.onopen = () => {
         console.log('WebSocket connected');
         _wsReconnectDelay = 2000; // reset backoff on success
-        // Keepalive ping to prevent browser from killing idle WebSocket in background tabs
-        ws._pingInterval = setInterval(() => {
+        // Web Worker keepalive — runs at full speed even in background tabs
+        // (setInterval gets throttled to ~60s by Chrome in background)
+        const workerBlob = new Blob([`setInterval(() => postMessage('ping'), 15000)`], {type: 'text/javascript'});
+        ws._pingWorker = new Worker(URL.createObjectURL(workerBlob));
+        ws._pingWorker.onmessage = () => {
             if (ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ action: 'ping' }));
             }
-        }, 15000);
+        };
         // Reload messages on reconnect to pick up any responses that completed while away.
         // Delay slightly so generation_active message can arrive first and set isStreaming.
         setTimeout(() => {
@@ -58,7 +61,7 @@ function connectWebSocket(convId) {
 
     ws.onclose = () => {
         console.log('WebSocket closed');
-        if (ws._pingInterval) clearInterval(ws._pingInterval);
+        if (ws._pingWorker) { ws._pingWorker.terminate(); ws._pingWorker = null; }
         // Reset streaming UI — server will keep generating and save the result.
         // On reconnect, loadMessages() will pick up the completed response.
         if (State.isStreaming) {
