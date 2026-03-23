@@ -70,15 +70,9 @@ function connectWebSocket(convId) {
             removeStreamingMessage();
             showGenStatus('Reconnecting... generation continues on server');
         }
-        // Only reconnect if still on the same conversation and in chat/tree view
+        // Reconnect immediately (don't rely on setTimeout which Chrome throttles)
         if (State.currentConvId === convId && State.currentView !== 'home') {
-            setTimeout(() => {
-                if (State.currentConvId === convId && State.currentView !== 'home') {
-                    connectWebSocket(convId);
-                }
-            }, _wsReconnectDelay);
-            // Exponential backoff, cap at 30s
-            _wsReconnectDelay = Math.min(_wsReconnectDelay * 1.5, 30000);
+            connectWebSocket(convId);
         }
     };
 
@@ -88,6 +82,16 @@ function connectWebSocket(convId) {
 // ── Generation Status ──
 let _streamTokenCount = 0;
 let _streamStartTime = 0;
+
+// Force reconnect when tab becomes visible again
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && State.currentConvId) {
+        if (!State.ws || State.ws.readyState !== WebSocket.OPEN) {
+            console.log('Tab visible — reconnecting WebSocket');
+            connectWebSocket(State.currentConvId);
+        }
+    }
+});
 
 function showGenStatus(text) {
     const el = document.getElementById('generation-status');
