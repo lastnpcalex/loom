@@ -1083,10 +1083,8 @@ function editMessage(msgId) {
         if (!newText) return;
 
         try {
-            // Find parent of this message to branch from
-            const msgIdx = State.messages.findIndex(m => m.id === msgId);
-            const parentMsg = msgIdx > 0 ? State.messages[msgIdx - 1] : null;
-            const parentId = parentMsg ? parentMsg.id : null;
+            // Branch from the same parent as the original message
+            const parentId = msg.parent_id || null;
 
             // Post new user message as sibling (new branch)
             const newMsg = await API.post(`/api/conversations/${State.currentConvId}/messages`, {
@@ -1095,11 +1093,8 @@ function editMessage(msgId) {
                 parent_id: parentId,
             });
 
-            // Rebuild message list up to the edit point, then add new message
-            State.messages = State.messages.slice(0, msgIdx);
-            State.messages.push(newMsg);
-            renderMessages();
-            scrollToBottom();
+            // Reload the branch from DB (set_active_branch already ran server-side)
+            await loadMessages(State.currentConvId);
 
             // Trigger generation
             if (State.ws && State.ws.readyState === WebSocket.OPEN) {
