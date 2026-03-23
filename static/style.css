@@ -1212,6 +1212,10 @@ body::after {
     border-color: var(--cyan);
     box-shadow: 0 0 6px rgba(0, 255, 255, 0.2);
 }
+#cc-inline-controls select option {
+    background: #1a1a2e;
+    color: var(--text-primary);
+}
 
 #image-preview {
     display: flex;
