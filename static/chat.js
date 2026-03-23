@@ -458,11 +458,11 @@ function createMessageElement(msg, cost) {
     if (msg.role === 'assistant') {
         actionsHtml = '<button onclick="regenerateMessage(' + msg.id + ')" title="Regenerate">&#x21BB;</button>' +
             '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
-            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x2298;</button>';
+            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>';
     } else {
         actionsHtml = '<button onclick="editMessage(' + msg.id + ')" title="Edit">&#x270E;</button>' +
             '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
-            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x2298;</button>';
+            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>';
     }
 
     // Branch indicator (async - will fill in after render)
@@ -831,7 +831,7 @@ function appendStreamingMessage() {
     streamingDiv.innerHTML = '<div class="message-header">' +
         '<span class="message-role">' + escapeHtml(label) + '</span>' +
         '<div class="message-actions">' +
-        '<button onclick="cancelGeneration()" title="Cancel">&#9632;</button>' +
+        '<button onclick="cancelGeneration()" title="Cancel">&#x2298;</button>' +
         '</div></div>' +
         '<div class="message-content"></div>';
     container.appendChild(streamingDiv);
