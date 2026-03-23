@@ -52,6 +52,9 @@ certs/
 # Startup script (machine-specific paths)
 start_loom.bat
 
+# Photoshop files
+*.psd
+
 # Environment / secrets
 .env
 .env.*
