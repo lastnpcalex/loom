@@ -884,6 +884,9 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
             parent_id = leaf["id"] if leaf else None
 
         project_dir = conv.get("project_dir") or "."
+        if project_dir != "." and not os.path.isdir(project_dir):
+            await _ws_send(conv_id, {"type": "error", "error": f"Working directory not found: {project_dir}"})
+            return
         cc_model = conv.get("cc_model") or "sonnet"
         cc_effort = conv.get("cc_effort") or "high"
         use_ollama = conv.get("_use_ollama", False)
@@ -1520,5 +1523,5 @@ if __name__ == "__main__":
     else:
         print("[SSL] No certs found — running plain HTTP")
     uvicorn.run(app, host=config.host, port=config.port,
-                ws_ping_interval=60, ws_ping_timeout=60,
+                ws_ping_interval=None, ws_ping_timeout=None,
                 **ssl_kwargs)
