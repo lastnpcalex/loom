@@ -134,6 +134,7 @@ async function init() {
     renderHomeLore();
     setupEventListeners();
     initInlineCCControls();
+    initPasteHandler();
     switchView('home');
     checkHealth();
 }
@@ -1035,6 +1036,23 @@ async function attachImage(file) {
     } catch (err) {
         showToast('Image upload failed', 'error');
     }
+}
+
+function initPasteHandler() {
+    const input = document.getElementById('user-input');
+    if (!input) return;
+    input.addEventListener('paste', async (e) => {
+        const items = e.clipboardData?.items;
+        if (!items) return;
+        for (const item of items) {
+            if (item.type.startsWith('image/')) {
+                e.preventDefault();
+                const file = item.getAsFile();
+                if (file) await attachImage(file);
+                return;
+            }
+        }
+    });
 }
 
 async function handleImageSelect(e) {
