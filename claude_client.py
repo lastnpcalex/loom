@@ -49,17 +49,33 @@ def _process_event(raw: dict) -> list[dict]:
                         events.append({"type": "text_delta", "text": text})
                 elif btype == "tool_use":
                     tool_id = block.get("id", "")
+                    tool_name = block.get("name", "")
+                    input_data = block.get("input", {})
+
                     events.append({
                         "type": "tool_start",
-                        "name": block.get("name", ""),
+                        "name": tool_name,
                         "tool_id": tool_id,
                     })
-                    # Include the input as formatted JSON
-                    input_data = block.get("input", {})
                     if input_data:
                         events.append({
                             "type": "tool_input_delta",
                             "json": json.dumps(input_data, indent=2),
+                            "tool_id": tool_id,
+                        })
+
+                    # Emit structured events for interactive tools
+                    if tool_name == "AskUserQuestion" and isinstance(input_data, dict):
+                        events.append({
+                            "type": "ask_user_question",
+                            "questions": input_data.get("questions", []),
+                            "tool_id": tool_id,
+                        })
+                    elif tool_name == "ExitPlanMode" and isinstance(input_data, dict):
+                        events.append({
+                            "type": "plan_ready",
+                            "plan": input_data.get("plan", ""),
+                            "plan_file": input_data.get("planFilePath", ""),
                             "tool_id": tool_id,
                         })
                 elif btype == "thinking":
@@ -191,6 +207,7 @@ def _configure_permission_hook(cwd: str):
 
 async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
                      model: str = "sonnet", effort: str = "high",
+                     permission_mode: str = "default",
                      resume_session_id: str = None, fork_session: bool = False,
                      use_ollama: bool = False):
     """Run Claude Code CLI and yield parsed events as an async generator.
@@ -213,6 +230,9 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     if not use_ollama:
         # Direct claude launch — model and effort are CC flags
         cc_args.extend(["--model", model, "--effort", effort])
+
+    if permission_mode and permission_mode != "default":
+        cc_args.extend(["--permission-mode", permission_mode])
 
     if resume_session_id:
         cc_args.extend(["--resume", resume_session_id])

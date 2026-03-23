@@ -191,6 +191,14 @@ function handleWSMessage(data) {
             appendThinkingChunk(data.content);
             break;
 
+        case 'ask_user_question':
+            renderAskUserQuestion(data.questions, data.tool_id);
+            break;
+
+        case 'plan_ready':
+            renderPlanReady(data.plan, data.plan_file, data.tool_id);
+            break;
+
         case 'permission_request':
             showPermissionPrompt(data);
             break;
@@ -1188,6 +1196,67 @@ function resolvePermissionPrompt(requestId, allowed) {
         prompt.querySelector('.permission-title').textContent = allowed ? 'Allowed' : 'Denied';
         prompt.classList.add(allowed ? 'resolved-allow' : 'resolved-deny');
     }
+}
+
+// ── AskUserQuestion / ExitPlanMode Rendering ──
+
+function renderAskUserQuestion(questions, toolId) {
+    if (!streamingDiv) return;
+    const contentEl = streamingDiv.querySelector('.message-content');
+
+    for (const q of questions) {
+        const block = document.createElement('div');
+        block.className = 'ask-question-block';
+        block.innerHTML = '<div class="ask-question-header">' + escapeHtml(q.header || 'Question') + '</div>' +
+            '<div class="ask-question-text">' + escapeHtml(q.question) + '</div>' +
+            '<div class="ask-question-options"></div>';
+
+        const optionsEl = block.querySelector('.ask-question-options');
+        for (const opt of (q.options || [])) {
+            const btn = document.createElement('button');
+            btn.className = 'ask-question-option';
+            btn.innerHTML = '<strong>' + escapeHtml(opt.label) + '</strong>' +
+                (opt.description ? '<span>' + escapeHtml(opt.description) + '</span>' : '');
+            btn.addEventListener('click', () => {
+                const input = document.getElementById('user-input');
+                input.value = opt.label;
+                input.focus();
+                // Mark selected
+                optionsEl.querySelectorAll('.ask-question-option').forEach(b => b.classList.remove('selected'));
+                btn.classList.add('selected');
+            });
+            optionsEl.appendChild(btn);
+        }
+        contentEl.appendChild(block);
+    }
+    scrollToBottom();
+}
+
+function renderPlanReady(plan, planFile, toolId) {
+    if (!streamingDiv) return;
+    const contentEl = streamingDiv.querySelector('.message-content');
+
+    const block = document.createElement('div');
+    block.className = 'plan-block';
+    block.innerHTML = '<div class="plan-header">Plan Ready</div>' +
+        (planFile ? '<div class="plan-file">' + escapeHtml(planFile) + '</div>' : '') +
+        '<div class="plan-actions">' +
+        '<button class="plan-action-btn approve">Approve</button>' +
+        '<button class="plan-action-btn revise">Revise</button>' +
+        '</div>';
+
+    block.querySelector('.approve').addEventListener('click', () => {
+        document.getElementById('user-input').value = 'Approved, proceed with the plan.';
+        document.getElementById('user-input').focus();
+    });
+    block.querySelector('.revise').addEventListener('click', () => {
+        const input = document.getElementById('user-input');
+        input.value = "I'd like to revise the plan: ";
+        input.focus();
+    });
+
+    contentEl.appendChild(block);
+    scrollToBottom();
 }
 
 // ── Code Block Preview ──

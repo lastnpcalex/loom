@@ -638,12 +638,17 @@ function updateInlineCCControls(conv) {
     const controls = document.getElementById('cc-inline-controls');
     if (!controls) return;
 
-    if (conv && conv.mode === 'claude') {
+    if (conv && (conv.mode === 'claude' || conv.mode === 'local')) {
         controls.classList.remove('hidden');
         const modelSel = document.getElementById('cc-model-inline');
         const effortSel = document.getElementById('cc-effort-inline');
+        const permSel = document.getElementById('cc-permission-mode-inline');
         modelSel.value = conv.cc_model || 'sonnet';
         effortSel.value = conv.cc_effort || 'high';
+        if (permSel) permSel.value = conv.cc_permission_mode || 'default';
+        // Hide model/effort for local mode (model is set at creation)
+        modelSel.style.display = conv.mode === 'local' ? 'none' : '';
+        effortSel.style.display = conv.mode === 'local' ? 'none' : '';
     } else {
         controls.classList.add('hidden');
     }
@@ -664,6 +669,9 @@ function initInlineCCControls() {
 
     modelSel.addEventListener('change', () => saveCC('cc_model', modelSel.value));
     effortSel.addEventListener('change', () => saveCC('cc_effort', effortSel.value));
+
+    const permSel = document.getElementById('cc-permission-mode-inline');
+    if (permSel) permSel.addEventListener('change', () => saveCC('cc_permission_mode', permSel.value));
 }
 
 function showWeaveFields(show) {

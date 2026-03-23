@@ -343,6 +343,8 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["cc_model"] = data["cc_model"]
     if "cc_effort" in data:
         fields["cc_effort"] = data["cc_effort"]
+    if "cc_permission_mode" in data:
+        fields["cc_permission_mode"] = data["cc_permission_mode"]
     if fields:
         await db.update_conversation_fields(conv_id, **fields)
     return await db.get_conversation(conv_id)
@@ -889,6 +891,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
             return
         cc_model = conv.get("cc_model") or "sonnet"
         cc_effort = conv.get("cc_effort") or "high"
+        cc_permission_mode = conv.get("cc_permission_mode") or "default"
         use_ollama = conv.get("_use_ollama", False)
 
         # --- Session resume logic ---
@@ -989,6 +992,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
             proc, event_stream = await claude_client.run_claude(
                 prompt, project_dir, conv_id=conv_id, server_port=config.port,
                 model=cc_model, effort=cc_effort,
+                permission_mode=cc_permission_mode,
                 resume_session_id=resume_session_id if use_resume else None,
                 fork_session=fork_session,
                 use_ollama=use_ollama,
@@ -1002,6 +1006,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 proc, event_stream = await claude_client.run_claude(
                     prompt, project_dir, conv_id=conv_id, server_port=config.port,
                     model=cc_model, effort=cc_effort,
+                    permission_mode=cc_permission_mode,
                     use_ollama=use_ollama,
                 )
                 use_resume = False
@@ -1055,6 +1060,21 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 await _ws_send(conv_id, {
                     "type": "tool_input_chunk",
                     "content": evt["json"],
+                    "tool_id": evt.get("tool_id", ""),
+                })
+
+            elif etype == "ask_user_question":
+                await _ws_send(conv_id, {
+                    "type": "ask_user_question",
+                    "questions": evt.get("questions", []),
+                    "tool_id": evt.get("tool_id", ""),
+                })
+
+            elif etype == "plan_ready":
+                await _ws_send(conv_id, {
+                    "type": "plan_ready",
+                    "plan": evt.get("plan", ""),
+                    "plan_file": evt.get("plan_file", ""),
                     "tool_id": evt.get("tool_id", ""),
                 })
 
@@ -1137,6 +1157,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
             proc, event_stream = await claude_client.run_claude(
                 fallback_prompt, project_dir, conv_id=conv_id, server_port=config.port,
                 model=cc_model, effort=cc_effort,
+                permission_mode=cc_permission_mode,
                 use_ollama=use_ollama,
             )
             _active_claude_procs[conv_id] = proc
