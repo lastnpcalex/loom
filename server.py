@@ -32,9 +32,28 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app):
     await db.init_db()
+    # Clean up stale draft messages (empty assistant msgs older than 30 min)
+    await _cleanup_stale_drafts()
     # Preload Gemma 3 1B for CPU summarization (downloads ~806MB on first run)
     asyncio.create_task(_preload_summarizer())
     yield
+
+
+async def _cleanup_stale_drafts():
+    """Remove empty assistant draft messages older than 30 minutes on startup."""
+    import time
+    cutoff = time.time() - 1800  # 30 minutes
+    conn = await db.get_db()
+    rows = await conn.execute_fetchall(
+        "SELECT id FROM messages WHERE role='assistant' AND (content IS NULL OR content='') AND content_blocks IS NULL AND created_at < ?",
+        (cutoff,)
+    )
+    if rows:
+        ids = [r["id"] for r in rows]
+        print(f"[STARTUP] Cleaning up {len(ids)} stale draft(s): {ids}")
+        for msg_id in ids:
+            await db.delete_branch(msg_id)
+    await conn.close()
 
 
 async def _preload_summarizer():
@@ -991,8 +1010,18 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                         files_str = ", ".join(file_notes)
                         prompt += f"\n\n[User attached {len(file_notes)} file(s): {files_str}. Use the Read tool to view them.]"
 
-        # Create draft message in DB immediately so it survives navigation/restarts
-        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
+        # Create draft message in DB immediately so it survives navigation/restarts.
+        # If parent already has an empty assistant child (stale draft), reuse it.
+        draft_msg = None
+        if parent_id:
+            existing_children = await db.get_children(parent_id)
+            for child in existing_children:
+                if child["role"] == "assistant" and not child.get("content", "").strip():
+                    draft_msg = child
+                    print(f"[CC] Reusing stale draft msg {child['id']}")
+                    break
+        if not draft_msg:
+            draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
         draft_msg_id = draft_msg["id"]
         await db.set_active_branch(conv_id, draft_msg_id)
 
@@ -1346,10 +1375,25 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
 
     except asyncio.CancelledError:
         _active_claude_procs.pop(conv_id, None)
+        # Save accumulated work to draft before cancelling
+        if draft_msg_id and (full_text or content_blocks):
+            await db.update_message_content(
+                draft_msg_id, content=full_text,
+                content_blocks=json.dumps(content_blocks) if content_blocks else None,
+            )
+            print(f"[GEN] Saved partial draft {draft_msg_id} on cancel")
         await _ws_send(conv_id, {"type": "cancelled"})
     except Exception as e:
         _active_claude_procs.pop(conv_id, None)
         print(f"[GEN] Claude generation error conv={conv_id}: {e}")
+        import traceback; traceback.print_exc()
+        # Save accumulated work to draft so it's not lost
+        if draft_msg_id and (full_text or content_blocks):
+            await db.update_message_content(
+                draft_msg_id, content=full_text or "[Generation interrupted]",
+                content_blocks=json.dumps(content_blocks) if content_blocks else None,
+            )
+            print(f"[GEN] Saved partial draft {draft_msg_id} on error")
         await _ws_send(conv_id, {"type": "error", "error": str(e)})
     finally:
         _active_generations.pop(conv_id, None)

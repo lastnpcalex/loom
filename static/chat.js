@@ -180,10 +180,9 @@ function handleWSMessage(data) {
             // Don't hide gen-status yet — keep showing until first content arrives
             hideRetryBar();
             appendStreamingMessage();
-            // Add ghost node to tree showing generation in progress
-            if (data.parent_id && typeof addGhostNode === 'function') {
-                addGhostNode(data.parent_id);
-            }
+            // Draft message already in DB serves as the ghost node on the tree
+            // Refresh tree to show it
+            refreshTree();
             // Keep send button enabled so user can queue next message
             break;
 
@@ -252,7 +251,7 @@ function handleWSMessage(data) {
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
             // Clear ghost node before tree refresh so it doesn't persist
-            if (typeof removeGhostNode === 'function') removeGhostNode();
+            // Tree refreshes on stream_end/cancel/error to replace draft with final node
             // Browser notification if tab is hidden
             if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
                 const convTitle = State.currentConv?.title || 'Conversation';
@@ -302,7 +301,7 @@ function handleWSMessage(data) {
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
             showRetryBar('Generation cancelled');
-            if (typeof removeGhostNode === 'function') removeGhostNode();
+            // Tree refreshes on stream_end/cancel/error to replace draft with final node
             _flushQueuedGeneration();
             break;
 
@@ -310,7 +309,7 @@ function handleWSMessage(data) {
             removeStreamingMessage();
             State.isStreaming = false;
             document.getElementById('btn-send').disabled = false;
-            if (typeof removeGhostNode === 'function') removeGhostNode();
+            // Tree refreshes on stream_end/cancel/error to replace draft with final node
             hideGenStatus();
             showRetryBar(data.error || 'Generation error');
             _flushQueuedGeneration();
@@ -322,7 +321,10 @@ function handleWSMessage(data) {
             removeStreamingMessage();
             showGenStatus('Generating in background...');
             State.isStreaming = true;
-            appendStreamingMessage();
+            // Load saved draft content, then create streaming div for new events
+            loadMessages(State.currentConvId).then(() => {
+                if (!streamingDiv) appendStreamingMessage();
+            });
             break;
 
         case 'generation_idle':
@@ -1196,7 +1198,7 @@ async function refreshTree() {
 // ── Permission Prompts ──
 
 function showPermissionPrompt(data) {
-    if (!streamingDiv) return;
+    if (!streamingDiv) appendStreamingMessage();
     const contentEl = streamingDiv.querySelector('.message-content');
 
     const prompt = document.createElement('div');

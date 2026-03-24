@@ -30,25 +30,6 @@ const TREE = {
     manualPositions: {},  // id -> {x, y} for manually dragged nodes
 };
 
-// ── Ghost Node (generating indicator) ──
-
-let _ghostNodeParentId = null;
-
-function addGhostNode(parentId) {
-    _ghostNodeParentId = parentId;
-    renderTree();  // re-render tree with ghost node injected
-}
-
-function removeGhostNode() {
-    if (!_ghostNodeParentId) return;
-    _ghostNodeParentId = null;
-    const ghost = document.querySelector('.tree-node-ghost');
-    if (ghost) {
-        ghost.classList.add('ghost-fade-out');
-        setTimeout(() => ghost.remove(), 300);
-    }
-}
-
 // ── Canvas Pan/Zoom ──
 
 function initLayoutToggle() {
@@ -300,21 +281,7 @@ async function renderTree() {
         }
     }
 
-    // Inject ghost node if generation is in progress
-    if (_ghostNodeParentId && nodeMap[_ghostNodeParentId]) {
-        const ghostId = 'ghost';
-        nodeMap[ghostId] = {
-            id: ghostId,
-            parent_id: _ghostNodeParentId,
-            role: 'assistant',
-            preview: 'Generating...',
-            is_active: true,
-            _isGhost: true,
-        };
-        childrenMap[ghostId] = [];
-        if (!childrenMap[_ghostNodeParentId]) childrenMap[_ghostNodeParentId] = [];
-        childrenMap[_ghostNodeParentId].push(ghostId);
-    }
+    // Draft messages in the DB serve as ghost nodes (empty content = generating)
 
     // Compute names
     const branchNames = computeBranchNames(roots, nodeMap, childrenMap);
@@ -386,7 +353,8 @@ function createNode(node, branchNames) {
     const label = branchNames[data.id] || '';
 
     // Ghost: either injected ghost node OR real draft message (empty assistant content)
-    const isGhost = !!data._isGhost || (data.role === 'assistant' && !data.preview?.trim());
+    // Empty assistant = draft/generating node → show ghost styling
+    const isGhost = data.role === 'assistant' && !data.preview?.trim();
     const el = document.createElement('div');
     el.className = `tree-node-card ${data.role}${isActive ? ' active' : ''}${isRoot ? ' root' : ''}${isGhost ? ' tree-node-ghost' : ''}`;
     el.dataset.msgId = data.id;
