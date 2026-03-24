@@ -247,6 +247,8 @@ function handleWSMessage(data) {
             State.isStreaming = false;
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
+            // Clear ghost node before tree refresh so it doesn't persist
+            if (typeof removeGhostNode === 'function') removeGhostNode();
             if (streamingDiv) {
                 finalizeStreamingMessage(data.message, data.cost);
                 // Display detected images inline after the message
