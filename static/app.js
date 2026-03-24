@@ -827,8 +827,9 @@ function setupEventListeners() {
         switchView('home');
     });
 
-    // Rename conversation (click title in header)
-    document.getElementById('conv-title').addEventListener('click', () => {
+    // Rename conversation (double-click title in header)
+    document.getElementById('conv-title').addEventListener('dblclick', (e) => {
+        e.stopPropagation();
         if (!State.currentConvId || !State.currentConv) return;
         const titleEl = document.getElementById('conv-title');
         const currentTitle = State.currentConv.title || '';

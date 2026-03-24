@@ -417,7 +417,14 @@ async def api_get_branch(conv_id: int, leaf_id: int):
 
 @app.post("/api/conversations/{conv_id}/switch-branch/{leaf_id}")
 async def api_switch_branch(conv_id: int, leaf_id: int):
-    await db.set_active_branch(conv_id, leaf_id)
+    # Walk down from clicked node to deepest descendant (follow first/latest child)
+    current = leaf_id
+    while True:
+        children = await db.get_children(current)
+        if not children:
+            break
+        current = max(children, key=lambda c: c.get("created_at", 0))["id"]
+    await db.set_active_branch(conv_id, current)
     branch = await db.get_active_branch(conv_id)
     return branch
 

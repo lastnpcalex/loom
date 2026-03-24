@@ -199,8 +199,10 @@ function getBranchLabel(depth) {
 function computeBranchNames(roots, nodeMap, childrenMap) {
     const names = {};  // nodeId -> label string
 
+    // Format: α2.β1 — fork letter + position number, dot separated
+    // Linear chains just increment the number. Forks add a new letter segment.
     function walk(nodeId, pathPrefix, position, forkDepth) {
-        const label = pathPrefix ? `${pathPrefix}.${position}` : `${position}`;
+        const label = pathPrefix ? `${pathPrefix}${position}` : `${position}`;
         names[nodeId] = label;
 
         const children = childrenMap[nodeId] || [];
@@ -209,16 +211,17 @@ function computeBranchNames(roots, nodeMap, childrenMap) {
         } else if (children.length > 1) {
             for (let i = 0; i < children.length; i++) {
                 const forkLetter = getBranchLabel(i);
-                // Format: "2β" — position + fork letter, then dot before next segment
-                const segment = `${position}${forkLetter}`;
-                const newPrefix = pathPrefix ? `${pathPrefix}.${segment}` : `${segment}`;
+                // e.g. "α2." becomes prefix, then "β1" for next segment
+                const newPrefix = pathPrefix
+                    ? `${pathPrefix}${position}.${forkLetter}`
+                    : `${position}.${forkLetter}`;
                 walk(children[i], newPrefix, 1, forkDepth + 1);
             }
         }
     }
 
     for (let i = 0; i < roots.length; i++) {
-        const rootLabel = roots.length > 1 ? getBranchLabel(i) : '';
+        const rootLabel = roots.length > 1 ? `${getBranchLabel(i)}` : '';
         walk(roots[i], rootLabel, 1, 0);
     }
 
