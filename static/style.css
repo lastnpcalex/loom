@@ -201,22 +201,19 @@ body::after {
     margin: 0 1px;
 }
 
-/* Branch label on chat messages */
+/* Branch label on chat messages — inline with role name */
 .message-branch-label {
     font-size: 10px;
     color: var(--text-muted);
-    background: rgba(255,255,255,0.04);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    padding: 1px 6px;
     margin-left: 6px;
     cursor: pointer;
     font-family: 'Space Grotesk', sans-serif;
+    opacity: 0.6;
     transition: var(--transition);
 }
 .message-branch-label:hover {
     color: var(--cyan);
-    border-color: var(--cyan);
+    opacity: 1;
 }
 
 /* Empty loom hint */

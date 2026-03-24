@@ -870,9 +870,8 @@ function setupEventListeners() {
         });
     });
 
-    // Back to tree
-    document.getElementById('conv-title').addEventListener('click', async () => {
-        // Refresh tree data first, then switch view, then render
+    // Back to tree (both conv-title and tree button)
+    async function goToTree() {
         try {
             if (State.currentConvId) {
                 State.treeData = await API.get(`/api/conversations/${State.currentConvId}/tree`);
@@ -888,12 +887,9 @@ function setupEventListeners() {
             document.getElementById('tree-nodes').innerHTML =
                 '<div style="color:var(--text-muted);padding:40px;">Error rendering tree. Check console.</div>';
         }
-    });
-
-    // Tree button (visible in chat view)
-    document.getElementById('btn-to-tree').addEventListener('click', () => {
-        document.getElementById('conv-title').click();
-    });
+    }
+    document.getElementById('conv-title').addEventListener('click', goToTree);
+    document.getElementById('btn-to-tree').addEventListener('click', goToTree);
 
     // Conversation filter tabs
     document.querySelectorAll('.conv-filter-btn').forEach(btn => {

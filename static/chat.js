@@ -455,6 +455,19 @@ function cancelGeneration() {
 // ── Render Messages ──
 
 function renderMessages() {
+    // Ensure branch names are computed from current tree data
+    if (State.treeData && State.treeData.length > 0 && typeof computeBranchNames === 'function') {
+        const nodeMap = {};
+        const childrenMap = {};
+        const roots = [];
+        for (const n of State.treeData) { nodeMap[n.id] = n; childrenMap[n.id] = []; }
+        for (const n of State.treeData) {
+            if (n.parent_id && nodeMap[n.parent_id]) childrenMap[n.parent_id].push(n.id);
+            else roots.push(n.id);
+        }
+        State.branchNames = computeBranchNames(roots, nodeMap, childrenMap);
+    }
+
     const container = document.getElementById('messages');
     container.innerHTML = '';
 
