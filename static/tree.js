@@ -213,17 +213,13 @@ function getBranchLabel(depth) {
     return depth < GREEK.length ? GREEK[depth] : `branch${depth}`;
 }
 
-const SUPERSCRIPT_DIGITS = {'0':'⁰','1':'¹','2':'²','3':'³','4':'⁴','5':'⁵','6':'⁶','7':'⁷','8':'⁸','9':'⁹'};
-function toSuperscript(n) {
-    return String(n).split('').map(c => SUPERSCRIPT_DIGITS[c] || c).join('');
-}
+// Superscript helpers removed — using position.fork dot notation instead
 
 function computeBranchNames(roots, nodeMap, childrenMap) {
     const names = {};  // nodeId -> label string
 
     function walk(nodeId, pathPrefix, position, forkDepth) {
-        const sup = toSuperscript(position);
-        const label = pathPrefix ? `${pathPrefix}${sup}` : `${sup}`;
+        const label = pathPrefix ? `${pathPrefix}.${position}` : `${position}`;
         names[nodeId] = label;
 
         const children = childrenMap[nodeId] || [];
@@ -231,8 +227,10 @@ function computeBranchNames(roots, nodeMap, childrenMap) {
             walk(children[0], pathPrefix, position + 1, forkDepth);
         } else if (children.length > 1) {
             for (let i = 0; i < children.length; i++) {
-                const branchName = getBranchLabel(i);
-                const newPrefix = `${pathPrefix}${sup}${branchName}`;
+                const forkLetter = getBranchLabel(i);
+                // Format: "2β" — position + fork letter, then dot before next segment
+                const segment = `${position}${forkLetter}`;
+                const newPrefix = pathPrefix ? `${pathPrefix}.${segment}` : `${segment}`;
                 walk(children[i], newPrefix, 1, forkDepth + 1);
             }
         }
