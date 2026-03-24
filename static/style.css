@@ -542,6 +542,25 @@ body::after {
     transform: translateY(-1px);
     box-shadow: 0 4px 20px rgba(191, 0, 255, 0.3);
 }
+.tree-node-ghost {
+    border-style: dashed;
+    opacity: 0.7;
+    animation: ghostPulse 2s ease-in-out infinite;
+}
+.tree-node-ghost .tree-node-summary {
+    font-style: italic;
+    color: var(--text-muted);
+}
+@keyframes ghostPulse {
+    0%, 100% { opacity: 0.5; border-color: var(--cyan); }
+    50% { opacity: 0.9; border-color: var(--accent); }
+}
+.ghost-fade-out {
+    animation: ghostFadeOut 300ms ease forwards;
+}
+@keyframes ghostFadeOut {
+    to { opacity: 0; transform: scale(0.8); }
+}
 
 .tree-node-card.user {
     background: rgba(0, 20, 30, 0.92);

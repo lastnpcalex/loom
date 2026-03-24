@@ -176,6 +176,10 @@ function handleWSMessage(data) {
             // Don't hide gen-status yet — keep showing until first content arrives
             hideRetryBar();
             appendStreamingMessage();
+            // Add ghost node to tree showing generation in progress
+            if (data.parent_id && typeof addGhostNode === 'function') {
+                addGhostNode(data.parent_id);
+            }
             // Keep send button enabled so user can queue next message
             break;
 
@@ -284,6 +288,7 @@ function handleWSMessage(data) {
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
             showRetryBar('Generation cancelled');
+            if (typeof removeGhostNode === 'function') removeGhostNode();
             _flushQueuedGeneration();
             break;
 
@@ -291,6 +296,7 @@ function handleWSMessage(data) {
             removeStreamingMessage();
             State.isStreaming = false;
             document.getElementById('btn-send').disabled = false;
+            if (typeof removeGhostNode === 'function') removeGhostNode();
             hideGenStatus();
             showRetryBar(data.error || 'Generation error');
             _flushQueuedGeneration();

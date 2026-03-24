@@ -30,6 +30,25 @@ const TREE = {
     manualPositions: {},  // id -> {x, y} for manually dragged nodes
 };
 
+// ── Ghost Node (generating indicator) ──
+
+let _ghostNodeParentId = null;
+
+function addGhostNode(parentId) {
+    _ghostNodeParentId = parentId;
+    renderTree();  // re-render tree with ghost node injected
+}
+
+function removeGhostNode() {
+    if (!_ghostNodeParentId) return;
+    _ghostNodeParentId = null;
+    const ghost = document.querySelector('.tree-node-ghost');
+    if (ghost) {
+        ghost.classList.add('ghost-fade-out');
+        setTimeout(() => ghost.remove(), 300);
+    }
+}
+
 // ── Canvas Pan/Zoom ──
 
 function initLayoutToggle() {
@@ -277,6 +296,22 @@ async function renderTree() {
         }
     }
 
+    // Inject ghost node if generation is in progress
+    if (_ghostNodeParentId && nodeMap[_ghostNodeParentId]) {
+        const ghostId = 'ghost';
+        nodeMap[ghostId] = {
+            id: ghostId,
+            parent_id: _ghostNodeParentId,
+            role: 'assistant',
+            preview: 'Generating...',
+            is_active: true,
+            _isGhost: true,
+        };
+        childrenMap[ghostId] = [];
+        if (!childrenMap[_ghostNodeParentId]) childrenMap[_ghostNodeParentId] = [];
+        childrenMap[_ghostNodeParentId].push(ghostId);
+    }
+
     // Compute names
     const branchNames = computeBranchNames(roots, nodeMap, childrenMap);
 
@@ -346,9 +381,21 @@ function createNode(node, branchNames) {
     const isForkPoint = node.childCount > 1;
     const label = branchNames[data.id] || '';
 
+    const isGhost = !!data._isGhost;
     const el = document.createElement('div');
-    el.className = `tree-node-card ${data.role}${isActive ? ' active' : ''}${isRoot ? ' root' : ''}`;
+    el.className = `tree-node-card ${data.role}${isActive ? ' active' : ''}${isRoot ? ' root' : ''}${isGhost ? ' tree-node-ghost' : ''}`;
     el.dataset.msgId = data.id;
+
+    if (isGhost) {
+        el.innerHTML = `
+            <div class="tree-node-header">
+                <span class="tree-node-role">${escapeHtml(getCharacterName())}</span>
+                <span class="tree-node-label">generating</span>
+            </div>
+            <div class="tree-node-summary"><span class="thinking-dots"></span> Generating...</div>
+        `;
+        return el;
+    }
 
     const roleLabel = data.role === 'user' ? 'You' : data.role === 'assistant' ? getCharacterName() : 'Sys';
     const preview = data.preview || '';

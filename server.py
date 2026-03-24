@@ -988,7 +988,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
         # Let the client know we're launching
         launch_label = f"Launching {cc_model} via Ollama..." if use_ollama else f"Launching Claude Code ({cc_model})..."
         await _ws_send(conv_id, {"type": "status", "text": launch_label})
-        await _ws_send(conv_id, {"type": "stream_start"})
+        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id})
 
         # Launch CC — with resume if available, with fallback on failure
         try:
@@ -1490,7 +1490,7 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
 
         # Stream the response
         print(f"[GEN] Starting generation for conv={conv_id} parent={parent_id} model={config.ollama_model}")
-        await _ws_send(conv_id, {"type": "stream_start"})
+        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id})
 
         full_response = ""
         async for token in stream_chat(messages):
