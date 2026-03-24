@@ -898,6 +898,13 @@ body::after {
 .message:hover .message-actions { opacity: 1; }
 .message.streaming .message-actions { opacity: 1; }
 .message.streaming .message-content { min-height: 28px; }
+.stream-thinking-footer {
+    color: var(--text-muted);
+    font-style: italic;
+    font-size: 12px;
+    padding: 8px 0 0;
+    opacity: 0.7;
+}
 
 .message-actions button {
     background: none;

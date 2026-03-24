@@ -958,7 +958,8 @@ function appendStreamingMessage() {
         '<div class="message-actions">' +
         '<button onclick="cancelGeneration()" title="Cancel">&#x2298;</button>' +
         '</div></div>' +
-        '<div class="message-content"></div>';
+        '<div class="message-content"></div>' +
+        '<div class="stream-thinking-footer"><span class="thinking-dots"></span> Working...</div>';
     container.appendChild(streamingDiv);
     scrollToBottom();
 }
