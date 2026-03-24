@@ -870,6 +870,11 @@ body::after {
     margin-bottom: 8px;
 }
 
+.message-header-left {
+    display: flex;
+    align-items: baseline;
+}
+
 .message-role {
     font-size: 12px;
     font-weight: 600;

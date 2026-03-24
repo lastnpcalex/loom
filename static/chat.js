@@ -648,8 +648,10 @@ function createMessageElement(msg, cost) {
     }
 
     div.innerHTML = '<div class="message-header">' +
-        '<span class="message-role">' + escapeHtml(roleLabel) + '</span>' +
-        (branchLabel ? '<span class="message-branch-label" title="Click to copy branch path">' + escapeHtml(branchLabel) + '</span>' : '') +
+        '<div class="message-header-left">' +
+            '<span class="message-role">' + escapeHtml(roleLabel) + '</span>' +
+            (branchLabel ? '<span class="message-branch-label" title="Click to copy branch path">' + escapeHtml(branchLabel) + '</span>' : '') +
+        '</div>' +
         '<div class="message-actions">' + branchPlaceholder + actionsHtml + '</div>' +
         '</div>' +
         '<div class="message-content">' + contentHtml + '</div>' +
