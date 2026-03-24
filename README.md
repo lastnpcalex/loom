@@ -35,25 +35,32 @@ The full Claude Code harness running on a local model via [`ollama launch claude
 
 Connects to the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) as a subprocess. Full access to Claude's tool suite with streaming responses, thinking blocks, and permission proxying.
 
-- Tool call blocks with expandable input/output
+- Tool call blocks with expandable input/output and success/error indicators
 - Edit tool diff rendering (red/green inline diffs)
 - Collapsible extended thinking display
 - Permission proxying — tool approvals appear in the browser UI
 - Model selection (Sonnet, Opus, Haiku) and thinking effort control — changeable mid-conversation
+- Plan/Act mode toggle — switch between planning and execution modes
 - Immutable session snapshots — every turn forks the CC session, enabling clean branching at any point
+- Progressive draft saving — generation survives navigation, reconnects, and server restarts
 - Per-turn and cumulative cost tracking
-- Image attachments via the Read tool
+- Image attachments via the Read tool or clipboard paste (Ctrl+V)
 
 ## Common features
 
 All three modes share the same conversation infrastructure:
 
-- **Tree-based conversations** — Every message is a node. Branch at any point, explore alternate paths, switch between branches. Nothing is lost.
-- **Fork and branch** — Fork from any message to create a new conversation. Regenerate creates a sibling branch, preserving the original.
-- **Tree visualization** — Interactive pan/zoom canvas with horizontal or vertical layout toggle.
+- **Tree-based conversations** — Every message is a node. Branch at any point, explore alternate paths, switch between branches. Nothing is lost. Branch names use Unicode Greek letters (`2α.4β.6`).
+- **Fork and branch** — Fork from any message to create a new conversation. Regenerate creates a sibling branch, preserving the original. Edit any message to create a new branch — including the root.
+- **Ghost nodes** — Active generations appear as pulsing nodes on the tree in real time, so you always know where a response is growing.
+- **Child branch hints** — When viewing a message with responses on other branches, clickable hints show where they are.
+- **Tree visualization** — Interactive pan/zoom canvas with horizontal or vertical layout toggle (persists across reloads).
 - **Import / export** — Characters, personas, lore (.md) and conversations (.json).
 - **Streaming generation** — Real-time token streaming over WebSocket with live token rate and tool success/error indicators.
-- **Image detection** — Images referenced in responses are detected and displayed inline with click-to-preview.
+- **Background generation** — Navigate away mid-generation, come back later. Responses are saved progressively and survive reconnects, tab switches, and server restarts.
+- **Browser notifications** — Get notified when a response completes while the tab is in the background.
+- **Image detection** — Images referenced in responses are detected and displayed inline with filename captions and click-to-preview.
+- **Clipboard paste** — Ctrl+V to paste images directly into the chat.
 - **Message queuing** — Send your next message while the model is still responding.
 - **HTTPS / Tailscale** — Serves over HTTPS with auto-detected SSL certs for secure access across your network.
 - **WebGL black hole** — Schwarzschild raytracer background with procedural galaxy texture and glassmorphism UI.
