@@ -255,7 +255,11 @@ function handleWSMessage(data) {
             if (typeof removeGhostNode === 'function') removeGhostNode();
             // Browser notification if tab is hidden
             if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-                new Notification('A Shadow Loom', { body: 'Response complete', icon: '/static/img/loom-ico-transparent.png' });
+                const convTitle = State.currentConv?.title || 'Conversation';
+                new Notification('A Shadow Loom', {
+                    body: `${convTitle} — response complete`,
+                    icon: '/static/img/loom-ico-transparent.png',
+                });
             }
             if (streamingDiv) {
                 finalizeStreamingMessage(data.message, data.cost);

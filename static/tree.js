@@ -5,7 +5,7 @@
  * Click pill → expand to chat. Hover → 6-word summary.
  */
 
-const GREEK = ['alpha','beta','gamma','delta','epsilon','zeta','eta','theta','iota','kappa','lambda','mu','nu','xi','omicron','pi','rho','sigma','tau','upsilon','phi','chi','psi','omega'];
+const GREEK = ['α','β','γ','δ','ε','ζ','η','θ','ι','κ','λ','μ','ν','ξ','ο','π','ρ','σ','τ','υ','φ','χ','ψ','ω'];
 
 const TREE = {
     nodeWidth: 260,
@@ -213,11 +213,17 @@ function getBranchLabel(depth) {
     return depth < GREEK.length ? GREEK[depth] : `branch${depth}`;
 }
 
+const SUPERSCRIPT_DIGITS = {'0':'⁰','1':'¹','2':'²','3':'³','4':'⁴','5':'⁵','6':'⁶','7':'⁷','8':'⁸','9':'⁹'};
+function toSuperscript(n) {
+    return String(n).split('').map(c => SUPERSCRIPT_DIGITS[c] || c).join('');
+}
+
 function computeBranchNames(roots, nodeMap, childrenMap) {
     const names = {};  // nodeId -> label string
 
     function walk(nodeId, pathPrefix, position, forkDepth) {
-        const label = pathPrefix ? `${pathPrefix}.${position}` : `${position}`;
+        const sup = toSuperscript(position);
+        const label = pathPrefix ? `${pathPrefix}${sup}` : `${sup}`;
         names[nodeId] = label;
 
         const children = childrenMap[nodeId] || [];
@@ -226,8 +232,8 @@ function computeBranchNames(roots, nodeMap, childrenMap) {
         } else if (children.length > 1) {
             for (let i = 0; i < children.length; i++) {
                 const branchName = getBranchLabel(i);
-                const newPrefix = pathPrefix ? `${pathPrefix}.${position}.${branchName}` : `${position}.${branchName}`;
-                walk(children[i], newPrefix.replace(/\.\d+$/, ''), 1, forkDepth + 1);
+                const newPrefix = `${pathPrefix}${sup}${branchName}`;
+                walk(children[i], newPrefix, 1, forkDepth + 1);
             }
         }
     }
