@@ -753,14 +753,15 @@ function renderContentBlocks(blocks) {
             html += formatContent(block.text);
         } else if (block.type === 'tool_use') {
             const name = block.name || 'Tool';
-            const input = (block.input || '').trim();
+            const rawInput = (block.input || '').trim();
+            const input = rawInput.length > 3000 ? rawInput.substring(0, 3000) + '\n... (truncated)' : rawInput;
             const result = (block.result || '').trim();
             const resultDisplay = result.length > 2000 ? result.substring(0, 2000) + '\n... (truncated)' : result;
 
             // Special rendering for Edit tool
             const isEdit = (name === 'Edit');
             const diffHtml = isEdit ? renderEditDiff(input) : null;
-            const autoExpand = isEdit || ['Write', 'Bash'].includes(name);
+            const autoExpand = false; // Collapse all tool blocks in saved messages for performance
             const expanded = autoExpand ? ' expanded' : '';
             const toggleChar = autoExpand ? '&#9662;' : '&#9656;';
 

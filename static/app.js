@@ -72,12 +72,14 @@ function switchView(view) {
     const sep = document.getElementById('header-separator');
     const title = document.getElementById('conv-title');
     const breadcrumb = document.getElementById('breadcrumb-trail');
+    const treeBtn = document.getElementById('btn-to-tree');
     const contextInfo = document.getElementById('context-info');
 
     if (view === 'home') {
         sep.classList.add('hidden');
         title.classList.add('hidden');
         breadcrumb.classList.add('hidden');
+        treeBtn.classList.add('hidden');
         contextInfo.classList.add('hidden');
         // Close WebSocket when leaving a conversation
         if (State.ws) { State.ws.close(); State.ws = null; }
@@ -86,12 +88,14 @@ function switchView(view) {
         title.classList.remove('hidden');
         title.textContent = State.currentConv?.title || '—';
         breadcrumb.classList.add('hidden');
+        treeBtn.classList.add('hidden');
         contextInfo.classList.remove('hidden');
     } else if (view === 'chat') {
         sep.classList.remove('hidden');
         title.classList.remove('hidden');
         title.textContent = State.currentConv?.title || '—';
         breadcrumb.classList.remove('hidden');
+        treeBtn.classList.remove('hidden');
         updateBreadcrumbs();
         contextInfo.classList.remove('hidden');
         // Refresh messages when switching back to chat (picks up responses
@@ -884,6 +888,11 @@ function setupEventListeners() {
             document.getElementById('tree-nodes').innerHTML =
                 '<div style="color:var(--text-muted);padding:40px;">Error rendering tree. Check console.</div>';
         }
+    });
+
+    // Tree button (visible in chat view)
+    document.getElementById('btn-to-tree').addEventListener('click', () => {
+        document.getElementById('conv-title').click();
     });
 
     // Conversation filter tabs
