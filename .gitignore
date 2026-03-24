@@ -55,6 +55,9 @@ start_loom.bat
 # Photoshop files
 *.psd
 
+# Log files
+*.log
+
 # Environment / secrets
 .env
 .env.*
