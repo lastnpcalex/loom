@@ -1107,7 +1107,6 @@ async function forkFromMessage(msgId) {
 // ── Edit User Message ──
 
 function editMessage(msgId) {
-    if (State.isStreaming) return;
     const msg = State.messages.find(m => m.id === msgId);
     if (!msg || msg.role !== 'user') return;
 
