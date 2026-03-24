@@ -555,6 +555,41 @@ body::after {
     0%, 100% { opacity: 0.5; border-color: var(--cyan); }
     50% { opacity: 0.9; border-color: var(--accent); }
 }
+/* ── Child Branch Hint ── */
+.child-branch-hint {
+    max-width: 800px;
+    margin: 8px auto;
+    padding: 10px 24px;
+    color: var(--text-muted);
+    font-size: 12px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    border-top: 1px dashed var(--border);
+}
+.child-branch-hint span {
+    font-style: italic;
+}
+.child-branch-hint button {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-secondary);
+    font-size: 11px;
+    padding: 4px 10px;
+    cursor: pointer;
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    transition: var(--transition);
+}
+.child-branch-hint button:hover {
+    border-color: var(--cyan);
+    color: var(--text-primary);
+}
+
 .ghost-fade-out {
     animation: ghostFadeOut 300ms ease forwards;
 }

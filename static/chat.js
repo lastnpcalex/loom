@@ -454,6 +454,39 @@ function renderMessages() {
     } else if (lastMsg && lastMsg.role === 'user' && !State.isStreaming) {
         showGenerateBar();
     }
+
+    // Check if the last message has children on other branches
+    if (lastMsg && !State.isStreaming) {
+        showChildBranchHint(lastMsg.id, container);
+    }
+}
+
+async function showChildBranchHint(msgId, container) {
+    try {
+        const children = await API.get(`/api/conversations/${State.currentConvId}/messages/${msgId}/children`);
+        if (!children || children.length === 0) return;
+
+        const hint = document.createElement('div');
+        hint.className = 'child-branch-hint';
+        const count = children.length;
+        hint.innerHTML = `<span>${count} response${count > 1 ? 's' : ''} on ${count > 1 ? 'branches' : 'a branch'} below</span>`;
+
+        // Add clickable branch buttons
+        for (const child of children) {
+            const btn = document.createElement('button');
+            const preview = (child.content || '').substring(0, 40) + (child.content?.length > 40 ? '...' : '');
+            btn.textContent = preview || child.role;
+            btn.title = 'Switch to this branch';
+            btn.addEventListener('click', async () => {
+                await switchToBranch(child.id);
+            });
+            hint.appendChild(btn);
+        }
+
+        container.appendChild(hint);
+    } catch {
+        // endpoint might not exist yet
+    }
 }
 
 function showGenerateBar() {

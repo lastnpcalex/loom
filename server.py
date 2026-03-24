@@ -446,6 +446,12 @@ async def api_get_siblings(conv_id: int, msg_id: int):
     return siblings
 
 
+@app.get("/api/conversations/{conv_id}/messages/{msg_id}/children")
+async def api_get_children(conv_id: int, msg_id: int):
+    children = await db.get_children(msg_id)
+    return children
+
+
 # ── Regenerate (branch) ──
 
 @app.post("/api/conversations/{conv_id}/regenerate/{msg_id}")
