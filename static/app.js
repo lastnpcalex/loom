@@ -53,6 +53,7 @@ const State = {
     selectedCharacterId: null,
     messages: [],
     treeData: [],
+    branchNames: {},  // msg_id → branch label (computed from tree data)
     ws: null,
     isStreaming: false,
     pendingImages: [],  // [{path, url}, ...] — max 5
@@ -70,13 +71,13 @@ function switchView(view) {
     // Update header
     const sep = document.getElementById('header-separator');
     const title = document.getElementById('conv-title');
-    const backBtn = document.getElementById('btn-back-to-tree');
+    const breadcrumb = document.getElementById('breadcrumb-trail');
     const contextInfo = document.getElementById('context-info');
 
     if (view === 'home') {
         sep.classList.add('hidden');
         title.classList.add('hidden');
-        backBtn.classList.add('hidden');
+        breadcrumb.classList.add('hidden');
         contextInfo.classList.add('hidden');
         // Close WebSocket when leaving a conversation
         if (State.ws) { State.ws.close(); State.ws = null; }
@@ -84,13 +85,14 @@ function switchView(view) {
         sep.classList.remove('hidden');
         title.classList.remove('hidden');
         title.textContent = State.currentConv?.title || '—';
-        backBtn.classList.add('hidden');
+        breadcrumb.classList.add('hidden');
         contextInfo.classList.remove('hidden');
     } else if (view === 'chat') {
         sep.classList.remove('hidden');
         title.classList.remove('hidden');
         title.textContent = State.currentConv?.title || '—';
-        backBtn.classList.remove('hidden');
+        breadcrumb.classList.remove('hidden');
+        updateBreadcrumbs();
         contextInfo.classList.remove('hidden');
         // Refresh messages when switching back to chat (picks up responses
         // that completed while on tree/home view)
@@ -98,6 +100,82 @@ function switchView(view) {
             loadMessages(State.currentConvId);
         }
     }
+}
+
+// ── Breadcrumb Navigation ──
+
+function updateBreadcrumbs() {
+    const trail = document.getElementById('breadcrumb-trail');
+    if (!trail || !State.messages || !State.messages.length) {
+        if (trail) trail.innerHTML = '';
+        return;
+    }
+
+    // Compute branch names from tree data if not already done
+    if (State.treeData && State.treeData.length > 0 && typeof computeBranchNames === 'function') {
+        // Build nodeMap/childrenMap/roots like tree.js does
+        const nodeMap = {};
+        const childrenMap = {};
+        const roots = [];
+        for (const n of State.treeData) {
+            nodeMap[n.id] = n;
+            childrenMap[n.id] = [];
+        }
+        for (const n of State.treeData) {
+            if (n.parent_id && nodeMap[n.parent_id]) {
+                childrenMap[n.parent_id].push(n.id);
+            } else {
+                roots.push(n.id);
+            }
+        }
+        State.branchNames = computeBranchNames(roots, nodeMap, childrenMap);
+    }
+
+    const lastMsg = State.messages[State.messages.length - 1];
+    const currentLabel = State.branchNames[lastMsg?.id] || '';
+
+    // Build breadcrumb: root → ... → current position
+    // Find branch points (forks) in the current path
+    const crumbs = [];
+
+    // Root
+    if (State.messages.length > 0) {
+        const rootMsg = State.messages[0];
+        const rootLabel = State.branchNames[rootMsg.id] || '1';
+        crumbs.push({ label: 'root', msgId: rootMsg.id, title: 'Navigate to root' });
+    }
+
+    // Find fork points in the path (messages with siblings)
+    if (State.treeData) {
+        const parentChildCount = {};
+        for (const n of State.treeData) {
+            const pid = n.parent_id;
+            if (pid) parentChildCount[pid] = (parentChildCount[pid] || 0) + 1;
+        }
+        for (const msg of State.messages) {
+            if (msg.parent_id && parentChildCount[msg.parent_id] > 1) {
+                const label = State.branchNames[msg.id] || String(msg.id);
+                crumbs.push({ label: label, msgId: msg.id, title: 'Navigate to this branch point' });
+            }
+        }
+    }
+
+    // Current leaf
+    if (currentLabel && (!crumbs.length || crumbs[crumbs.length - 1].msgId !== lastMsg.id)) {
+        crumbs.push({ label: currentLabel, msgId: lastMsg.id, title: 'Current position' });
+    }
+
+    // Render
+    trail.innerHTML = crumbs.map((c, i) =>
+        `<button class="breadcrumb-btn" data-msg-id="${c.msgId}" title="${c.title}">${escapeHtml(c.label)}</button>`
+    ).join('<span class="breadcrumb-sep">›</span>');
+
+    trail.querySelectorAll('.breadcrumb-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const msgId = parseInt(btn.dataset.msgId);
+            await switchToBranch(msgId);
+        });
+    });
 }
 
 // ── Toast Notifications ──
@@ -140,7 +218,13 @@ async function init() {
     setupEventListeners();
     initInlineCCControls();
     initPasteHandler();
-    switchView('home');
+    // Restore last conversation or show home
+    const lastConv = localStorage.getItem('loom-last-conv');
+    if (lastConv && State.conversations.find(c => c.id === parseInt(lastConv))) {
+        loadConversation(parseInt(lastConv));
+    } else {
+        switchView('home');
+    }
     checkHealth();
 }
 
@@ -409,6 +493,7 @@ function showFolderDropdown(anchorBtn, conv) {
 // ── Load Conversation → Tree View ──
 async function loadConversation(convId) {
     State.currentConvId = convId;
+    localStorage.setItem('loom-last-conv', convId);
 
     const [conv, treeData] = await Promise.all([
         API.get(`/api/conversations/${convId}`),
@@ -417,6 +502,19 @@ async function loadConversation(convId) {
 
     State.currentConv = conv;
     State.treeData = treeData;
+
+    // Compute branch names for breadcrumbs and message labels
+    if (treeData.length > 0 && typeof computeBranchNames === 'function') {
+        const nodeMap = {};
+        const childrenMap = {};
+        const roots = [];
+        for (const n of treeData) { nodeMap[n.id] = n; childrenMap[n.id] = []; }
+        for (const n of treeData) {
+            if (n.parent_id && nodeMap[n.parent_id]) childrenMap[n.parent_id].push(n.id);
+            else roots.push(n.id);
+        }
+        State.branchNames = computeBranchNames(roots, nodeMap, childrenMap);
+    }
 
     // Also load the active branch for chat
     const activeNodes = treeData.filter(n => n.is_active);
@@ -769,7 +867,7 @@ function setupEventListeners() {
     });
 
     // Back to tree
-    document.getElementById('btn-back-to-tree').addEventListener('click', async () => {
+    document.getElementById('conv-title').addEventListener('click', async () => {
         // Refresh tree data first, then switch view, then render
         try {
             if (State.currentConvId) {

@@ -458,6 +458,14 @@ function renderMessages() {
     const container = document.getElementById('messages');
     container.innerHTML = '';
 
+    if (State.messages.length === 0 && State.currentConvId) {
+        container.innerHTML = '<div class="empty-loom-hint">' +
+            '<p>No messages on this branch.</p>' +
+            '<p>Type a message below to start a new thread.</p>' +
+            '</div>';
+        return;
+    }
+
     for (const msg of State.messages) {
         if (msg.role === 'system') continue;
         container.appendChild(createMessageElement(msg));
@@ -534,6 +542,7 @@ function createMessageElement(msg, cost) {
         : isClaudeMode ? 'Claude'
         : isLocalMode ? (State.currentConv.local_model || 'Local')
         : getCharacterName();
+    const branchLabel = State.branchNames?.[msg.id] || '';
 
     let actionsHtml = '';
     if (msg.role === 'assistant') {
@@ -627,6 +636,7 @@ function createMessageElement(msg, cost) {
 
     div.innerHTML = '<div class="message-header">' +
         '<span class="message-role">' + escapeHtml(roleLabel) + '</span>' +
+        (branchLabel ? '<span class="message-branch-label" title="Click to copy branch path">' + escapeHtml(branchLabel) + '</span>' : '') +
         '<div class="message-actions">' + branchPlaceholder + actionsHtml + '</div>' +
         '</div>' +
         '<div class="message-content">' + contentHtml + '</div>' +
@@ -643,6 +653,17 @@ function createMessageElement(msg, cost) {
 
     // Load sibling info for branch indicator
     loadBranchIndicator(msg.id, div.querySelector('.branch-slot'));
+
+    // Click-to-copy branch label
+    const branchEl = div.querySelector('.message-branch-label');
+    if (branchEl) {
+        branchEl.addEventListener('click', () => {
+            navigator.clipboard.writeText(branchEl.textContent).then(
+                () => showToast('Branch path copied'),
+                () => {}
+            );
+        });
+    }
 
     return div;
 }

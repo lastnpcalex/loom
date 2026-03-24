@@ -158,6 +158,64 @@ body::after {
     color: var(--text-primary);
 }
 
+/* Breadcrumb trail */
+#breadcrumb-trail {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: 4px;
+}
+.breadcrumb-btn {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-size: 11px;
+    padding: 2px 8px;
+    cursor: pointer;
+    transition: var(--transition);
+    font-family: 'Space Grotesk', sans-serif;
+}
+.breadcrumb-btn:hover {
+    color: var(--cyan);
+    border-color: var(--cyan);
+}
+.breadcrumb-sep {
+    color: var(--text-muted);
+    font-size: 11px;
+    margin: 0 1px;
+}
+
+/* Branch label on chat messages */
+.message-branch-label {
+    font-size: 10px;
+    color: var(--text-muted);
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 1px 6px;
+    margin-left: 6px;
+    cursor: pointer;
+    font-family: 'Space Grotesk', sans-serif;
+    transition: var(--transition);
+}
+.message-branch-label:hover {
+    color: var(--cyan);
+    border-color: var(--cyan);
+}
+
+/* Empty loom hint */
+.empty-loom-hint {
+    max-width: 800px;
+    margin: 60px auto;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 14px;
+}
+.empty-loom-hint p + p {
+    margin-top: 8px;
+}
+
 .conv-title-input {
     font-weight: 500;
     font-size: 14px;
