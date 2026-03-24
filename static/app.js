@@ -92,6 +92,11 @@ function switchView(view) {
         title.textContent = State.currentConv?.title || '—';
         backBtn.classList.remove('hidden');
         contextInfo.classList.remove('hidden');
+        // Refresh messages when switching back to chat (picks up responses
+        // that completed while on tree/home view)
+        if (State.currentConvId && !State.isStreaming) {
+            loadMessages(State.currentConvId);
+        }
     }
 }
 
