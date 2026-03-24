@@ -279,17 +279,6 @@ async def get_message(msg_id: int) -> Optional[dict]:
     return dict(rows[0]) if rows else None
 
 
-async def update_message_content(msg_id: int, content: str):
-    db = await get_db()
-    token_est = len(content) // 3
-    await db.execute(
-        "UPDATE messages SET content = ?, token_estimate = ? WHERE id = ?",
-        (content, token_est, msg_id)
-    )
-    await db.commit()
-    await db.close()
-
-
 async def update_message_summary(msg_id: int, summary: str):
     db = await get_db()
     await db.execute(
