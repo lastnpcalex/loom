@@ -477,32 +477,29 @@ function renderMessages() {
     }
 }
 
-async function showChildBranchHint(msgId, container) {
-    try {
-        const children = await API.get(`/api/conversations/${State.currentConvId}/messages/${msgId}/children`);
-        if (!children || children.length === 0) return;
+function showChildBranchHint(msgId, container) {
+    // Compute children from State.treeData (no API call needed)
+    if (!State.treeData) return;
+    const children = State.treeData.filter(n => n.parent_id === msgId);
+    if (!children || children.length === 0) return;
 
-        const hint = document.createElement('div');
-        hint.className = 'child-branch-hint';
-        const count = children.length;
-        hint.innerHTML = `<span>${count} response${count > 1 ? 's' : ''} on ${count > 1 ? 'branches' : 'a branch'} below</span>`;
+    const hint = document.createElement('div');
+    hint.className = 'child-branch-hint';
+    const count = children.length;
+    hint.innerHTML = `<span>${count} response${count > 1 ? 's' : ''} on ${count > 1 ? 'branches' : 'a branch'} below</span>`;
 
-        // Add clickable branch buttons
-        for (const child of children) {
-            const btn = document.createElement('button');
-            const preview = (child.content || '').substring(0, 40) + (child.content?.length > 40 ? '...' : '');
-            btn.textContent = preview || child.role;
-            btn.title = 'Switch to this branch';
-            btn.addEventListener('click', async () => {
-                await switchToBranch(child.id);
-            });
-            hint.appendChild(btn);
-        }
-
-        container.appendChild(hint);
-    } catch {
-        // endpoint might not exist yet
+    for (const child of children) {
+        const btn = document.createElement('button');
+        const preview = (child.preview || '').substring(0, 40) + ((child.preview || '').length > 40 ? '...' : '');
+        btn.textContent = preview || child.role;
+        btn.title = 'Switch to this branch';
+        btn.addEventListener('click', async () => {
+            await switchToBranch(child.id);
+        });
+        hint.appendChild(btn);
     }
+
+    container.appendChild(hint);
 }
 
 function showGenerateBar() {
@@ -772,41 +769,43 @@ function renderContentBlocks(blocks) {
     return html;
 }
 
-async function loadBranchIndicator(msgId, slot) {
-    try {
-        const siblings = await API.get(`/api/conversations/${State.currentConvId}/messages/${msgId}/siblings`);
-        if (siblings.length <= 1) return;
+function loadBranchIndicator(msgId, slot) {
+    // Compute siblings from State.treeData (no API call needed)
+    if (!State.treeData) return;
+    const msg = State.treeData.find(n => n.id === msgId);
+    if (!msg) return;
 
-        const currentIndex = siblings.findIndex(s => s.id === msgId);
-        const total = siblings.length;
+    // Find siblings: messages with the same parent_id
+    const parentId = msg.parent_id;
+    const siblings = parentId === null
+        ? State.treeData.filter(n => n.parent_id === null && n.role === msg.role)
+        : State.treeData.filter(n => n.parent_id === parentId);
+    if (siblings.length <= 1) return;
 
-        const indicator = document.createElement('span');
-        indicator.className = 'branch-indicator';
-        indicator.innerHTML = `
-            <button ${currentIndex === 0 ? 'disabled' : ''} data-sibling-nav="prev" data-siblings='${JSON.stringify(siblings.map(s => s.id))}' data-current="${currentIndex}">‹</button>
-            <span>${currentIndex + 1}/${total}</span>
-            <button ${currentIndex === total - 1 ? 'disabled' : ''} data-sibling-nav="next" data-siblings='${JSON.stringify(siblings.map(s => s.id))}' data-current="${currentIndex}">›</button>
-        `;
+    siblings.sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+    const currentIndex = siblings.findIndex(s => s.id === msgId);
+    const total = siblings.length;
+    const siblingIds = siblings.map(s => s.id);
 
-        indicator.querySelectorAll('button').forEach(btn => {
-            btn.addEventListener('click', async (e) => {
-                e.stopPropagation();
-                const siblingIds = JSON.parse(btn.dataset.siblings);
-                const current = parseInt(btn.dataset.current);
-                const direction = btn.dataset.siblingNav;
-                const newIndex = direction === 'prev' ? current - 1 : current + 1;
-                if (newIndex < 0 || newIndex >= siblingIds.length) return;
+    const indicator = document.createElement('span');
+    indicator.className = 'branch-indicator';
+    indicator.innerHTML = `
+        <button ${currentIndex === 0 ? 'disabled' : ''}>‹</button>
+        <span>${currentIndex + 1}/${total}</span>
+        <button ${currentIndex === total - 1 ? 'disabled' : ''}>›</button>
+    `;
 
-                // Find the deepest active descendant of this sibling
-                const targetId = siblingIds[newIndex];
-                await switchToBranch(targetId);
-            });
-        });
+    const buttons = indicator.querySelectorAll('button');
+    buttons[0].addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (currentIndex > 0) await switchToBranch(siblingIds[currentIndex - 1]);
+    });
+    buttons[1].addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (currentIndex < total - 1) await switchToBranch(siblingIds[currentIndex + 1]);
+    });
 
-        slot.replaceWith(indicator);
-    } catch {
-        // No siblings or error — leave blank
-    }
+    slot.replaceWith(indicator);
 }
 
 async function switchToBranch(leafId) {
