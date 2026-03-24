@@ -1207,12 +1207,12 @@ body::after {
 @keyframes blink { 50% { opacity: 0; } }
 
 .thinking-indicator {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
+    display: block;
     color: var(--text-muted);
     font-style: italic;
     font-size: 0.9em;
+    height: 22px;
+    line-height: 22px;
 }
 
 .thinking-dots {

@@ -871,16 +871,21 @@ function formatContent(text) {
 
 function showThinkingIndicator() {
     if (!streamingDiv) return;
-    const contentEl = streamingDiv.querySelector('.message-content');
-    contentEl.innerHTML = '<span class="thinking-indicator"><span class="thinking-dots"></span> Thinking...</span>';
+    // Add thinking indicator without replacing content
+    let indicator = streamingDiv.querySelector('.thinking-indicator');
+    if (!indicator) {
+        indicator = document.createElement('span');
+        indicator.className = 'thinking-indicator';
+        indicator.innerHTML = '<span class="thinking-dots"></span> Thinking...';
+        streamingDiv.querySelector('.message-content').appendChild(indicator);
+    }
     scrollToBottom();
 }
 
 function hideThinkingIndicator() {
     if (!streamingDiv) return;
-    const contentEl = streamingDiv.querySelector('.message-content');
-    contentEl.innerHTML = '';
-    contentEl.dataset.rawContent = '';
+    const indicator = streamingDiv.querySelector('.thinking-indicator');
+    if (indicator) indicator.remove();
 }
 
 // ── Streaming Message ──
