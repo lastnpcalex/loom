@@ -991,10 +991,15 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                         files_str = ", ".join(file_notes)
                         prompt += f"\n\n[User attached {len(file_notes)} file(s): {files_str}. Use the Read tool to view them.]"
 
+        # Create draft message in DB immediately so it survives navigation/restarts
+        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
+        draft_msg_id = draft_msg["id"]
+        await db.set_active_branch(conv_id, draft_msg_id)
+
         # Let the client know we're launching
         launch_label = f"Launching {cc_model} via Ollama..." if use_ollama else f"Launching Claude Code ({cc_model})..."
         await _ws_send(conv_id, {"type": "status", "text": launch_label})
-        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id})
+        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id, "draft_msg_id": draft_msg_id})
 
         # Launch CC — with resume if available, with fallback on failure
         try:
@@ -1100,6 +1105,12 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                     "content": result_content,
                     "tool_id": tool_id,
                 })
+                # Progressive save: update draft with accumulated content_blocks
+                await db.update_message_content(
+                    draft_msg_id,
+                    content=full_text,
+                    content_blocks=json.dumps(content_blocks),
+                )
 
             elif etype == "thinking_delta":
                 if current_block and current_block["type"] == "thinking":
@@ -1239,6 +1250,11 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                     if image_url:
                         tool_result_msg["image_url"] = image_url
                     await _ws_send(conv_id, tool_result_msg)
+                    # Progressive save
+                    await db.update_message_content(
+                        draft_msg_id, content=full_text,
+                        content_blocks=json.dumps(content_blocks),
+                    )
                 elif etype == "thinking_delta":
                     if current_block and current_block["type"] == "thinking":
                         current_block["text"] += evt["text"]
@@ -1257,11 +1273,15 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
 
             _active_claude_procs.pop(conv_id, None)
 
-        # If CC produced no output at all, report error instead of saving blank
+        # If CC produced no output at all, report error and clean up draft
         if not full_text and not any(b["type"] == "tool_use" for b in content_blocks):
             error_msg = result_info.get("error") or "Claude Code exited with no response"
             if use_ollama:
                 error_msg += f" — check that '{cc_model}' is available in Ollama"
+            # Delete the empty draft
+            await db.delete_branch(draft_msg_id)
+            if parent_id:
+                await db.set_active_branch(conv_id, parent_id)
             await _ws_send(conv_id, {"type": "error", "error": error_msg})
             return
 
@@ -1272,16 +1292,17 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
         new_session_id = result_info.get("session_id", "") or new_session_id
         duration_ms = result_info.get("duration_ms", 0)
 
-        # Save assistant message with cc_session_id stored on the node
-        msg = await db.add_message(
-            conv_id, "assistant", full_text, parent_id=parent_id,
+        # Finalize the draft message with full content
+        await db.update_message_content(
+            draft_msg_id,
+            content=full_text,
             content_blocks=json.dumps(content_blocks),
             turn_cost_usd=cost_usd,
             turn_input_tokens=input_tokens,
             turn_output_tokens=output_tokens,
             cc_session_id=new_session_id or None,
         )
-        await db.set_active_branch(conv_id, msg["id"])
+        msg = await db.get_message(draft_msg_id)
 
         # Update conversation with session_id and cumulative cost
         old_cost = conv.get("total_cost_usd") or 0

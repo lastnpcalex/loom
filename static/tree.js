@@ -381,7 +381,8 @@ function createNode(node, branchNames) {
     const isForkPoint = node.childCount > 1;
     const label = branchNames[data.id] || '';
 
-    const isGhost = !!data._isGhost;
+    // Ghost: either injected ghost node OR real draft message (empty assistant content)
+    const isGhost = !!data._isGhost || (data.role === 'assistant' && !data.preview?.trim());
     const el = document.createElement('div');
     el.className = `tree-node-card ${data.role}${isActive ? ' active' : ''}${isRoot ? ' root' : ''}${isGhost ? ' tree-node-ghost' : ''}`;
     el.dataset.msgId = data.id;

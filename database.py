@@ -232,6 +232,46 @@ async def add_message(conversation_id: int, role: str, content: str,
     return dict(row[0])
 
 
+async def update_message_content(msg_id: int, content: str = None,
+                                  content_blocks: str = None,
+                                  turn_cost_usd: float = None,
+                                  turn_input_tokens: int = None,
+                                  turn_output_tokens: int = None,
+                                  cc_session_id: str = None):
+    """Update a message's content and metadata (used for draft → final)."""
+    db = await get_db()
+    updates = []
+    params = []
+    if content is not None:
+        updates.append("content = ?")
+        params.append(content)
+        updates.append("token_estimate = ?")
+        params.append(len(content) // 3)
+    if content_blocks is not None:
+        updates.append("content_blocks = ?")
+        params.append(content_blocks)
+    if turn_cost_usd is not None:
+        updates.append("turn_cost_usd = ?")
+        params.append(turn_cost_usd)
+    if turn_input_tokens is not None:
+        updates.append("turn_input_tokens = ?")
+        params.append(turn_input_tokens)
+    if turn_output_tokens is not None:
+        updates.append("turn_output_tokens = ?")
+        params.append(turn_output_tokens)
+    if cc_session_id is not None:
+        updates.append("cc_session_id = ?")
+        params.append(cc_session_id)
+    if updates:
+        params.append(msg_id)
+        await db.execute(
+            f"UPDATE messages SET {', '.join(updates)} WHERE id = ?",
+            params
+        )
+        await db.commit()
+    await db.close()
+
+
 async def get_message(msg_id: int) -> Optional[dict]:
     db = await get_db()
     rows = await db.execute_fetchall("SELECT * FROM messages WHERE id = ?", (msg_id,))

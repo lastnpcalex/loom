@@ -169,6 +169,10 @@ function handleWSMessage(data) {
 
         case 'stream_start':
             State.isStreaming = true;
+            // Request notification permission on first generation
+            if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+                Notification.requestPermission();
+            }
             _streamTokenCount = 0;
             _streamStartTime = Date.now();
             _streamBuffer = '';
@@ -249,6 +253,10 @@ function handleWSMessage(data) {
             hideGenStatus();
             // Clear ghost node before tree refresh so it doesn't persist
             if (typeof removeGhostNode === 'function') removeGhostNode();
+            // Browser notification if tab is hidden
+            if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+                new Notification('A Shadow Loom', { body: 'Response complete', icon: '/static/img/loom-ico-transparent.png' });
+            }
             if (streamingDiv) {
                 finalizeStreamingMessage(data.message, data.cost);
                 // Display detected images inline after the message
