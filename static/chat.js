@@ -454,6 +454,13 @@ function cancelGeneration() {
 
 // ── Render Messages ──
 
+const VIRTUAL_SCROLL = {
+    initialCount: 15,   // messages to render initially (from the end)
+    batchSize: 10,      // messages to load per scroll-up
+    renderedStart: 0,   // index into State.messages of the first rendered msg
+    observer: null,     // IntersectionObserver for the sentinel
+};
+
 function renderMessages() {
     // Ensure branch names are computed from current tree data
     if (State.treeData && State.treeData.length > 0 && typeof computeBranchNames === 'function') {
@@ -471,6 +478,12 @@ function renderMessages() {
     const container = document.getElementById('messages');
     container.innerHTML = '';
 
+    // Clean up previous observer
+    if (VIRTUAL_SCROLL.observer) {
+        VIRTUAL_SCROLL.observer.disconnect();
+        VIRTUAL_SCROLL.observer = null;
+    }
+
     if (State.messages.length === 0 && State.currentConvId) {
         container.innerHTML = '<div class="empty-loom-hint">' +
             '<p>No messages on this branch.</p>' +
@@ -479,9 +492,34 @@ function renderMessages() {
         return;
     }
 
-    for (const msg of State.messages) {
-        if (msg.role === 'system') continue;
-        container.appendChild(createMessageElement(msg));
+    // Filter out system messages for rendering
+    const renderMsgs = State.messages.filter(m => m.role !== 'system');
+
+    // Only render the last N messages initially
+    const startIdx = Math.max(0, renderMsgs.length - VIRTUAL_SCROLL.initialCount);
+    VIRTUAL_SCROLL.renderedStart = startIdx;
+
+    // Add sentinel at top if there are older messages to load
+    if (startIdx > 0) {
+        const sentinel = document.createElement('div');
+        sentinel.id = 'scroll-sentinel';
+        sentinel.className = 'scroll-sentinel';
+        sentinel.textContent = `↑ ${startIdx} older messages`;
+        container.appendChild(sentinel);
+
+        // Set up IntersectionObserver to load more on scroll
+        const scrollParent = document.getElementById('messages-container');
+        VIRTUAL_SCROLL.observer = new IntersectionObserver((entries) => {
+            if (entries[0].isIntersecting) {
+                loadOlderMessages(renderMsgs, container, scrollParent);
+            }
+        }, { root: scrollParent, threshold: 0.1 });
+        VIRTUAL_SCROLL.observer.observe(sentinel);
+    }
+
+    // Render the visible messages
+    for (let i = startIdx; i < renderMsgs.length; i++) {
+        container.appendChild(createMessageElement(renderMsgs[i]));
     }
 
     // Show generate/retry bar if needed (but not if generation is active)
@@ -496,6 +534,45 @@ function renderMessages() {
     if (lastMsg && !State.isStreaming) {
         showChildBranchHint(lastMsg.id, container);
     }
+}
+
+function loadOlderMessages(renderMsgs, container, scrollParent) {
+    const currentStart = VIRTUAL_SCROLL.renderedStart;
+    if (currentStart <= 0) return;
+
+    // Calculate new range
+    const newStart = Math.max(0, currentStart - VIRTUAL_SCROLL.batchSize);
+    const batch = renderMsgs.slice(newStart, currentStart);
+
+    // Remember scroll position
+    const scrollHeight = scrollParent.scrollHeight;
+    const scrollTop = scrollParent.scrollTop;
+
+    // Find the sentinel and insert batch after it
+    const sentinel = document.getElementById('scroll-sentinel');
+    const refNode = sentinel ? sentinel.nextSibling : container.firstChild;
+
+    for (let i = batch.length - 1; i >= 0; i--) {
+        const el = createMessageElement(batch[i]);
+        container.insertBefore(el, refNode);
+    }
+
+    VIRTUAL_SCROLL.renderedStart = newStart;
+
+    // Update sentinel text or remove if no more messages
+    if (newStart <= 0) {
+        if (sentinel) sentinel.remove();
+        if (VIRTUAL_SCROLL.observer) {
+            VIRTUAL_SCROLL.observer.disconnect();
+            VIRTUAL_SCROLL.observer = null;
+        }
+    } else if (sentinel) {
+        sentinel.textContent = `↑ ${newStart} older messages`;
+    }
+
+    // Maintain scroll position
+    const newScrollHeight = scrollParent.scrollHeight;
+    scrollParent.scrollTop = scrollTop + (newScrollHeight - scrollHeight);
 }
 
 function showChildBranchHint(msgId, container) {
