@@ -922,14 +922,44 @@ function loadBranchIndicator(msgId, slot) {
     slot.replaceWith(indicator);
 }
 
-async function switchToBranch(leafId) {
+async function switchToBranch(leafId, scrollToMsgId) {
     try {
-        // First try to find the deepest leaf along the active path from this node
+        // Walk to deepest leaf from the clicked node
         const branch = await API.post(`/api/conversations/${State.currentConvId}/switch-branch/${leafId}`);
         State.messages = branch;
         renderMessages();
         renderTree();
-        scrollToBottom();
+
+        // Scroll to the clicked message, or bottom if not specified
+        const targetId = scrollToMsgId || leafId;
+        const targetEl = document.querySelector(`.message[data-msg-id="${targetId}"]`);
+        if (targetEl) {
+            targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        } else {
+            // Message might be above the virtual scroll window — load it
+            const msgIdx = State.messages.findIndex(m => m.id === targetId);
+            if (msgIdx >= 0 && msgIdx < VIRTUAL_SCROLL.renderedStart) {
+                // Force render from that message
+                const container = document.getElementById('messages');
+                const renderMsgs = State.messages.filter(m => m.role !== 'system');
+                const scrollParent = document.getElementById('messages-container');
+                // Load all messages from target to what's rendered
+                for (let i = msgIdx; i < VIRTUAL_SCROLL.renderedStart; i++) {
+                    const el = createMessageElement(renderMsgs[i]);
+                    const sentinel = document.getElementById('scroll-sentinel');
+                    container.insertBefore(el, sentinel ? sentinel.nextSibling : container.firstChild);
+                }
+                VIRTUAL_SCROLL.renderedStart = msgIdx;
+                const sentinel = document.getElementById('scroll-sentinel');
+                if (sentinel) sentinel.textContent = `↑ ${msgIdx} older messages`;
+                if (msgIdx <= 0 && sentinel) sentinel.remove();
+                // Now scroll to it
+                const el = document.querySelector(`.message[data-msg-id="${targetId}"]`);
+                if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            } else {
+                scrollToBottom();
+            }
+        }
     } catch (err) {
         showToast('Failed to switch branch', 'error');
     }

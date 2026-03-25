@@ -452,7 +452,7 @@ function createNode(node, branchNames) {
         if (e.target.closest('.tree-node-expand-btn')) return;
         if (e.target.closest('.tree-node-delete-btn')) return;
         e.stopPropagation();
-        await switchToBranch(data.id);
+        await switchToBranch(data.id, data.id);
         switchView('chat');
     });
 
