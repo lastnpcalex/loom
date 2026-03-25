@@ -187,7 +187,10 @@ function handleWSMessage(data) {
             break;
 
         case 'thinking_start':
-            showThinkingIndicator();
+            // Only show for CC/Local modes (Weave already has "Working..." footer)
+            if (State.currentConv && State.currentConv.mode !== 'weave') {
+                showThinkingIndicator();
+            }
             break;
 
         case 'thinking_end':
