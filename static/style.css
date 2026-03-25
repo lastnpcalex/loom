@@ -664,6 +664,20 @@ body::after {
 @keyframes ghostFadeOut {
     to { opacity: 0; transform: scale(0.8); }
 }
+/* Queued messages (sent but waiting for current generation to finish) */
+.queued-message {
+    opacity: 0.6;
+    border-style: dashed !important;
+}
+.queued-message::after {
+    content: 'queued';
+    display: block;
+    font-size: 10px;
+    color: var(--text-muted);
+    font-style: italic;
+    margin-top: 4px;
+}
+
 /* Error messages in chat */
 .message-error {
     border-color: rgba(248, 81, 73, 0.3) !important;

@@ -322,12 +322,9 @@ function handleWSMessage(data) {
             // Reconnected while a generation is still running
             hideRetryBar();
             removeStreamingMessage();
-            showGenStatus('Generating in background...');
             State.isStreaming = true;
-            // Load saved draft content, then create streaming div for new events
-            loadMessages(State.currentConvId).then(() => {
-                if (!streamingDiv) appendStreamingMessage();
-            });
+            // loadMessages + renderMessages will create streaming div from the draft
+            loadMessages(State.currentConvId);
             break;
 
         case 'generation_idle':
@@ -384,6 +381,13 @@ async function sendMessage() {
         if (State.isStreaming) {
             // Queue it — will fire when current stream ends
             _queuedGeneration = msg;
+            State.messages.push(msg);
+            // Show queued message immediately in chat
+            const container = document.getElementById('messages');
+            const el = createMessageElement(msg);
+            el.classList.add('queued-message');
+            container.appendChild(el);
+            scrollToBottom();
             showToast('Message queued — will send after current turn');
         } else {
             State.messages.push(msg);
@@ -408,9 +412,10 @@ function _flushQueuedGeneration() {
     if (!_queuedGeneration) return;
     const msg = _queuedGeneration;
     _queuedGeneration = null;
-    State.messages.push(msg);
-    renderMessages();
-    scrollToBottom();
+    // Message already in State.messages and rendered — just trigger generation
+    // Remove queued styling
+    const queuedEl = document.querySelector('.queued-message');
+    if (queuedEl) queuedEl.classList.remove('queued-message');
     if (State.ws && State.ws.readyState === WebSocket.OPEN) {
         showGenStatus('Sending queued message...');
         State.ws.send(JSON.stringify({
@@ -525,12 +530,37 @@ function renderMessages() {
         container.appendChild(createMessageElement(renderMsgs[i]));
     }
 
-    // Show generate/retry bar if needed (but not if generation is active)
+    // If streaming and last message is a draft, convert it to a streaming div
     const lastMsg = State.messages[State.messages.length - 1];
-    if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.content?.trim()) {
-        showRetryBar('Empty response — try regenerating');
-    } else if (lastMsg && lastMsg.role === 'user' && !State.isStreaming) {
-        showGenerateBar();
+    if (lastMsg && lastMsg.role === 'assistant' && State.isStreaming) {
+        const lastEl = container.querySelector(`.message[data-msg-id="${lastMsg.id}"]`);
+        if (lastEl) lastEl.remove();
+        appendStreamingMessage();
+        // Render accumulated content_blocks from the draft
+        if (lastMsg.content_blocks && streamingDiv) {
+            try {
+                const blocks = typeof lastMsg.content_blocks === 'string'
+                    ? JSON.parse(lastMsg.content_blocks) : lastMsg.content_blocks;
+                if (blocks && blocks.length > 0) {
+                    const contentEl = streamingDiv.querySelector('.message-content');
+                    contentEl.innerHTML = renderContentBlocks(blocks);
+                }
+            } catch {}
+        }
+        // Also show any text content accumulated so far
+        if (lastMsg.content && lastMsg.content.trim() && streamingDiv) {
+            const contentEl = streamingDiv.querySelector('.message-content');
+            if (!contentEl.innerHTML.trim()) {
+                contentEl.innerHTML = formatContent(lastMsg.content);
+            }
+        }
+    } else {
+        // Show generate/retry bar if needed (but not if generation is active)
+        if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.content?.trim()) {
+            showRetryBar('Empty response — try regenerating');
+        } else if (lastMsg && lastMsg.role === 'user' && !State.isStreaming) {
+            showGenerateBar();
+        }
     }
 
     // Check if the last message has children on other branches
