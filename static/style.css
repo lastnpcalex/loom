@@ -664,6 +664,22 @@ body::after {
 @keyframes ghostFadeOut {
     to { opacity: 0; transform: scale(0.8); }
 }
+/* Error messages in chat */
+.message-error {
+    border-color: rgba(248, 81, 73, 0.3) !important;
+    opacity: 0.8;
+}
+.message-error .message-content {
+    color: #f85149;
+    font-style: italic;
+}
+
+.tree-node-error {
+    border-color: rgba(248, 81, 73, 0.4) !important;
+    opacity: 0.7;
+}
+.tree-node-error .tree-node-label { color: #f85149; }
+.tree-node-error .tree-node-summary { color: #f85149; font-style: italic; }
 
 .tree-node-card.user {
     background: rgba(0, 20, 30, 0.92);

@@ -356,10 +356,12 @@ function createNode(node, branchNames) {
     const label = branchNames[data.id] || '';
 
     // Ghost: either injected ghost node OR real draft message (empty assistant content)
+    // Error node = content starts with [Error:
+    const isError = data.role === 'assistant' && data.preview?.startsWith('[Error:');
     // Empty assistant = draft/generating node → show ghost styling
-    const isGhost = data.role === 'assistant' && !data.preview?.trim();
+    const isGhost = data.role === 'assistant' && !data.preview?.trim() && !isError;
     const el = document.createElement('div');
-    el.className = `tree-node-card ${data.role}${isActive ? ' active' : ''}${isRoot ? ' root' : ''}${isGhost ? ' tree-node-ghost' : ''}`;
+    el.className = `tree-node-card ${data.role}${isActive ? ' active' : ''}${isRoot ? ' root' : ''}${isGhost ? ' tree-node-ghost' : ''}${isError ? ' tree-node-error' : ''}`;
     el.dataset.msgId = data.id;
 
     if (isGhost) {
@@ -369,6 +371,18 @@ function createNode(node, branchNames) {
                 <span class="tree-node-label">generating</span>
             </div>
             <div class="tree-node-summary"><span class="thinking-dots"></span> Generating...</div>
+        `;
+        return el;
+    }
+
+    if (isError) {
+        const errorText = data.preview.replace(/^\[Error:\s*/, '').replace(/\]$/, '');
+        el.innerHTML = `
+            <div class="tree-node-header">
+                <span class="tree-node-role">${escapeHtml(getCharacterName())}</span>
+                <span class="tree-node-label">error</span>
+            </div>
+            <div class="tree-node-summary">${escapeHtml(errorText)}</div>
         `;
         return el;
     }

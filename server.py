@@ -1309,16 +1309,16 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
 
             _active_claude_procs.pop(conv_id, None)
 
-        # If CC produced no output at all, report error and clean up draft
+        # If CC produced no output at all, mark draft as error (don't delete)
         if not full_text and not any(b["type"] == "tool_use" for b in content_blocks):
             error_msg = result_info.get("error") or "Claude Code exited with no response"
             if use_ollama:
                 error_msg += f" — check that '{cc_model}' is available in Ollama"
-            # Delete the empty draft
-            await db.delete_branch(draft_msg_id)
-            if parent_id:
-                await db.set_active_branch(conv_id, parent_id)
+            await db.update_message_content(
+                draft_msg_id, content=f"[Error: {error_msg}]",
+            )
             await _ws_send(conv_id, {"type": "error", "error": error_msg})
+            await _ws_send(conv_id, {"type": "stream_end", "message": await db.get_message(draft_msg_id)})
             return
 
         # Extract cost info

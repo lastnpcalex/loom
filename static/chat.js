@@ -625,8 +625,9 @@ function showGenerateBar() {
 }
 
 function createMessageElement(msg, cost) {
+    const isErrorMsg = msg.role === 'assistant' && msg.content?.startsWith('[Error:');
     const div = document.createElement('div');
-    div.className = `message ${msg.role}`;
+    div.className = `message ${msg.role}${isErrorMsg ? ' message-error' : ''}`;
     div.dataset.msgId = msg.id;
 
     const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
