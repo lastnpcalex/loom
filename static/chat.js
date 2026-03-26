@@ -164,7 +164,7 @@ function handleWSMessage(data) {
             break;
 
         case 'status':
-            showGenStatus(data.text || 'Working...');
+            showGenStatus(data.text || 'Looming...');
             break;
 
         case 'stream_start':
@@ -187,7 +187,7 @@ function handleWSMessage(data) {
             break;
 
         case 'thinking_start':
-            // Only show for CC/Local modes (Weave already has "Working..." footer)
+            // Only show for CC/Local modes (Weave already has "Looming..." footer)
             if (State.currentConv && State.currentConv.mode !== 'weave') {
                 showThinkingIndicator();
             }
@@ -1103,7 +1103,7 @@ function appendStreamingMessage() {
         '<button onclick="cancelGeneration()" title="Cancel">&#x2298;</button>' +
         '</div></div>' +
         '<div class="message-content"></div>' +
-        '<div class="stream-thinking-footer"><span class="thinking-dots"></span> Working...</div>';
+        '<div class="stream-thinking-footer"><span class="thinking-dots"></span> Looming...</div>';
     container.appendChild(streamingDiv);
     scrollToBottom();
 }
