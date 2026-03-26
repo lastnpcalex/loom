@@ -222,10 +222,21 @@ body::after {
     font-size: 11px;
     margin: 0 1px;
 }
-/* Bookmark button */
-.message-actions .bookmarked {
-    color: var(--cyan) !important;
-    text-shadow: 0 0 6px rgba(0, 255, 255, 0.4);
+/* Bookmark/anchor button on tree nodes */
+.tree-node-bookmark-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 11px;
+    opacity: 0.3;
+    transition: var(--transition);
+    padding: 0 2px;
+}
+.tree-node-card:hover .tree-node-bookmark-btn { opacity: 0.7; }
+.tree-node-bookmark-btn:hover { opacity: 1 !important; }
+.tree-node-bookmark-btn.active {
+    opacity: 1;
+    filter: drop-shadow(0 0 4px rgba(0, 255, 255, 0.5));
 }
 
 .breadcrumb-ellipsis {

@@ -394,6 +394,7 @@ function createNode(node, branchNames) {
 
     const hasImage = !!data.image_path;
 
+    const isBookmarked = State.currentConv?.bookmark_msg_id === data.id;
     // Header (always shown)
     const headerHtml = `
         <div class="tree-node-header">
@@ -401,6 +402,7 @@ function createNode(node, branchNames) {
             ${hasImage ? '<span class="tree-node-img-badge" title="Has image">img</span>' : ''}
             <span class="tree-node-label">${escapeHtml(label)}</span>
             ${isForkPoint ? `<span class="tree-node-fork">${node.childCount} branches</span>` : ''}
+            <button class="tree-node-bookmark-btn${isBookmarked ? ' active' : ''}" title="${isBookmarked ? 'Remove anchor' : 'Set as anchor point'}">⚓</button>
             <button class="tree-node-delete-btn" title="Delete branch">&#x2715;</button>
         </div>
     `;
@@ -460,11 +462,22 @@ function createNode(node, branchNames) {
         });
     }
 
+    // Bookmark/anchor button
+    const bookmarkBtn = el.querySelector('.tree-node-bookmark-btn');
+    if (bookmarkBtn) {
+        bookmarkBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            await toggleBookmark(data.id);
+            await renderTree();
+        });
+    }
+
     // Click card body: navigate to this branch in chat
     el.addEventListener('click', async (e) => {
         if (TREE.isPanning || TREE._touchMoved) return;
         if (e.target.closest('.tree-node-expand-btn')) return;
         if (e.target.closest('.tree-node-delete-btn')) return;
+        if (e.target.closest('.tree-node-bookmark-btn')) return;
         e.stopPropagation();
         await switchToBranch(data.id, data.id);
         State._skipLoadOnChat = true; // prevent switchView('chat') from re-loading

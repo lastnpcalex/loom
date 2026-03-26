@@ -265,8 +265,9 @@ function handleWSMessage(data) {
             }
             if (streamingDiv) {
                 finalizeStreamingMessage(data.message, data.cost);
-                // Display detected images inline after the message
-                if (data.images && data.images.length > 0) {
+                // Images are detected client-side in createMessageElement
+                // No need to also render data.images (causes duplicates)
+                if (false && data.images && data.images.length > 0) {
                     const imgContainer = document.createElement('div');
                     imgContainer.className = 'detected-images';
                     for (const url of data.images) {
@@ -668,20 +669,15 @@ function createMessageElement(msg, cost) {
         : getCharacterName();
     const branchLabel = State.branchNames?.[msg.id] || '';
 
-    const isBookmarked = State.currentConv?.bookmark_msg_id === msg.id;
-    const bookmarkBtn = '<button onclick="toggleBookmark(' + msg.id + ')" title="' + (isBookmarked ? 'Remove bookmark' : 'Bookmark') + '" class="' + (isBookmarked ? 'bookmarked' : '') + '">&#x1F516;</button>';
-
     let actionsHtml = '';
     if (msg.role === 'assistant') {
         actionsHtml = '<button onclick="regenerateMessage(' + msg.id + ')" title="Regenerate">&#x21BB;</button>' +
             '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
-            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>' +
-            bookmarkBtn;
+            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>';
     } else {
         actionsHtml = '<button onclick="editMessage(' + msg.id + ')" title="Edit">&#x270E;</button>' +
             '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
-            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>' +
-            bookmarkBtn;
+            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>';
     }
 
     // Branch indicator (async - will fill in after render)
