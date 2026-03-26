@@ -364,6 +364,8 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["cc_effort"] = data["cc_effort"]
     if "cc_permission_mode" in data:
         fields["cc_permission_mode"] = data["cc_permission_mode"]
+    if "bookmark_msg_id" in data:
+        fields["bookmark_msg_id"] = data["bookmark_msg_id"]
     if fields:
         await db.update_conversation_fields(conv_id, **fields)
     return await db.get_conversation(conv_id)

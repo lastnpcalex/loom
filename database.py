@@ -102,6 +102,8 @@ async def _run_migrations(db):
         "ALTER TABLE conversations ADD COLUMN local_model TEXT",
         # Permission mode (default, plan, auto, etc.)
         "ALTER TABLE conversations ADD COLUMN cc_permission_mode TEXT DEFAULT 'default'",
+        # Bookmarked message — auto-navigate to this on conversation load
+        "ALTER TABLE conversations ADD COLUMN bookmark_msg_id INTEGER",
     ]
     for sql in migrations:
         try:
@@ -183,7 +185,8 @@ async def update_conversation_fields(conv_id: int, **fields):
     db = await get_db()
     allowed = {"persona_id", "lore_ids", "style_nudge", "custom_scene", "title",
                 "claude_session_id", "total_cost_usd", "cc_model", "cc_effort",
-                "starred", "folder", "local_model", "cc_permission_mode"}
+                "starred", "folder", "local_model", "cc_permission_mode",
+                "bookmark_msg_id"}
     updates = []
     params = []
     for key, val in fields.items():

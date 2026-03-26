@@ -172,17 +172,56 @@ function updateBreadcrumbs() {
         crumbs.push({ label: currentLabel, msgId: lastMsg.id, title: 'Current position' });
     }
 
-    // Render
-    trail.innerHTML = crumbs.map((c, i) =>
-        `<button class="breadcrumb-btn" data-msg-id="${c.msgId}" title="${c.title}">${escapeHtml(c.label)}</button>`
-    ).join('<span class="breadcrumb-sep">›</span>');
+    // Render — collapse middle crumbs if more than 3
+    const MAX_VISIBLE = 3;
+    let html = '';
 
+    if (crumbs.length <= MAX_VISIBLE) {
+        html = crumbs.map(c =>
+            `<button class="breadcrumb-btn" data-msg-id="${c.msgId}" title="${c.title}">${escapeHtml(c.label)}</button>`
+        ).join('<span class="breadcrumb-sep">›</span>');
+    } else {
+        // Show: root ... second-to-last > current
+        const first = crumbs[0];
+        const secondLast = crumbs[crumbs.length - 2];
+        const last = crumbs[crumbs.length - 1];
+        const hidden = crumbs.slice(1, crumbs.length - 2);
+
+        html = `<button class="breadcrumb-btn" data-msg-id="${first.msgId}" title="${first.title}">${escapeHtml(first.label)}</button>`;
+        html += '<span class="breadcrumb-sep">›</span>';
+        html += `<button class="breadcrumb-ellipsis" title="Show ${hidden.length} more">…</button>`;
+        html += '<span class="breadcrumb-hidden" style="display:none;">';
+        for (const c of hidden) {
+            html += `<span class="breadcrumb-sep">›</span><button class="breadcrumb-btn" data-msg-id="${c.msgId}" title="${c.title}">${escapeHtml(c.label)}</button>`;
+        }
+        html += '</span>';
+        html += '<span class="breadcrumb-sep">›</span>';
+        html += `<button class="breadcrumb-btn" data-msg-id="${secondLast.msgId}" title="${secondLast.title}">${escapeHtml(secondLast.label)}</button>`;
+        html += '<span class="breadcrumb-sep">›</span>';
+        html += `<button class="breadcrumb-btn" data-msg-id="${last.msgId}" title="${last.title}">${escapeHtml(last.label)}</button>`;
+    }
+
+    trail.innerHTML = html;
+
+    // Click handlers for breadcrumb buttons
     trail.querySelectorAll('.breadcrumb-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
             const msgId = parseInt(btn.dataset.msgId);
             await switchToBranch(msgId);
         });
     });
+
+    // Ellipsis expands hidden crumbs
+    const ellipsis = trail.querySelector('.breadcrumb-ellipsis');
+    if (ellipsis) {
+        ellipsis.addEventListener('click', () => {
+            const hidden = trail.querySelector('.breadcrumb-hidden');
+            if (hidden) {
+                hidden.style.display = hidden.style.display === 'none' ? 'contents' : 'none';
+                ellipsis.style.display = hidden.style.display === 'none' ? '' : 'none';
+            }
+        });
+    }
 }
 
 // ── Toast Notifications ──
@@ -560,7 +599,12 @@ async function loadConversation(convId) {
         return siblings.length > 1;
     });
 
-    if (hasForks) {
+    // If bookmarked, navigate to that message
+    if (conv.bookmark_msg_id) {
+        await switchToBranch(conv.bookmark_msg_id, conv.bookmark_msg_id);
+        State._skipLoadOnChat = true;
+        switchView('chat');
+    } else if (hasForks) {
         switchView('tree');
     } else {
         switchView('chat');

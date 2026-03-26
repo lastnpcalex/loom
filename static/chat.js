@@ -668,15 +668,20 @@ function createMessageElement(msg, cost) {
         : getCharacterName();
     const branchLabel = State.branchNames?.[msg.id] || '';
 
+    const isBookmarked = State.currentConv?.bookmark_msg_id === msg.id;
+    const bookmarkBtn = '<button onclick="toggleBookmark(' + msg.id + ')" title="' + (isBookmarked ? 'Remove bookmark' : 'Bookmark') + '" class="' + (isBookmarked ? 'bookmarked' : '') + '">&#x1F516;</button>';
+
     let actionsHtml = '';
     if (msg.role === 'assistant') {
         actionsHtml = '<button onclick="regenerateMessage(' + msg.id + ')" title="Regenerate">&#x21BB;</button>' +
             '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
-            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>';
+            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>' +
+            bookmarkBtn;
     } else {
         actionsHtml = '<button onclick="editMessage(' + msg.id + ')" title="Edit">&#x270E;</button>' +
             '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
-            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>';
+            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>' +
+            bookmarkBtn;
     }
 
     // Branch indicator (async - will fill in after render)
@@ -1360,6 +1365,18 @@ function copyMessage(msgId) {
             () => showToast('Copy failed', 'error')
         );
     }
+}
+
+async function toggleBookmark(msgId) {
+    if (!State.currentConvId || !State.currentConv) return;
+    const current = State.currentConv.bookmark_msg_id;
+    const newVal = current === msgId ? null : msgId;
+    try {
+        await API.put(`/api/conversations/${State.currentConvId}`, { bookmark_msg_id: newVal });
+        State.currentConv.bookmark_msg_id = newVal;
+        renderMessages();
+        showToast(newVal ? 'Bookmarked' : 'Bookmark removed');
+    } catch { showToast('Failed to bookmark', 'error'); }
 }
 
 // ── Refresh Tree ──
