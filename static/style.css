@@ -1378,10 +1378,16 @@ body::after {
     border-top: 1px solid;
     border-image: var(--gradient-border) 1;
     background: rgba(5, 5, 15, 0.9);
+    transition: border-color 0.2s;
     backdrop-filter: var(--glass);
     -webkit-backdrop-filter: var(--glass);
     padding: 12px 24px;
     padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+}
+#input-area.drag-over {
+    border-color: var(--cyan) !important;
+    border-image: none !important;
+    background: rgba(0, 255, 255, 0.05);
 }
 
 #cc-inline-controls {

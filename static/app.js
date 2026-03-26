@@ -1088,6 +1088,27 @@ function setupEventListeners() {
 
     // Paste image from clipboard
     document.getElementById('user-input').addEventListener('paste', handleImagePaste);
+
+    // Drag and drop files onto the input area
+    const inputArea = document.getElementById('input-area');
+    if (inputArea) {
+        inputArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            inputArea.classList.add('drag-over');
+        });
+        inputArea.addEventListener('dragleave', () => {
+            inputArea.classList.remove('drag-over');
+        });
+        inputArea.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            inputArea.classList.remove('drag-over');
+            if (e.dataTransfer && e.dataTransfer.files) {
+                for (const file of e.dataTransfer.files) {
+                    await attachImage(file);
+                }
+            }
+        });
+    }
 }
 
 function autoResizeTextarea() {
