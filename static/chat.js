@@ -967,33 +967,32 @@ async function switchToBranch(leafId, scrollToMsgId) {
 
         // Scroll to the clicked message, or bottom if not specified
         const targetId = scrollToMsgId || leafId;
+        const renderMsgs = State.messages.filter(m => m.role !== 'system');
+        const targetIdx = renderMsgs.findIndex(m => m.id === targetId);
+
+        if (targetIdx >= 0 && targetIdx < VIRTUAL_SCROLL.renderedStart) {
+            // Message is above the virtual scroll window — load from that point
+            const container = document.getElementById('messages');
+            const scrollParent = document.getElementById('messages-container');
+            for (let i = targetIdx; i < VIRTUAL_SCROLL.renderedStart; i++) {
+                const el = createMessageElement(renderMsgs[i]);
+                const sentinel = document.getElementById('scroll-sentinel');
+                container.insertBefore(el, sentinel ? sentinel.nextSibling : container.firstChild);
+            }
+            VIRTUAL_SCROLL.renderedStart = targetIdx;
+            const sentinel = document.getElementById('scroll-sentinel');
+            if (sentinel) sentinel.textContent = `↑ ${targetIdx} older messages`;
+            if (targetIdx <= 0 && sentinel) sentinel.remove();
+        }
+
+        // Now try to scroll to it
         const targetEl = document.querySelector(`.message[data-msg-id="${targetId}"]`);
         if (targetEl) {
             targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            targetEl.classList.add('message-highlight');
+            setTimeout(() => targetEl.classList.remove('message-highlight'), 2000);
         } else {
-            // Message might be above the virtual scroll window — load it
-            const msgIdx = State.messages.findIndex(m => m.id === targetId);
-            if (msgIdx >= 0 && msgIdx < VIRTUAL_SCROLL.renderedStart) {
-                // Force render from that message
-                const container = document.getElementById('messages');
-                const renderMsgs = State.messages.filter(m => m.role !== 'system');
-                const scrollParent = document.getElementById('messages-container');
-                // Load all messages from target to what's rendered
-                for (let i = msgIdx; i < VIRTUAL_SCROLL.renderedStart; i++) {
-                    const el = createMessageElement(renderMsgs[i]);
-                    const sentinel = document.getElementById('scroll-sentinel');
-                    container.insertBefore(el, sentinel ? sentinel.nextSibling : container.firstChild);
-                }
-                VIRTUAL_SCROLL.renderedStart = msgIdx;
-                const sentinel = document.getElementById('scroll-sentinel');
-                if (sentinel) sentinel.textContent = `↑ ${msgIdx} older messages`;
-                if (msgIdx <= 0 && sentinel) sentinel.remove();
-                // Now scroll to it
-                const el = document.querySelector(`.message[data-msg-id="${targetId}"]`);
-                if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            } else {
-                scrollToBottom();
-            }
+            scrollToBottom();
         }
     } catch (err) {
         showToast('Failed to switch branch', 'error');

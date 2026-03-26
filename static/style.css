@@ -1384,6 +1384,40 @@ body::after {
     padding: 12px 24px;
     padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
 }
+/* Jump to latest button */
+#jump-to-latest {
+    position: absolute;
+    bottom: 80px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    color: var(--text-secondary);
+    padding: 6px 16px;
+    font-size: 12px;
+    cursor: pointer;
+    z-index: 10;
+    transition: var(--transition);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+#jump-to-latest:hover {
+    color: var(--cyan);
+    border-color: var(--cyan);
+}
+#jump-to-latest.hidden { display: none; }
+
+/* Highlighted message (after clicking from tree) */
+.message-highlight {
+    animation: highlightPulse 2s ease;
+}
+@keyframes highlightPulse {
+    0%, 100% { box-shadow: none; }
+    25% { box-shadow: 0 0 15px rgba(0, 255, 255, 0.3); }
+    50% { box-shadow: 0 0 20px rgba(0, 255, 255, 0.4); }
+    75% { box-shadow: 0 0 15px rgba(0, 255, 255, 0.3); }
+}
+
 #input-area.drag-over {
     border-color: var(--cyan) !important;
     border-image: none !important;

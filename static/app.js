@@ -1653,5 +1653,29 @@ function scrollToBottom() {
     requestAnimationFrame(() => { container.scrollTop = container.scrollHeight; });
 }
 
+// "Jump to latest" button — appears when scrolled up
+(function initJumpToLatest() {
+    document.addEventListener('DOMContentLoaded', () => {
+        const container = document.getElementById('messages-container');
+        if (!container) return;
+
+        const btn = document.createElement('button');
+        btn.id = 'jump-to-latest';
+        btn.className = 'hidden';
+        btn.textContent = '↓ Latest';
+        btn.addEventListener('click', scrollToBottom);
+        container.parentElement.appendChild(btn);
+
+        container.addEventListener('scroll', () => {
+            const distFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+            if (distFromBottom > 200) {
+                btn.classList.remove('hidden');
+            } else {
+                btn.classList.add('hidden');
+            }
+        });
+    });
+})();
+
 // ── Start ──
 document.addEventListener('DOMContentLoaded', init);
