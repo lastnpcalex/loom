@@ -2496,7 +2496,23 @@ pre.tool-output {
 /* ── Responsive ── */
 @media (max-width: 768px) {
     #messages { padding: 0 12px; }
-    #input-area { padding: 8px 12px; }
+    #input-area {
+        padding: 6px 10px;
+        padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+    }
+    #cc-inline-controls {
+        margin-bottom: 4px;
+    }
+    #cc-inline-controls select {
+        font-size: 11px;
+        padding: 3px 6px;
+    }
+    #input-row {
+        gap: 6px;
+    }
+    #user-input {
+        font-size: 15px;
+    }
     .tree-pill { max-width: 200px; }
 
     /* Move token count below header on mobile */
