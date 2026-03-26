@@ -183,6 +183,22 @@ function updateBreadcrumbs() {
 }
 
 // ── Toast Notifications ──
+// ── Loading Overlay ──
+function showLoading() {
+    let overlay = document.getElementById('loading-overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'loading-overlay';
+        overlay.innerHTML = '<div class="loading-spinner"></div>';
+        document.body.appendChild(overlay);
+    }
+    overlay.classList.remove('hidden');
+}
+function hideLoading() {
+    const overlay = document.getElementById('loading-overlay');
+    if (overlay) overlay.classList.add('hidden');
+}
+
 function showToast(message, type = 'info') {
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
@@ -221,7 +237,7 @@ async function init() {
     renderHomeLore();
     setupEventListeners();
     initInlineCCControls();
-    initPasteHandler();
+    // Paste handler registered in setupEventListeners
     // Restore last conversation or show home
     const lastConv = localStorage.getItem('loom-last-conv');
     if (lastConv && State.conversations.find(c => c.id === parseInt(lastConv))) {
@@ -496,6 +512,7 @@ function showFolderDropdown(anchorBtn, conv) {
 
 // ── Load Conversation → Tree View ──
 async function loadConversation(convId) {
+    showLoading();
     State.currentConvId = convId;
     localStorage.setItem('loom-last-conv', convId);
 
@@ -545,6 +562,7 @@ async function loadConversation(convId) {
     } else {
         switchView('chat');
     }
+    hideLoading();
 }
 
 // ── Create Conversation ──
@@ -754,11 +772,20 @@ function updateInlineCCControls(conv) {
         modelSel.value = conv.cc_model || 'sonnet';
         effortSel.value = conv.cc_effort || 'high';
         if (permSel) permSel.value = conv.cc_permission_mode || 'default';
-        // Hide model/effort for local mode (model is set at creation)
         modelSel.style.display = conv.mode === 'local' ? 'none' : '';
         effortSel.style.display = conv.mode === 'local' ? 'none' : '';
     } else {
         controls.classList.add('hidden');
+    }
+
+    // Update file input accept types based on mode
+    const fileInput = document.getElementById('file-input');
+    if (fileInput && conv) {
+        if (conv.mode === 'weave') {
+            fileInput.accept = 'image/*,.md,.txt';
+        } else {
+            fileInput.accept = 'image/*,.md,.txt,.pdf,.json,.csv,.py,.js,.ts,.html,.css,.yaml,.yml,.xml,.sh,.bat,.ps1,.docx,.xlsx';
+        }
     }
 }
 
@@ -1147,22 +1174,7 @@ async function attachImage(file) {
     }
 }
 
-function initPasteHandler() {
-    const input = document.getElementById('user-input');
-    if (!input) return;
-    input.addEventListener('paste', async (e) => {
-        const items = e.clipboardData?.items;
-        if (!items) return;
-        for (const item of items) {
-            if (item.type.startsWith('image/')) {
-                e.preventDefault();
-                const file = item.getAsFile();
-                if (file) await attachImage(file);
-                return;
-            }
-        }
-    });
-}
+// Paste handler is registered in setupEventListeners via handleImagePaste
 
 async function handleImageSelect(e) {
     const file = e.target.files[0];
@@ -1174,16 +1186,16 @@ async function handleImageSelect(e) {
 async function handleImagePaste(e) {
     const items = e.clipboardData && e.clipboardData.items;
     if (!items) return;
-    const imageFiles = [];
+    const files = [];
     for (const item of items) {
         if (item.type.startsWith('image/')) {
             const file = item.getAsFile();
-            if (file) imageFiles.push(file);
+            if (file) files.push(file);
         }
     }
-    if (imageFiles.length > 0) {
+    if (files.length > 0) {
         e.preventDefault();
-        for (const file of imageFiles) {
+        for (const file of files) {
             await attachImage(file);
         }
     }

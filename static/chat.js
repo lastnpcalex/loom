@@ -958,6 +958,7 @@ function loadBranchIndicator(msgId, slot) {
 
 async function switchToBranch(leafId, scrollToMsgId) {
     try {
+        if (typeof showLoading === 'function') showLoading();
         // Walk to deepest leaf from the clicked node
         const branch = await API.post(`/api/conversations/${State.currentConvId}/switch-branch/${leafId}`);
         State.messages = branch;
@@ -996,6 +997,8 @@ async function switchToBranch(leafId, scrollToMsgId) {
         }
     } catch (err) {
         showToast('Failed to switch branch', 'error');
+    } finally {
+        if (typeof hideLoading === 'function') hideLoading();
     }
 }
 
