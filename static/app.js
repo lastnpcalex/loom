@@ -188,8 +188,11 @@ function updateBreadcrumbs() {
         const hidden = crumbs.slice(1, crumbs.length - 2);
 
         html = `<button class="breadcrumb-btn" data-msg-id="${first.msgId}" title="${first.title}">${escapeHtml(first.label)}</button>`;
+        // Ellipsis replaces the separator — clicking it reveals hidden crumbs
+        html += '<span class="breadcrumb-ellipsis-wrap">';
         html += '<span class="breadcrumb-sep">›</span>';
         html += `<button class="breadcrumb-ellipsis" title="Show ${hidden.length} more">…</button>`;
+        html += '</span>';
         html += '<span class="breadcrumb-hidden" style="display:none;">';
         for (const c of hidden) {
             html += `<span class="breadcrumb-sep">›</span><button class="breadcrumb-btn" data-msg-id="${c.msgId}" title="${c.title}">${escapeHtml(c.label)}</button>`;
@@ -216,9 +219,10 @@ function updateBreadcrumbs() {
     if (ellipsis) {
         ellipsis.addEventListener('click', () => {
             const hidden = trail.querySelector('.breadcrumb-hidden');
-            if (hidden) {
-                hidden.style.display = hidden.style.display === 'none' ? 'contents' : 'none';
-                ellipsis.style.display = hidden.style.display === 'none' ? '' : 'none';
+            const wrap = trail.querySelector('.breadcrumb-ellipsis-wrap');
+            if (hidden && wrap) {
+                hidden.style.display = 'contents';
+                wrap.style.display = 'none';
             }
         });
     }
