@@ -415,34 +415,8 @@ function createNode(node, branchNames) {
     } else {
         el.innerHTML = `
             ${headerHtml}
-            <div class="tree-node-body">
-                <div class="tree-node-summary">${escapeHtml(summary)}</div>
-                <div class="tree-node-expanded hidden">${escapeHtml(preview)}</div>
-                <button class="tree-node-expand-btn" title="Expand / Collapse">&#9662;</button>
-            </div>
+            <div class="tree-node-summary">${escapeHtml(summary)}</div>
         `;
-    }
-
-    // Expand button: toggle expand/collapse
-    const expandBtn = el.querySelector('.tree-node-expand-btn');
-    if (expandBtn) {
-        expandBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const expanded = el.querySelector('.tree-node-expanded');
-            const summaryEl = el.querySelector('.tree-node-summary');
-            const isExpanded = !expanded.classList.contains('hidden');
-            if (isExpanded) {
-                expanded.classList.add('hidden');
-                summaryEl.classList.remove('hidden');
-                el.classList.remove('expanded');
-                expandBtn.innerHTML = '&#9662;'; // ▾ down arrow
-            } else {
-                summaryEl.classList.add('hidden');
-                expanded.classList.remove('hidden');
-                el.classList.add('expanded');
-                expandBtn.innerHTML = '&#9652;'; // ▴ up arrow
-            }
-        });
     }
 
     // Delete button
@@ -475,7 +449,6 @@ function createNode(node, branchNames) {
     // Click card body: navigate to this branch in chat
     el.addEventListener('click', async (e) => {
         if (TREE.isPanning || TREE._touchMoved) return;
-        if (e.target.closest('.tree-node-expand-btn')) return;
         if (e.target.closest('.tree-node-delete-btn')) return;
         if (e.target.closest('.tree-node-bookmark-btn')) return;
         e.stopPropagation();
