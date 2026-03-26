@@ -100,7 +100,10 @@ function switchView(view) {
         contextInfo.classList.remove('hidden');
         // Refresh messages when switching back to chat (picks up responses
         // that completed while on tree/home view)
-        if (State.currentConvId && !State.isStreaming) {
+        // Skip if we just did switchToBranch (data is already fresh)
+        if (State._skipLoadOnChat) {
+            State._skipLoadOnChat = false;
+        } else if (State.currentConvId && !State.isStreaming) {
             loadMessages(State.currentConvId);
         }
     }

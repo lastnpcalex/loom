@@ -467,6 +467,7 @@ function createNode(node, branchNames) {
         if (e.target.closest('.tree-node-delete-btn')) return;
         e.stopPropagation();
         await switchToBranch(data.id, data.id);
+        State._skipLoadOnChat = true; // prevent switchView('chat') from re-loading
         switchView('chat');
     });
 
