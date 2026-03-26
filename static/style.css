@@ -1387,23 +1387,23 @@ body::after {
 /* Jump to latest button */
 #jump-to-latest {
     position: absolute;
-    bottom: 80px;
-    left: 50%;
-    transform: translateX(-50%);
-    background: var(--surface);
-    border: 1px solid var(--border);
+    bottom: 120px;
+    right: 24px;
+    background: rgba(10, 10, 25, 0.95);
+    border: 1px solid var(--cyan);
     border-radius: 20px;
-    color: var(--text-secondary);
-    padding: 6px 16px;
-    font-size: 12px;
+    color: var(--cyan);
+    padding: 8px 18px;
+    font-size: 13px;
+    font-weight: 500;
     cursor: pointer;
     z-index: 10;
     transition: var(--transition);
-    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    box-shadow: 0 2px 12px rgba(0, 255, 255, 0.2);
 }
 #jump-to-latest:hover {
-    color: var(--cyan);
-    border-color: var(--cyan);
+    background: rgba(0, 255, 255, 0.1);
+    box-shadow: 0 2px 16px rgba(0, 255, 255, 0.35);
 }
 #jump-to-latest.hidden { display: none; }
 
