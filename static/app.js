@@ -437,7 +437,6 @@ function buildConvItem(conv) {
             <span class="conv-meta">${escapeHtml(charName)}</span>
         </div>
         <div class="conv-actions">
-            <button class="char-action-btn conv-folder-btn" title="Move to folder"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
             <button class="char-action-btn conv-edit-btn" title="Rename">✎</button>
             <button class="char-action-btn conv-export-btn" title="Export">↓</button>
             <button class="char-action-btn char-delete-btn conv-delete-btn" title="Delete">✕</button>
@@ -464,11 +463,6 @@ function buildConvItem(conv) {
     div.querySelector('.conv-title-text').addEventListener('click', () => loadConversation(conv.id));
     div.querySelector('.conv-meta').addEventListener('click', () => loadConversation(conv.id));
 
-    // Folder move button
-    div.querySelector('.conv-folder-btn').addEventListener('click', (e) => {
-        e.stopPropagation();
-        showFolderDropdown(e.currentTarget, conv);
-    });
 
     // Rename
     div.querySelector('.conv-edit-btn').addEventListener('click', (e) => {
