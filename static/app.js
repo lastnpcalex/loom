@@ -1106,12 +1106,19 @@ function renderStateCards(targetListId) {
 
     // Wire delete buttons
     list.querySelectorAll('.state-card-delete').forEach(btn => {
-        btn.addEventListener('click', async () => {
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
             const cardId = parseInt(btn.dataset.cardId);
-            await API.del(`/api/state/${cardId}`);
-            State.stateCards = State.stateCards.filter(c => c.id !== cardId);
-            renderStateCards();
-            showToast('Card deleted');
+            if (!cardId || isNaN(cardId)) { console.warn('[State] No card ID on delete button'); return; }
+            try {
+                await API.del(`/api/state/${cardId}`);
+                State.stateCards = State.stateCards.filter(c => c.id !== cardId);
+                renderStateCards();
+                showToast('Card deleted');
+            } catch (err) {
+                console.error('[State] Delete failed:', err);
+                showToast('Failed to delete card', 'error');
+            }
         });
     });
 }
@@ -1323,11 +1330,18 @@ async function renderCharacterStateCards(charId) {
 
     // Wire delete
     list.querySelectorAll('.state-card-delete').forEach(btn => {
-        btn.addEventListener('click', async () => {
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
             const cardId = parseInt(btn.dataset.cardId);
-            await API.del(`/api/character-state/${cardId}`);
-            await renderCharacterStateCards(charId);
-            showToast('Card deleted');
+            if (!cardId || isNaN(cardId)) { console.warn('[State] No card ID on delete button'); return; }
+            try {
+                await API.del(`/api/character-state/${cardId}`);
+                await renderCharacterStateCards(charId);
+                showToast('Card deleted');
+            } catch (err) {
+                console.error('[State] Delete failed:', err);
+                showToast('Failed to delete card', 'error');
+            }
         });
     });
 }
