@@ -774,7 +774,7 @@ body::after {
 /* ── State Cards Panel ── */
 #state-panel {
     position: fixed;
-    bottom: 80px;
+    bottom: 100px;
     left: 12px;
     right: 12px;
     z-index: 200;
@@ -1116,9 +1116,9 @@ body::after {
     border: none;
     color: var(--text-secondary);
     cursor: pointer;
-    font-size: 10px;
+    font-size: 9px;
     font-family: 'Orbitron', sans-serif;
-    letter-spacing: 1px;
+    letter-spacing: 0.8px;
     text-transform: uppercase;
     padding: 3px 6px;
     transition: var(--transition);
