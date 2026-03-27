@@ -774,16 +774,17 @@ body::after {
 /* ── State Cards Panel ── */
 #state-panel {
     position: fixed;
-    top: 52px;
-    right: 12px;
+    bottom: 0;
+    left: 0;
+    right: 0;
     z-index: 200;
-    width: 340px;
-    max-height: 80vh;
+    max-height: 50vh;
     overflow-y: auto;
-    background: rgba(5, 5, 15, 0.92);
+    background: rgba(5, 5, 15, 0.95);
     backdrop-filter: var(--glass);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
+    border-top: 1px solid var(--cyan);
+    border-radius: var(--radius) var(--radius) 0 0;
+    box-shadow: 0 -4px 24px rgba(0, 255, 255, 0.06), 0 -2px 8px rgba(0, 0, 0, 0.5);
     padding: 12px;
     box-shadow: 0 0 24px rgba(0, 255, 255, 0.06), 0 8px 32px rgba(0, 0, 0, 0.5);
 }
@@ -1112,13 +1113,14 @@ body::after {
 /* Branch state button */
 .branch-state-btn {
     background: none;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
+    border: none;
     color: var(--text-secondary);
     cursor: pointer;
-    font-size: 11px;
-    font-family: 'Space Grotesk', sans-serif;
-    padding: 3px 10px;
+    font-size: 10px;
+    font-family: 'Orbitron', sans-serif;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    padding: 3px 6px;
     transition: var(--transition);
     display: flex;
     align-items: center;
@@ -1130,7 +1132,7 @@ body::after {
     box-shadow: 0 0 8px rgba(0, 255, 255, 0.15);
 }
 .delta-glow {
-    font-size: 14px;
+    font-size: 12px;
     color: var(--cyan);
     filter: drop-shadow(0 0 4px rgba(0, 255, 255, 0.6));
     text-shadow: 0 0 8px rgba(0, 255, 255, 0.5);
@@ -3125,9 +3127,6 @@ pre.tool-output {
         max-height: 60vh;
     }
     #state-panel {
-        right: 8px;
-        left: 8px;
-        width: auto;
-        max-height: 60vh;
+        max-height: 50vh;
     }
 }
