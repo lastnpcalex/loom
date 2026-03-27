@@ -65,6 +65,11 @@ start_loom.bat
 # Screenshots
 Screenshot*.png
 
+# Character creator workspace (generated content)
+character-creator/workspace/*
+!character-creator/workspace/.gitkeep
+character-creator/.claude/
+
 # Utility scripts (machine-specific)
 install_task.ps1
 restart_server.ps1
