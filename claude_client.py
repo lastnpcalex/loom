@@ -225,7 +225,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # Build the Claude Code arguments (common to both launch methods)
     cc_args = ["-p", prompt,
                "--output-format", "stream-json",
-               "--verbose"]
+               "--verbose",
+               "--disallowedTools", "AskUserQuestion"]
 
     if not use_ollama:
         # Direct claude launch — model and effort are CC flags
