@@ -383,6 +383,11 @@ async def api_delete_conversation(conv_id: int):
 
 # ── Bookmarks ──
 
+@app.get("/api/bookmarks")
+async def api_get_all_bookmarks():
+    return await db.get_all_bookmarks()
+
+
 @app.get("/api/conversations/{conv_id}/bookmarks")
 async def api_get_bookmarks(conv_id: int):
     return await db.get_bookmarks(conv_id)

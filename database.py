@@ -851,6 +851,18 @@ async def get_bookmarks(conv_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def get_all_bookmarks() -> list[dict]:
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        """SELECT b.*, c.title as conversation_title, c.mode as conversation_mode
+           FROM bookmarks b
+           JOIN conversations c ON b.conversation_id = c.id
+           ORDER BY b.created_at DESC"""
+    )
+    await db.close()
+    return [dict(r) for r in rows]
+
+
 async def add_bookmark(conv_id: int, message_id: int,
                        branch_name: str = '', description: str = '') -> dict:
     db = await get_db()

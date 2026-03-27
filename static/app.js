@@ -78,9 +78,12 @@ function switchView(view) {
     const contextInfo = document.getElementById('context-info');
     const globalBmBtn = document.getElementById('btn-bookmarks-global');
     const globalBmPanel = document.getElementById('bookmarks-panel-global');
+    const statePanelTree = document.getElementById('btn-state-panel-tree');
+    const statePanel = document.getElementById('state-panel');
 
-    // Hide global bookmarks panel on view switch
+    // Hide panels on view switch
     globalBmPanel?.classList.add('hidden');
+    statePanel?.classList.add('hidden');
 
     if (view === 'home') {
         sep.classList.add('hidden');
@@ -89,6 +92,7 @@ function switchView(view) {
         treeBtn.classList.add('hidden');
         contextInfo.classList.add('hidden');
         globalBmBtn?.classList.add('hidden');
+        statePanelTree?.classList.add('hidden');
         // Close WebSocket when leaving a conversation
         if (State.ws) { State.ws.close(); State.ws = null; }
     } else if (view === 'tree') {
@@ -99,6 +103,10 @@ function switchView(view) {
         treeBtn.classList.add('hidden');
         contextInfo.classList.remove('hidden');
         globalBmBtn?.classList.remove('hidden');
+        // Show state panel button in tree only for OODA-enabled Weave
+        const isOodaWeave = State.currentConv?.mode === 'weave' && State.currentConv?.ooda_enabled;
+        if (isOodaWeave) statePanelTree?.classList.remove('hidden');
+        else statePanelTree?.classList.add('hidden');
     } else if (view === 'chat') {
         sep.classList.remove('hidden');
         title.classList.remove('hidden');
@@ -575,7 +583,7 @@ async function loadConversation(convId) {
     const [conv, treeData, bookmarks] = await Promise.all([
         API.get(`/api/conversations/${convId}`),
         API.get(`/api/conversations/${convId}/tree`),
-        API.get(`/api/conversations/${convId}/bookmarks`),
+        API.get('/api/bookmarks'),
     ]);
 
     State.currentConv = conv;
@@ -827,7 +835,7 @@ async function loadDirBrowser(path) {
 function updateInlineCCControls(conv) {
     const controls = document.getElementById('cc-inline-controls');
     const weaveControls = document.getElementById('weave-inline-controls');
-    const statePanelBtn = document.getElementById('btn-state-panel');
+    const statePanelChat = document.getElementById('btn-state-panel-chat');
     if (!controls) return;
 
     if (conv && (conv.mode === 'claude' || conv.mode === 'local')) {
@@ -841,22 +849,21 @@ function updateInlineCCControls(conv) {
         if (permSel) permSel.value = conv.cc_permission_mode || 'default';
         modelSel.style.display = conv.mode === 'local' ? 'none' : '';
         effortSel.style.display = conv.mode === 'local' ? 'none' : '';
-        statePanelBtn?.classList.add('hidden');
+        statePanelChat?.classList.add('hidden');
     } else if (conv && conv.mode === 'weave') {
         controls.classList.add('hidden');
         weaveControls?.classList.remove('hidden');
         const oodaToggle = document.getElementById('ooda-toggle-inline');
         if (oodaToggle) oodaToggle.checked = !!conv.ooda_enabled;
-        // Show state panel button only when OODA is enabled
         if (conv.ooda_enabled) {
-            statePanelBtn?.classList.remove('hidden');
+            statePanelChat?.classList.remove('hidden');
         } else {
-            statePanelBtn?.classList.add('hidden');
+            statePanelChat?.classList.add('hidden');
         }
     } else {
         controls.classList.add('hidden');
         weaveControls?.classList.add('hidden');
-        statePanelBtn?.classList.add('hidden');
+        statePanelChat?.classList.add('hidden');
     }
 
     // Update file input accept types based on mode
@@ -916,16 +923,18 @@ function initInlineCCControls() {
         });
     }
 
-    // State panel toggle
-    const statePanelBtn = document.getElementById('btn-state-panel');
+    // State panel toggle — both tree and chat buttons open the same panel
     const statePanel = document.getElementById('state-panel');
-    if (statePanelBtn && statePanel) {
-        statePanelBtn.addEventListener('click', () => {
-            statePanel.classList.toggle('hidden');
-            if (!statePanel.classList.contains('hidden')) {
-                renderStateCards();
-            }
-        });
+    for (const btnId of ['btn-state-panel-tree', 'btn-state-panel-chat']) {
+        const btn = document.getElementById(btnId);
+        if (btn && statePanel) {
+            btn.addEventListener('click', () => {
+                statePanel.classList.toggle('hidden');
+                if (!statePanel.classList.contains('hidden')) {
+                    renderStateCards();
+                }
+            });
+        }
     }
 
     // State panel buttons
@@ -961,6 +970,27 @@ function initInlineCCControls() {
     }
 }
 
+const STATE_FIELD_TOOLTIPS = {
+    character_state: {
+        personality: 'Core traits that drive behavior. Be specific: "sardonic and distrustful" > "complex personality"',
+        appearance: 'Physical details for sensory writing. Include clothing, posture, distinctive features.',
+        current_mood: 'Emotional baseline — updated by the model each turn. Edit to steer direction.',
+        goals: 'Active motivations. Drives proactive behavior in scenes.',
+        relationships: 'How this character feels about others. Key driver of dialogue tone.',
+        physical_situation: 'Where and how the character is positioned. Grounds the prose physically.',
+    },
+    scene_state: {
+        location: 'Where the scene takes place. Be sensory — sounds, smells, lighting.',
+        time_of_day: 'Affects atmosphere, lighting, and character energy.',
+        atmosphere: 'Emotional texture of the scene. Model updates this as tension shifts.',
+        present_characters: 'Who is here. The model won\'t write absent characters if maintained.',
+        recent_events: 'What just happened. Prevents repetition, keeps continuity tight.',
+    },
+    lore: {
+        content: 'Background world info. Referenced when relevant to the current scene.',
+    },
+};
+
 function renderStateCards() {
     const list = document.getElementById('state-cards-list');
     if (!list) return;
@@ -973,12 +1003,13 @@ function renderStateCards() {
     list.innerHTML = State.stateCards.map(card => {
         const data = typeof card.data === 'string' ? JSON.parse(card.data) : card.data;
         const schemaClass = card.schema_id.replace('_', '-');
-        const fields = Object.entries(data).map(([k, v]) =>
-            `<div class="state-field" data-card-id="${card.id}" data-field="${escapeHtml(k)}">
-                <span class="state-field-key">${escapeHtml(k)}</span>
+        const fields = Object.entries(data).map(([k, v]) => {
+            const tip = STATE_FIELD_TOOLTIPS[card.schema_id]?.[k] || '';
+            return `<div class="state-field" data-card-id="${card.id}" data-field="${escapeHtml(k)}">
+                <span class="state-field-key"${tip ? ` title="${escapeHtml(tip)}"` : ''}>${escapeHtml(k)}</span>
                 <span class="state-field-value" contenteditable="true" data-original="${escapeHtml(v || '')}">${escapeHtml(v || '—')}</span>
-            </div>`
-        ).join('');
+            </div>`;
+        }).join('');
 
         return `<div class="state-card ${schemaClass}" data-card-id="${card.id}">
             <div class="state-card-header">

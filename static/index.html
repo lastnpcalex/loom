@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=62">
+    <link rel="stylesheet" href="/static/style.css?v=63">
 </head>
 <body>
     <div id="blackhole-container"></div>
@@ -27,7 +27,6 @@
                     <span id="token-count" title="Estimated tokens">—</span>
                 </div>
                 <button id="btn-bookmarks-global" title="Bookmarks" class="hidden">⬡</button>
-                <button id="btn-state-panel" title="State Cards" class="hidden">◈</button>
                 <button id="btn-settings" title="Settings">⚙</button>
             </div>
         </header>
@@ -118,6 +117,7 @@
             <div id="tree-toolbar">
                 <button id="tree-layout-toggle" title="Toggle layout">⇄</button>
                 <button id="tree-center-btn" title="Fit all nodes in view">⌖</button>
+                <button id="btn-state-panel-tree" title="State Cards" class="hidden">◈</button>
             </div>
             <div id="tree-canvas">
                 <div id="tree-nodes"></div>
@@ -143,6 +143,7 @@
                         <input type="checkbox" id="ooda-toggle-inline">
                         <span class="ooda-toggle-label">OODA</span>
                     </label>
+                    <button id="btn-state-panel-chat" title="State Cards" class="hidden">◈</button>
                 </div>
                 <div id="cc-inline-controls" class="hidden">
                     <select id="cc-model-inline" title="Model">
@@ -407,8 +408,8 @@ assistant: *Another example response*"></textarea>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=13"></script>
-    <script src="/static/app.js?v=43"></script>
-    <script src="/static/chat.js?v=66"></script>
-    <script src="/static/tree.js?v=25"></script>
+    <script src="/static/app.js?v=44"></script>
+    <script src="/static/chat.js?v=67"></script>
+    <script src="/static/tree.js?v=26"></script>
 </body>
 </html>

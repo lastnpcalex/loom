@@ -1400,6 +1400,8 @@ async function toggleChatBookmark(msgId) {
             branch_name: branchName,
             description: '',
         });
+        bm.conversation_title = State.currentConv?.title;
+        bm.conversation_mode = State.currentConv?.mode;
         State.bookmarks.push(bm);
         showToast('Bookmarked');
     }

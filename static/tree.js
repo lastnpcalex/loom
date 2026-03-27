@@ -226,8 +226,7 @@ function centerLoom() {
 }
 
 function renderBookmarksPanel(targetListId) {
-    // Render into all bookmark lists (tree + global) or a specific one
-    const listIds = targetListId ? [targetListId] : ['bookmarks-list', 'bookmarks-list-global'];
+    const listIds = targetListId ? [targetListId] : ['bookmarks-list-global'];
     for (const listId of listIds) {
         const list = document.getElementById(listId);
         if (!list) continue;
@@ -237,45 +236,56 @@ function renderBookmarksPanel(targetListId) {
             continue;
         }
 
-        list.innerHTML = State.bookmarks.map(b => `
-            <div class="bookmark-item" data-bookmark-id="${b.id}" data-msg-id="${b.message_id}">
-                <div class="bookmark-item-header">
-                    <span class="bookmark-icon">⏣</span>
-                    <span class="bookmark-branch">${escapeHtml(b.branch_name || '?')}</span>
-                    <button class="bookmark-edit-btn" title="Edit description">&#x270E;</button>
-                    <button class="bookmark-delete-btn" title="Remove bookmark">&#x2715;</button>
-                </div>
-                ${b.description ? `<div class="bookmark-desc">${escapeHtml(b.description)}</div>` : ''}
-            </div>
-        `).join('');
+        // Group by conversation
+        const grouped = {};
+        for (const b of State.bookmarks) {
+            const key = b.conversation_id;
+            if (!grouped[key]) grouped[key] = { title: b.conversation_title || 'Untitled', mode: b.conversation_mode || 'weave', items: [] };
+            grouped[key].items.push(b);
+        }
 
+        let html = '';
+        for (const [convId, group] of Object.entries(grouped)) {
+            html += `<div class="bookmark-conv-group">
+                <div class="bookmark-conv-header">
+                    <span class="bookmark-conv-name">${escapeHtml(group.title)}</span>
+                    <span class="bookmark-mode-badge ${group.mode}">${group.mode}</span>
+                </div>`;
+            for (const b of group.items) {
+                html += `<div class="bookmark-item" data-bookmark-id="${b.id}" data-msg-id="${b.message_id}" data-conv-id="${b.conversation_id}">
+                    <div class="bookmark-item-header">
+                        <span class="bookmark-icon">⏣</span>
+                        <span class="bookmark-branch">${escapeHtml(b.branch_name || '?')}</span>
+                        <button class="bookmark-delete-btn" title="Remove">&#x2715;</button>
+                    </div>
+                    <div class="bookmark-desc">
+                        <span class="bookmark-desc-value" contenteditable="true"
+                              data-bookmark-id="${b.id}"
+                              data-original="${escapeHtml(b.description || '')}">${escapeHtml(b.description || 'Add description...')}</span>
+                    </div>
+                </div>`;
+            }
+            html += '</div>';
+        }
+        list.innerHTML = html;
+
+        // Wire navigation
         for (const item of list.querySelectorAll('.bookmark-item')) {
             item.addEventListener('click', async (e) => {
-                if (e.target.closest('.bookmark-edit-btn') || e.target.closest('.bookmark-delete-btn')) return;
+                if (e.target.closest('.bookmark-delete-btn') || e.target.closest('.bookmark-desc-value')) return;
                 const msgId = parseInt(item.dataset.msgId);
+                const convId = parseInt(item.dataset.convId);
+                // Navigate cross-conversation if needed
+                if (convId !== State.currentConvId) {
+                    await loadConversation(convId);
+                }
                 await switchToBranch(msgId, msgId);
                 State._skipLoadOnChat = true;
                 switchView('chat');
-                // Close panels
-                document.getElementById('bookmarks-panel')?.classList.add('hidden');
                 document.getElementById('bookmarks-panel-global')?.classList.add('hidden');
             });
 
-            const editBtn = item.querySelector('.bookmark-edit-btn');
-            if (editBtn) {
-                editBtn.addEventListener('click', async (e) => {
-                    e.stopPropagation();
-                    const bmId = parseInt(item.dataset.bookmarkId);
-                    const bm = State.bookmarks.find(b => b.id === bmId);
-                    const desc = prompt('Bookmark description:', bm?.description || '');
-                    if (desc !== null) {
-                        await API.put(`/api/bookmarks/${bmId}`, { description: desc });
-                        bm.description = desc;
-                        renderBookmarksPanel();
-                    }
-                });
-            }
-
+            // Delete
             const delBtn = item.querySelector('.bookmark-delete-btn');
             if (delBtn) {
                 delBtn.addEventListener('click', async (e) => {
@@ -288,6 +298,28 @@ function renderBookmarksPanel(targetListId) {
                     showToast('Bookmark removed');
                 });
             }
+        }
+
+        // Wire inline description editing
+        for (const el of list.querySelectorAll('.bookmark-desc-value')) {
+            el.addEventListener('focus', () => {
+                if (el.textContent === 'Add description...') el.textContent = '';
+            });
+            el.addEventListener('blur', async () => {
+                const newVal = el.textContent.trim();
+                const original = el.dataset.original;
+                if (newVal === original || (!newVal && !original)) {
+                    if (!newVal) el.textContent = 'Add description...';
+                    return;
+                }
+                const bmId = parseInt(el.dataset.bookmarkId);
+                await API.put(`/api/bookmarks/${bmId}`, { description: newVal });
+                const bm = State.bookmarks.find(b => b.id === bmId);
+                if (bm) bm.description = newVal;
+                el.dataset.original = newVal;
+                if (!newVal) el.textContent = 'Add description...';
+            });
+            el.addEventListener('click', (e) => e.stopPropagation());
         }
     }
 }
@@ -571,6 +603,8 @@ function createNode(node, branchNames) {
                     branch_name: branchName,
                     description: '',
                 });
+                bm.conversation_title = State.currentConv?.title;
+                bm.conversation_mode = State.currentConv?.mode;
                 State.bookmarks.push(bm);
                 showToast('Bookmarked');
             }

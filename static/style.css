@@ -707,8 +707,50 @@ body::after {
     color: var(--text-muted);
     margin-top: 4px;
     padding-left: 20px;
-    font-style: italic;
 }
+.bookmark-desc-value {
+    outline: none;
+    border-bottom: 1px dashed transparent;
+    transition: var(--transition);
+    font-style: italic;
+    display: inline-block;
+    min-width: 60px;
+}
+.bookmark-desc-value:focus {
+    border-bottom-color: var(--cyan);
+    color: var(--text-primary);
+    font-style: normal;
+}
+.bookmark-desc-value[data-original=""] {
+    color: var(--text-muted);
+    opacity: 0.5;
+}
+.bookmark-conv-group { margin-bottom: 10px; }
+.bookmark-conv-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 4px;
+}
+.bookmark-conv-name {
+    font-size: 12px;
+    color: var(--text-primary);
+    font-weight: 500;
+    flex: 1;
+}
+.bookmark-mode-badge {
+    font-size: 9px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    font-family: 'Orbitron', sans-serif;
+    letter-spacing: 0.5px;
+}
+.bookmark-mode-badge.weave { background: rgba(0, 255, 255, 0.15); color: var(--cyan); }
+.bookmark-mode-badge.local { background: rgba(255, 170, 0, 0.15); color: #fa0; }
+.bookmark-mode-badge.claude { background: rgba(170, 100, 255, 0.15); color: #a64dff; }
 .bookmarks-empty {
     color: var(--text-muted);
     font-size: 12px;
@@ -769,7 +811,8 @@ body::after {
     color: var(--cyan);
     border-color: var(--cyan);
 }
-#btn-state-panel {
+#btn-state-panel-tree,
+#btn-state-panel-chat {
     background: none;
     border: none;
     color: var(--text-secondary);
@@ -778,7 +821,8 @@ body::after {
     transition: var(--transition);
     padding: 4px;
 }
-#btn-state-panel:hover {
+#btn-state-panel-tree:hover,
+#btn-state-panel-chat:hover {
     color: var(--cyan);
     filter: drop-shadow(0 0 6px rgba(0, 255, 255, 0.4));
 }
@@ -860,6 +904,10 @@ body::after {
 .state-field-updated {
     background: rgba(0, 255, 255, 0.12) !important;
     transition: background 1.5s;
+}
+.state-field-key[title] {
+    border-bottom: 1px dotted var(--text-muted);
+    cursor: help;
 }
 .state-empty {
     color: var(--text-muted);
