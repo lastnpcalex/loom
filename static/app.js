@@ -1046,18 +1046,17 @@ const STATE_FIELD_TOOLTIPS = {
 function flashSaveIndicator(indicatorId) {
     const el = document.getElementById(indicatorId);
     if (!el) return;
-    el.textContent = 'saving';
+    el.textContent = 'saving...';
     el.className = 'save-indicator saving visible';
     el.style.display = 'inline';
     setTimeout(() => {
-        el.textContent = 'saved ✓';
+        el.textContent = '✓ saved';
         el.className = 'save-indicator visible';
-        el.style.display = 'inline';
         setTimeout(() => {
             el.className = 'save-indicator';
             el.style.display = '';
-        }, 2500);
-    }, 400);
+        }, 3000);
+    }, 500);
 }
 
 function renderStateCards(targetListId) {
