@@ -311,17 +311,16 @@ async function init() {
     setupEventListeners();
     initInlineCCControls();
     // Paste handler registered in setupEventListeners
-    // Restore last page: conversation + view, or home
+    // Restore last page: view first, then conversation if applicable
     const lastConv = localStorage.getItem('loom-last-conv');
     const lastView = localStorage.getItem('loom-last-view');
-    if (lastConv && State.conversations.find(c => c.id === parseInt(lastConv))) {
+    if (lastView === 'home' || !lastView) {
+        switchView('home');
+    } else if (lastConv && State.conversations.find(c => c.id === parseInt(lastConv))) {
         await loadConversation(parseInt(lastConv));
-        // If they were on a specific view within that conv, restore it
         if (lastView === 'tree' || lastView === 'chat') {
             switchView(lastView);
         }
-    } else if (lastView === 'home' || !lastConv) {
-        switchView('home');
     } else {
         switchView('home');
     }
@@ -1112,12 +1111,17 @@ function showStateCardPicker(convId, onDone, charId) {
     picker.innerHTML = options;
     document.body.appendChild(picker);
 
-    // Position near the button
-    const panel = document.getElementById(charId ? 'char-state-panel' : 'state-panel');
-    if (panel) {
-        const rect = panel.getBoundingClientRect();
-        picker.style.top = (rect.top + 40) + 'px';
+    // Position near the add button
+    const addBtn = charId
+        ? document.getElementById('btn-char-state-add')
+        : document.getElementById('btn-state-add');
+    if (addBtn) {
+        const rect = addBtn.getBoundingClientRect();
+        picker.style.top = (rect.bottom + 4) + 'px';
         picker.style.right = (window.innerWidth - rect.right) + 'px';
+    } else {
+        picker.style.top = '80px';
+        picker.style.right = '20px';
     }
 
     picker.addEventListener('click', async (e) => {
