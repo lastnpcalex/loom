@@ -729,13 +729,17 @@ function createMessageElement(msg, cost) {
         const allText = (msg.content || '') + ' ' + (typeof msg.content_blocks === 'string' ? msg.content_blocks : JSON.stringify(msg.content_blocks || ''));
         const imgRegex = /[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)/gi;
         const matches = allText.match(imgRegex) || [];
+        console.log('[IMG] Regex matches:', matches);
         // Dedup by filename — keep the shortest relative path
         // (absolute paths from content_blocks get blocked by path traversal)
         const byFilename = new Map();
         for (const m of matches) {
             const norm = m.replace(/\\/g, '/');
             // Skip absolute paths (start with / or X:/)
-            if (norm.startsWith('/') || /^[A-Za-z]:/.test(norm)) continue;
+            if (norm.startsWith('/') || /^[A-Za-z]:/.test(norm)) {
+                console.log('[IMG] Skipped absolute:', norm);
+                continue;
+            }
             const filename = norm.split('/').pop();
             const existing = byFilename.get(filename);
             if (!existing || norm.length > existing.length) {
@@ -749,11 +753,12 @@ function createMessageElement(msg, cost) {
                 name: filename,
             });
         }
+        console.log('[IMG] Final entries:', imgEntries);
         if (imgEntries.length > 0) {
             projectImgHtml = '<div class="detected-images">' +
                 imgEntries.map(e =>
                     `<figure class="detected-image-figure">` +
-                    `<img class="generated-image" src="${e.url}" alt="${escapeHtml(e.name)}" loading="lazy" onerror="this.closest('figure').remove()">` +
+                    `<img class="generated-image" src="${e.url}" alt="${escapeHtml(e.name)}" loading="lazy" onerror="console.warn('[IMG] Failed to load:', this.src, '— removing figure'); this.closest('figure').remove()">` +
                     `<figcaption>${escapeHtml(e.name)}</figcaption></figure>`
                 ).join('') + '</div>';
         }

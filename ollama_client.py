@@ -266,6 +266,7 @@ async def describe_image(image_path: str, model: str = None) -> str:
                 }
             ],
             "stream": False,
+            "think": False,  # Disable thinking to avoid vision output routing bug
             "options": {
                 "temperature": 0.3,
                 "num_predict": 100,
@@ -276,6 +277,9 @@ async def describe_image(image_path: str, model: str = None) -> str:
             resp = await client.post(f"{config.ollama_host}/api/chat", json=payload)
             resp.raise_for_status()
             data = resp.json()
-            return data.get("message", {}).get("content", "An image was shared.")
+            msg = data.get("message", {})
+            # Workaround: Qwen 3.5 vision routes output to thinking field
+            # instead of content (ollama/ollama#14716)
+            return msg.get("content") or msg.get("thinking") or "An image was shared."
     except Exception:
         return "An image was shared."

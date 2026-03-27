@@ -738,7 +738,7 @@ async def serve_project_file(conv_id: int, path: str = ""):
         # Allow text files too for previews
         media_type = "text/plain"
 
-    return FileResponse(target, media_type=media_type)
+    return FileResponse(target, media_type=media_type, filename=target.name)
 
 
 # ── Claude Code Permission Hook Endpoint ──
@@ -978,15 +978,29 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                     for ip in img_paths:
                         src = Path(ip).resolve()
                         dest = Path(project_dir) / src.name
+                        copied = False
                         try:
                             shutil.copy2(str(src), str(dest))
-                            file_notes.append(f"{src.name} (placed in working directory)")
+                            copied = True
                         except Exception:
-                            abs_path = str(src).replace("\\", "/")
-                            file_notes.append(f"{abs_path}")
+                            pass
+                        if use_ollama:
+                            # Local mode: describe image via Ollama's native multimodal API
+                            # since CC's Read tool dumps base64 text that local models can't parse
+                            desc = await describe_image(str(src))
+                            file_notes.append(f"{src.name} — {desc}")
+                        else:
+                            if copied:
+                                file_notes.append(f"{src.name} (placed in working directory)")
+                            else:
+                                file_notes.append(str(src).replace("\\", "/"))
                     if file_notes:
-                        files_str = ", ".join(file_notes)
-                        prompt += f"\n\n[User attached {len(file_notes)} file(s): {files_str}. Use the Read tool to view them.]"
+                        if use_ollama:
+                            files_str = "\n".join(f"  • {note}" for note in file_notes)
+                            prompt += f"\n\n[User attached {len(file_notes)} image(s):\n{files_str}\nThe image files are also in the working directory if you need to reference them by path.]"
+                        else:
+                            files_str = ", ".join(file_notes)
+                            prompt += f"\n\n[User attached {len(file_notes)} file(s): {files_str}. Use the Read tool to view them.]"
         else:
             # No session to resume — fall back to full history rebuild
             branch = await db.get_branch_to_root(parent_id) if parent_id else []
@@ -1009,15 +1023,27 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                     for ip in img_paths:
                         src = Path(ip).resolve()
                         dest = Path(project_dir) / src.name
+                        copied = False
                         try:
                             shutil.copy2(str(src), str(dest))
-                            file_notes.append(f"{src.name} (placed in working directory)")
+                            copied = True
                         except Exception:
-                            abs_path = str(src).replace("\\", "/")
-                            file_notes.append(f"{abs_path}")
+                            pass
+                        if use_ollama:
+                            desc = await describe_image(str(src))
+                            file_notes.append(f"{src.name} — {desc}")
+                        else:
+                            if copied:
+                                file_notes.append(f"{src.name} (placed in working directory)")
+                            else:
+                                file_notes.append(str(src).replace("\\", "/"))
                     if file_notes:
-                        files_str = ", ".join(file_notes)
-                        prompt += f"\n\n[User attached {len(file_notes)} file(s): {files_str}. Use the Read tool to view them.]"
+                        if use_ollama:
+                            files_str = "\n".join(f"  • {note}" for note in file_notes)
+                            prompt += f"\n\n[User attached {len(file_notes)} image(s):\n{files_str}\nThe image files are also in the working directory if you need to reference them by path.]"
+                        else:
+                            files_str = ", ".join(file_notes)
+                            prompt += f"\n\n[User attached {len(file_notes)} file(s): {files_str}. Use the Read tool to view them.]"
 
         # Create draft message in DB immediately so it survives navigation/restarts.
         # If parent already has an empty assistant child (stale draft), reuse it.
@@ -1202,15 +1228,27 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                     for ip in img_paths:
                         src = Path(ip).resolve()
                         dest = Path(project_dir) / src.name
+                        copied = False
                         try:
                             shutil.copy2(str(src), str(dest))
-                            file_notes.append(f"{src.name} (placed in working directory)")
+                            copied = True
                         except Exception:
-                            abs_path = str(src).replace("\\", "/")
-                            file_notes.append(f"{abs_path}")
+                            pass
+                        if use_ollama:
+                            desc = await describe_image(str(src))
+                            file_notes.append(f"{src.name} — {desc}")
+                        else:
+                            if copied:
+                                file_notes.append(f"{src.name} (placed in working directory)")
+                            else:
+                                file_notes.append(str(src).replace("\\", "/"))
                     if file_notes:
-                        files_str = ", ".join(file_notes)
-                        fallback_prompt += f"\n\n[User attached {len(file_notes)} file(s): {files_str}. Use the Read tool to view them.]"
+                        if use_ollama:
+                            files_str = "\n".join(f"  • {note}" for note in file_notes)
+                            fallback_prompt += f"\n\n[User attached {len(file_notes)} image(s):\n{files_str}\nThe image files are also in the working directory if you need to reference them by path.]"
+                        else:
+                            files_str = ", ".join(file_notes)
+                            fallback_prompt += f"\n\n[User attached {len(file_notes)} file(s): {files_str}. Use the Read tool to view them.]"
 
             proc, event_stream = await claude_client.run_claude(
                 fallback_prompt, project_dir, conv_id=conv_id, server_port=config.port,
