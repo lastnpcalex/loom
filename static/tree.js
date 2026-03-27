@@ -298,16 +298,11 @@ function initTreeToolbar() {
         centerBtn.addEventListener('click', centerLoom);
     }
 
-    const bookmarksBtn = document.getElementById('tree-bookmarks-btn');
-    const bookmarksPanel = document.getElementById('bookmarks-panel');
-    if (bookmarksBtn && bookmarksPanel) {
-        bookmarksBtn.addEventListener('click', () => {
-            bookmarksPanel.classList.toggle('hidden');
-            if (!bookmarksPanel.classList.contains('hidden')) {
-                renderBookmarksPanel();
-            }
-        });
-    }
+}
+
+function refreshOpenBookmarksPanels() {
+    const globalPanel = document.getElementById('bookmarks-panel-global');
+    if (globalPanel && !globalPanel.classList.contains('hidden')) renderBookmarksPanel('bookmarks-list-global');
 }
 
 // ── Branch Naming ──
@@ -580,6 +575,7 @@ function createNode(node, branchNames) {
                 showToast('Bookmarked');
             }
             await renderTree();
+            refreshOpenBookmarksPanels();
         });
     }
 

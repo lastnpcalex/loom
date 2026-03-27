@@ -1394,6 +1394,7 @@ async function toggleChatBookmark(msgId) {
         showToast('Bookmarked');
     }
     renderMessages();
+    if (typeof refreshOpenBookmarksPanels === 'function') refreshOpenBookmarksPanels();
 }
 
 // ── Refresh Tree ──
