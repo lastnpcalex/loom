@@ -266,7 +266,7 @@ async def describe_image(image_path: str, model: str = None) -> str:
             "messages": [
                 {
                     "role": "user",
-                    "content": "Describe this image in 1-2 concise sentences. Focus on what's depicted, the setting, and any notable details. No preamble.",
+                    "content": "Describe this image in thorough detail. Include: subjects and their appearance (clothing, expression, posture, physical features), setting and environment, lighting and mood, composition and framing, any text or symbols visible, and notable artistic or photographic qualities. Describe what you observe objectively and completely without editorializing or omitting details. No preamble.",
                     "images": [img_data],
                 }
             ],
@@ -274,7 +274,7 @@ async def describe_image(image_path: str, model: str = None) -> str:
             "think": False,  # Disable thinking to avoid vision output routing bug
             "options": {
                 "temperature": 0.3,
-                "num_predict": 100,
+                "num_predict": 300,
             },
         }
 
