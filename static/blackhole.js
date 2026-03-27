@@ -217,7 +217,7 @@ void main() {
                 if (r > ACCRETION_MIN_R) {
                     vec2 tex_coord = vec2(
                         (r - ACCRETION_MIN_R) / ACCRETION_WIDTH,
-                        fract(atan(isec.x, isec.y) / M_PI * 0.5 + 0.5 + time * 0.01)
+                        fract(atan(isec.x, isec.y) / M_PI * 0.5 + 0.5 + time * 0.15)
                     );
 
                     float accretion_intensity = ACCRETION_BRIGHTNESS;
