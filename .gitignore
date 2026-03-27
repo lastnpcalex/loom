@@ -61,3 +61,10 @@ start_loom.bat
 # Environment / secrets
 .env
 .env.*
+
+# Utility scripts (machine-specific)
+install_task.ps1
+restart_server.ps1
+run_server.py
+cc_permission_hook-*.py
+test_ooda_live.py

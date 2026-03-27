@@ -58,6 +58,7 @@ const State = {
     isStreaming: false,
     pendingImages: [],  // [{path, url}, ...] — max 5
     bookmarks: [],
+    stateCards: [],
     config: {},
     convFilter: 'all',
     convFolderCollapsed: {},
@@ -580,6 +581,12 @@ async function loadConversation(convId) {
     State.currentConv = conv;
     State.treeData = treeData;
     State.bookmarks = bookmarks || [];
+    // Load state cards if OODA is enabled
+    if (conv.ooda_enabled) {
+        State.stateCards = await API.get(`/api/conversations/${convId}/state`);
+    } else {
+        State.stateCards = [];
+    }
 
     // Compute branch names for breadcrumbs and message labels
     if (treeData.length > 0 && typeof computeBranchNames === 'function') {
@@ -819,10 +826,13 @@ async function loadDirBrowser(path) {
 
 function updateInlineCCControls(conv) {
     const controls = document.getElementById('cc-inline-controls');
+    const weaveControls = document.getElementById('weave-inline-controls');
+    const statePanelBtn = document.getElementById('btn-state-panel');
     if (!controls) return;
 
     if (conv && (conv.mode === 'claude' || conv.mode === 'local')) {
         controls.classList.remove('hidden');
+        weaveControls?.classList.add('hidden');
         const modelSel = document.getElementById('cc-model-inline');
         const effortSel = document.getElementById('cc-effort-inline');
         const permSel = document.getElementById('cc-permission-mode-inline');
@@ -831,8 +841,22 @@ function updateInlineCCControls(conv) {
         if (permSel) permSel.value = conv.cc_permission_mode || 'default';
         modelSel.style.display = conv.mode === 'local' ? 'none' : '';
         effortSel.style.display = conv.mode === 'local' ? 'none' : '';
+        statePanelBtn?.classList.add('hidden');
+    } else if (conv && conv.mode === 'weave') {
+        controls.classList.add('hidden');
+        weaveControls?.classList.remove('hidden');
+        const oodaToggle = document.getElementById('ooda-toggle-inline');
+        if (oodaToggle) oodaToggle.checked = !!conv.ooda_enabled;
+        // Show state panel button only when OODA is enabled
+        if (conv.ooda_enabled) {
+            statePanelBtn?.classList.remove('hidden');
+        } else {
+            statePanelBtn?.classList.add('hidden');
+        }
     } else {
         controls.classList.add('hidden');
+        weaveControls?.classList.add('hidden');
+        statePanelBtn?.classList.add('hidden');
     }
 
     // Update file input accept types based on mode
@@ -864,6 +888,139 @@ function initInlineCCControls() {
 
     const permSel = document.getElementById('cc-permission-mode-inline');
     if (permSel) permSel.addEventListener('change', () => saveCC('cc_permission_mode', permSel.value));
+
+    // OODA toggle
+    const oodaToggle = document.getElementById('ooda-toggle-inline');
+    if (oodaToggle) {
+        oodaToggle.addEventListener('change', async () => {
+            if (!State.currentConvId || !State.currentConv) return;
+            const enabled = oodaToggle.checked ? 1 : 0;
+            try {
+                await API.put(`/api/conversations/${State.currentConvId}`, { ooda_enabled: enabled });
+                State.currentConv.ooda_enabled = enabled;
+                updateInlineCCControls(State.currentConv);
+                if (enabled) {
+                    // Auto-seed state cards on first enable
+                    const existing = await API.get(`/api/conversations/${State.currentConvId}/state`);
+                    if (existing.length === 0) {
+                        await API.post(`/api/conversations/${State.currentConvId}/state/seed`);
+                        showToast('OODA enabled — state cards seeded from character');
+                    } else {
+                        showToast('OODA enabled');
+                    }
+                    State.stateCards = await API.get(`/api/conversations/${State.currentConvId}/state`);
+                } else {
+                    showToast('OODA disabled');
+                }
+            } catch { showToast('Failed to toggle OODA', 'error'); }
+        });
+    }
+
+    // State panel toggle
+    const statePanelBtn = document.getElementById('btn-state-panel');
+    const statePanel = document.getElementById('state-panel');
+    if (statePanelBtn && statePanel) {
+        statePanelBtn.addEventListener('click', () => {
+            statePanel.classList.toggle('hidden');
+            if (!statePanel.classList.contains('hidden')) {
+                renderStateCards();
+            }
+        });
+    }
+
+    // State panel buttons
+    const stateCloseBtn = document.getElementById('btn-state-close');
+    if (stateCloseBtn) stateCloseBtn.addEventListener('click', () => statePanel?.classList.add('hidden'));
+
+    const stateSeedBtn = document.getElementById('btn-state-seed');
+    if (stateSeedBtn) {
+        stateSeedBtn.addEventListener('click', async () => {
+            if (!State.currentConvId) return;
+            await API.post(`/api/conversations/${State.currentConvId}/state/seed`);
+            State.stateCards = await API.get(`/api/conversations/${State.currentConvId}/state`);
+            renderStateCards();
+            showToast('State cards seeded');
+        });
+    }
+
+    const stateAddBtn = document.getElementById('btn-state-add');
+    if (stateAddBtn) {
+        stateAddBtn.addEventListener('click', async () => {
+            if (!State.currentConvId) return;
+            const schemaId = prompt('Schema (character_state, scene_state, lore):');
+            if (!schemaId) return;
+            const label = prompt('Label (e.g. character name, location):');
+            if (!label) return;
+            await API.post(`/api/conversations/${State.currentConvId}/state`, {
+                schema_id: schemaId, label: label, data: {},
+            });
+            State.stateCards = await API.get(`/api/conversations/${State.currentConvId}/state`);
+            renderStateCards();
+            showToast('Card added');
+        });
+    }
+}
+
+function renderStateCards() {
+    const list = document.getElementById('state-cards-list');
+    if (!list) return;
+
+    if (!State.stateCards || State.stateCards.length === 0) {
+        list.innerHTML = '<div class="state-empty">No state cards. Click ⟳ to seed from character.</div>';
+        return;
+    }
+
+    list.innerHTML = State.stateCards.map(card => {
+        const data = typeof card.data === 'string' ? JSON.parse(card.data) : card.data;
+        const schemaClass = card.schema_id.replace('_', '-');
+        const fields = Object.entries(data).map(([k, v]) =>
+            `<div class="state-field" data-card-id="${card.id}" data-field="${escapeHtml(k)}">
+                <span class="state-field-key">${escapeHtml(k)}</span>
+                <span class="state-field-value" contenteditable="true" data-original="${escapeHtml(v || '')}">${escapeHtml(v || '—')}</span>
+            </div>`
+        ).join('');
+
+        return `<div class="state-card ${schemaClass}" data-card-id="${card.id}">
+            <div class="state-card-header">
+                <span class="state-card-schema">${escapeHtml(card.schema_id.replace('_', ' '))}</span>
+                <span class="state-card-label">${escapeHtml(card.label)}</span>
+                <button class="state-card-delete" data-card-id="${card.id}" title="Delete">&times;</button>
+            </div>
+            <div class="state-card-fields">${fields}</div>
+        </div>`;
+    }).join('');
+
+    // Wire inline editing
+    list.querySelectorAll('.state-field-value').forEach(el => {
+        el.addEventListener('blur', async () => {
+            const newVal = el.textContent.trim();
+            const original = el.dataset.original;
+            if (newVal === original || newVal === '—') return;
+            const fieldDiv = el.closest('.state-field');
+            const cardId = parseInt(fieldDiv.dataset.cardId);
+            const field = fieldDiv.dataset.field;
+            const card = State.stateCards.find(c => c.id === cardId);
+            if (!card) return;
+            const data = typeof card.data === 'string' ? JSON.parse(card.data) : card.data;
+            data[field] = newVal;
+            await API.put(`/api/state/${cardId}`, { data });
+            card.data = JSON.stringify(data);
+            el.dataset.original = newVal;
+            el.classList.add('state-field-updated');
+            setTimeout(() => el.classList.remove('state-field-updated'), 1500);
+        });
+    });
+
+    // Wire delete buttons
+    list.querySelectorAll('.state-card-delete').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const cardId = parseInt(btn.dataset.cardId);
+            await API.del(`/api/state/${cardId}`);
+            State.stateCards = State.stateCards.filter(c => c.id !== cardId);
+            renderStateCards();
+            showToast('Card deleted');
+        });
+    });
 }
 
 function showWeaveFields(show) {

@@ -249,6 +249,16 @@ function handleWSMessage(data) {
             console.log('[CC debug]', data.event_type, data.data);
             break;
 
+        case 'state_update':
+            // OODA harness updated state cards — refresh the panel
+            if (State.currentConvId) {
+                API.get(`/api/conversations/${State.currentConvId}/state`).then(cards => {
+                    State.stateCards = cards;
+                    if (typeof renderStateCards === 'function') renderStateCards();
+                });
+            }
+            break;
+
         case 'stream_end':
             State.isStreaming = false;
             document.getElementById('btn-send').disabled = false;

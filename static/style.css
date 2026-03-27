@@ -716,6 +716,178 @@ body::after {
     padding: 16px 8px;
 }
 
+/* ── State Cards Panel ── */
+#state-panel {
+    position: fixed;
+    top: 52px;
+    right: 12px;
+    z-index: 200;
+    width: 340px;
+    max-height: 80vh;
+    overflow-y: auto;
+    background: rgba(5, 5, 15, 0.92);
+    backdrop-filter: var(--glass);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px;
+    box-shadow: 0 0 24px rgba(0, 255, 255, 0.06), 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+.state-panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+}
+.state-panel-header span {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 12px;
+    color: var(--cyan);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+.state-panel-actions {
+    display: flex;
+    gap: 6px;
+}
+.state-panel-actions button {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 4px);
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 14px;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: var(--transition);
+}
+.state-panel-actions button:hover {
+    color: var(--cyan);
+    border-color: var(--cyan);
+}
+#btn-state-panel {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 18px;
+    cursor: pointer;
+    transition: var(--transition);
+    padding: 4px;
+}
+#btn-state-panel:hover {
+    color: var(--cyan);
+    filter: drop-shadow(0 0 6px rgba(0, 255, 255, 0.4));
+}
+
+/* State card tiles */
+.state-card {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 4px);
+    margin-bottom: 10px;
+    overflow: hidden;
+    transition: var(--transition);
+}
+.state-card:hover { border-color: rgba(0, 255, 255, 0.2); }
+.state-card.character-state { border-left: 3px solid var(--cyan); }
+.state-card.scene-state { border-left: 3px solid var(--purple, #bf00ff); }
+.state-card.lore { border-left: 3px solid var(--magenta, #ff00ff); }
+.state-card-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    background: rgba(0, 255, 255, 0.03);
+    border-bottom: 1px solid var(--border);
+}
+.state-card-schema {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    opacity: 0.7;
+}
+.state-card-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    flex: 1;
+}
+.state-card-delete {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 14px;
+    opacity: 0;
+    transition: var(--transition);
+}
+.state-card:hover .state-card-delete { opacity: 0.6; }
+.state-card-delete:hover { opacity: 1 !important; color: #ff4444; }
+.state-card-fields { padding: 6px 8px; }
+.state-field {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 4px;
+    font-size: 12px;
+    line-height: 1.4;
+}
+.state-field-key {
+    color: var(--text-muted);
+    min-width: 70px;
+    flex-shrink: 0;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    padding-top: 2px;
+}
+.state-field-value {
+    color: var(--text-primary);
+    flex: 1;
+    cursor: text;
+    border-radius: 2px;
+    padding: 1px 3px;
+    transition: background 0.3s;
+}
+.state-field-value:focus {
+    outline: none;
+    background: rgba(0, 255, 255, 0.08);
+    box-shadow: 0 0 0 1px rgba(0, 255, 255, 0.2);
+}
+.state-field-updated {
+    background: rgba(0, 255, 255, 0.12) !important;
+    transition: background 1.5s;
+}
+.state-empty {
+    color: var(--text-muted);
+    font-size: 12px;
+    text-align: center;
+    padding: 20px 8px;
+}
+
+/* OODA inline toggle */
+.ooda-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.ooda-toggle input[type="checkbox"] {
+    accent-color: var(--cyan);
+    cursor: pointer;
+}
+.ooda-toggle-label {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}
+
 /* Global bookmarks panel (header-level, chat + tree) */
 #bookmarks-panel-global {
     position: fixed;
@@ -2688,5 +2860,11 @@ pre.tool-output {
         left: 8px;
         width: auto;
         max-height: 50vh;
+    }
+    #state-panel {
+        right: 8px;
+        left: 8px;
+        width: auto;
+        max-height: 60vh;
     }
 }
