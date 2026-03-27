@@ -39,8 +39,8 @@ var AcidburnGalaxy = (function() {
     // Grid
     grid: {
       enabled: true,
-      latLines: 24,
-      lonLines: 48,
+      latLines: 16,
+      lonLines: 24,
       lineWidth: 1,
       opacity: 0.25
     },
