@@ -923,6 +923,43 @@ body::after {
     cursor: help;
 }
 
+/* State card picker dropdown */
+.state-card-picker {
+    position: fixed;
+    z-index: 300;
+    width: 240px;
+    max-height: 400px;
+    overflow-y: auto;
+    background: rgba(5, 5, 15, 0.95);
+    backdrop-filter: var(--glass);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 6px;
+    box-shadow: 0 0 20px rgba(0, 255, 255, 0.08), 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.picker-section {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 9px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    padding: 8px 8px 4px;
+    border-top: 1px solid var(--border);
+}
+.picker-section:first-child { border-top: none; }
+.picker-option {
+    padding: 6px 10px;
+    border-radius: var(--radius-sm, 4px);
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text-primary);
+    transition: var(--transition);
+}
+.picker-option:hover {
+    background: rgba(0, 255, 255, 0.08);
+    color: var(--cyan);
+}
+
 /* Avatar image support */
 .char-avatar[style*="background-image"] { font-size: 0; }
 .char-avatar { cursor: pointer; }

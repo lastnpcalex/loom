@@ -958,18 +958,12 @@ function initInlineCCControls() {
 
     const stateAddBtn = document.getElementById('btn-state-add');
     if (stateAddBtn) {
-        stateAddBtn.addEventListener('click', async () => {
+        stateAddBtn.addEventListener('click', () => {
             if (!State.currentConvId) return;
-            const schemaId = prompt('Schema (character_state, scene_state, lore):');
-            if (!schemaId) return;
-            const label = prompt('Label (e.g. character name, location):');
-            if (!label) return;
-            await API.post(`/api/conversations/${State.currentConvId}/state`, {
-                schema_id: schemaId, label: label, data: {},
+            showStateCardPicker(State.currentConvId, async () => {
+                State.stateCards = await API.get(`/api/conversations/${State.currentConvId}/state`);
+                renderStateCards();
             });
-            State.stateCards = await API.get(`/api/conversations/${State.currentConvId}/state`);
-            renderStateCards();
-            showToast('Card added');
         });
     }
 }
@@ -1058,6 +1052,106 @@ function renderStateCards() {
     });
 }
 
+// ── State Card Picker (shared by conv + character panels) ──
+
+function showStateCardPicker(convId, onDone, charId) {
+    // Remove any existing picker
+    document.getElementById('state-card-picker')?.remove();
+
+    const picker = document.createElement('div');
+    picker.id = 'state-card-picker';
+    picker.className = 'state-card-picker';
+
+    let options = `
+        <div class="picker-section">New Card</div>
+        <div class="picker-option" data-schema="character_state" data-action="new">+ Character State</div>
+        <div class="picker-option" data-schema="scene_state" data-action="new">+ Scene State</div>
+        <div class="picker-option" data-schema="lore" data-action="new">+ Lore Entry</div>
+        <div class="picker-option" data-schema="persona_state" data-action="new">+ Persona State</div>
+    `;
+
+    // Add existing personas to insert
+    if (State.personas && State.personas.length > 0) {
+        options += '<div class="picker-section">Insert Persona</div>';
+        for (const p of State.personas) {
+            options += `<div class="picker-option" data-schema="persona_state" data-action="insert-persona" data-id="${p.id}">⟶ ${escapeHtml(p.name)}</div>`;
+        }
+    }
+
+    // Add existing lore to insert
+    if (State.lore && State.lore.length > 0) {
+        options += '<div class="picker-section">Insert Lore</div>';
+        for (const l of State.lore) {
+            options += `<div class="picker-option" data-schema="lore" data-action="insert-lore" data-id="${l.id}">⟶ ${escapeHtml(l.name)}</div>`;
+        }
+    }
+
+    picker.innerHTML = options;
+    document.body.appendChild(picker);
+
+    // Position near the button
+    const panel = document.getElementById(charId ? 'char-state-panel' : 'state-panel');
+    if (panel) {
+        const rect = panel.getBoundingClientRect();
+        picker.style.top = (rect.top + 40) + 'px';
+        picker.style.right = (window.innerWidth - rect.right) + 'px';
+    }
+
+    picker.addEventListener('click', async (e) => {
+        const opt = e.target.closest('.picker-option');
+        if (!opt) return;
+        const action = opt.dataset.action;
+        const schema = opt.dataset.schema;
+
+        try {
+            if (action === 'new') {
+                const label = prompt('Label:');
+                if (!label) { picker.remove(); return; }
+                if (charId) {
+                    await API.post(`/api/characters/${charId}/state`, { schema_id: schema, label, data: {} });
+                } else {
+                    await API.post(`/api/conversations/${convId}/state`, { schema_id: schema, label, data: {} });
+                }
+            } else if (action === 'insert-persona') {
+                const persona = State.personas.find(p => p.id === opt.dataset.id);
+                if (!persona) { picker.remove(); return; }
+                const endpoint = charId
+                    ? `/api/characters/${charId}/state`
+                    : `/api/conversations/${convId}/state`;
+                await API.post(endpoint, {
+                    schema_id: 'persona_state', label: persona.name,
+                    data: { description: persona.content || '', appearance: '', goals: '' },
+                });
+            } else if (action === 'insert-lore') {
+                const lore = State.lore.find(l => l.id === opt.dataset.id);
+                if (!lore) { picker.remove(); return; }
+                const endpoint = charId
+                    ? `/api/characters/${charId}/state`
+                    : `/api/conversations/${convId}/state`;
+                await API.post(endpoint, {
+                    schema_id: 'lore', label: lore.name,
+                    data: { content: lore.content || '' }, is_readonly: true,
+                });
+            }
+            showToast('Card added');
+            if (onDone) await onDone();
+        } catch (err) {
+            showToast('Failed to add card', 'error');
+        }
+        picker.remove();
+    });
+
+    // Close on outside click
+    setTimeout(() => {
+        document.addEventListener('click', function close(e) {
+            if (!picker.contains(e.target)) {
+                picker.remove();
+                document.removeEventListener('click', close);
+            }
+        });
+    }, 0);
+}
+
 // ── Character State Panel (Tier 1 — Global) ──
 
 async function openCharacterStatePanel(charId, charName) {
@@ -1139,21 +1233,12 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('char-state-panel')?.classList.add('hidden');
     });
     const addBtn = document.getElementById('btn-char-state-add');
-    if (addBtn) addBtn.addEventListener('click', async () => {
+    if (addBtn) addBtn.addEventListener('click', () => {
         const charName = document.getElementById('char-state-name')?.textContent;
         if (!charName) return;
-        const schemaId = prompt('Schema (character_state, scene_state, lore, persona_state):');
-        if (!schemaId) return;
-        const label = prompt('Label (e.g. character name, location):');
-        if (!label) return;
-        // Find the character ID from name
         const char = State.characters.find(c => c.name === charName);
         if (!char) return;
-        await API.post(`/api/characters/${char.id}/state`, {
-            schema_id: schemaId, label: label, data: {},
-        });
-        await renderCharacterStateCards(char.id);
-        showToast('Card added');
+        showStateCardPicker(null, () => renderCharacterStateCards(char.id), char.id);
     });
 });
 
