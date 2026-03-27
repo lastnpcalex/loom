@@ -847,6 +847,8 @@ body::after {
     margin-bottom: 10px;
     overflow: hidden;
     transition: var(--transition);
+    background: rgba(5, 5, 15, 0.85);
+    backdrop-filter: var(--glass);
 }
 .state-card:hover { border-color: rgba(0, 255, 255, 0.2); }
 .state-card.character-state { border-left: 3px solid var(--cyan); }
@@ -1028,12 +1030,29 @@ body::after {
 }
 .char-state-grid {
     display: flex;
-    flex-wrap: wrap;
-    gap: 16px;
-    align-content: flex-start;
+    flex-direction: column;
+    gap: 20px;
 }
-.char-state-grid .state-card {
-    width: 320px;
+.state-section {
+    width: 100%;
+}
+.state-section-header {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 13px;
+    color: var(--cyan);
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-bottom: 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+}
+.state-section-cards {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+}
+.state-section-cards .state-card {
+    width: 340px;
     flex-shrink: 0;
 }
 .state-empty {

@@ -1210,25 +1210,41 @@ async function renderCharacterStateCards(charId) {
         return;
     }
 
-    list.innerHTML = cards.map(card => {
-        const data = typeof card.data === 'string' ? JSON.parse(card.data) : card.data;
-        const schemaClass = card.schema_id.replace('_', '-');
-        const fields = Object.entries(data).map(([k, v]) => {
-            const tip = STATE_FIELD_TOOLTIPS[card.schema_id]?.[k] || '';
-            return `<div class="state-field" data-card-id="${card.id}" data-field="${escapeHtml(k)}">
-                <span class="state-field-key"${tip ? ` title="${escapeHtml(tip)}"` : ''}>${escapeHtml(k)}</span>
-                <span class="state-field-value" contenteditable="true" data-original="${escapeHtml(v || '')}">${escapeHtml(v || '—')}</span>
+    // Group cards by schema
+    const SCHEMA_LABELS = { character_state: 'Characters', scene_state: 'Scenes', lore: 'Lore', persona_state: 'Personas' };
+    const grouped = {};
+    for (const card of cards) {
+        if (!grouped[card.schema_id]) grouped[card.schema_id] = [];
+        grouped[card.schema_id].push(card);
+    }
+
+    let html = '';
+    for (const [schemaId, schemaCards] of Object.entries(grouped)) {
+        const sectionLabel = SCHEMA_LABELS[schemaId] || schemaId.replace('_', ' ');
+        html += `<div class="state-section">
+            <div class="state-section-header">${escapeHtml(sectionLabel)}</div>
+            <div class="state-section-cards">`;
+        for (const card of schemaCards) {
+            const data = typeof card.data === 'string' ? JSON.parse(card.data) : card.data;
+            const schemaClass = card.schema_id.replace('_', '-');
+            const fields = Object.entries(data).map(([k, v]) => {
+                const tip = STATE_FIELD_TOOLTIPS[card.schema_id]?.[k] || '';
+                return `<div class="state-field" data-card-id="${card.id}" data-field="${escapeHtml(k)}">
+                    <span class="state-field-key"${tip ? ` title="${escapeHtml(tip)}"` : ''}>${escapeHtml(k)}</span>
+                    <span class="state-field-value" contenteditable="true" data-original="${escapeHtml(v || '')}">${escapeHtml(v || '—')}</span>
+                </div>`;
+            }).join('');
+            html += `<div class="state-card ${schemaClass}" data-card-id="${card.id}">
+                <div class="state-card-header">
+                    <span class="state-card-label">${escapeHtml(card.label)}</span>
+                    <button class="state-card-delete" data-card-id="${card.id}" title="Delete">&times;</button>
+                </div>
+                <div class="state-card-fields">${fields}</div>
             </div>`;
-        }).join('');
-        return `<div class="state-card ${schemaClass}" data-card-id="${card.id}">
-            <div class="state-card-header">
-                <span class="state-card-schema">${escapeHtml(card.schema_id.replace('_', ' '))}</span>
-                <span class="state-card-label">${escapeHtml(card.label)}</span>
-                <button class="state-card-delete" data-card-id="${card.id}" title="Delete">&times;</button>
-            </div>
-            <div class="state-card-fields">${fields}</div>
-        </div>`;
-    }).join('');
+        }
+        html += '</div></div>';
+    }
+    list.innerHTML = html;
 
     // Wire inline editing
     list.querySelectorAll('.state-field-value').forEach(el => {
