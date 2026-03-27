@@ -363,6 +363,41 @@ async def api_create_conversation(data: dict = None):
     # Refresh conv data
     conv = await db.get_conversation(conv["id"])
 
+    # Auto-seed state cards for OODA-enabled Weave conversations
+    if mode == "weave" and character_id:
+        global_cards = await db.get_character_state_cards(character_id)
+        if global_cards:
+            await db.copy_character_state_to_conversation(character_id, conv["id"])
+        else:
+            char = load_character(os.path.join(config.characters_dir, f"{character_id}.md"))
+            if char:
+                await db.create_state_card(conv["id"], "character_state", char.get("name", "Character"), {
+                    "personality": char.get("personality", ""),
+                    "appearance": "",
+                    "current_mood": "",
+                    "goals": "",
+                    "relationships": "",
+                    "physical_situation": char.get("scenario", ""),
+                })
+                if char.get("scenario"):
+                    await db.create_state_card(conv["id"], "scene_state", "current", {
+                        "location": "", "time_of_day": "", "atmosphere": "",
+                        "present_characters": "", "recent_events": char["scenario"],
+                    })
+        if persona_id:
+            persona = load_persona(os.path.join("personas", f"{persona_id}.md"))
+            if persona:
+                await db.create_state_card(conv["id"], "persona_state", persona["name"], {
+                    "description": persona.get("content", ""), "appearance": "", "goals": "",
+                })
+        if lore_ids:
+            for lid in lore_ids:
+                entry = load_lore_entry(os.path.join("lore", f"{lid}.md"))
+                if entry:
+                    await db.create_state_card(conv["id"], "lore", entry["name"], {
+                        "content": entry["content"],
+                    }, is_readonly=True)
+
     # If character goes first:
     #   - Custom scene → add it as a user message so the model responds to it
     #   - No custom scene + greeting exists → use the static greeting
