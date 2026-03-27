@@ -420,9 +420,9 @@ function buildConvItem(conv) {
         : conv.character_id
         ? (State.characters.find(c => c.id === conv.character_id)?.name || conv.character_id)
         : 'Freeform';
-    const modeBadge = isCC ? '<span class="mode-badge">CC</span>'
-        : isLocal ? '<span class="mode-badge">L</span>'
-        : '<span class="mode-badge">W</span>';
+    const modeBadge = isCC ? '<span class="mode-badge">Loom</span>'
+        : isLocal ? '<span class="mode-badge">Braid</span>'
+        : '<span class="mode-badge">Weave</span>';
     const starred = conv.starred ? 1 : 0;
     const starChar = starred ? '★' : '☆';
     const starClass = starred ? 'conv-star-btn active' : 'conv-star-btn';
