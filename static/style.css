@@ -977,8 +977,6 @@ body::after {
 
 /* Character state view (Tier 1 editor — full page) */
 #view-char-state {
-    display: flex;
-    flex-direction: column;
     overflow-y: auto;
     padding: 16px 24px;
 }
