@@ -69,7 +69,7 @@ var AcidburnGalaxy = (function() {
 
     // Loom strings — flow toward equator, get braided by gravitational lensing
     strings: {
-      enabled: true,
+      enabled: false,
       count: 18,
       opacity: 0.35,
       width: 1.5,
@@ -277,18 +277,18 @@ var AcidburnGalaxy = (function() {
     
     // Longitude lines (purple)
     ctx.strokeStyle = config.colors.purple;
-    for (let i = 0; i <= lonLines; i++) {
+    for (let i = 0; i < lonLines; i++) {
       const x = (i / lonLines) * width;
       ctx.beginPath();
       ctx.moveTo(x, 0);
       ctx.lineTo(x, height);
       ctx.stroke();
     }
-    
+
     // Accent points at intersections
     ctx.fillStyle = '#ffffff';
     ctx.globalAlpha = opacity * 0.8;
-    for (let i = 0; i <= lonLines; i += 4) {
+    for (let i = 0; i < lonLines; i += 4) {
       for (let j = 0; j <= latLines; j += 4) {
         const x = (i / lonLines) * width;
         const y = (j / latLines) * height;
