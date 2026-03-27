@@ -1013,6 +1013,20 @@ const STATE_FIELD_TOOLTIPS = {
     },
 };
 
+function flashSaveIndicator(indicatorId) {
+    const el = document.getElementById(indicatorId);
+    if (!el) return;
+    el.textContent = 'saving';
+    el.className = 'save-indicator saving visible';
+    setTimeout(() => {
+        el.textContent = 'saved ✓';
+        el.className = 'save-indicator visible';
+        setTimeout(() => {
+            el.className = 'save-indicator hidden';
+        }, 1500);
+    }, 300);
+}
+
 function renderStateCards() {
     const list = document.getElementById('state-cards-list');
     if (!list) return;
@@ -1056,6 +1070,7 @@ function renderStateCards() {
             if (!card) return;
             const data = typeof card.data === 'string' ? JSON.parse(card.data) : card.data;
             data[field] = newVal;
+            flashSaveIndicator('state-save-indicator');
             await API.put(`/api/state/${cardId}`, { data });
             card.data = JSON.stringify(data);
             el.dataset.original = newVal;
@@ -1272,6 +1287,7 @@ async function renderCharacterStateCards(charId) {
             if (!card) return;
             const cardData = typeof card.data === 'string' ? JSON.parse(card.data) : card.data;
             cardData[field] = newVal;
+            flashSaveIndicator('char-state-save-indicator');
             await API.put(`/api/character-state/${cardId}`, { data: cardData });
             card.data = JSON.stringify(cardData);
             el.dataset.original = newVal;

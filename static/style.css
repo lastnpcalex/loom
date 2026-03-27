@@ -920,6 +920,33 @@ body::after {
     background: rgba(0, 255, 255, 0.12) !important;
     transition: background 1.5s;
 }
+/* Auto-save indicator */
+.save-indicator {
+    font-size: 11px;
+    color: var(--cyan);
+    opacity: 0;
+    transition: opacity 0.3s;
+    font-family: 'Space Grotesk', sans-serif;
+    letter-spacing: 0.5px;
+    filter: drop-shadow(0 0 4px rgba(0, 255, 255, 0.4));
+}
+.save-indicator.visible {
+    opacity: 1;
+}
+.save-indicator.saving {
+    color: var(--text-muted);
+    filter: none;
+}
+.save-indicator.saving::after {
+    content: '...';
+    animation: saving-dots 1s steps(3) infinite;
+}
+@keyframes saving-dots {
+    0% { content: '.'; }
+    33% { content: '..'; }
+    66% { content: '...'; }
+}
+
 .state-field-key[title] {
     border-bottom: 1px dotted var(--text-muted);
     cursor: help;
