@@ -993,15 +993,17 @@ async function switchToBranch(leafId, scrollToMsgId) {
             if (targetIdx <= 0 && sentinel) sentinel.remove();
         }
 
-        // Now try to scroll to it
-        const targetEl = document.querySelector(`.message[data-msg-id="${targetId}"]`);
-        if (targetEl) {
-            targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            targetEl.classList.add('message-highlight');
-            setTimeout(() => targetEl.classList.remove('message-highlight'), 2000);
-        } else {
-            scrollToBottom();
-        }
+        // Now try to scroll to it (defer to allow DOM layout to settle)
+        requestAnimationFrame(() => {
+            const targetEl = document.querySelector(`.message[data-msg-id="${targetId}"]`);
+            if (targetEl) {
+                targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                targetEl.classList.add('message-highlight');
+                setTimeout(() => targetEl.classList.remove('message-highlight'), 2000);
+            } else {
+                scrollToBottom();
+            }
+        });
     } catch (err) {
         showToast('Failed to switch branch', 'error');
     } finally {
