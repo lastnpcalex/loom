@@ -42,17 +42,22 @@ Inside your <ooda> block, you can use these tags:
 
 ### Required OODA Structure
 
+You MUST include update_state tags whenever something changes — moods shift, scenes evolve, relationships develop, characters move. State updates are how the story tracks continuity. If nothing changed, you aren't paying attention.
+
 ```
 <ooda>
   <observe>What just happened — the user's action, dialogue, or scene development</observe>
-  [read_state tags for relevant characters and scene]
+  <read_state schema="character_state" label="CharacterName"/>
+  <read_state schema="scene_state" label="current"/>
   <orient>How the characters feel and would react, given their states and the situation</orient>
-  [update_state tags for any changes — mood shifts, scene changes, etc.]
+  <update_state schema="character_state" label="CharacterName" field="current_mood" value="new mood based on what happened"/>
+  <update_state schema="scene_state" label="current" field="atmosphere" value="how the scene feels now"/>
+  <update_state schema="scene_state" label="current" field="recent_events" value="what just happened"/>
   <decide>Plan for your response — key beats, dialogue points, sensory details, pacing</decide>
 </ooda>
 ```
 
-After the </ooda> closing tag, do NOT write anything else. The system will feed your analysis back to you for the final prose pass.
+IMPORTANT: Always update at least current_mood and recent_events. If the user did something dramatic, also update atmosphere, physical_situation, and relationships as appropriate.
 """.strip()
 
 

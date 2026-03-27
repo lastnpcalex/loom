@@ -1793,6 +1793,7 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
         raw_pass1 = await sync_chat(messages, max_tokens=1024, think=False)
         cleaned_pass1 = _re.sub(r'<think>[\s\S]*?</think>\s*', '', raw_pass1).strip()
         print(f"[OODA] Pass 1 done: {len(cleaned_pass1)} chars")
+        print(f"[OODA] Raw OODA output:\n{cleaned_pass1[:1500]}")
 
         # Parse OODA block
         ooda = parse_ooda_block(cleaned_pass1)
