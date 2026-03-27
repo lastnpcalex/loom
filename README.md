@@ -16,18 +16,36 @@ The Loom weaves conversations across three modes — pick the thread that fits t
 
 Character cards, personas, lore files, style nudges, and incremental summarization. A full RP harness built on local Ollama models with context window management that scales beyond what the model natively supports.
 
-- Character system with personality, scenario, greeting, and example messages
-- Personas and lore for richer world-building context
-- Style nudge rotation and repetition detection
+- Character system with personality, appearance, goals, relationships, scenario, greeting, and example messages
+- Personas (player characters) and lore for richer world-building context
+- Style nudge selection and repetition detection
 - Thinking model support (`<think>` stripping, content token counting)
 - Incremental context summarization via Gemma 3 1B on CPU
-- **OODA Harness** (optional) — cognitive scaffolding for better RP quality:
-  - Two-pass generation: model observes, orients, decides, then acts
-  - Persistent state cards (character state, scene state, lore) updated each turn
-  - State reads/updates visible as collapsible tool blocks in the conversation
-  - Inspired by [metacog](https://github.com/inanna-malick/metacog) and [popup-mcp](https://tidepool.leaflet.pub/3mcbegnuf2k2i)
 
-### Local — Claude Code powered by any Ollama model
+#### OODA Harness — enabled by default
+
+The OODA (Observe-Orient-Decide-Act) harness is cognitive scaffolding that guides the model through a structured reasoning loop before writing each response. Inspired by [metacog](https://github.com/inanna-malick/metacog) (tools as cognitive scaffolding — LLMs treat tool results as ground truth) and [popup-mcp](https://tidepool.leaflet.pub/3mcbegnuf2k2i) (amortize latency into fewer, richer passes).
+
+**How it works:** Before generating RP prose, the model emits a structured `<ooda>` block containing observations about what happened, state reads to refresh its understanding of characters and scenes, orientation reasoning about how characters would react, state updates for any changes (mood shifts, scene evolution), and a decision plan for the response. The server parses this block, executes the state operations, and the model writes its prose grounded in the analysis.
+
+**State cards** are persistent, structured data that track the evolving state of the RP:
+
+- **Character State** — personality, appearance, current mood, goals, relationships, physical situation
+- **Scene State** — location, time, atmosphere, present characters, recent events
+- **Persona State** — the player's character (description, appearance, goals)
+- **Lore** — read-only background information referenced when relevant
+
+**Three-tier state hierarchy:**
+
+1. **Tier 1 (Character Global)** — baseline state cards defined on the character itself. Editable from the home page via the ▣ button. These are the template that gets copied when a character enters a conversation.
+2. **Tier 2 (Conversation)** — copied from Tier 1 when OODA is enabled. Represents the starting state for the conversation. Stays pristine as the base.
+3. **Tier 3 (Branch Deltas)** — state changes are saved as deltas on each assistant message, not applied to the base. Different branches see different state. When you navigate a branch, the effective state is reconstructed: base cards + deltas along the branch path.
+
+**Visibility:** OODA steps appear as collapsible tool blocks in the conversation (Observe, Orient, Decide). The δ Branch State button in the chat view shows the effective state for the current branch. The ▣ button in the tree view shows the base conversation state.
+
+**State cards are editable:** Click any field value to edit inline. Changes auto-save with a visual indicator. The model reads these on the next turn, so manual edits steer the story.
+
+### Braid — Claude Code powered by any Ollama model
 
 The full Claude Code harness running on a local model via [`ollama launch claude`](https://docs.ollama.com/integrations/claude-code). Same tools, same permissions, same UI — just running on your hardware.
 
@@ -36,7 +54,7 @@ The full Claude Code harness running on a local model via [`ollama launch claude
 - Generated image display inline in responses
 - Works with any Ollama model with sufficient context (64k+ recommended)
 
-### Claude — Claude Code in the browser
+### Loom — Claude Code in the browser
 
 Connects to the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) as a subprocess. Full access to Claude's tool suite with streaming responses, thinking blocks, and permission proxying.
 
