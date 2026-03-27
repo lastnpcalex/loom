@@ -1053,7 +1053,9 @@ function flashSaveIndicator(indicatorId) {
 }
 
 function renderStateCards(targetListId) {
-    const list = document.getElementById(targetListId || 'state-cards-list');
+    const listId = targetListId || 'state-cards-list';
+    const saveIndicatorId = listId === 'tree-state-cards-list' ? 'tree-state-save-indicator' : 'state-save-indicator';
+    const list = document.getElementById(listId);
     if (!list) return;
 
     if (!State.stateCards || State.stateCards.length === 0) {
@@ -1095,7 +1097,7 @@ function renderStateCards(targetListId) {
             if (!card) return;
             const data = typeof card.data === 'string' ? JSON.parse(card.data) : card.data;
             data[field] = newVal;
-            flashSaveIndicator('state-save-indicator');
+            flashSaveIndicator(saveIndicatorId);
             await API.put(`/api/state/${cardId}`, { data });
             card.data = JSON.stringify(data);
             el.dataset.original = newVal;

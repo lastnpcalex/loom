@@ -412,7 +412,8 @@ async function renderTree() {
     }
 
     if (!State.treeData || State.treeData.length === 0) {
-        container.innerHTML = '<div style="color:var(--text-muted);padding:60px;text-align:center;font-size:14px;">No messages yet. Start writing to build the tree.</div>';
+        // Switch to chat view so user can type
+        if (typeof switchView === 'function') switchView('chat');
         return;
     }
 
