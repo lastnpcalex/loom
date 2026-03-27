@@ -1026,12 +1026,12 @@ body::after {
 /* Tree state sidebar */
 #tree-state-sidebar {
     position: absolute;
-    top: 0;
+    top: 52px;
     right: 0;
     width: 420px;
     min-width: 280px;
     max-width: 80vw;
-    height: 100%;
+    height: calc(100% - 52px);
     z-index: 15;
     resize: horizontal;
     overflow-y: auto;

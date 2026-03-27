@@ -983,6 +983,14 @@ function initInlineCCControls() {
         });
         const closeBtn = document.getElementById('btn-tree-state-close');
         if (closeBtn) closeBtn.addEventListener('click', () => treeSidebar.classList.add('hidden'));
+        const seedBtn = document.getElementById('btn-tree-state-seed');
+        if (seedBtn) seedBtn.addEventListener('click', async () => {
+            if (!State.currentConvId) return;
+            await API.post(`/api/conversations/${State.currentConvId}/state/seed`);
+            State.stateCards = await API.get(`/api/conversations/${State.currentConvId}/state`);
+            renderStateCards('tree-state-cards-list');
+            showToast('State cards seeded');
+        });
     }
 
     // State panel buttons
@@ -1055,7 +1063,7 @@ function renderStateCards(targetListId) {
     if (!list) return;
 
     if (!State.stateCards || State.stateCards.length === 0) {
-        list.innerHTML = '<div class="state-empty">No state cards. Click ⟳ to seed from character.</div>';
+        list.innerHTML = '<div class="state-empty">No state cards yet. Use the ⟳ button to seed from your character.</div>';
         return;
     }
 
