@@ -67,6 +67,7 @@ const State = {
 // ── View Switching ──
 function switchView(view) {
     State.currentView = view;
+    localStorage.setItem('loom-last-view', view);
     document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
     document.getElementById(`view-${view}`).classList.add('active');
 
@@ -302,10 +303,17 @@ async function init() {
     setupEventListeners();
     initInlineCCControls();
     // Paste handler registered in setupEventListeners
-    // Restore last conversation or show home
+    // Restore last page: conversation + view, or home
     const lastConv = localStorage.getItem('loom-last-conv');
+    const lastView = localStorage.getItem('loom-last-view');
     if (lastConv && State.conversations.find(c => c.id === parseInt(lastConv))) {
-        loadConversation(parseInt(lastConv));
+        await loadConversation(parseInt(lastConv));
+        // If they were on a specific view within that conv, restore it
+        if (lastView === 'tree' || lastView === 'chat') {
+            switchView(lastView);
+        }
+    } else if (lastView === 'home' || !lastConv) {
+        switchView('home');
     } else {
         switchView('home');
     }
