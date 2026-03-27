@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=60">
+    <link rel="stylesheet" href="/static/style.css?v=61">
 </head>
 <body>
     <div id="blackhole-container"></div>
@@ -94,7 +94,15 @@
 
         <!-- View: Tree Canvas -->
         <div id="view-tree" class="view">
-            <button id="tree-layout-toggle" title="Toggle horizontal/vertical layout">⇄</button>
+            <div id="tree-toolbar">
+                <button id="tree-layout-toggle" title="Toggle layout">⇄</button>
+                <button id="tree-center-btn" title="Fit all nodes in view">◎</button>
+                <button id="tree-bookmarks-btn" title="Bookmarks">⬡</button>
+            </div>
+            <div id="bookmarks-panel" class="hidden">
+                <div class="bookmarks-panel-header"><span>Bookmarks</span></div>
+                <div id="bookmarks-list"></div>
+            </div>
             <div id="tree-canvas">
                 <div id="tree-nodes"></div>
             </div>
@@ -377,8 +385,8 @@ assistant: *Another example response*"></textarea>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=12"></script>
-    <script src="/static/app.js?v=41"></script>
-    <script src="/static/chat.js?v=64"></script>
-    <script src="/static/tree.js?v=24"></script>
+    <script src="/static/app.js?v=42"></script>
+    <script src="/static/chat.js?v=65"></script>
+    <script src="/static/tree.js?v=25"></script>
 </body>
 </html>

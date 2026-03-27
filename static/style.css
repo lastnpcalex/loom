@@ -222,21 +222,24 @@ body::after {
     font-size: 11px;
     margin: 0 1px;
 }
-/* Bookmark/anchor button on tree nodes */
+/* Bookmark button on tree nodes — ⬡ hexagon / ⏣ benzene */
 .tree-node-bookmark-btn {
     background: none;
     border: none;
     cursor: pointer;
-    font-size: 11px;
+    font-size: 13px;
     opacity: 0.3;
     transition: var(--transition);
     padding: 0 2px;
+    color: var(--text-secondary);
 }
 .tree-node-card:hover .tree-node-bookmark-btn { opacity: 0.7; }
-.tree-node-bookmark-btn:hover { opacity: 1 !important; }
+.tree-node-bookmark-btn:hover { opacity: 1 !important; color: var(--cyan); }
 .tree-node-bookmark-btn.active {
     opacity: 1;
-    filter: drop-shadow(0 0 4px rgba(0, 255, 255, 0.5));
+    color: var(--cyan);
+    filter: drop-shadow(0 0 6px rgba(0, 255, 255, 0.6));
+    text-shadow: 0 0 8px rgba(0, 255, 255, 0.8);
 }
 
 .breadcrumb-ellipsis {
@@ -602,11 +605,15 @@ body::after {
 }
 
 /* ── Tree Canvas View ── */
-#tree-layout-toggle {
+#tree-toolbar {
     position: absolute;
     top: 12px;
     right: 12px;
     z-index: 20;
+    display: flex;
+    gap: 8px;
+}
+#tree-toolbar button {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
@@ -620,10 +627,93 @@ body::after {
     align-items: center;
     justify-content: center;
 }
-#tree-layout-toggle:hover {
+#tree-toolbar button:hover {
     color: var(--cyan);
     border-color: var(--cyan);
     box-shadow: 0 0 8px rgba(0, 255, 255, 0.2);
+}
+
+/* Bookmarks panel */
+#bookmarks-panel {
+    position: absolute;
+    top: 56px;
+    right: 12px;
+    z-index: 25;
+    width: 280px;
+    max-height: 400px;
+    overflow-y: auto;
+    background: rgba(5, 5, 15, 0.95);
+    backdrop-filter: var(--glass);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px;
+}
+.bookmarks-panel-header {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 12px;
+    color: var(--cyan);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+}
+.bookmark-item {
+    padding: 8px 10px;
+    border-radius: var(--radius-sm, 4px);
+    cursor: pointer;
+    transition: var(--transition);
+    margin-bottom: 4px;
+    border: 1px solid transparent;
+}
+.bookmark-item:hover {
+    background: rgba(0, 255, 255, 0.05);
+    border-color: var(--border);
+}
+.bookmark-item-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.bookmark-icon {
+    color: var(--cyan);
+    font-size: 14px;
+    filter: drop-shadow(0 0 4px rgba(0, 255, 255, 0.4));
+}
+.bookmark-branch {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 13px;
+    color: var(--text-primary);
+    flex: 1;
+}
+.bookmark-edit-btn, .bookmark-delete-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 12px;
+    opacity: 0;
+    transition: var(--transition);
+    padding: 2px 4px;
+}
+.bookmark-item:hover .bookmark-edit-btn,
+.bookmark-item:hover .bookmark-delete-btn { opacity: 0.7; }
+.bookmark-edit-btn:hover, .bookmark-delete-btn:hover {
+    opacity: 1 !important;
+    color: var(--cyan);
+}
+.bookmark-desc {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 4px;
+    padding-left: 20px;
+    font-style: italic;
+}
+.bookmarks-empty {
+    color: var(--text-muted);
+    font-size: 12px;
+    text-align: center;
+    padding: 16px 8px;
 }
 
 #view-tree {
@@ -2527,5 +2617,23 @@ pre.tool-output {
     }
     #breadcrumb-trail {
         max-width: 60%;
+    }
+    /* Tree toolbar mobile */
+    #tree-toolbar {
+        top: 8px;
+        right: 8px;
+        gap: 6px;
+    }
+    #tree-toolbar button {
+        width: 32px;
+        height: 32px;
+        font-size: 16px;
+    }
+    #bookmarks-panel {
+        top: 48px;
+        right: 8px;
+        left: 8px;
+        width: auto;
+        max-height: 50vh;
     }
 }

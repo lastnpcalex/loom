@@ -364,8 +364,6 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["cc_effort"] = data["cc_effort"]
     if "cc_permission_mode" in data:
         fields["cc_permission_mode"] = data["cc_permission_mode"]
-    if "bookmark_msg_id" in data:
-        fields["bookmark_msg_id"] = data["bookmark_msg_id"]
     if fields:
         await db.update_conversation_fields(conv_id, **fields)
     return await db.get_conversation(conv_id)
@@ -374,6 +372,34 @@ async def api_update_conversation(conv_id: int, data: dict):
 @app.delete("/api/conversations/{conv_id}")
 async def api_delete_conversation(conv_id: int):
     await db.delete_conversation(conv_id)
+    return {"ok": True}
+
+
+# ── Bookmarks ──
+
+@app.get("/api/conversations/{conv_id}/bookmarks")
+async def api_get_bookmarks(conv_id: int):
+    return await db.get_bookmarks(conv_id)
+
+
+@app.post("/api/conversations/{conv_id}/bookmarks")
+async def api_add_bookmark(conv_id: int, data: dict):
+    return await db.add_bookmark(
+        conv_id,
+        data["message_id"],
+        data.get("branch_name", ""),
+        data.get("description", ""),
+    )
+
+
+@app.put("/api/bookmarks/{bookmark_id}")
+async def api_update_bookmark(bookmark_id: int, data: dict):
+    return await db.update_bookmark(bookmark_id, data.get("description", ""))
+
+
+@app.delete("/api/bookmarks/{bookmark_id}")
+async def api_delete_bookmark(bookmark_id: int):
+    await db.delete_bookmark(bookmark_id)
     return {"ok": True}
 
 

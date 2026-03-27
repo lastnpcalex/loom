@@ -57,6 +57,7 @@ const State = {
     ws: null,
     isStreaming: false,
     pendingImages: [],  // [{path, url}, ...] — max 5
+    bookmarks: [],
     config: {},
     convFilter: 'all',
     convFolderCollapsed: {},
@@ -562,13 +563,15 @@ async function loadConversation(convId) {
     State.currentConvId = convId;
     localStorage.setItem('loom-last-conv', convId);
 
-    const [conv, treeData] = await Promise.all([
+    const [conv, treeData, bookmarks] = await Promise.all([
         API.get(`/api/conversations/${convId}`),
         API.get(`/api/conversations/${convId}/tree`),
+        API.get(`/api/conversations/${convId}/bookmarks`),
     ]);
 
     State.currentConv = conv;
     State.treeData = treeData;
+    State.bookmarks = bookmarks || [];
 
     // Compute branch names for breadcrumbs and message labels
     if (treeData.length > 0 && typeof computeBranchNames === 'function') {
@@ -603,12 +606,7 @@ async function loadConversation(convId) {
         return siblings.length > 1;
     });
 
-    // If bookmarked, navigate to that message
-    if (conv.bookmark_msg_id) {
-        await switchToBranch(conv.bookmark_msg_id, conv.bookmark_msg_id);
-        State._skipLoadOnChat = true;
-        switchView('chat');
-    } else if (hasForks) {
+    if (hasForks) {
         switchView('tree');
     } else {
         switchView('chat');

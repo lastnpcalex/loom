@@ -188,6 +188,124 @@ function resetCanvasView() {
     applyTransform();
 }
 
+function centerLoom() {
+    const canvas = document.getElementById('tree-canvas');
+    const nodesContainer = document.getElementById('tree-nodes');
+    if (!canvas || !nodesContainer) return;
+
+    const nodeEls = nodesContainer.querySelectorAll('.tree-node-card');
+    if (nodeEls.length === 0) return;
+
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const el of nodeEls) {
+        const x = parseFloat(el.style.left);
+        const y = parseFloat(el.style.top);
+        const w = el.offsetWidth;
+        const h = el.offsetHeight;
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x + w);
+        maxY = Math.max(maxY, y + h);
+    }
+
+    const contentW = maxX - minX;
+    const contentH = maxY - minY;
+    const canvasRect = canvas.getBoundingClientRect();
+    const padding = 60;
+    const availW = canvasRect.width - padding * 2;
+    const availH = canvasRect.height - padding * 2;
+
+    const zoom = Math.min(1.5, Math.max(0.2, Math.min(availW / contentW, availH / contentH)));
+    const panX = padding + (availW - contentW * zoom) / 2 - minX * zoom;
+    const panY = padding + (availH - contentH * zoom) / 2 - minY * zoom;
+
+    TREE.zoom = zoom;
+    TREE.panX = panX;
+    TREE.panY = panY;
+    applyTransform();
+}
+
+function renderBookmarksPanel() {
+    const list = document.getElementById('bookmarks-list');
+    if (!list) return;
+
+    if (!State.bookmarks || State.bookmarks.length === 0) {
+        list.innerHTML = '<div class="bookmarks-empty">No bookmarks yet. Click ⬡ on a node to bookmark it.</div>';
+        return;
+    }
+
+    list.innerHTML = State.bookmarks.map(b => `
+        <div class="bookmark-item" data-bookmark-id="${b.id}" data-msg-id="${b.message_id}">
+            <div class="bookmark-item-header">
+                <span class="bookmark-icon">⏣</span>
+                <span class="bookmark-branch">${escapeHtml(b.branch_name || '?')}</span>
+                <button class="bookmark-edit-btn" title="Edit description">&#x270E;</button>
+                <button class="bookmark-delete-btn" title="Remove bookmark">&#x2715;</button>
+            </div>
+            ${b.description ? `<div class="bookmark-desc">${escapeHtml(b.description)}</div>` : ''}
+        </div>
+    `).join('');
+
+    for (const item of list.querySelectorAll('.bookmark-item')) {
+        // Navigate on click
+        item.addEventListener('click', async (e) => {
+            if (e.target.closest('.bookmark-edit-btn') || e.target.closest('.bookmark-delete-btn')) return;
+            const msgId = parseInt(item.dataset.msgId);
+            await switchToBranch(msgId, msgId);
+            State._skipLoadOnChat = true;
+            switchView('chat');
+        });
+
+        // Edit description
+        const editBtn = item.querySelector('.bookmark-edit-btn');
+        if (editBtn) {
+            editBtn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const bmId = parseInt(item.dataset.bookmarkId);
+                const bm = State.bookmarks.find(b => b.id === bmId);
+                const desc = prompt('Bookmark description:', bm?.description || '');
+                if (desc !== null) {
+                    await API.put(`/api/bookmarks/${bmId}`, { description: desc });
+                    bm.description = desc;
+                    renderBookmarksPanel();
+                }
+            });
+        }
+
+        // Delete
+        const delBtn = item.querySelector('.bookmark-delete-btn');
+        if (delBtn) {
+            delBtn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const bmId = parseInt(item.dataset.bookmarkId);
+                await API.del(`/api/bookmarks/${bmId}`);
+                State.bookmarks = State.bookmarks.filter(b => b.id !== bmId);
+                renderBookmarksPanel();
+                renderTree();
+                showToast('Bookmark removed');
+            });
+        }
+    }
+}
+
+function initTreeToolbar() {
+    const centerBtn = document.getElementById('tree-center-btn');
+    if (centerBtn) {
+        centerBtn.addEventListener('click', centerLoom);
+    }
+
+    const bookmarksBtn = document.getElementById('tree-bookmarks-btn');
+    const bookmarksPanel = document.getElementById('bookmarks-panel');
+    if (bookmarksBtn && bookmarksPanel) {
+        bookmarksBtn.addEventListener('click', () => {
+            bookmarksPanel.classList.toggle('hidden');
+            if (!bookmarksPanel.classList.contains('hidden')) {
+                renderBookmarksPanel();
+            }
+        });
+    }
+}
+
 // ── Branch Naming ──
 
 function getBranchLabel(depth) {
@@ -343,6 +461,7 @@ async function renderTree() {
     if (!TREE._initialized) {
         initCanvas();
         initLayoutToggle();
+        initTreeToolbar();
         resetCanvasView();
         TREE._initialized = true;
     }
@@ -394,7 +513,7 @@ function createNode(node, branchNames) {
 
     const hasImage = !!data.image_path;
 
-    const isBookmarked = State.currentConv?.bookmark_msg_id === data.id;
+    const isBookmarked = State.bookmarks?.some(b => b.message_id === data.id);
     // Header (always shown)
     const headerHtml = `
         <div class="tree-node-header">
@@ -402,7 +521,7 @@ function createNode(node, branchNames) {
             ${hasImage ? '<span class="tree-node-img-badge" title="Has image">img</span>' : ''}
             <span class="tree-node-label">${escapeHtml(label)}</span>
             ${isForkPoint ? `<span class="tree-node-fork">${node.childCount} branches</span>` : ''}
-            <button class="tree-node-bookmark-btn${isBookmarked ? ' active' : ''}" title="${isBookmarked ? 'Remove anchor' : 'Set as anchor point'}">⚓</button>
+            <button class="tree-node-bookmark-btn${isBookmarked ? ' active' : ''}" title="${isBookmarked ? 'Remove bookmark' : 'Bookmark this node'}">${isBookmarked ? '⏣' : '⬡'}</button>
             <button class="tree-node-delete-btn" title="Delete branch">&#x2715;</button>
         </div>
     `;
@@ -436,12 +555,26 @@ function createNode(node, branchNames) {
         });
     }
 
-    // Bookmark/anchor button
+    // Bookmark button
     const bookmarkBtn = el.querySelector('.tree-node-bookmark-btn');
     if (bookmarkBtn) {
         bookmarkBtn.addEventListener('click', async (e) => {
             e.stopPropagation();
-            await toggleBookmark(data.id);
+            const existing = State.bookmarks.find(b => b.message_id === data.id);
+            if (existing) {
+                await API.del(`/api/bookmarks/${existing.id}`);
+                State.bookmarks = State.bookmarks.filter(b => b.id !== existing.id);
+                showToast('Bookmark removed');
+            } else {
+                const branchName = State.branchNames?.[data.id] || '';
+                const bm = await API.post(`/api/conversations/${State.currentConvId}/bookmarks`, {
+                    message_id: data.id,
+                    branch_name: branchName,
+                    description: '',
+                });
+                State.bookmarks.push(bm);
+                showToast('Bookmarked');
+            }
             await renderTree();
         });
     }

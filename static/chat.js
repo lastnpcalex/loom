@@ -1370,18 +1370,6 @@ function copyMessage(msgId) {
     }
 }
 
-async function toggleBookmark(msgId) {
-    if (!State.currentConvId || !State.currentConv) return;
-    const current = State.currentConv.bookmark_msg_id;
-    const newVal = current === msgId ? null : msgId;
-    try {
-        await API.put(`/api/conversations/${State.currentConvId}`, { bookmark_msg_id: newVal });
-        State.currentConv.bookmark_msg_id = newVal;
-        renderMessages();
-        showToast(newVal ? 'Bookmarked' : 'Bookmark removed');
-    } catch { showToast('Failed to bookmark', 'error'); }
-}
-
 // ── Refresh Tree ──
 
 async function refreshTree() {

@@ -58,6 +58,19 @@ CREATE TABLE IF NOT EXISTS style_state (
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id);
 CREATE INDEX IF NOT EXISTS idx_summaries_conv ON summaries(conversation_id);
+
+CREATE TABLE IF NOT EXISTS bookmarks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    branch_name TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+    UNIQUE(conversation_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_conv ON bookmarks(conversation_id);
 """
 
 
@@ -102,7 +115,7 @@ async def _run_migrations(db):
         "ALTER TABLE conversations ADD COLUMN local_model TEXT",
         # Permission mode (default, plan, auto, etc.)
         "ALTER TABLE conversations ADD COLUMN cc_permission_mode TEXT DEFAULT 'default'",
-        # Bookmarked message — auto-navigate to this on conversation load
+        # Bookmarked message — auto-navigate to this on conversation load (deprecated)
         "ALTER TABLE conversations ADD COLUMN bookmark_msg_id INTEGER",
     ]
     for sql in migrations:
@@ -110,6 +123,24 @@ async def _run_migrations(db):
             await db.execute(sql)
         except Exception:
             pass  # Column already exists
+
+    # Table-level migrations (CREATE IF NOT EXISTS is idempotent)
+    table_migrations = [
+        """CREATE TABLE IF NOT EXISTS bookmarks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            branch_name TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+            FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+            UNIQUE(conversation_id, message_id)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_bookmarks_conv ON bookmarks(conversation_id)",
+    ]
+    for sql in table_migrations:
+        await db.execute(sql)
 
 
 # ── Conversations ──
@@ -185,8 +216,7 @@ async def update_conversation_fields(conv_id: int, **fields):
     db = await get_db()
     allowed = {"persona_id", "lore_ids", "style_nudge", "custom_scene", "title",
                 "claude_session_id", "total_cost_usd", "cc_model", "cc_effort",
-                "starred", "folder", "local_model", "cc_permission_mode",
-                "bookmark_msg_id"}
+                "starred", "folder", "local_model", "cc_permission_mode"}
     updates = []
     params = []
     for key, val in fields.items():
@@ -605,6 +635,56 @@ async def update_style_state(conv_id: int, nudge_index: int = None,
             params
         )
         await db.commit()
+    await db.close()
+
+
+# ── Bookmarks ──
+
+async def get_bookmarks(conv_id: int) -> list[dict]:
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM bookmarks WHERE conversation_id = ? ORDER BY created_at DESC",
+        (conv_id,)
+    )
+    await db.close()
+    return [dict(r) for r in rows]
+
+
+async def add_bookmark(conv_id: int, message_id: int,
+                       branch_name: str = '', description: str = '') -> dict:
+    db = await get_db()
+    now = time.time()
+    cursor = await db.execute(
+        "INSERT OR IGNORE INTO bookmarks (conversation_id, message_id, branch_name, description, created_at) VALUES (?, ?, ?, ?, ?)",
+        (conv_id, message_id, branch_name, description, now)
+    )
+    await db.commit()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM bookmarks WHERE conversation_id = ? AND message_id = ?",
+        (conv_id, message_id)
+    )
+    await db.close()
+    return dict(rows[0]) if rows else {}
+
+
+async def update_bookmark(bookmark_id: int, description: str) -> dict:
+    db = await get_db()
+    await db.execute(
+        "UPDATE bookmarks SET description = ? WHERE id = ?",
+        (description, bookmark_id)
+    )
+    await db.commit()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM bookmarks WHERE id = ?", (bookmark_id,)
+    )
+    await db.close()
+    return dict(rows[0]) if rows else {}
+
+
+async def delete_bookmark(bookmark_id: int):
+    db = await get_db()
+    await db.execute("DELETE FROM bookmarks WHERE id = ?", (bookmark_id,))
+    await db.commit()
     await db.close()
 
 
