@@ -92,7 +92,7 @@ function switchView(view) {
         breadcrumb.classList.add('hidden');
         treeBtn.classList.add('hidden');
         contextInfo.classList.add('hidden');
-        globalBmBtn?.classList.add('hidden');
+        globalBmBtn?.classList.remove('hidden');
         statePanelTree?.classList.add('hidden');
         // Close WebSocket when leaving a conversation
         if (State.ws) { State.ws.close(); State.ws = null; }
@@ -650,6 +650,10 @@ async function loadConversation(convId) {
 
     if (hasForks) {
         switchView('tree');
+        // Auto-center the loom after rendering
+        if (typeof centerLoom === 'function') {
+            requestAnimationFrame(() => centerLoom());
+        }
     } else {
         switchView('chat');
     }

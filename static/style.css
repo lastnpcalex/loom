@@ -774,7 +774,7 @@ body::after {
 /* ── State Cards Panel ── */
 #state-panel {
     position: fixed;
-    bottom: 100px;
+    bottom: 120px;
     left: 12px;
     right: 12px;
     z-index: 200;
@@ -786,9 +786,14 @@ body::after {
     border-radius: var(--radius);
     box-shadow: 0 0 24px rgba(0, 255, 255, 0.06), 0 -4px 16px rgba(0, 0, 0, 0.5);
     padding: 12px;
-    box-shadow: 0 0 24px rgba(0, 255, 255, 0.06), 0 8px 32px rgba(0, 0, 0, 0.5);
 }
 .state-panel-header {
+    position: sticky;
+    top: -12px;
+    z-index: 10;
+    background: rgba(5, 5, 15, 0.98);
+    margin: -12px -12px 0;
+    padding: 12px;
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -1116,9 +1121,9 @@ body::after {
     border: none;
     color: var(--text-secondary);
     cursor: pointer;
-    font-size: 9px;
+    font-size: 8px;
     font-family: 'Orbitron', sans-serif;
-    letter-spacing: 0.8px;
+    letter-spacing: 0.5px;
     text-transform: uppercase;
     padding: 3px 6px;
     transition: var(--transition);

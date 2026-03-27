@@ -1004,7 +1004,7 @@ async function switchToBranch(leafId, scrollToMsgId) {
         }
 
         // Now try to scroll to it (defer to allow DOM layout to settle)
-        requestAnimationFrame(() => {
+        setTimeout(() => {
             const targetEl = document.querySelector(`.message[data-msg-id="${targetId}"]`);
             if (targetEl) {
                 targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -1013,7 +1013,7 @@ async function switchToBranch(leafId, scrollToMsgId) {
             } else {
                 scrollToBottom();
             }
-        });
+        }, 150);
     } catch (err) {
         showToast('Failed to switch branch', 'error');
     } finally {
