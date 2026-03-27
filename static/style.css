@@ -959,6 +959,16 @@ body::after {
     background: rgba(0, 255, 255, 0.08);
     color: var(--cyan);
 }
+.picker-label-input {
+    width: 100%;
+    background: rgba(0, 255, 255, 0.05);
+    border: 1px solid var(--cyan);
+    border-radius: 3px;
+    color: var(--text-primary);
+    font-size: 13px;
+    padding: 4px 8px;
+    outline: none;
+}
 
 /* Avatar image support */
 .char-avatar[style*="background-image"] { font-size: 0; }

@@ -1105,13 +1105,26 @@ function showStateCardPicker(convId, onDone, charId) {
 
         try {
             if (action === 'new') {
-                const label = prompt('Label:');
-                if (!label) { picker.remove(); return; }
-                if (charId) {
-                    await API.post(`/api/characters/${charId}/state`, { schema_id: schema, label, data: {} });
-                } else {
-                    await API.post(`/api/conversations/${convId}/state`, { schema_id: schema, label, data: {} });
-                }
+                // Show inline label input instead of prompt()
+                opt.innerHTML = `<input class="picker-label-input" type="text" placeholder="Enter label..." autofocus>`;
+                const input = opt.querySelector('input');
+                input.focus();
+                input.addEventListener('click', (ev) => ev.stopPropagation());
+                const submitLabel = async () => {
+                    const label = input.value.trim();
+                    if (!label) { picker.remove(); return; }
+                    if (charId) {
+                        await API.post(`/api/characters/${charId}/state`, { schema_id: schema, label, data: {} });
+                    } else {
+                        await API.post(`/api/conversations/${convId}/state`, { schema_id: schema, label, data: {} });
+                    }
+                    showToast('Card added');
+                    if (onDone) await onDone();
+                    picker.remove();
+                };
+                input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submitLabel(); if (ev.key === 'Escape') picker.remove(); });
+                input.addEventListener('blur', () => setTimeout(() => { if (document.contains(picker)) picker.remove(); }, 200));
+                return; // Don't fall through to the picker.remove() below
             } else if (action === 'insert-persona') {
                 const persona = State.personas.find(p => p.id === opt.dataset.id);
                 if (!persona) { picker.remove(); return; }
@@ -1705,7 +1718,8 @@ function renderHomeCharacters() {
         card.className = 'char-card home-char-card';
         const initial = char.name ? char.name[0].toUpperCase() : '?';
         const tags = Array.isArray(char.tags) ? char.tags.join(', ') : '';
-        const avatarHtml = char.avatar
+        const hasAvatar = char.avatar && char.avatar !== 'null';
+        const avatarHtml = hasAvatar
             ? `<div class="char-avatar" style="background-image: url('${char.avatar}'); background-size: cover; background-position: center;"></div>`
             : `<div class="char-avatar">${initial}</div>`;
         card.innerHTML = `
@@ -1882,7 +1896,8 @@ function renderHomePersonas() {
         card.className = 'char-card home-persona-card';
         const initial = persona.name ? persona.name[0].toUpperCase() : '?';
         const tags = Array.isArray(persona.tags) ? persona.tags.join(', ') : '';
-        const pAvatarHtml = persona.avatar
+        const pHasAvatar = persona.avatar && persona.avatar !== 'null';
+        const pAvatarHtml = pHasAvatar
             ? `<div class="char-avatar persona-avatar" style="background-image: url('${persona.avatar}'); background-size: cover; background-position: center;"></div>`
             : `<div class="char-avatar persona-avatar">${initial}</div>`;
         card.innerHTML = `
@@ -1991,7 +2006,8 @@ function renderHomeLore() {
         card.className = 'char-card home-lore-card';
         const initial = entry.name ? entry.name[0].toUpperCase() : '?';
         const tags = Array.isArray(entry.tags) ? entry.tags.join(', ') : '';
-        const lAvatarHtml = entry.avatar
+        const lHasAvatar = entry.avatar && entry.avatar !== 'null';
+        const lAvatarHtml = lHasAvatar
             ? `<div class="char-avatar lore-avatar" style="background-image: url('${entry.avatar}'); background-size: cover; background-position: center;"></div>`
             : `<div class="char-avatar lore-avatar">${initial}</div>`;
         card.innerHTML = `

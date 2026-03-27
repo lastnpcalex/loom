@@ -272,7 +272,7 @@ function renderBookmarksPanel(targetListId) {
         // Wire navigation
         for (const item of list.querySelectorAll('.bookmark-item')) {
             item.addEventListener('click', async (e) => {
-                if (e.target.closest('.bookmark-delete-btn') || e.target.closest('.bookmark-desc-value')) return;
+                if (e.target.closest('.bookmark-delete-btn') || e.target.closest('.bookmark-desc')) return;
                 const msgId = parseInt(item.dataset.msgId);
                 const convId = parseInt(item.dataset.convId);
                 // Navigate cross-conversation if needed
