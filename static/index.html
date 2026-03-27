@@ -26,9 +26,16 @@
                 <div id="context-info" class="hidden">
                     <span id="token-count" title="Estimated tokens">—</span>
                 </div>
+                <button id="btn-bookmarks-global" title="Bookmarks" class="hidden">⬡</button>
                 <button id="btn-settings" title="Settings">⚙</button>
             </div>
         </header>
+
+        <!-- Global bookmarks dropdown (visible from chat/tree) -->
+        <div id="bookmarks-panel-global" class="hidden">
+            <div class="bookmarks-panel-header"><span>Bookmarks</span></div>
+            <div id="bookmarks-list-global"></div>
+        </div>
 
         <!-- View: Conversation List (home) -->
         <div id="view-home" class="view active">

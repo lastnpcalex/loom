@@ -669,15 +669,17 @@ function createMessageElement(msg, cost) {
         : getCharacterName();
     const branchLabel = State.branchNames?.[msg.id] || '';
 
+    const isBm = State.bookmarks?.some(b => b.message_id === msg.id);
+    const bmBtn = `<button onclick="toggleChatBookmark(${msg.id})" title="${isBm ? 'Remove bookmark' : 'Bookmark'}" class="chat-bookmark-btn${isBm ? ' active' : ''}">${isBm ? '⏣' : '⬡'}</button>`;
     let actionsHtml = '';
     if (msg.role === 'assistant') {
         actionsHtml = '<button onclick="regenerateMessage(' + msg.id + ')" title="Regenerate">&#x21BB;</button>' +
             '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
-            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>';
+            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>' + bmBtn;
     } else {
         actionsHtml = '<button onclick="editMessage(' + msg.id + ')" title="Edit">&#x270E;</button>' +
             '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
-            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>';
+            '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>' + bmBtn;
     }
 
     // Branch indicator (async - will fill in after render)
@@ -1368,6 +1370,28 @@ function copyMessage(msgId) {
             () => showToast('Copy failed', 'error')
         );
     }
+}
+
+// ── Chat Bookmark Toggle ──
+
+async function toggleChatBookmark(msgId) {
+    if (!State.currentConvId) return;
+    const existing = State.bookmarks.find(b => b.message_id === msgId);
+    if (existing) {
+        await API.del(`/api/bookmarks/${existing.id}`);
+        State.bookmarks = State.bookmarks.filter(b => b.id !== existing.id);
+        showToast('Bookmark removed');
+    } else {
+        const branchName = State.branchNames?.[msgId] || '';
+        const bm = await API.post(`/api/conversations/${State.currentConvId}/bookmarks`, {
+            message_id: msgId,
+            branch_name: branchName,
+            description: '',
+        });
+        State.bookmarks.push(bm);
+        showToast('Bookmarked');
+    }
+    renderMessages();
 }
 
 // ── Refresh Tree ──

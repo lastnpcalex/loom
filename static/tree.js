@@ -225,65 +225,69 @@ function centerLoom() {
     applyTransform();
 }
 
-function renderBookmarksPanel() {
-    const list = document.getElementById('bookmarks-list');
-    if (!list) return;
+function renderBookmarksPanel(targetListId) {
+    // Render into all bookmark lists (tree + global) or a specific one
+    const listIds = targetListId ? [targetListId] : ['bookmarks-list', 'bookmarks-list-global'];
+    for (const listId of listIds) {
+        const list = document.getElementById(listId);
+        if (!list) continue;
 
-    if (!State.bookmarks || State.bookmarks.length === 0) {
-        list.innerHTML = '<div class="bookmarks-empty">No bookmarks yet. Click ⬡ on a node to bookmark it.</div>';
-        return;
-    }
-
-    list.innerHTML = State.bookmarks.map(b => `
-        <div class="bookmark-item" data-bookmark-id="${b.id}" data-msg-id="${b.message_id}">
-            <div class="bookmark-item-header">
-                <span class="bookmark-icon">⏣</span>
-                <span class="bookmark-branch">${escapeHtml(b.branch_name || '?')}</span>
-                <button class="bookmark-edit-btn" title="Edit description">&#x270E;</button>
-                <button class="bookmark-delete-btn" title="Remove bookmark">&#x2715;</button>
-            </div>
-            ${b.description ? `<div class="bookmark-desc">${escapeHtml(b.description)}</div>` : ''}
-        </div>
-    `).join('');
-
-    for (const item of list.querySelectorAll('.bookmark-item')) {
-        // Navigate on click
-        item.addEventListener('click', async (e) => {
-            if (e.target.closest('.bookmark-edit-btn') || e.target.closest('.bookmark-delete-btn')) return;
-            const msgId = parseInt(item.dataset.msgId);
-            await switchToBranch(msgId, msgId);
-            State._skipLoadOnChat = true;
-            switchView('chat');
-        });
-
-        // Edit description
-        const editBtn = item.querySelector('.bookmark-edit-btn');
-        if (editBtn) {
-            editBtn.addEventListener('click', async (e) => {
-                e.stopPropagation();
-                const bmId = parseInt(item.dataset.bookmarkId);
-                const bm = State.bookmarks.find(b => b.id === bmId);
-                const desc = prompt('Bookmark description:', bm?.description || '');
-                if (desc !== null) {
-                    await API.put(`/api/bookmarks/${bmId}`, { description: desc });
-                    bm.description = desc;
-                    renderBookmarksPanel();
-                }
-            });
+        if (!State.bookmarks || State.bookmarks.length === 0) {
+            list.innerHTML = '<div class="bookmarks-empty">No bookmarks yet. Click ⬡ on a node to bookmark it.</div>';
+            continue;
         }
 
-        // Delete
-        const delBtn = item.querySelector('.bookmark-delete-btn');
-        if (delBtn) {
-            delBtn.addEventListener('click', async (e) => {
-                e.stopPropagation();
-                const bmId = parseInt(item.dataset.bookmarkId);
-                await API.del(`/api/bookmarks/${bmId}`);
-                State.bookmarks = State.bookmarks.filter(b => b.id !== bmId);
-                renderBookmarksPanel();
-                renderTree();
-                showToast('Bookmark removed');
+        list.innerHTML = State.bookmarks.map(b => `
+            <div class="bookmark-item" data-bookmark-id="${b.id}" data-msg-id="${b.message_id}">
+                <div class="bookmark-item-header">
+                    <span class="bookmark-icon">⏣</span>
+                    <span class="bookmark-branch">${escapeHtml(b.branch_name || '?')}</span>
+                    <button class="bookmark-edit-btn" title="Edit description">&#x270E;</button>
+                    <button class="bookmark-delete-btn" title="Remove bookmark">&#x2715;</button>
+                </div>
+                ${b.description ? `<div class="bookmark-desc">${escapeHtml(b.description)}</div>` : ''}
+            </div>
+        `).join('');
+
+        for (const item of list.querySelectorAll('.bookmark-item')) {
+            item.addEventListener('click', async (e) => {
+                if (e.target.closest('.bookmark-edit-btn') || e.target.closest('.bookmark-delete-btn')) return;
+                const msgId = parseInt(item.dataset.msgId);
+                await switchToBranch(msgId, msgId);
+                State._skipLoadOnChat = true;
+                switchView('chat');
+                // Close panels
+                document.getElementById('bookmarks-panel')?.classList.add('hidden');
+                document.getElementById('bookmarks-panel-global')?.classList.add('hidden');
             });
+
+            const editBtn = item.querySelector('.bookmark-edit-btn');
+            if (editBtn) {
+                editBtn.addEventListener('click', async (e) => {
+                    e.stopPropagation();
+                    const bmId = parseInt(item.dataset.bookmarkId);
+                    const bm = State.bookmarks.find(b => b.id === bmId);
+                    const desc = prompt('Bookmark description:', bm?.description || '');
+                    if (desc !== null) {
+                        await API.put(`/api/bookmarks/${bmId}`, { description: desc });
+                        bm.description = desc;
+                        renderBookmarksPanel();
+                    }
+                });
+            }
+
+            const delBtn = item.querySelector('.bookmark-delete-btn');
+            if (delBtn) {
+                delBtn.addEventListener('click', async (e) => {
+                    e.stopPropagation();
+                    const bmId = parseInt(item.dataset.bookmarkId);
+                    await API.del(`/api/bookmarks/${bmId}`);
+                    State.bookmarks = State.bookmarks.filter(b => b.id !== bmId);
+                    renderBookmarksPanel();
+                    if (typeof renderTree === 'function') renderTree();
+                    showToast('Bookmark removed');
+                });
+            }
         }
     }
 }

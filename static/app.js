@@ -75,6 +75,11 @@ function switchView(view) {
     const breadcrumb = document.getElementById('breadcrumb-trail');
     const treeBtn = document.getElementById('btn-to-tree');
     const contextInfo = document.getElementById('context-info');
+    const globalBmBtn = document.getElementById('btn-bookmarks-global');
+    const globalBmPanel = document.getElementById('bookmarks-panel-global');
+
+    // Hide global bookmarks panel on view switch
+    globalBmPanel?.classList.add('hidden');
 
     if (view === 'home') {
         sep.classList.add('hidden');
@@ -82,6 +87,7 @@ function switchView(view) {
         breadcrumb.classList.add('hidden');
         treeBtn.classList.add('hidden');
         contextInfo.classList.add('hidden');
+        globalBmBtn?.classList.add('hidden');
         // Close WebSocket when leaving a conversation
         if (State.ws) { State.ws.close(); State.ws = null; }
     } else if (view === 'tree') {
@@ -91,6 +97,7 @@ function switchView(view) {
         breadcrumb.classList.add('hidden');
         treeBtn.classList.add('hidden');
         contextInfo.classList.remove('hidden');
+        globalBmBtn?.classList.remove('hidden');
     } else if (view === 'chat') {
         sep.classList.remove('hidden');
         title.classList.remove('hidden');
@@ -99,6 +106,7 @@ function switchView(view) {
         treeBtn.classList.remove('hidden');
         updateBreadcrumbs();
         contextInfo.classList.remove('hidden');
+        globalBmBtn?.classList.remove('hidden');
         // Refresh messages when switching back to chat (picks up responses
         // that completed while on tree/home view)
         // Skip if we just did switchToBranch (data is already fresh)
@@ -1079,6 +1087,18 @@ function setupEventListeners() {
             btn.classList.add('active');
         });
     });
+
+    // Global bookmarks button (header)
+    const globalBmBtn = document.getElementById('btn-bookmarks-global');
+    const globalBmPanel = document.getElementById('bookmarks-panel-global');
+    if (globalBmBtn && globalBmPanel) {
+        globalBmBtn.addEventListener('click', () => {
+            globalBmPanel.classList.toggle('hidden');
+            if (!globalBmPanel.classList.contains('hidden')) {
+                renderBookmarksPanel('bookmarks-list-global');
+            }
+        });
+    }
 
     // Settings
     document.getElementById('btn-settings').addEventListener('click', async () => {
