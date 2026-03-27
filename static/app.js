@@ -2039,11 +2039,22 @@ function openPersonaModal(personaId) {
         if (!persona) return;
         document.getElementById('persona-name').value = persona.name || '';
         document.getElementById('persona-tags').value = Array.isArray(persona.tags) ? persona.tags.join(', ') : '';
-        document.getElementById('persona-content').value = persona.content || '';
+        // Parse structured content back into fields
+        let content = persona.content || '';
+        let appearance = '', goals = '';
+        const appMatch = content.match(/\n## Appearance\n([\s\S]*?)(?=\n## |$)/);
+        if (appMatch) { appearance = appMatch[1].trim(); content = content.replace(appMatch[0], ''); }
+        const goalMatch = content.match(/\n## Goals\n([\s\S]*?)(?=\n## |$)/);
+        if (goalMatch) { goals = goalMatch[1].trim(); content = content.replace(goalMatch[0], ''); }
+        document.getElementById('persona-content').value = content.trim();
+        document.getElementById('persona-appearance').value = appearance;
+        document.getElementById('persona-goals').value = goals;
     } else {
         document.getElementById('persona-name').value = '';
         document.getElementById('persona-tags').value = '';
         document.getElementById('persona-content').value = '';
+        document.getElementById('persona-appearance').value = '';
+        document.getElementById('persona-goals').value = '';
     }
 
     openModal('modal-persona-edit');
@@ -2058,10 +2069,17 @@ async function savePersona() {
         return;
     }
 
+    const appearance = document.getElementById('persona-appearance')?.value?.trim() || '';
+    const goals = document.getElementById('persona-goals')?.value?.trim() || '';
+    const description = document.getElementById('persona-content').value.trim();
+    // Store structured data as content with markers for parsing back
+    let content = description;
+    if (appearance) content += `\n\n## Appearance\n${appearance}`;
+    if (goals) content += `\n\n## Goals\n${goals}`;
     const data = {
         name,
         tags: document.getElementById('persona-tags').value,
-        content: document.getElementById('persona-content').value,
+        content,
     };
 
     try {
