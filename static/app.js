@@ -1954,6 +1954,8 @@ async function saveCharacter() {
         return;
     }
 
+    // Preserve existing avatar when editing
+    const existingChar = editId ? State.characters.find(c => c.id === editId) : null;
     const data = {
         name,
         tags: document.getElementById('char-tags').value,
@@ -1961,6 +1963,7 @@ async function saveCharacter() {
         scenario: document.getElementById('char-scenario').value,
         greeting: document.getElementById('char-greeting').value,
         example_messages_raw: document.getElementById('char-examples').value,
+        avatar: existingChar?.avatar || null,
         // State card fields
         _appearance: document.getElementById('char-appearance')?.value || '',
         _goals: document.getElementById('char-goals')?.value || '',
