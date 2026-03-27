@@ -1705,7 +1705,7 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
         # ── Pass 1: Orient ──
         print(f"[OODA] Pass 1: Orient...")
         await _ws_send(conv_id, {"type": "status", "text": "OODA: Observing and orienting..."})
-        raw_pass1 = await sync_chat(messages, max_tokens=1024)
+        raw_pass1 = await sync_chat(messages, max_tokens=1024, think=False)
         cleaned_pass1 = _re.sub(r'<think>[\s\S]*?</think>\s*', '', raw_pass1).strip()
         print(f"[OODA] Pass 1 done: {len(cleaned_pass1)} chars")
 
