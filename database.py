@@ -71,6 +71,27 @@ CREATE TABLE IF NOT EXISTS bookmarks (
     UNIQUE(conversation_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_bookmarks_conv ON bookmarks(conversation_id);
+
+CREATE TABLE IF NOT EXISTS state_schemas (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    fields TEXT NOT NULL,
+    is_builtin INTEGER DEFAULT 0,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS state_cards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL,
+    schema_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    data TEXT NOT NULL DEFAULT '{}',
+    is_readonly INTEGER DEFAULT 0,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+    UNIQUE(conversation_id, schema_id, label)
+);
+CREATE INDEX IF NOT EXISTS idx_state_cards_conv ON state_cards(conversation_id);
 """
 
 
@@ -117,6 +138,8 @@ async def _run_migrations(db):
         "ALTER TABLE conversations ADD COLUMN cc_permission_mode TEXT DEFAULT 'default'",
         # Bookmarked message — auto-navigate to this on conversation load (deprecated)
         "ALTER TABLE conversations ADD COLUMN bookmark_msg_id INTEGER",
+        # OODA harness toggle
+        "ALTER TABLE conversations ADD COLUMN ooda_enabled INTEGER DEFAULT 0",
     ]
     for sql in migrations:
         try:
@@ -138,9 +161,75 @@ async def _run_migrations(db):
             UNIQUE(conversation_id, message_id)
         )""",
         "CREATE INDEX IF NOT EXISTS idx_bookmarks_conv ON bookmarks(conversation_id)",
+        """CREATE TABLE IF NOT EXISTS state_schemas (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            fields TEXT NOT NULL,
+            is_builtin INTEGER DEFAULT 0,
+            created_at REAL NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS state_cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id INTEGER NOT NULL,
+            schema_id TEXT NOT NULL,
+            label TEXT NOT NULL,
+            data TEXT NOT NULL DEFAULT '{}',
+            is_readonly INTEGER DEFAULT 0,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+            UNIQUE(conversation_id, schema_id, label)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_state_cards_conv ON state_cards(conversation_id)",
     ]
     for sql in table_migrations:
         await db.execute(sql)
+
+    # Seed builtin state schemas
+    await _seed_builtin_schemas(db)
+
+
+BUILTIN_SCHEMAS = [
+    {
+        "id": "character_state",
+        "name": "Character State",
+        "fields": json.dumps([
+            {"name": "personality", "type": "text", "description": "Core personality traits"},
+            {"name": "appearance", "type": "text", "description": "Physical appearance"},
+            {"name": "current_mood", "type": "text", "description": "Current emotional state"},
+            {"name": "goals", "type": "text", "description": "Active goals and motivations"},
+            {"name": "relationships", "type": "text", "description": "Key relationships"},
+            {"name": "physical_situation", "type": "text", "description": "Current physical state and location"},
+        ]),
+    },
+    {
+        "id": "scene_state",
+        "name": "Scene State",
+        "fields": json.dumps([
+            {"name": "location", "type": "text", "description": "Current location"},
+            {"name": "time_of_day", "type": "text", "description": "Time of day"},
+            {"name": "atmosphere", "type": "text", "description": "Mood and atmosphere"},
+            {"name": "present_characters", "type": "text", "description": "Characters in the scene"},
+            {"name": "recent_events", "type": "text", "description": "What just happened"},
+        ]),
+    },
+    {
+        "id": "lore",
+        "name": "Lore",
+        "fields": json.dumps([
+            {"name": "content", "type": "text", "description": "Background information"},
+        ]),
+    },
+]
+
+
+async def _seed_builtin_schemas(db):
+    """Insert builtin state schemas if they don't exist."""
+    now = time.time()
+    for schema in BUILTIN_SCHEMAS:
+        await db.execute(
+            "INSERT OR IGNORE INTO state_schemas (id, name, fields, is_builtin, created_at) VALUES (?, ?, ?, 1, ?)",
+            (schema["id"], schema["name"], schema["fields"], now)
+        )
 
 
 # ── Conversations ──
@@ -216,7 +305,8 @@ async def update_conversation_fields(conv_id: int, **fields):
     db = await get_db()
     allowed = {"persona_id", "lore_ids", "style_nudge", "custom_scene", "title",
                 "claude_session_id", "total_cost_usd", "cc_model", "cc_effort",
-                "starred", "folder", "local_model", "cc_permission_mode"}
+                "starred", "folder", "local_model", "cc_permission_mode",
+                "ooda_enabled"}
     updates = []
     params = []
     for key, val in fields.items():
@@ -635,6 +725,117 @@ async def update_style_state(conv_id: int, nudge_index: int = None,
             params
         )
         await db.commit()
+    await db.close()
+
+
+# ── State Cards ──
+
+async def get_state_schemas() -> list[dict]:
+    db = await get_db()
+    rows = await db.execute_fetchall("SELECT * FROM state_schemas ORDER BY is_builtin DESC, name")
+    await db.close()
+    return [dict(r) for r in rows]
+
+
+async def get_state_cards(conv_id: int, schema_id: str = None) -> list[dict]:
+    db = await get_db()
+    if schema_id:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM state_cards WHERE conversation_id = ? AND schema_id = ? ORDER BY label",
+            (conv_id, schema_id)
+        )
+    else:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM state_cards WHERE conversation_id = ? ORDER BY schema_id, label",
+            (conv_id,)
+        )
+    await db.close()
+    return [dict(r) for r in rows]
+
+
+async def get_state_card_by_label(conv_id: int, schema_id: str, label: str):
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM state_cards WHERE conversation_id = ? AND schema_id = ? AND label = ?",
+        (conv_id, schema_id, label)
+    )
+    await db.close()
+    return dict(rows[0]) if rows else None
+
+
+async def create_state_card(conv_id: int, schema_id: str, label: str,
+                            data: dict = None, is_readonly: bool = False) -> dict:
+    db = await get_db()
+    now = time.time()
+    data_json = json.dumps(data or {})
+    await db.execute(
+        "INSERT OR IGNORE INTO state_cards (conversation_id, schema_id, label, data, is_readonly, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (conv_id, schema_id, label, data_json, int(is_readonly), now)
+    )
+    await db.commit()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM state_cards WHERE conversation_id = ? AND schema_id = ? AND label = ?",
+        (conv_id, schema_id, label)
+    )
+    await db.close()
+    return dict(rows[0]) if rows else {}
+
+
+async def update_state_card(card_id: int, data: dict) -> dict:
+    db = await get_db()
+    now = time.time()
+    # Merge: load existing data, update fields
+    rows = await db.execute_fetchall("SELECT * FROM state_cards WHERE id = ?", (card_id,))
+    if not rows:
+        await db.close()
+        return {}
+    existing = json.loads(rows[0]["data"] or "{}")
+    existing.update(data)
+    await db.execute(
+        "UPDATE state_cards SET data = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(existing), now, card_id)
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM state_cards WHERE id = ?", (card_id,))
+    await db.close()
+    return dict(rows[0]) if rows else {}
+
+
+async def update_state_card_field(conv_id: int, schema_id: str, label: str,
+                                  field: str, value: str) -> dict:
+    """Update a single field on a state card, creating the card if it doesn't exist."""
+    db = await get_db()
+    now = time.time()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM state_cards WHERE conversation_id = ? AND schema_id = ? AND label = ?",
+        (conv_id, schema_id, label)
+    )
+    if rows:
+        existing = json.loads(rows[0]["data"] or "{}")
+        existing[field] = value
+        await db.execute(
+            "UPDATE state_cards SET data = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(existing), now, rows[0]["id"])
+        )
+    else:
+        data = {field: value}
+        await db.execute(
+            "INSERT INTO state_cards (conversation_id, schema_id, label, data, is_readonly, updated_at) VALUES (?, ?, ?, ?, 0, ?)",
+            (conv_id, schema_id, label, json.dumps(data), now)
+        )
+    await db.commit()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM state_cards WHERE conversation_id = ? AND schema_id = ? AND label = ?",
+        (conv_id, schema_id, label)
+    )
+    await db.close()
+    return dict(rows[0]) if rows else {}
+
+
+async def delete_state_card(card_id: int):
+    db = await get_db()
+    await db.execute("DELETE FROM state_cards WHERE id = ?", (card_id,))
+    await db.commit()
     await db.close()
 
 

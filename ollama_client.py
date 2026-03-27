@@ -214,8 +214,9 @@ async def stream_chat(messages: list[dict],
 async def sync_chat(messages: list[dict],
                     temperature: float = None,
                     max_tokens: int = None,
-                    model: str = None) -> str:
-    """Non-streaming chat completion (for summarization etc.)."""
+                    model: str = None,
+                    think: bool = None) -> str:
+    """Non-streaming chat completion (for summarization, OODA passes, etc.)."""
     global _mock_mode
 
     if _mock_mode:
@@ -231,12 +232,16 @@ async def sync_chat(messages: list[dict],
                 "num_predict": max_tokens or config.max_tokens,
             },
         }
+        if think is not None:
+            payload["think"] = think
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
             resp = await client.post(f"{config.ollama_host}/api/chat", json=payload)
             resp.raise_for_status()
             data = resp.json()
-            return data.get("message", {}).get("content", "")
+            msg = data.get("message", {})
+            # Workaround: some models route output to thinking field
+            return msg.get("content") or msg.get("thinking") or ""
     except (httpx.ConnectError, httpx.ConnectTimeout, OSError):
         _mock_mode = True
         return "Summary: The conversation continues with escalating tension and mutual wariness."

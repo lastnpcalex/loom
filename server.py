@@ -18,7 +18,11 @@ from character_loader import (
     load_all_personas, load_persona, save_persona, delete_persona,
     load_all_lore, load_lore_entry, save_lore, delete_lore,
 )
-from ollama_client import health_check, stream_chat, describe_image
+from ollama_client import health_check, stream_chat, sync_chat, describe_image
+from ooda_harness import (
+    build_ooda_system_prompt, parse_ooda_block, extract_post_ooda_prose,
+    execute_ooda_reads, execute_ooda_updates, build_pass2_context,
+)
 from prompt_engine import (
     build_system_prompt, assemble_prompt,
     get_style_nudge, STYLE_NUDGES
@@ -364,6 +368,8 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["cc_effort"] = data["cc_effort"]
     if "cc_permission_mode" in data:
         fields["cc_permission_mode"] = data["cc_permission_mode"]
+    if "ooda_enabled" in data:
+        fields["ooda_enabled"] = int(data["ooda_enabled"])
     if fields:
         await db.update_conversation_fields(conv_id, **fields)
     return await db.get_conversation(conv_id)
@@ -401,6 +407,89 @@ async def api_update_bookmark(bookmark_id: int, data: dict):
 async def api_delete_bookmark(bookmark_id: int):
     await db.delete_bookmark(bookmark_id)
     return {"ok": True}
+
+
+# ── State Cards ──
+
+@app.get("/api/state-schemas")
+async def api_get_state_schemas():
+    return await db.get_state_schemas()
+
+
+@app.get("/api/conversations/{conv_id}/state")
+async def api_get_state_cards(conv_id: int, schema_id: str = None):
+    return await db.get_state_cards(conv_id, schema_id)
+
+
+@app.post("/api/conversations/{conv_id}/state")
+async def api_create_state_card(conv_id: int, data: dict):
+    return await db.create_state_card(
+        conv_id, data["schema_id"], data["label"],
+        data.get("data", {}), data.get("is_readonly", False),
+    )
+
+
+@app.put("/api/state/{card_id}")
+async def api_update_state_card(card_id: int, data: dict):
+    return await db.update_state_card(card_id, data.get("data", {}))
+
+
+@app.delete("/api/state/{card_id}")
+async def api_delete_state_card(card_id: int):
+    await db.delete_state_card(card_id)
+    return {"ok": True}
+
+
+@app.post("/api/conversations/{conv_id}/state/seed")
+async def api_seed_state_cards(conv_id: int):
+    """Auto-seed state cards from the conversation's character, persona, and lore."""
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+
+    cards_created = []
+    # Seed from character
+    if conv.get("character_id"):
+        char = load_character(os.path.join(config.characters_dir, f"{conv['character_id']}.md"))
+        if char:
+            card = await db.create_state_card(conv_id, "character_state", char.get("name", "Character"), {
+                "personality": char.get("personality", ""),
+                "appearance": "",
+                "current_mood": "",
+                "goals": "",
+                "relationships": "",
+                "physical_situation": char.get("scenario", ""),
+            })
+            if card:
+                cards_created.append(card)
+            # Seed scene from scenario
+            if char.get("scenario"):
+                scene = await db.create_state_card(conv_id, "scene_state", "current", {
+                    "location": "",
+                    "time_of_day": "",
+                    "atmosphere": "",
+                    "present_characters": "",
+                    "recent_events": char["scenario"],
+                })
+                if scene:
+                    cards_created.append(scene)
+
+    # Seed from lore
+    if conv.get("lore_ids"):
+        try:
+            lore_ids = json.loads(conv["lore_ids"]) if isinstance(conv["lore_ids"], str) else conv["lore_ids"]
+        except (ValueError, TypeError):
+            lore_ids = []
+        for lid in lore_ids:
+            entry = load_lore_entry(os.path.join("lore", f"{lid}.md"))
+            if entry:
+                card = await db.create_state_card(conv_id, "lore", entry["name"], {
+                    "content": entry["content"],
+                }, is_readonly=True)
+                if card:
+                    cards_created.append(card)
+
+    return {"seeded": len(cards_created), "cards": cards_created}
 
 
 # ── Tree ──
@@ -764,7 +853,8 @@ async def serve_project_file(conv_id: int, path: str = ""):
         # Allow text files too for previews
         media_type = "text/plain"
 
-    return FileResponse(target, media_type=media_type, filename=target.name)
+    return FileResponse(target, media_type=media_type, filename=target.name,
+                        content_disposition_type="inline")
 
 
 # ── Claude Code Permission Hook Endpoint ──
@@ -935,7 +1025,10 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
         await _handle_local_generation(websocket, conv_id, conv, data)
         return
 
-    await _handle_weave_generation(websocket, conv_id, conv, data)
+    if conv.get("ooda_enabled"):
+        await _handle_ooda_generation(websocket, conv_id, conv, data)
+    else:
+        await _handle_weave_generation(websocket, conv_id, conv, data)
 
 
 async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: dict, data: dict):
@@ -1530,6 +1623,177 @@ async def _handle_local_generation(websocket: WebSocket, conv_id: int, conv: dic
     conv["cc_model"] = conv.get("local_model") or config.ollama_model
     conv["_use_ollama"] = True
     await _handle_claude_generation(websocket, conv_id, conv, data)
+
+
+async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict, data: dict):
+    """Handle OODA-enhanced Weave generation — two-pass with state card scaffolding."""
+    import re as _re
+    try:
+        action = data.get("action")
+        parent_id = data.get("parent_id")
+        print(f"[OODA] Starting ooda_generation conv={conv_id} action={action} parent={parent_id}")
+
+        if action == "generate" and parent_id is None:
+            leaf = await db.get_active_leaf(conv_id)
+            parent_id = leaf["id"] if leaf else None
+
+        # ── Setup (same as weave) ──
+        character = None
+        if conv and conv.get("character_id"):
+            char_path = os.path.join(config.characters_dir, f"{conv['character_id']}.md")
+            character = load_character(char_path)
+
+        style_nudge_name = conv.get("style_nudge", "Natural") if conv else "Natural"
+        nudge_index = 0
+        for i, nudge in enumerate(STYLE_NUDGES):
+            if nudge["name"] == style_nudge_name:
+                nudge_index = i
+                break
+
+        persona = None
+        if conv and conv.get("persona_id"):
+            persona = load_persona(os.path.join("personas", f"{conv['persona_id']}.md"))
+
+        lore_entries = []
+        if conv and conv.get("lore_ids"):
+            try:
+                lore_ids = json.loads(conv["lore_ids"]) if isinstance(conv["lore_ids"], str) else conv["lore_ids"]
+            except (ValueError, TypeError):
+                lore_ids = []
+            for lid in lore_ids:
+                entry = load_lore_entry(os.path.join("lore", f"{lid}.md"))
+                if entry:
+                    lore_entries.append(entry)
+
+        context = await get_context_for_generation(conv_id, character)
+        if action == "regenerate" and parent_id is not None:
+            context["verbatim_messages"] = [
+                m for m in context["verbatim_messages"] if m["id"] <= parent_id
+            ]
+
+        custom_scene = conv.get("custom_scene") if conv else None
+        base_system = build_system_prompt(
+            character=character, style_nudge_index=nudge_index, scenario_override=custom_scene,
+        )
+
+        # ── OODA enhancement: build system prompt with state cards ──
+        state_cards = await db.get_state_cards(conv_id)
+        ooda_system = build_ooda_system_prompt(base_system, state_cards)
+
+        example_msgs = character.get("example_messages", []) if character else []
+        messages = assemble_prompt(
+            system_prompt=ooda_system,
+            example_messages=example_msgs,
+            summary=context.get("summary"),
+            conversation_messages=context["verbatim_messages"],
+            persona=persona,
+            lore_entries=lore_entries,
+        )
+
+        actual_tokens = sum(len(m["content"]) // 3 for m in messages)
+        active_nudge = get_style_nudge(nudge_index)
+        await _ws_send(conv_id, {
+            "type": "context_info",
+            "total_tokens": actual_tokens,
+            "was_compactified": context["was_compactified"],
+            "style_nudge": active_nudge["name"],
+        })
+
+        print(f"[OODA] System prompt: {len(ooda_system)} chars, {len(messages)} messages, {len(state_cards)} state cards")
+        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id})
+
+        # ── Pass 1: Orient ──
+        print(f"[OODA] Pass 1: Orient...")
+        await _ws_send(conv_id, {"type": "status", "text": "OODA: Observing and orienting..."})
+        raw_pass1 = await sync_chat(messages, max_tokens=1024)
+        cleaned_pass1 = _re.sub(r'<think>[\s\S]*?</think>\s*', '', raw_pass1).strip()
+        print(f"[OODA] Pass 1 done: {len(cleaned_pass1)} chars")
+
+        # Parse OODA block
+        ooda = parse_ooda_block(cleaned_pass1)
+
+        if ooda:
+            # Emit OODA steps as tool blocks for visibility
+            if ooda["observe"]:
+                tool_id = f"ooda-observe-{conv_id}"
+                await _ws_send(conv_id, {"type": "tool_start", "name": "Observe", "tool_id": tool_id})
+                await _ws_send(conv_id, {"type": "tool_result", "content": ooda["observe"], "tool_id": tool_id})
+            if ooda["orient"]:
+                tool_id = f"ooda-orient-{conv_id}"
+                await _ws_send(conv_id, {"type": "tool_start", "name": "Orient", "tool_id": tool_id})
+                await _ws_send(conv_id, {"type": "tool_result", "content": ooda["orient"], "tool_id": tool_id})
+            if ooda["decide"]:
+                tool_id = f"ooda-decide-{conv_id}"
+                await _ws_send(conv_id, {"type": "tool_start", "name": "Decide", "tool_id": tool_id})
+                await _ws_send(conv_id, {"type": "tool_result", "content": ooda["decide"], "tool_id": tool_id})
+
+            # Execute state reads
+            resolved = await execute_ooda_reads(conv_id, ooda["reads"])
+            print(f"[OODA] Resolved {len(resolved)} reads, applying {len(ooda['updates'])} updates, {len(ooda['creates'])} creates")
+
+            # Execute state updates
+            changed = await execute_ooda_updates(conv_id, ooda["updates"], ooda["creates"])
+            if changed:
+                await _ws_send(conv_id, {"type": "state_update", "cards": [dict(c) for c in changed]})
+
+        # ── Check for Pass 1 prose ──
+        pass1_prose = extract_post_ooda_prose(cleaned_pass1) if ooda else ""
+        final_prose = ""
+
+        if pass1_prose:
+            print(f"[OODA] Pass 1 prose found ({len(pass1_prose)} chars), skipping Pass 2")
+            final_prose = pass1_prose
+            # Stream it to client
+            for i in range(0, len(final_prose), 8):
+                await _ws_send(conv_id, {"type": "stream_chunk", "content": final_prose[i:i+8]})
+        elif ooda:
+            # ── Pass 2: Act ──
+            print(f"[OODA] Pass 2: Act (streaming)...")
+            await _ws_send(conv_id, {"type": "status", "text": "OODA: Writing scene..."})
+
+            pass2_context = build_pass2_context(ooda, resolved)
+            ooda_end = cleaned_pass1.find("</ooda>")
+            ooda_only = cleaned_pass1[:ooda_end + len("</ooda>")] if ooda_end >= 0 else cleaned_pass1
+
+            pass2_messages = list(messages)
+            pass2_messages.insert(0, {"role": "system", "content": pass2_context})
+            pass2_messages.append({"role": "assistant", "content": ooda_only})
+
+            async for token in stream_chat(pass2_messages):
+                if isinstance(token, dict):
+                    await _ws_send(conv_id, token)
+                    continue
+                final_prose += token
+                await _ws_send(conv_id, {"type": "stream_chunk", "content": token})
+
+            final_prose = _re.sub(r'<think>[\s\S]*?</think>\s*', '', final_prose).strip()
+            final_prose = _re.sub(r'<ooda>[\s\S]*?</ooda>\s*', '', final_prose).strip()
+        else:
+            # No OODA block — treat entire output as prose (fallback)
+            print(f"[OODA] No OODA block found, using raw output as prose")
+            final_prose = cleaned_pass1
+            for i in range(0, len(final_prose), 8):
+                await _ws_send(conv_id, {"type": "stream_chunk", "content": final_prose[i:i+8]})
+
+        if not final_prose.strip():
+            await _ws_send(conv_id, {"type": "error", "error": "OODA: Model returned an empty response — try again"})
+            return
+
+        # Save
+        msg = await db.add_message(conv_id, "assistant", final_prose, parent_id=parent_id)
+        await db.set_active_branch(conv_id, msg["id"])
+        asyncio.create_task(_background_summarize_message(msg["id"], final_prose, "assistant", conv_id=conv_id))
+        await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
+
+    except asyncio.CancelledError:
+        await _ws_send(conv_id, {"type": "cancelled"})
+    except Exception as e:
+        print(f"[OODA] Generation error conv={conv_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        await _ws_send(conv_id, {"type": "error", "error": str(e)})
+    finally:
+        _active_generations.pop(conv_id, None)
 
 
 async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dict, data: dict):
