@@ -1848,7 +1848,7 @@ function renderHomeCharacters() {
 
 
 // ── Character Creator/Editor Modal ──
-function openCharacterModal(charId) {
+async function openCharacterModal(charId) {
     const isEdit = !!charId;
     document.getElementById('char-modal-title').textContent = isEdit ? 'Edit Character' : 'Create Character';
     document.getElementById('char-edit-id').value = charId || '';
@@ -1874,10 +1874,24 @@ function openCharacterModal(charId) {
             exText += `${examples[i].role}: ${examples[i].content}\n`;
         }
         document.getElementById('char-examples').value = exText.trim();
+        // Populate state card fields from Tier 1
+        try {
+            const stateCards = await API.get(`/api/characters/${charId}/state`);
+            const charCard = stateCards.find(c => c.schema_id === 'character_state');
+            if (charCard) {
+                const d = typeof charCard.data === 'string' ? JSON.parse(charCard.data) : charCard.data;
+                document.getElementById('char-appearance').value = d.appearance || '';
+                document.getElementById('char-goals').value = d.goals || '';
+                document.getElementById('char-relationships').value = d.relationships || '';
+            }
+        } catch {}
     } else {
         document.getElementById('char-name').value = '';
         document.getElementById('char-tags').value = '';
         document.getElementById('char-personality').value = '';
+        document.getElementById('char-appearance').value = '';
+        document.getElementById('char-goals').value = '';
+        document.getElementById('char-relationships').value = '';
         document.getElementById('char-scenario').value = '';
         document.getElementById('char-greeting').value = '';
         document.getElementById('char-examples').value = '';
@@ -1902,6 +1916,10 @@ async function saveCharacter() {
         scenario: document.getElementById('char-scenario').value,
         greeting: document.getElementById('char-greeting').value,
         example_messages_raw: document.getElementById('char-examples').value,
+        // State card fields
+        _appearance: document.getElementById('char-appearance')?.value || '',
+        _goals: document.getElementById('char-goals')?.value || '',
+        _relationships: document.getElementById('char-relationships')?.value || '',
     };
 
     try {
@@ -1910,6 +1928,36 @@ async function saveCharacter() {
             saved = await API.put(`/api/characters/${editId}`, data);
         } else {
             saved = await API.post('/api/characters', data);
+        }
+
+        // Auto-create/update Tier 1 state cards from character data
+        const charId = saved.id;
+        const existingCards = await API.get(`/api/characters/${charId}/state`);
+        if (existingCards.length === 0) {
+            // Seed initial state cards from the character fields
+            await API.post(`/api/characters/${charId}/state`, {
+                schema_id: 'character_state', label: saved.name,
+                data: {
+                    personality: data.personality || '',
+                    appearance: data._appearance || '',
+                    current_mood: '',
+                    goals: data._goals || '',
+                    relationships: data._relationships || '',
+                    physical_situation: '',
+                },
+            });
+            if (data.scenario) {
+                await API.post(`/api/characters/${charId}/state`, {
+                    schema_id: 'scene_state', label: 'default',
+                    data: {
+                        location: '',
+                        time_of_day: '',
+                        atmosphere: '',
+                        present_characters: '',
+                        recent_events: data.scenario,
+                    },
+                });
+            }
         }
 
         // Refresh character list

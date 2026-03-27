@@ -2171,6 +2171,8 @@ body::after {
 }
 
 .form-group { margin-bottom: 16px; }
+.form-row { display: flex; gap: 12px; }
+.form-half { flex: 1; }
 
 .form-group label {
     display: block;
