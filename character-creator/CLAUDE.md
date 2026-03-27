@@ -75,6 +75,20 @@ curl -sk -X POST https://localhost:3000/api/characters/{char_id}/state \
   }'
 ```
 
+### Set a character avatar/PFP:
+```bash
+# First upload the image
+curl -sk -X POST https://localhost:3000/api/upload -F "file=@/path/to/avatar.png"
+# Returns: {"path": "uploads/abc123.png", "url": "/uploads/abc123.png"}
+
+# Then update the character with the avatar URL
+curl -sk -X PUT https://localhost:3000/api/characters/{char_id} \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Character Name", "avatar": "/uploads/abc123.png"}'
+```
+
+If the user provides a reference image for the character, upload it and set it as the avatar.
+
 ## How to Process a Character
 
 When the user gives you a character description (any format), follow this process:
