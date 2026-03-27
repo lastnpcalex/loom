@@ -926,6 +926,17 @@ body::after {
     background: rgba(0, 255, 255, 0.12) !important;
     transition: background 1.5s;
 }
+/* OODA tool blocks — hidden by default, shown when parent has .show-ooda */
+.ooda-block {
+    display: none;
+    opacity: 0.7;
+    border-left: 2px solid var(--cyan);
+}
+.message.show-ooda .ooda-block,
+.streaming.show-ooda .ooda-block {
+    display: block;
+}
+
 /* Auto-save indicator */
 .save-indicator {
     font-size: 11px;

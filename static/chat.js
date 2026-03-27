@@ -214,7 +214,7 @@ function handleWSMessage(data) {
 
         case 'tool_start':
             hideGenStatus();
-            appendToolBlock(data.name, data.tool_id);
+            appendToolBlock(data.name, data.tool_id, data.ooda);
             break;
 
         case 'tool_input_chunk':
@@ -1187,11 +1187,15 @@ function removeStreamingMessage() {
 
 // ── Claude Code: Tool + Thinking Blocks ──
 
-function appendToolBlock(name, toolId) {
+function appendToolBlock(name, toolId, isOoda) {
     if (!streamingDiv) return;
+    // Add show-ooda class on first OODA block so they're visible during streaming
+    if (isOoda && !streamingDiv.classList.contains('show-ooda')) {
+        streamingDiv.classList.add('show-ooda');
+    }
     const contentEl = streamingDiv.querySelector('.message-content');
     const block = document.createElement('div');
-    block.className = 'tool-block';
+    block.className = 'tool-block' + (isOoda ? ' ooda-block' : '');
     block.dataset.toolId = toolId;
     block.innerHTML = '<div class="tool-block-header">' +
         '<span class="tool-name">' + escapeHtml(name) + '</span>' +

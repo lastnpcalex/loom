@@ -1803,15 +1803,15 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
             # Emit OODA steps as tool blocks for visibility
             if ooda["observe"]:
                 tool_id = f"ooda-observe-{conv_id}"
-                await _ws_send(conv_id, {"type": "tool_start", "name": "Observe", "tool_id": tool_id})
+                await _ws_send(conv_id, {"type": "tool_start", "name": "OODA: Observe", "tool_id": tool_id, "ooda": True})
                 await _ws_send(conv_id, {"type": "tool_result", "content": ooda["observe"], "tool_id": tool_id})
             if ooda["orient"]:
                 tool_id = f"ooda-orient-{conv_id}"
-                await _ws_send(conv_id, {"type": "tool_start", "name": "Orient", "tool_id": tool_id})
+                await _ws_send(conv_id, {"type": "tool_start", "name": "OODA: Orient", "tool_id": tool_id, "ooda": True})
                 await _ws_send(conv_id, {"type": "tool_result", "content": ooda["orient"], "tool_id": tool_id})
             if ooda["decide"]:
                 tool_id = f"ooda-decide-{conv_id}"
-                await _ws_send(conv_id, {"type": "tool_start", "name": "Decide", "tool_id": tool_id})
+                await _ws_send(conv_id, {"type": "tool_start", "name": "OODA: Decide", "tool_id": tool_id, "ooda": True})
                 await _ws_send(conv_id, {"type": "tool_result", "content": ooda["decide"], "tool_id": tool_id})
 
             # Execute state reads
