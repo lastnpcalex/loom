@@ -985,6 +985,14 @@ function initInlineCCControls() {
             renderStateCards('tree-state-cards-list');
             showToast('State cards seeded');
         });
+        const addBtn = document.getElementById('btn-tree-state-add');
+        if (addBtn) addBtn.addEventListener('click', () => {
+            if (!State.currentConvId) return;
+            showStateCardPicker(State.currentConvId, async () => {
+                State.stateCards = await API.get(`/api/conversations/${State.currentConvId}/state`);
+                renderStateCards('tree-state-cards-list');
+            });
+        });
     }
 
     // State panel buttons
