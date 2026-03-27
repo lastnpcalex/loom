@@ -975,21 +975,68 @@ body::after {
 .char-avatar { cursor: pointer; }
 .char-avatar:hover { opacity: 0.8; }
 
-/* Character state panel (Tier 1 editor) */
-#char-state-panel {
-    position: fixed;
-    top: 52px;
-    right: 12px;
-    z-index: 200;
-    width: 340px;
-    max-height: 80vh;
+/* Character state view (Tier 1 editor — full page) */
+#view-char-state {
+    display: flex;
+    flex-direction: column;
     overflow-y: auto;
-    background: rgba(5, 5, 15, 0.92);
-    backdrop-filter: var(--glass);
+    padding: 16px 24px;
+}
+.char-state-view-header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 20px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+}
+.char-state-view-header h2 {
+    flex: 1;
+    font-family: 'Orbitron', sans-serif;
+    font-size: 16px;
+    color: var(--text-primary);
+    margin: 0;
+}
+.char-state-view-header h2 span {
+    color: var(--cyan);
+}
+#btn-char-state-back {
+    background: none;
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    padding: 12px;
-    box-shadow: 0 0 24px rgba(191, 0, 255, 0.08), 0 8px 32px rgba(0, 0, 0, 0.5);
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 6px 12px;
+    font-size: 13px;
+    transition: var(--transition);
+}
+#btn-char-state-back:hover {
+    color: var(--cyan);
+    border-color: var(--cyan);
+}
+#btn-char-state-add {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 6px 12px;
+    font-size: 13px;
+    transition: var(--transition);
+}
+#btn-char-state-add:hover {
+    color: var(--cyan);
+    border-color: var(--cyan);
+}
+.char-state-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    align-content: flex-start;
+}
+.char-state-grid .state-card {
+    width: 320px;
+    flex-shrink: 0;
 }
 .state-empty {
     color: var(--text-muted);

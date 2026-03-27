@@ -125,6 +125,14 @@ function switchView(view) {
         } else if (State.currentConvId && !State.isStreaming) {
             loadMessages(State.currentConvId);
         }
+    } else if (view === 'char-state') {
+        sep.classList.add('hidden');
+        title.classList.add('hidden');
+        breadcrumb.classList.add('hidden');
+        treeBtn.classList.add('hidden');
+        contextInfo.classList.add('hidden');
+        globalBmBtn?.classList.add('hidden');
+        statePanelTree?.classList.add('hidden');
     }
 }
 
@@ -1062,6 +1070,13 @@ function renderStateCards() {
 
 // ── State Card Picker (shared by conv + character panels) ──
 
+const SCHEMA_DEFAULT_FIELDS = {
+    character_state: { personality: '', appearance: '', current_mood: '', goals: '', relationships: '', physical_situation: '' },
+    scene_state: { location: '', time_of_day: '', atmosphere: '', present_characters: '', recent_events: '' },
+    lore: { content: '' },
+    persona_state: { description: '', appearance: '', goals: '' },
+};
+
 function showStateCardPicker(convId, onDone, charId) {
     // Remove any existing picker
     document.getElementById('state-card-picker')?.remove();
@@ -1121,10 +1136,11 @@ function showStateCardPicker(convId, onDone, charId) {
                 const submitLabel = async () => {
                     const label = input.value.trim();
                     if (!label) { picker.remove(); return; }
+                    const defaultData = SCHEMA_DEFAULT_FIELDS[schema] || {};
                     if (charId) {
-                        await API.post(`/api/characters/${charId}/state`, { schema_id: schema, label, data: {} });
+                        await API.post(`/api/characters/${charId}/state`, { schema_id: schema, label, data: {...defaultData} });
                     } else {
-                        await API.post(`/api/conversations/${convId}/state`, { schema_id: schema, label, data: {} });
+                        await API.post(`/api/conversations/${convId}/state`, { schema_id: schema, label, data: {...defaultData} });
                     }
                     showToast('Card added');
                     if (onDone) await onDone();
@@ -1176,11 +1192,10 @@ function showStateCardPicker(convId, onDone, charId) {
 // ── Character State Panel (Tier 1 — Global) ──
 
 async function openCharacterStatePanel(charId, charName) {
-    const panel = document.getElementById('char-state-panel');
+    State._editingCharId = charId;
     const nameEl = document.getElementById('char-state-name');
-    if (!panel) return;
-    nameEl.textContent = charName;
-    panel.classList.remove('hidden');
+    if (nameEl) nameEl.textContent = charName;
+    switchView('char-state');
     await renderCharacterStateCards(charId);
 }
 
@@ -1249,17 +1264,13 @@ async function renderCharacterStateCards(charId) {
 
 // Wire character state panel buttons on DOMContentLoaded
 document.addEventListener('DOMContentLoaded', () => {
-    const closeBtn = document.getElementById('btn-char-state-close');
-    if (closeBtn) closeBtn.addEventListener('click', () => {
-        document.getElementById('char-state-panel')?.classList.add('hidden');
-    });
+    const backBtn = document.getElementById('btn-char-state-back');
+    if (backBtn) backBtn.addEventListener('click', () => switchView('home'));
     const addBtn = document.getElementById('btn-char-state-add');
     if (addBtn) addBtn.addEventListener('click', () => {
-        const charName = document.getElementById('char-state-name')?.textContent;
-        if (!charName) return;
-        const char = State.characters.find(c => c.name === charName);
-        if (!char) return;
-        showStateCardPicker(null, () => renderCharacterStateCards(char.id), char.id);
+        const charId = State._editingCharId;
+        if (!charId) return;
+        showStateCardPicker(null, () => renderCharacterStateCards(charId), charId);
     });
 });
 
