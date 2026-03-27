@@ -198,6 +198,55 @@ async def api_delete_character(char_id: str):
     return {"ok": True}
 
 
+# ── Character State Cards (Tier 1) ──
+
+@app.get("/api/characters/{char_id}/state")
+async def api_get_character_state(char_id: str):
+    return await db.get_character_state_cards(char_id)
+
+
+@app.post("/api/characters/{char_id}/state")
+async def api_create_character_state(char_id: str, data: dict):
+    return await db.create_character_state_card(
+        char_id, data["schema_id"], data["label"],
+        data.get("data", {}), data.get("is_readonly", False),
+    )
+
+
+@app.put("/api/character-state/{card_id}")
+async def api_update_character_state(card_id: int, data: dict):
+    return await db.update_character_state_card(card_id, data.get("data", {}))
+
+
+@app.delete("/api/character-state/{card_id}")
+async def api_delete_character_state(card_id: int):
+    await db.delete_character_state_card(card_id)
+    return {"ok": True}
+
+
+@app.post("/api/characters/{char_id}/duplicate")
+async def api_duplicate_character(char_id: str):
+    """Duplicate a character and its global state cards."""
+    char = load_character(os.path.join(config.characters_dir, f"{char_id}.md"))
+    if not char:
+        raise HTTPException(404, "Character not found")
+    # Generate unique ID
+    base_name = char["name"] + " Copy"
+    new_data = {**char, "name": base_name, "id": None}  # id=None → auto-slug
+    new_char = save_character(config.characters_dir, new_data)
+    if not new_char:
+        raise HTTPException(500, "Failed to duplicate character")
+    # Copy global state cards
+    old_cards = await db.get_character_state_cards(char_id)
+    for card in old_cards:
+        card_data = json.loads(card["data"]) if isinstance(card["data"], str) else card["data"]
+        await db.create_character_state_card(
+            new_char["id"], card["schema_id"], card["label"],
+            card_data, card.get("is_readonly", False),
+        )
+    return new_char
+
+
 # ── Personas ──
 
 @app.get("/api/personas")
@@ -453,31 +502,52 @@ async def api_seed_state_cards(conv_id: int):
         raise HTTPException(404, "Conversation not found")
 
     cards_created = []
-    # Seed from character
+
+    # Seed from character — prefer Tier 1 global state cards, fallback to text extraction
     if conv.get("character_id"):
-        char = load_character(os.path.join(config.characters_dir, f"{conv['character_id']}.md"))
-        if char:
-            card = await db.create_state_card(conv_id, "character_state", char.get("name", "Character"), {
-                "personality": char.get("personality", ""),
+        char_id = conv["character_id"]
+        global_cards = await db.get_character_state_cards(char_id)
+        if global_cards:
+            # Copy Tier 1 → Tier 2
+            count = await db.copy_character_state_to_conversation(char_id, conv_id)
+            if count:
+                cards_created.extend(await db.get_state_cards(conv_id))
+        else:
+            # Fallback: extract from character text
+            char = load_character(os.path.join(config.characters_dir, f"{char_id}.md"))
+            if char:
+                card = await db.create_state_card(conv_id, "character_state", char.get("name", "Character"), {
+                    "personality": char.get("personality", ""),
+                    "appearance": "",
+                    "current_mood": "",
+                    "goals": "",
+                    "relationships": "",
+                    "physical_situation": char.get("scenario", ""),
+                })
+                if card:
+                    cards_created.append(card)
+                if char.get("scenario"):
+                    scene = await db.create_state_card(conv_id, "scene_state", "current", {
+                        "location": "",
+                        "time_of_day": "",
+                        "atmosphere": "",
+                        "present_characters": "",
+                        "recent_events": char["scenario"],
+                    })
+                    if scene:
+                        cards_created.append(scene)
+
+    # Seed persona as persona_state card
+    if conv.get("persona_id"):
+        persona = load_persona(os.path.join("personas", f"{conv['persona_id']}.md"))
+        if persona:
+            card = await db.create_state_card(conv_id, "persona_state", persona["name"], {
+                "description": persona.get("content", ""),
                 "appearance": "",
-                "current_mood": "",
                 "goals": "",
-                "relationships": "",
-                "physical_situation": char.get("scenario", ""),
             })
             if card:
                 cards_created.append(card)
-            # Seed scene from scenario
-            if char.get("scenario"):
-                scene = await db.create_state_card(conv_id, "scene_state", "current", {
-                    "location": "",
-                    "time_of_day": "",
-                    "atmosphere": "",
-                    "present_characters": "",
-                    "recent_events": char["scenario"],
-                })
-                if scene:
-                    cards_created.append(scene)
 
     # Seed from lore
     if conv.get("lore_ids"):
@@ -1683,7 +1753,8 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
 
         # ── OODA enhancement: build system prompt with state cards ──
         state_cards = await db.get_state_cards(conv_id)
-        ooda_system = build_ooda_system_prompt(base_system, state_cards)
+        global_cards = await db.get_character_state_cards(conv.get("character_id", "")) if conv.get("character_id") else []
+        ooda_system = build_ooda_system_prompt(base_system, state_cards, global_cards=global_cards)
 
         example_msgs = character.get("example_messages", []) if character else []
         messages = assemble_prompt(

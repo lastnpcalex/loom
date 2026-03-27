@@ -542,18 +542,20 @@ body::after {
 
 #conv-list {
     display: flex;
-    flex-direction: column;
-    gap: 6px;
+    flex-wrap: wrap;
+    gap: 10px;
     overflow-y: auto;
     flex: 1;
     min-height: 0;
     padding-bottom: 8px;
+    align-content: flex-start;
 }
 
 .conv-item {
     display: flex;
-    align-items: center;
-    padding: 10px 14px;
+    flex-direction: column;
+    width: 200px;
+    padding: 12px;
     border-radius: var(--radius);
     cursor: pointer;
     transition: all var(--transition);
@@ -563,8 +565,19 @@ body::after {
     background: rgba(5, 5, 15, 0.6);
     backdrop-filter: var(--glass);
     -webkit-backdrop-filter: var(--glass);
-    gap: 8px;
-    flex-shrink: 0;
+    gap: 6px;
+    position: relative;
+}
+.conv-card-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.conv-card-body {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1;
 }
 
 .conv-item:hover {
@@ -908,6 +921,28 @@ body::after {
 .state-field-key[title] {
     border-bottom: 1px dotted var(--text-muted);
     cursor: help;
+}
+
+/* Avatar image support */
+.char-avatar[style*="background-image"] { font-size: 0; }
+.char-avatar { cursor: pointer; }
+.char-avatar:hover { opacity: 0.8; }
+
+/* Character state panel (Tier 1 editor) */
+#char-state-panel {
+    position: fixed;
+    top: 52px;
+    right: 12px;
+    z-index: 200;
+    width: 340px;
+    max-height: 80vh;
+    overflow-y: auto;
+    background: rgba(5, 5, 15, 0.92);
+    backdrop-filter: var(--glass);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px;
+    box-shadow: 0 0 24px rgba(191, 0, 255, 0.08), 0 8px 32px rgba(0, 0, 0, 0.5);
 }
 .state-empty {
     color: var(--text-muted);
@@ -2908,6 +2943,19 @@ pre.tool-output {
         left: 8px;
         width: auto;
         max-height: 50vh;
+    }
+    .conv-item {
+        width: 100%;
+        flex-direction: row;
+        align-items: center;
+    }
+    .conv-card-top { flex-direction: row; gap: 6px; }
+    .conv-card-body { flex-direction: row; gap: 8px; flex: 1; }
+    #char-state-panel {
+        right: 8px;
+        left: 8px;
+        width: auto;
+        max-height: 60vh;
     }
     #state-panel {
         right: 8px;

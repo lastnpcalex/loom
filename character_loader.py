@@ -138,7 +138,7 @@ def save_character(directory: str, data: dict) -> dict:
     lines = [
         "---",
         f"name: {name}",
-        "avatar: null",
+        f"avatar: {data.get('avatar') or 'null'}",
         f"tags: {tags_str}",
         "---",
     ]
@@ -193,6 +193,7 @@ def load_persona(filepath: str) -> Optional[dict]:
     return {
         "id": Path(filepath).stem,
         "name": meta.get("name", Path(filepath).stem),
+        "avatar": meta.get("avatar", None),
         "tags": meta.get("tags", []),
         "content": body.strip(),
         "filepath": filepath,
@@ -225,7 +226,8 @@ def save_persona(directory: str, data: dict) -> dict:
     tags_str = "[" + ", ".join(tags) + "]" if tags else "[]"
     content = data.get("content", "").strip()
 
-    text = f"---\nname: {name}\ntags: {tags_str}\n---\n{content}\n"
+    avatar = data.get("avatar") or "null"
+    text = f"---\nname: {name}\navatar: {avatar}\ntags: {tags_str}\n---\n{content}\n"
 
     filepath = os.path.join(directory, f"{persona_id}.md")
     with open(filepath, 'w', encoding='utf-8') as f:
@@ -257,6 +259,7 @@ def load_lore_entry(filepath: str) -> Optional[dict]:
     return {
         "id": Path(filepath).stem,
         "name": meta.get("name", Path(filepath).stem),
+        "avatar": meta.get("avatar", None),
         "tags": meta.get("tags", []),
         "content": body.strip(),
         "filepath": filepath,
@@ -288,8 +291,9 @@ def save_lore(directory: str, data: dict) -> dict:
 
     tags_str = "[" + ", ".join(tags) + "]" if tags else "[]"
     content = data.get("content", "").strip()
+    avatar = data.get("avatar") or "null"
 
-    text = f"---\nname: {name}\ntags: {tags_str}\n---\n{content}\n"
+    text = f"---\nname: {name}\navatar: {avatar}\ntags: {tags_str}\n---\n{content}\n"
 
     filepath = os.path.join(directory, f"{lore_id}.md")
     with open(filepath, 'w', encoding='utf-8') as f:

@@ -56,16 +56,46 @@ After the </ooda> closing tag, do NOT write anything else. The system will feed 
 """.strip()
 
 
-def build_ooda_system_prompt(base_system_prompt: str, state_cards: list[dict]) -> str:
-    """Build the full system prompt with OODA tools and current state summary."""
+def _merge_state_tiers(conv_cards: list[dict], global_cards: list[dict]) -> list[dict]:
+    """Merge Tier 1 (global) into Tier 2 (conversation) — empty fields inherit from global."""
+    if not global_cards:
+        return conv_cards
+
+    # Index global cards by (schema_id, label)
+    global_index = {}
+    for gc in global_cards:
+        gdata = json.loads(gc["data"]) if isinstance(gc["data"], str) else gc["data"]
+        global_index[(gc["schema_id"], gc["label"])] = gdata
+
+    merged = []
+    for card in conv_cards:
+        data = json.loads(card["data"]) if isinstance(card["data"], str) else card["data"]
+        gdata = global_index.get((card["schema_id"], card["label"]), {})
+        # Inherit empty fields from global
+        for k, v in gdata.items():
+            if k not in data or not data[k]:
+                data[k] = v
+        merged.append({**card, "data": data})
+    return merged
+
+
+def build_ooda_system_prompt(base_system_prompt: str, state_cards: list[dict],
+                             global_cards: list[dict] = None) -> str:
+    """Build the full system prompt with OODA tools and current state summary.
+
+    state_cards: Tier 2 (conversation-level)
+    global_cards: Tier 1 (character-level) — empty fields in Tier 2 inherit from these
+    """
     parts = [base_system_prompt, "", OODA_TOOL_DEFINITIONS]
 
-    if state_cards:
+    effective_cards = _merge_state_tiers(state_cards, global_cards or [])
+
+    if effective_cards:
         parts.append("")
         parts.append("## Current State Cards")
         parts.append("")
-        for card in state_cards:
-            data = json.loads(card["data"]) if isinstance(card["data"], str) else card["data"]
+        for card in effective_cards:
+            data = card["data"] if isinstance(card["data"], dict) else json.loads(card["data"])
             schema = card["schema_id"]
             label = card["label"]
             fields = ", ".join(f"{k}={v}" for k, v in data.items() if v)

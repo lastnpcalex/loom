@@ -413,10 +413,14 @@ function buildConvItem(conv) {
     const starClass = starred ? 'conv-star-btn active' : 'conv-star-btn';
 
     div.innerHTML = `
-        <button class="${starClass}" title="Star">${starChar}</button>
-        ${modeBadge}
-        <span class="conv-title-text">${escapeHtml(conv.title)}</span>
-        <span class="conv-meta">${escapeHtml(charName)}</span>
+        <div class="conv-card-top">
+            ${modeBadge}
+            <button class="${starClass}" title="Star">${starChar}</button>
+        </div>
+        <div class="conv-card-body">
+            <span class="conv-title-text">${escapeHtml(conv.title)}</span>
+            <span class="conv-meta">${escapeHtml(charName)}</span>
+        </div>
         <div class="conv-actions">
             <button class="char-action-btn conv-folder-btn" title="Move to folder"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
             <button class="char-action-btn conv-edit-btn" title="Rename">✎</button>
@@ -1054,6 +1058,105 @@ function renderStateCards() {
     });
 }
 
+// ── Character State Panel (Tier 1 — Global) ──
+
+async function openCharacterStatePanel(charId, charName) {
+    const panel = document.getElementById('char-state-panel');
+    const nameEl = document.getElementById('char-state-name');
+    if (!panel) return;
+    nameEl.textContent = charName;
+    panel.classList.remove('hidden');
+    await renderCharacterStateCards(charId);
+}
+
+async function renderCharacterStateCards(charId) {
+    const list = document.getElementById('char-state-cards-list');
+    if (!list) return;
+
+    const cards = await API.get(`/api/characters/${charId}/state`);
+
+    if (!cards || cards.length === 0) {
+        list.innerHTML = '<div class="state-empty">No global state cards. Click + to add one.</div>';
+        return;
+    }
+
+    list.innerHTML = cards.map(card => {
+        const data = typeof card.data === 'string' ? JSON.parse(card.data) : card.data;
+        const schemaClass = card.schema_id.replace('_', '-');
+        const fields = Object.entries(data).map(([k, v]) => {
+            const tip = STATE_FIELD_TOOLTIPS[card.schema_id]?.[k] || '';
+            return `<div class="state-field" data-card-id="${card.id}" data-field="${escapeHtml(k)}">
+                <span class="state-field-key"${tip ? ` title="${escapeHtml(tip)}"` : ''}>${escapeHtml(k)}</span>
+                <span class="state-field-value" contenteditable="true" data-original="${escapeHtml(v || '')}">${escapeHtml(v || '—')}</span>
+            </div>`;
+        }).join('');
+        return `<div class="state-card ${schemaClass}" data-card-id="${card.id}">
+            <div class="state-card-header">
+                <span class="state-card-schema">${escapeHtml(card.schema_id.replace('_', ' '))}</span>
+                <span class="state-card-label">${escapeHtml(card.label)}</span>
+                <button class="state-card-delete" data-card-id="${card.id}" title="Delete">&times;</button>
+            </div>
+            <div class="state-card-fields">${fields}</div>
+        </div>`;
+    }).join('');
+
+    // Wire inline editing
+    list.querySelectorAll('.state-field-value').forEach(el => {
+        el.addEventListener('blur', async () => {
+            const newVal = el.textContent.trim();
+            const original = el.dataset.original;
+            if (newVal === original || newVal === '—') return;
+            const fieldDiv = el.closest('.state-field');
+            const cardId = parseInt(fieldDiv.dataset.cardId);
+            const field = fieldDiv.dataset.field;
+            const card = cards.find(c => c.id === cardId);
+            if (!card) return;
+            const cardData = typeof card.data === 'string' ? JSON.parse(card.data) : card.data;
+            cardData[field] = newVal;
+            await API.put(`/api/character-state/${cardId}`, { data: cardData });
+            card.data = JSON.stringify(cardData);
+            el.dataset.original = newVal;
+            el.classList.add('state-field-updated');
+            setTimeout(() => el.classList.remove('state-field-updated'), 1500);
+        });
+    });
+
+    // Wire delete
+    list.querySelectorAll('.state-card-delete').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const cardId = parseInt(btn.dataset.cardId);
+            await API.del(`/api/character-state/${cardId}`);
+            await renderCharacterStateCards(charId);
+            showToast('Card deleted');
+        });
+    });
+}
+
+// Wire character state panel buttons on DOMContentLoaded
+document.addEventListener('DOMContentLoaded', () => {
+    const closeBtn = document.getElementById('btn-char-state-close');
+    if (closeBtn) closeBtn.addEventListener('click', () => {
+        document.getElementById('char-state-panel')?.classList.add('hidden');
+    });
+    const addBtn = document.getElementById('btn-char-state-add');
+    if (addBtn) addBtn.addEventListener('click', async () => {
+        const charName = document.getElementById('char-state-name')?.textContent;
+        if (!charName) return;
+        const schemaId = prompt('Schema (character_state, scene_state, lore, persona_state):');
+        if (!schemaId) return;
+        const label = prompt('Label (e.g. character name, location):');
+        if (!label) return;
+        // Find the character ID from name
+        const char = State.characters.find(c => c.name === charName);
+        if (!char) return;
+        await API.post(`/api/characters/${char.id}/state`, {
+            schema_id: schemaId, label: label, data: {},
+        });
+        await renderCharacterStateCards(char.id);
+        showToast('Card added');
+    });
+});
+
 function showWeaveFields(show) {
     const weaveFields = ['character-grid', 'persona-select', 'lore-checklist',
                          'first-turn-toggle', 'custom-scene-group'];
@@ -1517,13 +1620,18 @@ function renderHomeCharacters() {
         card.className = 'char-card home-char-card';
         const initial = char.name ? char.name[0].toUpperCase() : '?';
         const tags = Array.isArray(char.tags) ? char.tags.join(', ') : '';
+        const avatarHtml = char.avatar
+            ? `<div class="char-avatar" style="background-image: url('${char.avatar}'); background-size: cover; background-position: center;"></div>`
+            : `<div class="char-avatar">${initial}</div>`;
         card.innerHTML = `
             <div class="char-card-main">
-                <div class="char-avatar">${initial}</div>
+                ${avatarHtml}
                 <div class="char-name">${escapeHtml(char.name)}</div>
                 <div class="char-tags">${escapeHtml(tags)}</div>
             </div>
             <div class="char-card-actions">
+                <button class="char-action-btn char-state-btn" title="State Cards">◈</button>
+                <button class="char-action-btn char-copy-btn" title="Duplicate">⧉</button>
                 <button class="char-action-btn char-edit-btn" title="Edit">✎</button>
                 <button class="char-action-btn char-export-btn" title="Export">↓</button>
                 <button class="char-action-btn char-delete-btn" title="Delete">✕</button>
@@ -1556,6 +1664,41 @@ function renderHomeCharacters() {
             } catch (err) {
                 showToast('Failed to delete character', 'error');
             }
+        });
+        // State cards button
+        card.querySelector('.char-state-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            openCharacterStatePanel(char.id, char.name);
+        });
+        // Duplicate button
+        card.querySelector('.char-copy-btn').addEventListener('click', async (e) => {
+            e.stopPropagation();
+            try {
+                const newChar = await API.post(`/api/characters/${char.id}/duplicate`);
+                State.characters.push(newChar);
+                renderHomeCharacters();
+                showToast(`Duplicated as "${newChar.name}"`);
+            } catch (err) {
+                showToast('Failed to duplicate', 'error');
+            }
+        });
+        // Avatar click → upload
+        const avatarEl = card.querySelector('.char-avatar');
+        avatarEl.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = 'image/*';
+            input.onchange = async () => {
+                if (!input.files[0]) return;
+                try {
+                    const result = await API.upload(input.files[0]);
+                    await API.put(`/api/characters/${char.id}`, { ...char, avatar: result.url });
+                    char.avatar = result.url;
+                    renderHomeCharacters();
+                } catch { showToast('Failed to upload avatar', 'error'); }
+            };
+            input.click();
         });
         grid.appendChild(card);
     }
@@ -1654,9 +1797,12 @@ function renderHomePersonas() {
         card.className = 'char-card home-persona-card';
         const initial = persona.name ? persona.name[0].toUpperCase() : '?';
         const tags = Array.isArray(persona.tags) ? persona.tags.join(', ') : '';
+        const pAvatarHtml = persona.avatar
+            ? `<div class="char-avatar persona-avatar" style="background-image: url('${persona.avatar}'); background-size: cover; background-position: center;"></div>`
+            : `<div class="char-avatar persona-avatar">${initial}</div>`;
         card.innerHTML = `
             <div class="char-card-main">
-                <div class="char-avatar persona-avatar">${initial}</div>
+                ${pAvatarHtml}
                 <div class="char-name">${escapeHtml(persona.name)}</div>
                 <div class="char-tags">${escapeHtml(tags)}</div>
             </div>
@@ -1760,9 +1906,12 @@ function renderHomeLore() {
         card.className = 'char-card home-lore-card';
         const initial = entry.name ? entry.name[0].toUpperCase() : '?';
         const tags = Array.isArray(entry.tags) ? entry.tags.join(', ') : '';
+        const lAvatarHtml = entry.avatar
+            ? `<div class="char-avatar lore-avatar" style="background-image: url('${entry.avatar}'); background-size: cover; background-position: center;"></div>`
+            : `<div class="char-avatar lore-avatar">${initial}</div>`;
         card.innerHTML = `
             <div class="char-card-main">
-                <div class="char-avatar lore-avatar">${initial}</div>
+                ${lAvatarHtml}
                 <div class="char-name">${escapeHtml(entry.name)}</div>
                 <div class="char-tags">${escapeHtml(tags)}</div>
             </div>
