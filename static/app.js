@@ -415,8 +415,8 @@ function buildConvItem(conv) {
 
     const isCC = conv.mode === 'claude';
     const isLocal = conv.mode === 'local';
-    const charName = isCC ? 'Claude Code'
-        : isLocal ? (conv.local_model || 'Local')
+    const charName = isCC ? (conv.cc_model || 'Claude')
+        : isLocal ? (conv.local_model || 'Ollama')
         : conv.character_id
         ? (State.characters.find(c => c.id === conv.character_id)?.name || conv.character_id)
         : 'Freeform';
@@ -946,27 +946,43 @@ function initInlineCCControls() {
         });
     }
 
-    // State panel toggle — both tree and chat buttons open the same panel
+    // Chat state panel (bottom sheet)
     const statePanel = document.getElementById('state-panel');
-    for (const btnId of ['btn-state-panel-tree', 'btn-state-panel-chat']) {
-        const btn = document.getElementById(btnId);
-        if (btn && statePanel) {
-            btn.addEventListener('click', async () => {
-                statePanel.classList.toggle('hidden');
-                if (!statePanel.classList.contains('hidden')) {
-                    // Fetch branch-specific state if we have a current branch leaf
-                    const leafMsg = State.messages?.filter(m => m.role !== 'system').slice(-1)[0];
-                    if (leafMsg && State.currentConvId) {
-                        try {
-                            State.stateCards = await API.get(`/api/conversations/${State.currentConvId}/branch-state/${leafMsg.id}`);
-                        } catch {
-                            State.stateCards = await API.get(`/api/conversations/${State.currentConvId}/state`);
-                        }
+    const chatStateBtn = document.getElementById('btn-state-panel-chat');
+    if (chatStateBtn && statePanel) {
+        chatStateBtn.addEventListener('click', async () => {
+            statePanel.classList.toggle('hidden');
+            if (!statePanel.classList.contains('hidden')) {
+                const leafMsg = State.messages?.filter(m => m.role !== 'system').slice(-1)[0];
+                if (leafMsg && State.currentConvId) {
+                    try {
+                        State.stateCards = await API.get(`/api/conversations/${State.currentConvId}/branch-state/${leafMsg.id}`);
+                    } catch {
+                        State.stateCards = await API.get(`/api/conversations/${State.currentConvId}/state`);
                     }
-                    renderStateCards();
                 }
-            });
-        }
+                renderStateCards();
+            }
+        });
+    }
+
+    // Tree state sidebar (right panel)
+    const treeStateBtn = document.getElementById('btn-state-panel-tree');
+    const treeSidebar = document.getElementById('tree-state-sidebar');
+    if (treeStateBtn && treeSidebar) {
+        treeStateBtn.addEventListener('click', async () => {
+            treeSidebar.classList.toggle('hidden');
+            if (!treeSidebar.classList.contains('hidden')) {
+                if (State.currentConvId) {
+                    try {
+                        State.stateCards = await API.get(`/api/conversations/${State.currentConvId}/state`);
+                    } catch {}
+                }
+                renderStateCards('tree-state-cards-list');
+            }
+        });
+        const closeBtn = document.getElementById('btn-tree-state-close');
+        if (closeBtn) closeBtn.addEventListener('click', () => treeSidebar.classList.add('hidden'));
     }
 
     // State panel buttons
@@ -1031,8 +1047,8 @@ function flashSaveIndicator(indicatorId) {
     }, 300);
 }
 
-function renderStateCards() {
-    const list = document.getElementById('state-cards-list');
+function renderStateCards(targetListId) {
+    const list = document.getElementById(targetListId || 'state-cards-list');
     if (!list) return;
 
     if (!State.stateCards || State.stateCards.length === 0) {

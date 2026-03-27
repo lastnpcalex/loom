@@ -250,9 +250,13 @@ function handleWSMessage(data) {
             break;
 
         case 'state_update':
-            // OODA harness updated state cards — refresh the panel
+            // OODA harness updated branch state — refresh with branch-aware data
             if (State.currentConvId) {
-                API.get(`/api/conversations/${State.currentConvId}/state`).then(cards => {
+                const leaf = State.messages?.filter(m => m.role !== 'system').slice(-1)[0];
+                const stateUrl = leaf
+                    ? `/api/conversations/${State.currentConvId}/branch-state/${leaf.id}`
+                    : `/api/conversations/${State.currentConvId}/state`;
+                API.get(stateUrl).then(cards => {
                     State.stateCards = cards;
                     if (typeof renderStateCards === 'function') renderStateCards();
                 });

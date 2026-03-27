@@ -355,6 +355,7 @@ async def api_create_conversation(data: dict = None):
         custom_scene=custom_scene,
         cc_model=cc_model,
         cc_effort=cc_effort,
+        ooda_enabled=1 if mode == "weave" else 0,
     )
     if local_model:
         fields["local_model"] = local_model
