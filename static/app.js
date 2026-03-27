@@ -1682,8 +1682,12 @@ function renderCharacterGrid() {
         card.className = `char-card${State.selectedCharacterId === char.id ? ' selected' : ''}`;
         const initial = char.name ? char.name[0].toUpperCase() : '?';
         const tags = Array.isArray(char.tags) ? char.tags.join(', ') : '';
+        const gridHasAvatar = char.avatar && char.avatar !== 'null';
+        const gridAvatarHtml = gridHasAvatar
+            ? `<div class="char-avatar" style="background-image: url('${char.avatar}'); background-size: cover; background-position: center;"></div>`
+            : `<div class="char-avatar">${initial}</div>`;
         card.innerHTML = `
-            <div class="char-avatar">${initial}</div>
+            ${gridAvatarHtml}
             <div class="char-name">${escapeHtml(char.name)}</div>
             <div class="char-tags">${escapeHtml(tags)}</div>
         `;
