@@ -774,17 +774,17 @@ body::after {
 /* ── State Cards Panel ── */
 #state-panel {
     position: fixed;
-    bottom: 0;
-    left: 0;
-    right: 0;
+    bottom: 80px;
+    left: 12px;
+    right: 12px;
     z-index: 200;
-    max-height: 50vh;
+    max-height: 45vh;
     overflow-y: auto;
     background: rgba(5, 5, 15, 0.95);
     backdrop-filter: var(--glass);
-    border-top: 1px solid var(--cyan);
-    border-radius: var(--radius) var(--radius) 0 0;
-    box-shadow: 0 -4px 24px rgba(0, 255, 255, 0.06), 0 -2px 8px rgba(0, 0, 0, 0.5);
+    border: 1px solid rgba(0, 255, 255, 0.2);
+    border-radius: var(--radius);
+    box-shadow: 0 0 24px rgba(0, 255, 255, 0.06), 0 -4px 16px rgba(0, 0, 0, 0.5);
     padding: 12px;
     box-shadow: 0 0 24px rgba(0, 255, 255, 0.06), 0 8px 32px rgba(0, 0, 0, 0.5);
 }
@@ -1136,6 +1136,7 @@ body::after {
     color: var(--cyan);
     filter: drop-shadow(0 0 4px rgba(0, 255, 255, 0.6));
     text-shadow: 0 0 8px rgba(0, 255, 255, 0.5);
+    text-transform: none;
 }
 
 /* Global bookmarks panel (header-level, chat + tree) */
