@@ -1736,44 +1736,19 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
             if changed:
                 await _ws_send(conv_id, {"type": "state_update", "cards": [dict(c) for c in changed]})
 
-        # ── Check for Pass 1 prose ──
-        pass1_prose = extract_post_ooda_prose(cleaned_pass1) if ooda else ""
+        # ── Extract prose (single-pass: prose comes after </ooda> tag) ──
         final_prose = ""
-
-        if pass1_prose:
-            print(f"[OODA] Pass 1 prose found ({len(pass1_prose)} chars), skipping Pass 2")
-            final_prose = pass1_prose
-            # Stream it to client
-            for i in range(0, len(final_prose), 8):
-                await _ws_send(conv_id, {"type": "stream_chunk", "content": final_prose[i:i+8]})
-        elif ooda:
-            # ── Pass 2: Act ──
-            print(f"[OODA] Pass 2: Act (streaming)...")
-            await _ws_send(conv_id, {"type": "status", "text": "OODA: Writing scene..."})
-
-            pass2_context = build_pass2_context(ooda, resolved)
-            ooda_end = cleaned_pass1.find("</ooda>")
-            ooda_only = cleaned_pass1[:ooda_end + len("</ooda>")] if ooda_end >= 0 else cleaned_pass1
-
-            pass2_messages = list(messages)
-            pass2_messages.insert(0, {"role": "system", "content": pass2_context})
-            pass2_messages.append({"role": "assistant", "content": ooda_only})
-
-            async for token in stream_chat(pass2_messages):
-                if isinstance(token, dict):
-                    await _ws_send(conv_id, token)
-                    continue
-                final_prose += token
-                await _ws_send(conv_id, {"type": "stream_chunk", "content": token})
-
-            final_prose = _re.sub(r'<think>[\s\S]*?</think>\s*', '', final_prose).strip()
-            final_prose = _re.sub(r'<ooda>[\s\S]*?</ooda>\s*', '', final_prose).strip()
-        else:
-            # No OODA block — treat entire output as prose (fallback)
-            print(f"[OODA] No OODA block found, using raw output as prose")
+        if ooda:
+            final_prose = extract_post_ooda_prose(cleaned_pass1)
+        if not final_prose:
+            # No OODA block or no prose after it — use the whole output
             final_prose = cleaned_pass1
-            for i in range(0, len(final_prose), 8):
-                await _ws_send(conv_id, {"type": "stream_chunk", "content": final_prose[i:i+8]})
+            # Strip any ooda block from it
+            final_prose = _re.sub(r'<ooda>[\s\S]*?</ooda>\s*', '', final_prose).strip()
+
+        # Stream prose to client
+        for i in range(0, len(final_prose), 8):
+            await _ws_send(conv_id, {"type": "stream_chunk", "content": final_prose[i:i+8]})
 
         if not final_prose.strip():
             await _ws_send(conv_id, {"type": "error", "error": "OODA: Model returned an empty response — try again"})
