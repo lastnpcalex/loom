@@ -249,7 +249,7 @@ function renderBookmarksPanel(targetListId) {
             html += `<div class="bookmark-conv-group">
                 <div class="bookmark-conv-header">
                     <span class="bookmark-conv-name">${escapeHtml(group.title)}</span>
-                    <span class="bookmark-mode-badge ${group.mode}">${({claude:'loom',local:'braid',weave:'weave'})[group.mode]||group.mode}</span>
+                    <span class="bookmark-mode-badge ${group.mode}">${({claude:'loom {claude}',local:'braid {local}',weave:'weave'})[group.mode]||group.mode}</span>
                 </div>`;
             for (const b of group.items) {
                 html += `<div class="bookmark-item" data-bookmark-id="${b.id}" data-msg-id="${b.message_id}" data-conv-id="${b.conversation_id}">

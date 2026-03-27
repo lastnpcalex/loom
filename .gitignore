@@ -62,6 +62,9 @@ start_loom.bat
 .env
 .env.*
 
+# Screenshots
+Screenshot*.png
+
 # Utility scripts (machine-specific)
 install_task.ps1
 restart_server.ps1

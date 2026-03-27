@@ -1817,13 +1817,10 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
             resolved = await execute_ooda_reads(conv_id, ooda["reads"])
             print(f"[OODA] Resolved {len(resolved)} reads, applying {len(ooda['updates'])} updates, {len(ooda['creates'])} creates")
 
-            # Execute state updates (applies to base Tier 2 cards)
-            changed = await execute_ooda_updates(conv_id, ooda["updates"], ooda["creates"])
-            if changed:
-                await _ws_send(conv_id, {"type": "state_update", "cards": [dict(c) for c in changed]})
-
-            # Collect deltas for Tier 3 branch storage
-            _ooda_deltas = ooda["updates"]  # save for after message creation
+            # State updates saved as branch deltas only (Tier 3) — base cards stay pristine
+            # Notify client of the effective state change for this branch
+            if ooda["updates"] or ooda["creates"]:
+                await _ws_send(conv_id, {"type": "state_update", "updates": ooda["updates"]})
 
         # ── Extract prose (single-pass: prose comes after </ooda> tag) ──
         final_prose = ""

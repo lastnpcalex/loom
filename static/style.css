@@ -774,7 +774,7 @@ body::after {
 /* ── State Cards Panel ── */
 #state-panel {
     position: fixed;
-    bottom: 120px;
+    bottom: 140px;
     left: 12px;
     right: 12px;
     z-index: 200;
