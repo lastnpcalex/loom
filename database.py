@@ -153,6 +153,8 @@ async def _run_migrations(db):
         "ALTER TABLE conversations ADD COLUMN bookmark_msg_id INTEGER",
         # OODA harness toggle
         "ALTER TABLE conversations ADD COLUMN ooda_enabled INTEGER DEFAULT 0",
+        # Tier 3: branch-level state deltas stored per assistant message
+        "ALTER TABLE messages ADD COLUMN state_deltas TEXT",
     ]
     for sql in migrations:
         try:
@@ -870,6 +872,62 @@ async def delete_state_card(card_id: int):
     await db.execute("DELETE FROM state_cards WHERE id = ?", (card_id,))
     await db.commit()
     await db.close()
+
+
+# ── Branch State (Tier 3 — Deltas per message) ──
+
+async def save_state_deltas(msg_id: int, deltas: list[dict]):
+    """Save state deltas on an assistant message.
+    deltas: [{"schema_id": ..., "label": ..., "field": ..., "value": ...}, ...]
+    """
+    db = await get_db()
+    await db.execute(
+        "UPDATE messages SET state_deltas = ? WHERE id = ?",
+        (json.dumps(deltas), msg_id)
+    )
+    await db.commit()
+    await db.close()
+
+
+async def get_branch_state(conv_id: int, leaf_msg_id: int) -> list[dict]:
+    """Reconstruct effective state for a branch by applying deltas along the path.
+
+    Returns state cards with deltas applied: base conversation cards + all
+    deltas from root to leaf_msg_id, in order.
+    """
+    # Get base conversation state cards
+    base_cards = await get_state_cards(conv_id)
+
+    # Get the branch path (root to leaf)
+    branch = await get_branch_to_root(leaf_msg_id)
+
+    # Build effective state: start from base, apply deltas in order
+    # Index base cards by (schema_id, label)
+    effective = {}
+    for card in base_cards:
+        data = json.loads(card["data"]) if isinstance(card["data"], str) else card["data"]
+        effective[(card["schema_id"], card["label"])] = {**card, "data": data}
+
+    # Walk branch in chronological order (branch_to_root returns root-first)
+    for msg in branch:
+        deltas_raw = msg.get("state_deltas")
+        if not deltas_raw:
+            continue
+        try:
+            deltas = json.loads(deltas_raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for delta in deltas:
+            key = (delta["schema_id"], delta["label"])
+            if key not in effective:
+                effective[key] = {
+                    "schema_id": delta["schema_id"],
+                    "label": delta["label"],
+                    "data": {},
+                }
+            effective[key]["data"][delta["field"]] = delta["value"]
+
+    return list(effective.values())
 
 
 # ── Character State Cards (Tier 1 — Global) ──

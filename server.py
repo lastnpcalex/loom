@@ -494,6 +494,12 @@ async def api_delete_state_card(card_id: int):
     return {"ok": True}
 
 
+@app.get("/api/conversations/{conv_id}/branch-state/{msg_id}")
+async def api_get_branch_state(conv_id: int, msg_id: int):
+    """Get effective state for a specific branch point (base + deltas)."""
+    return await db.get_branch_state(conv_id, msg_id)
+
+
 @app.post("/api/conversations/{conv_id}/state/seed")
 async def api_seed_state_cards(conv_id: int):
     """Auto-seed state cards from the conversation's character, persona, and lore."""
@@ -1751,8 +1757,11 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
             character=character, style_nudge_index=nudge_index, scenario_override=custom_scene,
         )
 
-        # ── OODA enhancement: build system prompt with state cards ──
-        state_cards = await db.get_state_cards(conv_id)
+        # ── OODA enhancement: build system prompt with branch-aware state ──
+        if parent_id:
+            state_cards = await db.get_branch_state(conv_id, parent_id)
+        else:
+            state_cards = await db.get_state_cards(conv_id)
         global_cards = await db.get_character_state_cards(conv.get("character_id", "")) if conv.get("character_id") else []
         ooda_system = build_ooda_system_prompt(base_system, state_cards, global_cards=global_cards)
 
@@ -1807,10 +1816,13 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
             resolved = await execute_ooda_reads(conv_id, ooda["reads"])
             print(f"[OODA] Resolved {len(resolved)} reads, applying {len(ooda['updates'])} updates, {len(ooda['creates'])} creates")
 
-            # Execute state updates
+            # Execute state updates (applies to base Tier 2 cards)
             changed = await execute_ooda_updates(conv_id, ooda["updates"], ooda["creates"])
             if changed:
                 await _ws_send(conv_id, {"type": "state_update", "cards": [dict(c) for c in changed]})
+
+            # Collect deltas for Tier 3 branch storage
+            _ooda_deltas = ooda["updates"]  # save for after message creation
 
         # ── Extract prose (single-pass: prose comes after </ooda> tag) ──
         final_prose = ""
@@ -1833,6 +1845,9 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
         # Save
         msg = await db.add_message(conv_id, "assistant", final_prose, parent_id=parent_id)
         await db.set_active_branch(conv_id, msg["id"])
+        # Save branch-level state deltas (Tier 3)
+        if ooda and ooda.get("updates"):
+            await db.save_state_deltas(msg["id"], ooda["updates"])
         asyncio.create_task(_background_summarize_message(msg["id"], final_prose, "assistant", conv_id=conv_id))
         await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
 

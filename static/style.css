@@ -1082,6 +1082,33 @@ body::after {
     text-transform: uppercase;
 }
 
+/* Branch state button */
+.branch-state-btn {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 11px;
+    font-family: 'Space Grotesk', sans-serif;
+    padding: 3px 10px;
+    transition: var(--transition);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.branch-state-btn:hover {
+    color: var(--cyan);
+    border-color: var(--cyan);
+    box-shadow: 0 0 8px rgba(0, 255, 255, 0.15);
+}
+.delta-glow {
+    font-size: 14px;
+    color: var(--cyan);
+    filter: drop-shadow(0 0 4px rgba(0, 255, 255, 0.6));
+    text-shadow: 0 0 8px rgba(0, 255, 255, 0.5);
+}
+
 /* Global bookmarks panel (header-level, chat + tree) */
 #bookmarks-panel-global {
     position: fixed;

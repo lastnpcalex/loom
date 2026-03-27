@@ -947,9 +947,18 @@ function initInlineCCControls() {
     for (const btnId of ['btn-state-panel-tree', 'btn-state-panel-chat']) {
         const btn = document.getElementById(btnId);
         if (btn && statePanel) {
-            btn.addEventListener('click', () => {
+            btn.addEventListener('click', async () => {
                 statePanel.classList.toggle('hidden');
                 if (!statePanel.classList.contains('hidden')) {
+                    // Fetch branch-specific state if we have a current branch leaf
+                    const leafMsg = State.messages?.filter(m => m.role !== 'system').slice(-1)[0];
+                    if (leafMsg && State.currentConvId) {
+                        try {
+                            State.stateCards = await API.get(`/api/conversations/${State.currentConvId}/branch-state/${leafMsg.id}`);
+                        } catch {
+                            State.stateCards = await API.get(`/api/conversations/${State.currentConvId}/state`);
+                        }
+                    }
                     renderStateCards();
                 }
             });
@@ -1768,7 +1777,7 @@ function renderHomeCharacters() {
                 <div class="char-tags">${escapeHtml(tags)}</div>
             </div>
             <div class="char-card-actions">
-                <button class="char-action-btn char-state-btn" title="State Cards">◈</button>
+                <button class="char-action-btn char-state-btn" title="State Cards">▣</button>
                 <button class="char-action-btn char-copy-btn" title="Duplicate">⧉</button>
                 <button class="char-action-btn char-edit-btn" title="Edit">✎</button>
                 <button class="char-action-btn char-export-btn" title="Export">↓</button>
