@@ -343,9 +343,20 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
 
 
 async def cancel_claude(proc):
-    """Kill a running Claude Code subprocess."""
+    """Kill a running Claude Code subprocess and its process tree."""
     if proc.returncode is None:
-        proc.terminate()
+        import sys
+        if sys.platform == 'win32':
+            # On Windows, terminate() only kills the top process.
+            # Use taskkill /T to kill the entire process tree.
+            import subprocess
+            try:
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                               capture_output=True, timeout=5)
+            except Exception:
+                proc.kill()
+        else:
+            proc.terminate()
         try:
             await asyncio.wait_for(proc.wait(), timeout=5)
         except asyncio.TimeoutError:

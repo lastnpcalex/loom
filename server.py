@@ -1056,6 +1056,8 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 for rid in list(_pending_hook_permissions):
                     if _pending_hook_permissions[rid].get("conv_id") == conv_id:
                         _pending_hook_permissions.pop(rid, None)
+                # Send cancelled event immediately so UI responds
+                await _ws_send(conv_id, {"type": "cancelled"})
                 continue
 
             if action == "permission_response":
@@ -1792,6 +1794,9 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
         print(f"[OODA] Pass 1: Orient...")
         await _ws_send(conv_id, {"type": "status", "text": "OODA: Observing and orienting..."})
         raw_pass1 = await sync_chat(messages, max_tokens=1024, think=False)
+        # Check if cancelled during the sync call
+        if asyncio.current_task().cancelled():
+            raise asyncio.CancelledError()
         cleaned_pass1 = _re.sub(r'<think>[\s\S]*?</think>\s*', '', raw_pass1).strip()
         print(f"[OODA] Pass 1 done: {len(cleaned_pass1)} chars")
         print(f"[OODA] Raw OODA output:\n{cleaned_pass1[:1500]}")
