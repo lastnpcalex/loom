@@ -1333,10 +1333,12 @@ function editMessage(msgId) {
             const parentId = msg.parent_id || null;
 
             // Post new user message as sibling (new branch)
+            // Carry over images from the original message
             const newMsg = await API.post(`/api/conversations/${State.currentConvId}/messages`, {
                 role: 'user',
                 content: newText,
                 parent_id: parentId,
+                image_path: msg.image_path || null,
             });
 
             // Reload the branch from DB (set_active_branch already ran server-side)
