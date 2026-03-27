@@ -1038,13 +1038,16 @@ function flashSaveIndicator(indicatorId) {
     if (!el) return;
     el.textContent = 'saving';
     el.className = 'save-indicator saving visible';
+    el.style.display = 'inline';
     setTimeout(() => {
         el.textContent = 'saved ✓';
         el.className = 'save-indicator visible';
+        el.style.display = 'inline';
         setTimeout(() => {
-            el.className = 'save-indicator hidden';
-        }, 1500);
-    }, 300);
+            el.className = 'save-indicator';
+            el.style.display = '';
+        }, 2500);
+    }, 400);
 }
 
 function renderStateCards(targetListId) {
