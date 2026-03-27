@@ -21,6 +21,11 @@ Character cards, personas, lore files, style nudges, and incremental summarizati
 - Style nudge rotation and repetition detection
 - Thinking model support (`<think>` stripping, content token counting)
 - Incremental context summarization via Gemma 3 1B on CPU
+- **OODA Harness** (optional) — cognitive scaffolding for better RP quality:
+  - Two-pass generation: model observes, orients, decides, then acts
+  - Persistent state cards (character state, scene state, lore) updated each turn
+  - State reads/updates visible as collapsible tool blocks in the conversation
+  - Inspired by [metacog](https://github.com/inanna-malick/metacog) and [popup-mcp](https://tidepool.leaflet.pub/3mcbegnuf2k2i)
 
 ### Local — Claude Code powered by any Ollama model
 
@@ -93,6 +98,7 @@ database.py            — SQLite schema, message tree CRUD, branch management
 config.py              — Configuration (model, context budget, SSL, generation params)
 prompt_engine.py       — System prompt assembly, repetition detection, style nudges
 context_manager.py     — Token counting, rolling summary, context window management
+ooda_harness.py        — OODA loop: XML parser, state executors, prompt builder
 character_loader.py    — Parse/save character, persona, and lore .md files
 ollama_client.py       — Ollama API client (chat streaming, image description)
 claude_client.py       — Claude Code CLI subprocess wrapper, NDJSON stream parser
