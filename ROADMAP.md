@@ -2,7 +2,7 @@
 
 ## Immediate Todo
 
-- [ ] **Claude Code skills integration** — bring CC skills, MCP servers, and hooks into the Loom interface. Browse, configure, and install directly into conversations.
+- [ ] **Claude Code skills & slash commands** — CC slash commands (`/model`, `/compact`, installed skills) currently do nothing in Loom. These should hook into CC's functionality — either by intercepting them before they're sent as text, or by passing them through CC's CLI interface. Goal: Loom should be as close to feature-complete CC as possible.
 - [ ] **Unread message queue** — a section under conversations on the home page showing freshly generated loom messages that haven't been viewed yet, labeled by conversation name. Background generations become visible without opening each conversation.
 - [ ] **Bookmark scroll accuracy** — bookmarks currently land the user approximately near the bookmarked message but sometimes slightly above or below in the message stream. Fix scroll-to-message precision.
 

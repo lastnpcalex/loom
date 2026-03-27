@@ -69,6 +69,8 @@ Connects to the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code
 - Per-turn and cumulative cost tracking
 - Image attachments via the Read tool or clipboard paste (Ctrl+V)
 
+> **Note:** `AskUserQuestion` is disabled in Loom's CC modes. CC's headless `-p` mode has no mechanism to send user responses back to an active `AskUserQuestion` tool call — stdin is closed after the initial prompt. This is an [open feature request](https://github.com/anthropics/claude-code/issues/16712) in Claude Code. When CC adds support for `--input-format stream-json` responses to pending tool calls, Loom can re-enable interactive questions. Until then, CC proceeds with its best judgment instead of asking.
+
 ## Common features
 
 All three modes share the same conversation infrastructure:
