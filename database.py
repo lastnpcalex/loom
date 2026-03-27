@@ -92,6 +92,18 @@ CREATE TABLE IF NOT EXISTS state_cards (
     UNIQUE(conversation_id, schema_id, label)
 );
 CREATE INDEX IF NOT EXISTS idx_state_cards_conv ON state_cards(conversation_id);
+
+CREATE TABLE IF NOT EXISTS character_state_cards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id TEXT NOT NULL,
+    schema_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    data TEXT NOT NULL DEFAULT '{}',
+    is_readonly INTEGER DEFAULT 0,
+    updated_at REAL NOT NULL,
+    UNIQUE(character_id, schema_id, label)
+);
+CREATE INDEX IF NOT EXISTS idx_char_state_cards ON character_state_cards(character_id);
 """
 
 
@@ -180,6 +192,17 @@ async def _run_migrations(db):
             UNIQUE(conversation_id, schema_id, label)
         )""",
         "CREATE INDEX IF NOT EXISTS idx_state_cards_conv ON state_cards(conversation_id)",
+        """CREATE TABLE IF NOT EXISTS character_state_cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            character_id TEXT NOT NULL,
+            schema_id TEXT NOT NULL,
+            label TEXT NOT NULL,
+            data TEXT NOT NULL DEFAULT '{}',
+            is_readonly INTEGER DEFAULT 0,
+            updated_at REAL NOT NULL,
+            UNIQUE(character_id, schema_id, label)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_char_state_cards ON character_state_cards(character_id)",
     ]
     for sql in table_migrations:
         await db.execute(sql)
@@ -217,6 +240,15 @@ BUILTIN_SCHEMAS = [
         "name": "Lore",
         "fields": json.dumps([
             {"name": "content", "type": "text", "description": "Background information"},
+        ]),
+    },
+    {
+        "id": "persona_state",
+        "name": "Persona State",
+        "fields": json.dumps([
+            {"name": "description", "type": "text", "description": "Who you are in this RP"},
+            {"name": "appearance", "type": "text", "description": "Your physical appearance"},
+            {"name": "goals", "type": "text", "description": "Your active goals"},
         ]),
     },
 ]
@@ -837,6 +869,87 @@ async def delete_state_card(card_id: int):
     await db.execute("DELETE FROM state_cards WHERE id = ?", (card_id,))
     await db.commit()
     await db.close()
+
+
+# ── Character State Cards (Tier 1 — Global) ──
+
+async def get_character_state_cards(character_id: str, schema_id: str = None) -> list[dict]:
+    db = await get_db()
+    if schema_id:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM character_state_cards WHERE character_id = ? AND schema_id = ? ORDER BY label",
+            (character_id, schema_id)
+        )
+    else:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM character_state_cards WHERE character_id = ? ORDER BY schema_id, label",
+            (character_id,)
+        )
+    await db.close()
+    return [dict(r) for r in rows]
+
+
+async def create_character_state_card(character_id: str, schema_id: str, label: str,
+                                      data: dict = None, is_readonly: bool = False) -> dict:
+    db = await get_db()
+    now = time.time()
+    data_json = json.dumps(data or {})
+    await db.execute(
+        "INSERT OR IGNORE INTO character_state_cards (character_id, schema_id, label, data, is_readonly, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (character_id, schema_id, label, data_json, int(is_readonly), now)
+    )
+    await db.commit()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM character_state_cards WHERE character_id = ? AND schema_id = ? AND label = ?",
+        (character_id, schema_id, label)
+    )
+    await db.close()
+    return dict(rows[0]) if rows else {}
+
+
+async def update_character_state_card(card_id: int, data: dict) -> dict:
+    db = await get_db()
+    now = time.time()
+    rows = await db.execute_fetchall("SELECT * FROM character_state_cards WHERE id = ?", (card_id,))
+    if not rows:
+        await db.close()
+        return {}
+    existing = json.loads(rows[0]["data"] or "{}")
+    existing.update(data)
+    await db.execute(
+        "UPDATE character_state_cards SET data = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(existing), now, card_id)
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM character_state_cards WHERE id = ?", (card_id,))
+    await db.close()
+    return dict(rows[0]) if rows else {}
+
+
+async def delete_character_state_card(card_id: int):
+    db = await get_db()
+    await db.execute("DELETE FROM character_state_cards WHERE id = ?", (card_id,))
+    await db.commit()
+    await db.close()
+
+
+async def copy_character_state_to_conversation(character_id: str, conv_id: int) -> int:
+    """Copy all character-level state cards into conversation-level state cards. Returns count."""
+    db = await get_db()
+    now = time.time()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM character_state_cards WHERE character_id = ?", (character_id,)
+    )
+    count = 0
+    for row in rows:
+        await db.execute(
+            "INSERT OR IGNORE INTO state_cards (conversation_id, schema_id, label, data, is_readonly, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (conv_id, row["schema_id"], row["label"], row["data"], row["is_readonly"], now)
+        )
+        count += 1
+    await db.commit()
+    await db.close()
+    return count
 
 
 # ── Bookmarks ──
