@@ -1028,7 +1028,7 @@ body::after {
     position: absolute;
     top: 0;
     right: 0;
-    width: 320px;
+    width: 420px;
     height: 100%;
     z-index: 15;
     overflow-y: auto;
