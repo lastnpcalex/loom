@@ -1167,6 +1167,7 @@ body::after {
 }
 .state-section-cards .state-card {
     width: 100%;
+    max-width: 800px;
     flex-shrink: 0;
 }
 .state-empty {
