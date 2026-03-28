@@ -1692,6 +1692,7 @@ function setupEventListeners() {
     if (treeNewBranch) {
         treeNewBranch.addEventListener('click', () => {
             State._createRootBranch = true;
+            State._skipLoadOnChat = true;
             // Clear messages to show blank chat for new root
             const container = document.getElementById('messages');
             if (container) container.innerHTML = '';
