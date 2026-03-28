@@ -41,6 +41,7 @@ async def lifespan(app):
     # Preload Gemma 3 1B for CPU summarization (downloads ~806MB on first run)
     asyncio.create_task(_preload_summarizer())
     yield
+    await db.close_db()
 
 
 async def _cleanup_stale_drafts():

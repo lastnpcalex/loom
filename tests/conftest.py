@@ -18,6 +18,7 @@ async def tmp_database(tmp_path):
     db.DB_PATH = db_file
     await db.init_db()
     yield db_file
+    await db.close_db()
     db.DB_PATH = original
 
 
