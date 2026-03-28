@@ -1035,6 +1035,8 @@ async def handle_cc_permission(data: dict):
         "event": event,
         "response": None,
         "conv_id": conv_id,
+        "tool_name": tool_name,
+        "tool_input": tool_input,
     }
 
     await event.wait()
@@ -1073,6 +1075,16 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
     # Tell the client whether a generation is running so it can sync state
     if conv_id in _active_generations and not _active_generations[conv_id].done():
         await websocket.send_json({"type": "generation_active"})
+        # Resend any pending permission requests that the old WS missed
+        for rid, pending in list(_pending_hook_permissions.items()):
+            if pending.get("conv_id") == conv_id and "response" not in pending:
+                print(f"[WS] Resending pending permission request {rid} on reconnect")
+                await websocket.send_json({
+                    "type": "permission_request",
+                    "request_id": rid,
+                    "tool_name": pending.get("tool_name", ""),
+                    "tool_input": pending.get("tool_input", ""),
+                })
     else:
         await websocket.send_json({"type": "generation_idle"})
 
