@@ -3177,9 +3177,11 @@ pre.tool-output {
         width: 100%;
         flex-direction: row;
         align-items: center;
+        overflow: hidden;
     }
-    .conv-card-top { flex-direction: row; gap: 6px; }
-    .conv-card-body { flex-direction: row; gap: 8px; flex: 1; }
+    .conv-card-top { flex-direction: row; gap: 6px; flex-shrink: 0; }
+    .conv-card-body { flex-direction: row; gap: 8px; flex: 1; min-width: 0; overflow: hidden; }
+    .conv-item .conv-title-text { max-width: 50vw; }
     #char-state-panel {
         right: 8px;
         left: 8px;
