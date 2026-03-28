@@ -974,8 +974,9 @@ body::after {
 .state-card-picker {
     position: fixed;
     z-index: 300;
-    width: 240px;
-    max-height: 400px;
+    width: 260px;
+    max-width: calc(100vw - 24px);
+    max-height: min(400px, 60vh);
     overflow-y: auto;
     background: rgba(5, 5, 15, 0.95);
     backdrop-filter: var(--glass);
@@ -1064,6 +1065,49 @@ body::after {
     font-size: 16px;
 }
 .tree-state-header button:hover { color: var(--cyan); }
+
+/* Tree input bar for new root branches */
+#tree-input-bar {
+    display: flex;
+    gap: 8px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--border);
+    background: rgba(5, 5, 15, 0.9);
+    backdrop-filter: var(--glass);
+}
+#tree-new-branch {
+    flex: 1;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    font-size: 13px;
+    padding: 8px 12px;
+    outline: none;
+    transition: var(--transition);
+}
+#tree-new-branch:focus {
+    border-color: var(--cyan);
+    box-shadow: 0 0 8px rgba(0, 255, 255, 0.1);
+}
+#tree-new-branch::placeholder {
+    color: var(--text-muted);
+    font-size: 12px;
+}
+#btn-tree-send {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-secondary);
+    font-size: 18px;
+    width: 40px;
+    cursor: pointer;
+    transition: var(--transition);
+}
+#btn-tree-send:hover {
+    color: var(--cyan);
+    border-color: var(--cyan);
+}
 
 #view-char-state {
     overflow-y: auto;

@@ -1177,13 +1177,16 @@ function showStateCardPicker(convId, onDone, charId) {
     document.body.appendChild(picker);
 
     // Position near the add button
+    // Find the triggering button — could be char editor, conv panel, or tree sidebar
     const addBtn = charId
         ? document.getElementById('btn-char-state-add')
-        : document.getElementById('btn-state-add');
+        : (document.getElementById('btn-tree-state-add') || document.getElementById('btn-state-add'));
     if (addBtn) {
         const rect = addBtn.getBoundingClientRect();
-        picker.style.top = (rect.bottom + 4) + 'px';
-        picker.style.right = (window.innerWidth - rect.right) + 'px';
+        const top = Math.min(rect.bottom + 4, window.innerHeight - 420);
+        const right = Math.max(0, window.innerWidth - rect.right);
+        picker.style.top = Math.max(8, top) + 'px';
+        picker.style.right = right + 'px';
     } else {
         picker.style.top = '80px';
         picker.style.right = '20px';
@@ -1677,6 +1680,36 @@ function setupEventListeners() {
                     await attachImage(file);
                 }
             }
+        });
+    }
+
+    // Tree input bar — create new root branch
+    const treeInput = document.getElementById('tree-new-branch');
+    const treeSendBtn = document.getElementById('btn-tree-send');
+    if (treeInput && treeSendBtn) {
+        async function sendTreeMessage() {
+            const content = treeInput.value.trim();
+            if (!content || !State.currentConvId) return;
+            try {
+                const msg = await API.post(`/api/conversations/${State.currentConvId}/messages`, {
+                    role: 'user',
+                    content,
+                    parent_id: null,  // null = new root
+                });
+                treeInput.value = '';
+                // Switch to chat and trigger generation
+                await loadMessages(State.currentConvId);
+                switchView('chat');
+                if (State.ws && State.ws.readyState === WebSocket.OPEN) {
+                    State.ws.send(JSON.stringify({ action: 'generate', parent_id: msg.id }));
+                }
+            } catch (err) {
+                showToast('Failed to create branch', 'error');
+            }
+        }
+        treeSendBtn.addEventListener('click', sendTreeMessage);
+        treeInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendTreeMessage(); }
         });
     }
 }
