@@ -67,7 +67,9 @@ const State = {
 // ── View Switching ──
 function switchView(view) {
     State.currentView = view;
-    localStorage.setItem('loom-last-view', view);
+    if (!State._restoringView) {
+        localStorage.setItem('loom-last-view', view);
+    }
     document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
     document.getElementById(`view-${view}`).classList.add('active');
 
@@ -317,7 +319,9 @@ async function init() {
     if (lastView === 'home' || !lastView) {
         switchView('home');
     } else if (lastConv && State.conversations.find(c => c.id === parseInt(lastConv))) {
+        State._restoringView = true;  // prevent loadConversation from overwriting lastView
         await loadConversation(parseInt(lastConv));
+        State._restoringView = false;
         if (lastView === 'tree' || lastView === 'chat') {
             switchView(lastView);
         }
@@ -1687,6 +1691,7 @@ function setupEventListeners() {
     const treeNewBranch = document.getElementById('btn-tree-new-branch');
     if (treeNewBranch) {
         treeNewBranch.addEventListener('click', () => {
+            State._createRootBranch = true;
             switchView('chat');
             const input = document.getElementById('user-input');
             if (input) {
