@@ -148,8 +148,6 @@
             </div>
             <div id="tree-input-bar">
                 <button id="btn-tree-last-branch" title="Return to last branch">↩ Last Branch</button>
-                <input type="text" id="tree-branch-input" class="hidden" placeholder="Type first message, press Enter...">
-                <button id="btn-tree-new-branch" title="Start a new root branch">+ New Branch</button>
             </div>
         </div>
 
@@ -165,40 +163,42 @@
                     <span class="typing-cursor"></span>
                 </div>
             </div>
-            <div id="input-area">
-                <div id="image-preview" class="hidden"></div>
-                <div id="weave-inline-controls" class="hidden">
-                    <label class="ooda-toggle" title="OODA Harness — cognitive scaffolding for better RP">
-                        <input type="checkbox" id="ooda-toggle-inline">
-                        <span class="ooda-toggle-label">OODA</span>
-                    </label>
-                    <button id="btn-state-panel-chat" title="View and edit state cards for this branch — character moods, scene details, and lore tracked by the OODA harness" class="hidden branch-state-btn"><span class="delta-glow">δ</span> Branch State</button>
-                </div>
-                <div id="cc-inline-controls" class="hidden">
-                    <select id="cc-model-inline" title="Model">
-                        <option value="sonnet">Sonnet</option>
-                        <option value="opus">Opus</option>
-                        <option value="haiku">Haiku</option>
-                    </select>
-                    <select id="cc-effort-inline" title="Thinking effort">
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="max">Max</option>
-                    </select>
-                    <select id="cc-permission-mode-inline" title="Permission mode">
-                        <option value="default">Act</option>
-                        <option value="plan">Plan</option>
-                    </select>
-                </div>
-                <div id="input-row">
-                    <label id="btn-attach" title="Attach file">
-                        <input type="file" id="file-input" accept="image/*,.md,.txt,.pdf,.json,.csv,.py,.js,.ts,.html,.css" hidden>
-                        📎
-                    </label>
-                    <textarea id="user-input" placeholder="Write your message..." rows="1"></textarea>
-                    <button id="btn-send" title="Send">↑</button>
-                </div>
+        </div>
+
+        <!-- Shared input area (visible on both chat and tree views) -->
+        <div id="input-area" class="hidden">
+            <div id="image-preview" class="hidden"></div>
+            <div id="weave-inline-controls" class="hidden">
+                <label class="ooda-toggle" title="OODA Harness — cognitive scaffolding for better RP">
+                    <input type="checkbox" id="ooda-toggle-inline">
+                    <span class="ooda-toggle-label">OODA</span>
+                </label>
+                <button id="btn-state-panel-chat" title="View and edit state cards for this branch — character moods, scene details, and lore tracked by the OODA harness" class="hidden branch-state-btn"><span class="delta-glow">δ</span> Branch State</button>
+            </div>
+            <div id="cc-inline-controls" class="hidden">
+                <select id="cc-model-inline" title="Model">
+                    <option value="sonnet">Sonnet</option>
+                    <option value="opus">Opus</option>
+                    <option value="haiku">Haiku</option>
+                </select>
+                <select id="cc-effort-inline" title="Thinking effort">
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="max">Max</option>
+                </select>
+                <select id="cc-permission-mode-inline" title="Permission mode">
+                    <option value="default">Act</option>
+                    <option value="plan">Plan</option>
+                </select>
+            </div>
+            <div id="input-row">
+                <label id="btn-attach" title="Attach file">
+                    <input type="file" id="file-input" accept="image/*,.md,.txt,.pdf,.json,.csv,.py,.js,.ts,.html,.css" hidden>
+                    📎
+                </label>
+                <textarea id="user-input" placeholder="Write your message..." rows="1"></textarea>
+                <button id="btn-send" title="Send">↑</button>
             </div>
         </div>
     </div>

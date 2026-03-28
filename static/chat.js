@@ -379,11 +379,16 @@ async function sendMessage() {
 
     // Add user message via REST — send image paths as JSON array
     const imagePaths = hasImages ? State.pendingImages.map(img => img.path) : null;
+    const isFromTree = State.currentView === 'tree';
     const msgData = {
         role: 'user',
         content: content,
         image_path: imagePaths,
     };
+    // From tree view: create a new root branch
+    if (isFromTree) {
+        msgData.parent_id = null;
+    }
 
     try {
         const msg = await API.post(`/api/conversations/${State.currentConvId}/messages`, msgData);
@@ -392,6 +397,18 @@ async function sendMessage() {
         input.value = '';
         autoResizeTextarea();
         clearPendingImages();
+
+        // If sent from tree view, switch to that branch in chat
+        if (isFromTree) {
+            await switchToBranch(msg.id, msg.id);
+            State._skipLoadOnChat = true;
+            switchView('chat');
+            if (State.ws && State.ws.readyState === WebSocket.OPEN) {
+                showGenStatus('Sending...');
+                State.ws.send(JSON.stringify({ action: 'generate', parent_id: msg.id }));
+            }
+            return;
+        }
 
         if (State.isStreaming) {
             // Queue it — will fire when current stream ends

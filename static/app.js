@@ -87,8 +87,10 @@ function switchView(view) {
     // Hide panels on view switch
     globalBmPanel?.classList.add('hidden');
     statePanel?.classList.add('hidden');
+    const inputArea = document.getElementById('input-area');
 
     if (view === 'home') {
+        inputArea?.classList.add('hidden');
         sep.classList.add('hidden');
         title.classList.add('hidden');
         breadcrumb.classList.add('hidden');
@@ -106,6 +108,9 @@ function switchView(view) {
         treeBtn.classList.add('hidden');
         contextInfo.classList.remove('hidden');
         globalBmBtn?.classList.remove('hidden');
+        inputArea?.classList.remove('hidden');
+        const userInput = document.getElementById('user-input');
+        if (userInput) userInput.placeholder = 'Write a message to create a new root branch...';
         // Show state panel button in tree only for OODA-enabled Weave
         const isOodaWeave = State.currentConv?.mode === 'weave' && State.currentConv?.ooda_enabled;
         if (isOodaWeave) statePanelTree?.classList.remove('hidden');
@@ -119,6 +124,9 @@ function switchView(view) {
         updateBreadcrumbs();
         contextInfo.classList.remove('hidden');
         globalBmBtn?.classList.remove('hidden');
+        inputArea?.classList.remove('hidden');
+        const userInput = document.getElementById('user-input');
+        if (userInput) userInput.placeholder = 'Write your message...';
         // Refresh messages when switching back to chat (picks up responses
         // that completed while on tree/home view)
         // Skip if we just did switchToBranch (data is already fresh)
@@ -135,6 +143,7 @@ function switchView(view) {
         contextInfo.classList.add('hidden');
         globalBmBtn?.classList.add('hidden');
         statePanelTree?.classList.add('hidden');
+        inputArea?.classList.add('hidden');
     }
 }
 
@@ -1687,41 +1696,6 @@ function setupEventListeners() {
         });
     }
 
-    // Tree new branch button — switch to chat for full input experience
-    const treeNewBranch = document.getElementById('btn-tree-new-branch');
-    if (treeNewBranch) {
-        const branchInput = document.getElementById('tree-branch-input');
-        treeNewBranch.addEventListener('click', () => {
-            if (!branchInput) return;
-            branchInput.classList.toggle('hidden');
-            if (!branchInput.classList.contains('hidden')) {
-                branchInput.value = '';
-                branchInput.focus();
-            }
-        });
-        if (branchInput) {
-            async function createRootBranch() {
-                const content = branchInput.value.trim();
-                if (!content || !State.currentConvId) return;
-                branchInput.classList.add('hidden');
-                try {
-                    const msg = await API.post(`/api/conversations/${State.currentConvId}/messages`, {
-                        role: 'user', content, parent_id: null,
-                    });
-                    await switchToBranch(msg.id, msg.id);
-                    State._skipLoadOnChat = true;
-                    switchView('chat');
-                    if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-                        State.ws.send(JSON.stringify({ action: 'generate', parent_id: msg.id }));
-                    }
-                } catch { showToast('Failed to create branch', 'error'); }
-            }
-            branchInput.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') { e.preventDefault(); createRootBranch(); }
-                if (e.key === 'Escape') branchInput.classList.add('hidden');
-            });
-        }
-    }
     const treeLastBranch = document.getElementById('btn-tree-last-branch');
     if (treeLastBranch) {
         treeLastBranch.addEventListener('click', () => switchView('chat'));
