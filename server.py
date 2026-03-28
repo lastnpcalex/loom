@@ -71,6 +71,20 @@ async def _preload_summarizer():
 
 app = FastAPI(title="Ex Astris Umbra — A Loom Interface", lifespan=lifespan)
 
+# --- Graceful shutdown endpoint ---
+_server_ref: list = []  # holds uvicorn.Server for shutdown
+
+@app.post("/shutdown")
+async def shutdown():
+    """Gracefully stop this server instance."""
+    if _server_ref:
+        _server_ref[0].should_exit = True
+        return JSONResponse({"status": "shutting down"})
+    # Fallback: signal the process
+    import signal
+    os.kill(os.getpid(), signal.SIGINT)
+    return JSONResponse({"status": "shutting down (signal)"})
+
 # Ensure upload directory exists
 os.makedirs(config.upload_dir, exist_ok=True)
 
@@ -2089,6 +2103,12 @@ if __name__ == "__main__":
         print(f"[SSL] HTTPS enabled — cert={config.ssl_certfile}")
     else:
         print("[SSL] No certs found — running plain HTTP")
-    uvicorn.run(app, host=config.host, port=config.port,
-                ws_ping_interval=None, ws_ping_timeout=None,
-                **ssl_kwargs)
+
+    uv_config = uvicorn.Config(
+        app, host=config.host, port=config.port,
+        ws_ping_interval=None, ws_ping_timeout=None,
+        **ssl_kwargs,
+    )
+    server = uvicorn.Server(uv_config)
+    _server_ref.append(server)
+    server.run()
