@@ -110,7 +110,7 @@ function switchView(view) {
         globalBmBtn?.classList.remove('hidden');
         inputArea?.classList.remove('hidden');
         const userInput = document.getElementById('user-input');
-        if (userInput) userInput.placeholder = 'Write a message to create a new root branch...';
+        if (userInput) userInput.placeholder = 'Create a branch...';
         // Show state panel button in tree only for OODA-enabled Weave
         const isOodaWeave = State.currentConv?.mode === 'weave' && State.currentConv?.ooda_enabled;
         if (isOodaWeave) statePanelTree?.classList.remove('hidden');
