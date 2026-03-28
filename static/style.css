@@ -2035,6 +2035,9 @@ body::after {
 
 /* ── Input Area ── */
 #input-area {
+    flex-shrink: 0;
+    position: relative;
+    z-index: 5;
     border-top: 1px solid;
     border-image: var(--gradient-border) 1;
     background: rgba(5, 5, 15, 0.9);
