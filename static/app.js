@@ -1683,33 +1683,16 @@ function setupEventListeners() {
         });
     }
 
-    // Tree input bar — create new root branch
-    const treeInput = document.getElementById('tree-new-branch');
-    const treeSendBtn = document.getElementById('btn-tree-send');
-    if (treeInput && treeSendBtn) {
-        async function sendTreeMessage() {
-            const content = treeInput.value.trim();
-            if (!content || !State.currentConvId) return;
-            try {
-                const msg = await API.post(`/api/conversations/${State.currentConvId}/messages`, {
-                    role: 'user',
-                    content,
-                    parent_id: null,  // null = new root
-                });
-                treeInput.value = '';
-                // Switch to chat and trigger generation
-                await loadMessages(State.currentConvId);
-                switchView('chat');
-                if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-                    State.ws.send(JSON.stringify({ action: 'generate', parent_id: msg.id }));
-                }
-            } catch (err) {
-                showToast('Failed to create branch', 'error');
+    // Tree new branch button — switch to chat for full input experience
+    const treeNewBranch = document.getElementById('btn-tree-new-branch');
+    if (treeNewBranch) {
+        treeNewBranch.addEventListener('click', () => {
+            switchView('chat');
+            const input = document.getElementById('user-input');
+            if (input) {
+                input.placeholder = 'Write a message to create a new root branch...';
+                input.focus();
             }
-        }
-        treeSendBtn.addEventListener('click', sendTreeMessage);
-        treeInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendTreeMessage(); }
         });
     }
 }
