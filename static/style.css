@@ -1075,7 +1075,8 @@ body::after {
     background: rgba(5, 5, 15, 0.9);
     backdrop-filter: var(--glass);
 }
-#btn-tree-new-branch {
+#btn-tree-new-branch,
+#btn-tree-last-branch {
     background: none;
     border: 1px solid var(--border);
     border-radius: var(--radius);
@@ -1086,7 +1087,8 @@ body::after {
     transition: var(--transition);
     font-family: 'Space Grotesk', sans-serif;
 }
-#btn-tree-new-branch:hover {
+#btn-tree-new-branch:hover,
+#btn-tree-last-branch:hover {
     color: var(--cyan);
     border-color: var(--cyan);
     box-shadow: 0 0 8px rgba(0, 255, 255, 0.15);

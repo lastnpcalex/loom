@@ -1692,16 +1692,20 @@ function setupEventListeners() {
     if (treeNewBranch) {
         treeNewBranch.addEventListener('click', () => {
             State._createRootBranch = true;
-            // Show empty chat — clear messages temporarily
+            // Clear messages to show blank chat for new root
             const container = document.getElementById('messages');
-            if (container) container.innerHTML = '<div style="flex:1;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:14px;">New root branch — type your first message below</div>';
+            if (container) container.innerHTML = '';
             switchView('chat');
             const input = document.getElementById('user-input');
             if (input) {
-                input.placeholder = 'Write a message to create a new root branch...';
+                input.placeholder = 'Write your first message for a new root branch...';
                 input.focus();
             }
         });
+    }
+    const treeLastBranch = document.getElementById('btn-tree-last-branch');
+    if (treeLastBranch) {
+        treeLastBranch.addEventListener('click', () => switchView('chat'));
     }
 }
 
