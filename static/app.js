@@ -1690,19 +1690,37 @@ function setupEventListeners() {
     // Tree new branch button — switch to chat for full input experience
     const treeNewBranch = document.getElementById('btn-tree-new-branch');
     if (treeNewBranch) {
+        const branchInput = document.getElementById('tree-branch-input');
         treeNewBranch.addEventListener('click', () => {
-            State._createRootBranch = true;
-            State._skipLoadOnChat = true;
-            // Clear messages to show blank chat for new root
-            const container = document.getElementById('messages');
-            if (container) container.innerHTML = '';
-            switchView('chat');
-            const input = document.getElementById('user-input');
-            if (input) {
-                input.placeholder = 'Write your first message for a new root branch...';
-                input.focus();
+            if (!branchInput) return;
+            branchInput.classList.toggle('hidden');
+            if (!branchInput.classList.contains('hidden')) {
+                branchInput.value = '';
+                branchInput.focus();
             }
         });
+        if (branchInput) {
+            async function createRootBranch() {
+                const content = branchInput.value.trim();
+                if (!content || !State.currentConvId) return;
+                branchInput.classList.add('hidden');
+                try {
+                    const msg = await API.post(`/api/conversations/${State.currentConvId}/messages`, {
+                        role: 'user', content, parent_id: null,
+                    });
+                    await switchToBranch(msg.id, msg.id);
+                    State._skipLoadOnChat = true;
+                    switchView('chat');
+                    if (State.ws && State.ws.readyState === WebSocket.OPEN) {
+                        State.ws.send(JSON.stringify({ action: 'generate', parent_id: msg.id }));
+                    }
+                } catch { showToast('Failed to create branch', 'error'); }
+            }
+            branchInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); createRootBranch(); }
+                if (e.key === 'Escape') branchInput.classList.add('hidden');
+            });
+        }
     }
     const treeLastBranch = document.getElementById('btn-tree-last-branch');
     if (treeLastBranch) {

@@ -1087,6 +1087,18 @@ body::after {
     transition: var(--transition);
     font-family: 'Space Grotesk', sans-serif;
 }
+#tree-branch-input {
+    flex: 1;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--cyan);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    font-size: 13px;
+    padding: 8px 12px;
+    outline: none;
+    font-family: 'Space Grotesk', sans-serif;
+}
+#tree-branch-input::placeholder { color: var(--text-muted); }
 #btn-tree-new-branch:hover,
 #btn-tree-last-branch:hover {
     color: var(--cyan);

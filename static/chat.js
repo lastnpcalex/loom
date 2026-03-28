@@ -384,12 +384,6 @@ async function sendMessage() {
         content: content,
         image_path: imagePaths,
     };
-    // If flagged for new root branch, send parent_id: null explicitly
-    if (State._createRootBranch) {
-        msgData.parent_id = null;
-        State._createRootBranch = false;
-        input.placeholder = '';  // reset placeholder
-    }
 
     try {
         const msg = await API.post(`/api/conversations/${State.currentConvId}/messages`, msgData);
