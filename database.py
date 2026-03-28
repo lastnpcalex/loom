@@ -117,6 +117,16 @@ async def get_db() -> aiosqlite.Connection:
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA foreign_keys=ON")
         await _db.execute("PRAGMA busy_timeout=30000")
+    else:
+        # Check if connection is still alive; reconnect if dead
+        try:
+            await _db.execute("SELECT 1")
+        except (ValueError, Exception):
+            _db = await aiosqlite.connect(DB_PATH)
+            _db.row_factory = aiosqlite.Row
+            await _db.execute("PRAGMA journal_mode=WAL")
+            await _db.execute("PRAGMA foreign_keys=ON")
+            await _db.execute("PRAGMA busy_timeout=30000")
     return _db
 
 
