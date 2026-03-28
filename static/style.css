@@ -1066,31 +1066,6 @@ body::after {
 }
 .tree-state-header button:hover { color: var(--cyan); }
 
-/* Tree input bar */
-#tree-input-bar {
-    display: flex;
-    justify-content: center;
-    padding: 10px 16px;
-    border-top: 1px solid var(--border);
-    background: rgba(5, 5, 15, 0.9);
-    backdrop-filter: var(--glass);
-}
-#btn-tree-last-branch {
-    background: none;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    color: var(--text-secondary);
-    font-size: 13px;
-    padding: 8px 20px;
-    cursor: pointer;
-    transition: var(--transition);
-    font-family: 'Space Grotesk', sans-serif;
-}
-#btn-tree-last-branch:hover {
-    color: var(--cyan);
-    border-color: var(--cyan);
-    box-shadow: 0 0 8px rgba(0, 255, 255, 0.15);
-}
 
 #view-char-state {
     overflow-y: auto;
