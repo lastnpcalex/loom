@@ -112,27 +112,34 @@ CREATE INDEX IF NOT EXISTS idx_char_state_cards ON character_state_cards(charact
 async def get_db() -> aiosqlite.Connection:
     global _db
     if _db is None:
+        print("[DB] Opening new shared connection")
         _db = await aiosqlite.connect(DB_PATH)
         _db.row_factory = aiosqlite.Row
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA foreign_keys=ON")
         await _db.execute("PRAGMA busy_timeout=30000")
     else:
-        # Check if connection is still alive; reconnect if dead
         try:
             await _db.execute("SELECT 1")
-        except (ValueError, Exception):
+        except (ValueError, Exception) as e:
+            print(f"[DB] Shared connection dead ({e}), reconnecting...")
+            try:
+                await _db.close()
+            except Exception:
+                pass
             _db = await aiosqlite.connect(DB_PATH)
             _db.row_factory = aiosqlite.Row
             await _db.execute("PRAGMA journal_mode=WAL")
             await _db.execute("PRAGMA foreign_keys=ON")
             await _db.execute("PRAGMA busy_timeout=30000")
+            print("[DB] Reconnected successfully")
     return _db
 
 
 async def close_db():
     global _db
     if _db:
+        print("[DB] Closing shared connection")
         await _db.close()
         _db = None
 
