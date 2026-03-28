@@ -1692,6 +1692,9 @@ function setupEventListeners() {
     if (treeNewBranch) {
         treeNewBranch.addEventListener('click', () => {
             State._createRootBranch = true;
+            // Show empty chat — clear messages temporarily
+            const container = document.getElementById('messages');
+            if (container) container.innerHTML = '<div style="flex:1;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:14px;">New root branch — type your first message below</div>';
             switchView('chat');
             const input = document.getElementById('user-input');
             if (input) {
