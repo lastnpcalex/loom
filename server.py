@@ -30,6 +30,7 @@ from prompt_engine import (
 from context_manager import get_context_for_generation, update_rolling_summary
 import local_summary
 import claude_client
+from skill_scanner import get_all_skills, BUILTIN_COMMANDS
 
 from contextlib import asynccontextmanager
 
@@ -100,6 +101,28 @@ _active_websockets: dict[int, set[WebSocket]] = {}
 _pending_hook_permissions: dict[str, dict] = {}
 # Sessions where user clicked "Allow All" — auto-approve for rest of generation
 _auto_approve_sessions: set[int] = set()
+# Live generation state — survives WS disconnects so reconnecting clients get a snapshot.
+# Keyed by gen_key (conv_id, parent_id, seq). Updated on every stream event.
+_generation_snapshots: dict[tuple[int, int | None, int], dict] = {}
+
+
+def _update_gen_snapshot(gen_key: tuple, **fields):
+    """Update the live snapshot for an active generation (called on every stream event)."""
+    snap = _generation_snapshots.get(gen_key)
+    if snap is None:
+        snap = {
+            "full_text": "",
+            "content_blocks": [],
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "started_at": 0,
+            "draft_msg_id": None,
+            "parent_id": None,
+            "mode": "claude",
+        }
+        _generation_snapshots[gen_key] = snap
+    snap.update(fields)
+    return snap
 
 
 def _parse_image_paths(image_path) -> list[str]:
@@ -1041,25 +1064,36 @@ async def handle_cc_permission(data: dict):
     elif isinstance(tool_input, str):
         input_summary = tool_input[:500]
 
-    # Wait indefinitely for a WebSocket connection (user may need to navigate to this conversation)
-    clients = _active_websockets.get(conv_id, set())
-    ws = next((c for c in clients if c.client_state == WebSocketState.CONNECTED), None)
-    if not ws:
-        print(f"[PERM] No WebSocket for conv={conv_id} — waiting for UI to connect...")
-    while True:
-        clients = _active_websockets.get(conv_id, set())
-        ws = next((c for c in clients if c.client_state == WebSocketState.CONNECTED), None)
-        if ws:
-            break
-        await asyncio.sleep(1)
-
-    await ws.send_json({
+    # Build permission message once — broadcast to all active WebSockets globally
+    perm_msg = {
         "type": "permission_request",
         "request_id": request_id,
+        "conv_id": conv_id,
         "tool_name": tool_name,
         "tool_input": tool_input,
         "input_summary": input_summary,
-    })
+    }
+
+    # Wait for at least one WebSocket anywhere (user may need to open the app)
+    while True:
+        any_ws = any(
+            ws.client_state == WebSocketState.CONNECTED
+            for clients in _active_websockets.values() for ws in clients
+        )
+        if any_ws:
+            break
+        await asyncio.sleep(1)
+
+    # Broadcast to ALL active WebSockets across ALL conversations
+    dead_pairs = []
+    for cid, clients in _active_websockets.items():
+        for ws in clients:
+            try:
+                await ws.send_json(perm_msg)
+            except Exception:
+                dead_pairs.append((cid, ws))
+    for cid, ws in dead_pairs:
+        _active_websockets.get(cid, set()).discard(ws)
 
     # Wait for user response
     event = asyncio.Event()
@@ -1069,6 +1103,7 @@ async def handle_cc_permission(data: dict):
         "conv_id": conv_id,
         "tool_name": tool_name,
         "tool_input": tool_input,
+        "input_summary": input_summary,
     }
 
     await event.wait()
@@ -1081,6 +1116,136 @@ async def handle_cc_permission(data: dict):
         return {"allow": True}
     else:
         return {"allow": False, "message": "Denied by user in Loom UI"}
+
+
+# ── Skills & Modules ──
+
+@app.get("/api/skills")
+async def list_skills(conv_id: int = None):
+    """List available skills for a conversation (or globally).
+    Scans both built-in skills and .claude/skills/ in the project directory.
+    """
+    project_dir = None
+    if conv_id:
+        conv = await db.get_conversation(conv_id)
+        if conv:
+            project_dir = conv.get("project_dir")
+    skills = get_all_skills(project_dir)
+    return skills
+
+
+@app.get("/api/modules")
+async def list_modules(module_type: str = None):
+    """List registered modules from the database."""
+    return await db.get_modules(module_type=module_type)
+
+
+@app.post("/api/modules/sync")
+async def sync_modules(conv_id: int = None):
+    """Sync skills from filesystem into the modules database.
+    Call this after changing project_dir or adding new skills.
+    """
+    project_dir = None
+    if conv_id:
+        conv = await db.get_conversation(conv_id)
+        if conv:
+            project_dir = conv.get("project_dir")
+    skills = get_all_skills(project_dir)
+    synced = []
+    for skill in skills:
+        module = await db.upsert_module(
+            module_id=skill["id"],
+            name=skill["name"],
+            module_type="skill",
+            description=skill.get("description", ""),
+            source=skill.get("source_path", "builtin"),
+            config={
+                "command": skill.get("command", ""),
+                "prompt_template": skill.get("prompt_template", ""),
+            },
+        )
+        synced.append(module)
+    return {"synced": len(synced), "modules": synced}
+
+
+@app.put("/api/modules/{module_id}/enabled")
+async def toggle_module(module_id: str, data: dict):
+    """Enable or disable a module."""
+    enabled = data.get("enabled", True)
+    await db.set_module_enabled(module_id, enabled)
+    return {"ok": True}
+
+
+@app.post("/api/skills/create")
+async def create_user_skill(data: dict):
+    """Create a custom user skill by writing a SKILL.md file.
+
+    Expects: { conv_id, name, description, prompt_template }
+    Writes to: <project_dir>/.claude/skills/<name>/SKILL.md
+    """
+    conv_id = data.get("conv_id")
+    name = data.get("name", "").strip().lower().replace(" ", "-")
+    description = data.get("description", "")
+    prompt_template = data.get("prompt_template", "")
+
+    if not name:
+        raise HTTPException(400, "Skill name is required")
+    if not prompt_template:
+        raise HTTPException(400, "Prompt template is required")
+
+    # Determine project directory
+    project_dir = "."
+    if conv_id:
+        conv = await db.get_conversation(int(conv_id))
+        if conv and conv.get("project_dir"):
+            project_dir = conv["project_dir"]
+
+    skills_dir = Path(project_dir) / ".claude" / "skills" / name
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    skill_md = skills_dir / "SKILL.md"
+
+    content = f"---\ndescription: {description}\n---\n\n{prompt_template}\n"
+    skill_md.write_text(content, encoding="utf-8")
+
+    return {
+        "ok": True,
+        "path": str(skill_md),
+        "skill": {
+            "id": f"skill:custom:{name}",
+            "name": name,
+            "command": f"/{name}",
+            "description": description,
+            "prompt_template": prompt_template,
+        },
+    }
+
+
+@app.get("/api/skills/user")
+async def list_user_skills(conv_id: int = None):
+    """List only user-created custom skills (from .claude/skills/)."""
+    from skill_scanner import scan_skills_dir
+    project_dir = "."
+    if conv_id:
+        conv = await db.get_conversation(conv_id)
+        if conv and conv.get("project_dir"):
+            project_dir = conv["project_dir"]
+    return scan_skills_dir(project_dir)
+
+
+@app.delete("/api/skills/user/{skill_name}")
+async def delete_user_skill(skill_name: str, conv_id: int = None):
+    """Delete a user-created skill by removing its directory."""
+    import shutil
+    project_dir = "."
+    if conv_id:
+        conv = await db.get_conversation(conv_id)
+        if conv and conv.get("project_dir"):
+            project_dir = conv["project_dir"]
+    skills_dir = Path(project_dir) / ".claude" / "skills" / skill_name
+    if not skills_dir.exists():
+        raise HTTPException(404, f"Skill '{skill_name}' not found")
+    shutil.rmtree(skills_dir)
+    return {"ok": True, "deleted": skill_name}
 
 
 # ── WebSocket Chat ──
@@ -1117,22 +1282,54 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
         _active_websockets[conv_id] = set()
     _active_websockets[conv_id].add(websocket)
 
-    # Tell the client whether a generation is running so it can sync state
-    conv_has_gen = any(k[0] == conv_id and not t.done() for k, t in _active_generations.items())
-    if conv_has_gen:
-        await websocket.send_json({"type": "generation_active"})
-        # Resend any pending permission requests that the old WS missed
+    # Tell the client whether a generation is running — include live snapshot if available
+    active_gen_keys = [k for k, t in _active_generations.items() if k[0] == conv_id and not t.done()]
+    if active_gen_keys:
+        # Find the snapshot for the active generation(s)
+        snapshots = []
+        for gk in active_gen_keys:
+            snap = _generation_snapshots.get(gk)
+            if snap:
+                snapshots.append({
+                    "gen_id": gk[2],
+                    "parent_id": snap.get("parent_id"),
+                    "draft_msg_id": snap.get("draft_msg_id"),
+                    "full_text": snap.get("full_text", ""),
+                    "content_blocks": snap.get("content_blocks", []),
+                    "input_tokens": snap.get("input_tokens", 0),
+                    "output_tokens": snap.get("output_tokens", 0),
+                    "started_at": snap.get("started_at", 0),
+                    "mode": snap.get("mode", "claude"),
+                })
+        await websocket.send_json({
+            "type": "generation_active",
+            "snapshots": snapshots,
+        })
+        # Resend ALL pending permission requests (broadcast globally now)
         for rid, pending in list(_pending_hook_permissions.items()):
-            if pending.get("conv_id") == conv_id and "response" not in pending:
+            if "response" not in pending:
                 print(f"[WS] Resending pending permission request {rid} on reconnect")
                 await websocket.send_json({
                     "type": "permission_request",
                     "request_id": rid,
+                    "conv_id": pending.get("conv_id"),
                     "tool_name": pending.get("tool_name", ""),
                     "tool_input": pending.get("tool_input", ""),
+                    "input_summary": pending.get("input_summary", ""),
                 })
     else:
         await websocket.send_json({"type": "generation_idle"})
+        # Even when idle, resend any pending permissions from other conversations
+        for rid, pending in list(_pending_hook_permissions.items()):
+            if "response" not in pending:
+                await websocket.send_json({
+                    "type": "permission_request",
+                    "request_id": rid,
+                    "conv_id": pending.get("conv_id"),
+                    "tool_name": pending.get("tool_name", ""),
+                    "tool_input": pending.get("tool_input", ""),
+                    "input_summary": pending.get("input_summary", ""),
+                })
 
     try:
         while True:
@@ -1398,6 +1595,19 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
         draft_msg_id = draft_msg["id"]
         await db.set_active_branch(conv_id, draft_msg_id)
 
+        # Initialize live snapshot for this generation (survives WS disconnects)
+        import time as _time
+        _gen_key_local = getattr(asyncio.current_task(), '_gen_key', None)
+        if _gen_key_local:
+            _update_gen_snapshot(_gen_key_local,
+                full_text="", content_blocks=[],
+                input_tokens=0, output_tokens=0,
+                started_at=_time.time(),
+                draft_msg_id=draft_msg_id,
+                parent_id=parent_id,
+                mode="local" if use_ollama else "claude",
+            )
+
         # Let the client know we're launching
         launch_label = f"Launching {cc_model} via Ollama..." if use_ollama else f"Launching Claude Code ({cc_model})..."
         await _ws_send(conv_id, {"type": "status", "text": launch_label, "parent_id": parent_id})
@@ -1545,6 +1755,15 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                     full_text = evt["result_text"]
                     content_blocks.append({"type": "text", "text": full_text})
 
+            # Keep live snapshot in sync (reconnecting clients read this)
+            if _gen_key_local:
+                _update_gen_snapshot(_gen_key_local,
+                    full_text=full_text,
+                    content_blocks=content_blocks,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                )
+
         _active_claude_procs.pop(conv_id, None)
 
         # If --resume failed (is_error), retry with full history fallback
@@ -1685,6 +1904,15 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                         full_text = evt["result_text"]
                         content_blocks.append({"type": "text", "text": full_text})
 
+                # Keep live snapshot in sync (fallback retry loop)
+                if _gen_key_local:
+                    _update_gen_snapshot(_gen_key_local,
+                        full_text=full_text,
+                        content_blocks=content_blocks,
+                        input_tokens=total_input_tokens,
+                        output_tokens=total_output_tokens,
+                    )
+
             _active_claude_procs.pop(conv_id, None)
 
         # If CC produced no output at all, mark draft as error (don't delete)
@@ -1784,6 +2012,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
         _gen_key = getattr(asyncio.current_task(), '_gen_key', None)
         if _gen_key:
             _active_generations.pop(_gen_key, None)
+            _generation_snapshots.pop(_gen_key, None)
         _auto_approve_sessions.discard(conv_id)
         # Clean up any pending hook permissions for this conversation
         for rid in list(_pending_hook_permissions):
@@ -2031,6 +2260,7 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
         _gen_key = getattr(asyncio.current_task(), '_gen_key', None)
         if _gen_key:
             _active_generations.pop(_gen_key, None)
+            _generation_snapshots.pop(_gen_key, None)
 
 
 async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dict, data: dict):
@@ -2144,6 +2374,18 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
         print(f"[GEN] Starting generation for conv={conv_id} parent={parent_id} model={config.ollama_model}")
         await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id, "draft_msg_id": draft_msg_id})
 
+        # Initialize live snapshot for Weave generation
+        import time as _time
+        _gen_key_local = getattr(asyncio.current_task(), '_gen_key', None)
+        if _gen_key_local:
+            _update_gen_snapshot(_gen_key_local,
+                full_text="", content_blocks=[],
+                started_at=_time.time(),
+                draft_msg_id=draft_msg_id,
+                parent_id=parent_id,
+                mode="weave",
+            )
+
         full_response = ""
         weave_model = conv.get("local_model") or None
         async for token in stream_chat(messages, model=weave_model):
@@ -2156,6 +2398,9 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
                 "type": "stream_chunk",
                 "content": token,
             })
+            # Keep live snapshot in sync
+            if _gen_key_local:
+                _update_gen_snapshot(_gen_key_local, full_text=full_response)
 
         # Strip <think>...</think> blocks (thinking models like qwen3)
         import re as _re
@@ -2204,6 +2449,7 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
         _gen_key = getattr(asyncio.current_task(), '_gen_key', None)
         if _gen_key:
             _active_generations.pop(_gen_key, None)
+            _generation_snapshots.pop(_gen_key, None)
 
 
 if __name__ == "__main__":
