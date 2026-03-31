@@ -392,14 +392,17 @@ async def api_create_conversation(data: dict = None):
                     "personality": char.get("personality", ""),
                     "appearance": "",
                     "current_mood": "",
-                    "goals": "",
-                    "relationships": "",
-                    "physical_situation": char.get("scenario", ""),
+                    "current_goal": "",
+                    "physical_state": "",
+                    "speech_pattern": "",
+                    "relationship_to_player": "",
+                    "secrets": "",
                 })
                 if char.get("scenario"):
                     await db.create_state_card(conv["id"], "scene_state", "current", {
                         "location": "", "time_of_day": "", "atmosphere": "",
-                        "present_characters": "", "recent_events": char["scenario"],
+                        "characters_present": "", "recent_events": char["scenario"],
+                        "tension_level": "",
                     })
         if persona_id:
             persona = load_persona(os.path.join("personas", f"{persona_id}.md"))
@@ -579,9 +582,11 @@ async def api_seed_state_cards(conv_id: int):
                     "personality": char.get("personality", ""),
                     "appearance": "",
                     "current_mood": "",
-                    "goals": "",
-                    "relationships": "",
-                    "physical_situation": char.get("scenario", ""),
+                    "current_goal": "",
+                    "physical_state": "",
+                    "speech_pattern": "",
+                    "relationship_to_player": "",
+                    "secrets": "",
                 })
                 if card:
                     cards_created.append(card)
@@ -590,8 +595,9 @@ async def api_seed_state_cards(conv_id: int):
                         "location": "",
                         "time_of_day": "",
                         "atmosphere": "",
-                        "present_characters": "",
+                        "characters_present": "",
                         "recent_events": char["scenario"],
+                        "tension_level": "",
                     })
                     if scene:
                         cards_created.append(scene)
@@ -1036,12 +1042,14 @@ async def handle_cc_permission(data: dict):
         input_summary = tool_input[:500]
 
     # Wait indefinitely for a WebSocket connection (user may need to navigate to this conversation)
-    ws = _active_websockets.get(conv_id)
-    if not ws or ws.client_state != WebSocketState.CONNECTED:
+    clients = _active_websockets.get(conv_id, set())
+    ws = next((c for c in clients if c.client_state == WebSocketState.CONNECTED), None)
+    if not ws:
         print(f"[PERM] No WebSocket for conv={conv_id} — waiting for UI to connect...")
     while True:
-        ws = _active_websockets.get(conv_id)
-        if ws and ws.client_state == WebSocketState.CONNECTED:
+        clients = _active_websockets.get(conv_id, set())
+        ws = next((c for c in clients if c.client_state == WebSocketState.CONNECTED), None)
+        if ws:
             break
         await asyncio.sleep(1)
 

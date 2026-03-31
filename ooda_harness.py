@@ -22,42 +22,62 @@ import database as db
 OODA_TOOL_DEFINITIONS = """
 ## OODA Workflow
 
-Before writing your response, you MUST emit an <ooda> block that follows the Observe-Orient-Decide-Act cycle. This structures your thinking and keeps the scene grounded.
+Before writing your response, you MUST emit an <ooda> block. This is your cognitive scaffold — observe the scene, orient your character, decide what to do, then act through prose. Never skip it.
 
-### Available State Operations
+### State Operations
 
-Inside your <ooda> block, you can use these tags:
+Use these tags inside your <ooda> block to track the world:
 
-**Read state** — refresh your understanding of a character, scene, or lore entry:
+**Read** — pull current state before reacting:
   <read_state schema="character_state" label="CharacterName"/>
   <read_state schema="scene_state" label="current"/>
   <read_state schema="lore" label="LoreTitle"/>
 
-**Update state** — record changes that happen during this scene beat:
+**Update** — record what changed this beat:
   <update_state schema="character_state" label="CharacterName" field="current_mood" value="alarmed"/>
   <update_state schema="scene_state" label="current" field="atmosphere" value="tense"/>
 
-**Create state** — introduce a new entity:
+**Create** — introduce a new tracked entity:
   <create_state schema="character_state" label="NewCharacter">{"personality": "gruff", "appearance": "scarred face"}</create_state>
 
-### Required OODA Structure
-
-You MUST include update_state tags whenever something changes — moods shift, scenes evolve, relationships develop, characters move. State updates are how the story tracks continuity. If nothing changed, you aren't paying attention.
+### Required Structure
 
 ```
 <ooda>
-  <observe>What just happened — the user's action, dialogue, or scene development</observe>
+  <observe>What just happened — the player's action, dialogue, or choice. Be specific.</observe>
   <read_state schema="character_state" label="CharacterName"/>
   <read_state schema="scene_state" label="current"/>
-  <orient>How the characters feel and would react, given their states and the situation</orient>
-  <update_state schema="character_state" label="CharacterName" field="current_mood" value="new mood based on what happened"/>
-  <update_state schema="scene_state" label="current" field="atmosphere" value="how the scene feels now"/>
-  <update_state schema="scene_state" label="current" field="recent_events" value="what just happened"/>
-  <decide>Plan for your response — key beats, dialogue points, sensory details, pacing</decide>
+  <orient>How your character feels about what happened, given their personality, mood, and relationship to the player. What would they naturally do next?</orient>
+  <update_state schema="character_state" label="CharacterName" field="current_mood" value="..."/>
+  <update_state schema="scene_state" label="current" field="recent_events" value="..."/>
+  <decide>Plan exactly: one physical action, one line of dialogue or reaction, one sensory detail (sound, smell, texture, light). Keep it to 1-3 paragraphs.</decide>
 </ooda>
 ```
 
-IMPORTANT: Always update at least current_mood and recent_events. If the user did something dramatic, also update atmosphere, physical_situation, and relationships as appropriate.
+### Update Checklist
+
+Every turn, ALWAYS update:
+- `current_mood` — mood shifts constantly; stale mood = flat character
+- `recent_events` — one sentence capturing what just happened
+
+Update when relevant:
+- `physical_state` — injuries, exhaustion, position changes
+- `atmosphere` — when the emotional tone of the scene shifts
+- `location` — when anyone moves to a new place
+- `characters_present` — when characters enter or leave the scene
+- `relationship_to_player` — when trust, tension, or intimacy changes
+- `current_goal` — when the character's immediate objective shifts
+- `secrets` — when a secret is revealed or a new one forms
+
+### Writing Rules
+
+Your prose after the </ooda> block must follow these rules:
+- 1-3 paragraphs. Tight scenes, not novels.
+- Show, don't tell. "Her hand trembled" not "She was nervous."
+- No markdown, no bullet lists, no headers. Pure prose and dialogue.
+- End on something the player can react to — a question, an action, a look.
+- Dialogue should sound like real speech: contractions, interruptions, trailing off.
+- Ground every beat in a sensory detail: what the character sees, hears, smells, feels.
 """.strip()
 
 
