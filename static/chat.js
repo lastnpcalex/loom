@@ -97,6 +97,8 @@ async function loadMessages(convId) {
     try {
         const prevCount = State.messages.length;
         const treeData = await API.get(`/api/conversations/${convId}/tree`);
+        State.treeData = treeData;  // keep branch indicators in sync
+        hideRetryBar();
         const activeNodes = treeData.filter(n => n.is_active);
         if (activeNodes.length > 0) {
             const leafId = activeNodes[activeNodes.length - 1].id;
@@ -156,35 +158,72 @@ function hideRetryBar() {
     if (existing) existing.remove();
 }
 
+function _isOurBranch(data) {
+    // If we're following a specific gen_id, only match that one
+    if (State._followingGenId != null && data.gen_id != null) {
+        return data.gen_id === State._followingGenId;
+    }
+    // If we're not streaming, reject any gen_id-tagged events (stale parallel siblings)
+    if (!State.isStreaming && data.gen_id != null) {
+        return false;
+    }
+    // If we already determined this via stream_start, use cached result
+    if (State._streamIsOurBranch !== undefined) return State._streamIsOurBranch;
+    // For pre-stream messages (status, context_info), check parent_id if available
+    if (data.parent_id != null) {
+        const myMsgIds = new Set(State.messages.map(m => m.id));
+        return myMsgIds.has(data.parent_id);
+    }
+    // Unknown — assume ours (will be corrected on stream_start)
+    return true;
+}
+
 function handleWSMessage(data) {
     switch (data.type) {
         case 'context_info':
+            if (!_isOurBranch(data)) break;
             updateContextInfo(data);
             showGenStatus(`Context: ${data.total_tokens.toLocaleString()} tokens — Waiting for model...`);
             break;
 
         case 'status':
+            if (!_isOurBranch(data)) break;
             showGenStatus(data.text || 'Looming...');
             break;
 
-        case 'stream_start':
-            State.isStreaming = true;
-            // Request notification permission on first generation
-            if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
-                Notification.requestPermission();
+        case 'stream_start': {
+            // Check if this generation is for our current branch
+            const parentId = data.parent_id;
+            const myMsgIds = new Set(State.messages.map(m => m.id));
+            const isOnOurBranch = parentId == null || myMsgIds.has(parentId);
+            // Only follow the FIRST stream on our branch — parallel siblings stream silently
+            const shouldFollow = isOnOurBranch && !State.isStreaming;
+            console.log('[WS] stream_start parent_id=', parentId, 'gen_id=', data.gen_id, 'follow=', shouldFollow);
+
+            if (shouldFollow) {
+                State._streamIsOurBranch = true;
+                State._followingGenId = data.gen_id ?? null;
+                State.isStreaming = true;
+                State._parallelCount = (State._parallelCount || 0) + 1;
+                if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+                    Notification.requestPermission();
+                }
+                _streamTokenCount = 0;
+                _streamStartTime = Date.now();
+                _streamBuffer = '';
+                _streamFlushTimer = null;
+                hideRetryBar();
+                appendStreamingMessage();
+            } else if (isOnOurBranch) {
+                // Parallel sibling — count it but don't render
+                State._parallelCount = (State._parallelCount || 0) + 1;
+            } else if (!State.isStreaming) {
+                State._streamIsOurBranch = false;
             }
-            _streamTokenCount = 0;
-            _streamStartTime = Date.now();
-            _streamBuffer = '';
-            _streamFlushTimer = null;
-            // Don't hide gen-status yet — keep showing until first content arrives
-            hideRetryBar();
-            appendStreamingMessage();
-            // Draft message already in DB serves as the ghost node on the tree
-            // Refresh tree to show it
+            // Refresh tree to show ghost/draft nodes for all parallel generations
             refreshTree();
-            // Keep send button enabled so user can queue next message
             break;
+        }
 
         case 'thinking_start':
             // Only show for CC/Local modes (Weave already has "Looming..." footer)
@@ -200,32 +239,30 @@ function handleWSMessage(data) {
             break;
 
         case 'stream_chunk':
+            if (!State._streamIsOurBranch) break;
             hideGenStatus();
             _streamTokenCount++;
             appendStreamChunk(data.content);
-            // Update token rate in status
-            const elapsed = (Date.now() - _streamStartTime) / 1000;
-            if (elapsed > 0.5) {
-                const rate = (_streamTokenCount / elapsed).toFixed(1);
-                document.getElementById('token-count').textContent =
-                    `${_streamTokenCount} tok · ${rate} t/s`;
-            }
             break;
 
         case 'tool_start':
+            if (!State._streamIsOurBranch) break;
             hideGenStatus();
             appendToolBlock(data.name, data.tool_id, data.ooda);
             break;
 
         case 'tool_input_chunk':
+            if (!State._streamIsOurBranch) break;
             appendToolInput(data.content, data.tool_id);
             break;
 
         case 'tool_result':
+            if (!State._streamIsOurBranch) break;
             finalizeToolBlock(data.content, data.tool_id, data.image_url, data.is_error);
             break;
 
         case 'thinking_chunk':
+            if (!State._streamIsOurBranch) break;
             appendThinkingChunk(data.content);
             break;
 
@@ -263,8 +300,39 @@ function handleWSMessage(data) {
             }
             break;
 
-        case 'stream_end':
+        case 'stream_end': {
+            // Is this the stream we're following, or a parallel sibling?
+            const isFollowed = State._followingGenId != null
+                ? data.gen_id === State._followingGenId
+                : State._streamIsOurBranch;
+            // Decrement parallel counter
+            if (State._parallelCount > 0) State._parallelCount--;
+            const allDone = !State._parallelCount;
+
+            if (!isFollowed) {
+                // Parallel sibling finished — refresh tree, notify user
+                refreshTree();
+                if (data.message && data.message.content?.trim()) {
+                    addNotification(data.message);
+                }
+                // If the completed message is on our current branch (e.g. user navigated
+                // to a draft that just finished), reload messages to show the content
+                if (data.message && data.message.id) {
+                    const viewedIds = new Set(State.messages.map(m => m.id));
+                    if (viewedIds.has(data.message.id)) {
+                        loadMessages(State.currentConvId);
+                    }
+                }
+                if (allDone) {
+                    State._streamIsOurBranch = undefined;
+                    State._followingGenId = null;
+                }
+                break;
+            }
+            // Our followed stream ended
             State.isStreaming = false;
+            State._streamIsOurBranch = undefined;
+            State._followingGenId = null;
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
             // Clear ghost node before tree refresh so it doesn't persist
@@ -312,25 +380,47 @@ function handleWSMessage(data) {
             refreshTree();
             _flushQueuedGeneration();
             break;
+        }
 
         case 'cancelled':
+            if (!_isOurBranch(data)) {
+                refreshTree();
+                // If viewing a draft that was cancelled (server deletes it), reload
+                if (data.message_id) {
+                    const viewedIds = new Set(State.messages.map(m => m.id));
+                    if (viewedIds.has(data.message_id)) loadMessages(State.currentConvId);
+                }
+                break;
+            }
             removeStreamingMessage();
             State.isStreaming = false;
+            State._followingGenId = null;
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
             showRetryBar('Generation cancelled');
-            // Tree refreshes on stream_end/cancel/error to replace draft with final node
             _flushQueuedGeneration();
             break;
 
         case 'error':
+            if (!_isOurBranch(data)) {
+                refreshTree();
+                if (data.message_id) {
+                    const viewedIds = new Set(State.messages.map(m => m.id));
+                    if (viewedIds.has(data.message_id)) loadMessages(State.currentConvId);
+                }
+                break;
+            }
             removeStreamingMessage();
             State.isStreaming = false;
+            State._followingGenId = null;
             document.getElementById('btn-send').disabled = false;
-            // Tree refreshes on stream_end/cancel/error to replace draft with final node
             hideGenStatus();
-            showRetryBar(data.error || 'Generation error');
-            _flushQueuedGeneration();
+            if (data.error && data.error.includes('another branch')) {
+                showToast(data.error, 'error');
+            } else {
+                showRetryBar(data.error || 'Generation error');
+                _flushQueuedGeneration();
+            }
             break;
 
         case 'generation_active':
@@ -356,9 +446,7 @@ function handleWSMessage(data) {
 }
 
 function updateContextInfo(data) {
-    const infoEl = document.getElementById('context-info');
-    infoEl.classList.remove('hidden');
-    document.getElementById('token-count').textContent = `${data.total_tokens.toLocaleString()} tok`;
+    // Context token info now shown via gen status bar, not header
 }
 
 // ── Send Message ──
@@ -405,7 +493,7 @@ async function sendMessage() {
             switchView('chat');
             if (State.ws && State.ws.readyState === WebSocket.OPEN) {
                 showGenStatus('Sending...');
-                State.ws.send(JSON.stringify({ action: 'generate', parent_id: msg.id }));
+                _triggerParallelGenerate(State.branchCount, msg.id);
             }
             return;
         }
@@ -428,11 +516,9 @@ async function sendMessage() {
 
             // Request generation via WebSocket
             if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-                showGenStatus('Sending...');
-                State.ws.send(JSON.stringify({
-                    action: 'generate',
-                    parent_id: msg.id,
-                }));
+                const count = State.branchCount || 1;
+                showGenStatus(count > 1 ? `Generating ${count} branches...` : 'Sending...');
+                _triggerParallelGenerate(count, msg.id);
             }
         }
     } catch (err) {
@@ -490,6 +576,108 @@ function cancelGeneration() {
     if (State.ws && State.ws.readyState === WebSocket.OPEN) {
         State.ws.send(JSON.stringify({ action: 'cancel' }));
     }
+    // If not actively streaming (e.g. viewing a draft), reload after a short
+    // delay to pick up the server-side cleanup (draft deletion)
+    if (!State.isStreaming && State.currentConvId) {
+        setTimeout(() => loadMessages(State.currentConvId), 500);
+    }
+}
+
+// ── Notifications (background generation landings) ──
+
+const _notifications = [];
+
+function addNotification(message) {
+    const preview = (message.content || '').replace(/[#*_`>\[\]]/g, '').trim();
+    _notifications.push({
+        id: message.id,
+        convId: State.currentConvId,
+        convTitle: State.currentConv?.title || 'Conversation',
+        parentId: message.parent_id,
+        preview: preview.slice(0, 120) + (preview.length > 120 ? '…' : ''),
+        time: new Date(),
+    });
+    _renderNotifBell();
+}
+
+function _renderNotifBell() {
+    const bell = document.getElementById('notif-bell');
+    const badge = document.getElementById('notif-badge');
+    if (!bell) return;
+    bell.classList.remove('hidden');
+    if (_notifications.length > 0) {
+        badge.textContent = _notifications.length;
+        badge.classList.remove('hidden');
+        bell.classList.add('notif-active');
+    } else {
+        badge.classList.add('hidden');
+        bell.classList.remove('notif-active');
+        document.getElementById('notif-dropdown').classList.add('hidden');
+    }
+}
+
+function _renderNotifDropdown() {
+    const list = document.getElementById('notif-list');
+    list.innerHTML = '';
+    if (_notifications.length === 0) {
+        list.innerHTML = '<div class="notif-empty">No new branches</div>';
+        return;
+    }
+    for (const n of _notifications) {
+        const item = document.createElement('div');
+        item.className = 'notif-item';
+        const timeStr = n.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        item.innerHTML = `<span class="notif-time">${timeStr}</span>`
+            + `<span class="notif-preview">${escapeHtml(n.preview || '(empty)')}</span>`;
+        item.addEventListener('click', async () => {
+            document.getElementById('notif-dropdown').classList.add('hidden');
+            // Remove this notification
+            const idx = _notifications.indexOf(n);
+            if (idx !== -1) _notifications.splice(idx, 1);
+            _renderNotifBell();
+            // Navigate to the branch — load conversation first if needed
+            if (State.currentConvId !== n.convId) {
+                State._skipLoadOnChat = true;
+                await loadConversation(n.convId);
+            }
+            await switchToBranch(n.id);
+            switchView('chat');
+        });
+        list.appendChild(item);
+    }
+    // Clear all button at bottom
+    const clearBtn = document.createElement('div');
+    clearBtn.className = 'notif-clear-all';
+    clearBtn.textContent = 'Clear all';
+    clearBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        _notifications.length = 0;
+        _renderNotifBell();
+    });
+    list.appendChild(clearBtn);
+}
+
+// Wire up bell + clear — called once from initInlineCCControls or on DOMContentLoaded
+function _initNotifications() {
+    const bell = document.getElementById('notif-bell');
+    const dropdown = document.getElementById('notif-dropdown');
+    if (!bell) return;
+    bell.addEventListener('click', (e) => {
+        e.stopPropagation();
+        dropdown.classList.toggle('hidden');
+        if (!dropdown.classList.contains('hidden')) _renderNotifDropdown();
+    });
+    document.getElementById('notif-clear').addEventListener('click', (e) => {
+        e.stopPropagation();
+        _notifications.length = 0;
+        _renderNotifBell();
+    });
+    // Close dropdown on outside click
+    document.addEventListener('click', (e) => {
+        if (!dropdown.contains(e.target) && e.target !== bell) {
+            dropdown.classList.add('hidden');
+        }
+    });
 }
 
 // ── Render Messages ──
@@ -587,10 +775,10 @@ function renderMessages() {
             }
         }
     } else {
-        // Show generate/retry bar if needed (but not if generation is active)
-        if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.content?.trim()) {
-            showRetryBar('Empty response — try regenerating');
-        } else if (lastMsg && lastMsg.role === 'user' && !State.isStreaming) {
+        // Empty assistant messages are rendered as "Generating..." by createMessageElement.
+        // The retry bar is only shown from WS error/cancelled events, not from render path,
+        // because empty drafts in the DB are still-generating (server deletes failed drafts).
+        if (lastMsg && lastMsg.role === 'user' && !State.isStreaming) {
             showGenerateBar();
         }
     }
@@ -613,14 +801,14 @@ function loadOlderMessages(renderMsgs, container, scrollParent) {
     const scrollHeight = scrollParent.scrollHeight;
     const scrollTop = scrollParent.scrollTop;
 
-    // Find the sentinel and insert batch after it
+    // Find the sentinel and insert batch after it (in correct order)
     const sentinel = document.getElementById('scroll-sentinel');
-    const refNode = sentinel ? sentinel.nextSibling : container.firstChild;
-
-    for (let i = batch.length - 1; i >= 0; i--) {
-        const el = createMessageElement(batch[i]);
-        container.insertBefore(el, refNode);
+    const fragment = document.createDocumentFragment();
+    for (let i = 0; i < batch.length; i++) {
+        fragment.appendChild(createMessageElement(batch[i]));
     }
+    const refNode = sentinel ? sentinel.nextSibling : container.firstChild;
+    container.insertBefore(fragment, refNode);
 
     VIRTUAL_SCROLL.renderedStart = newStart;
 
@@ -665,6 +853,19 @@ function showChildBranchHint(msgId, container) {
     container.appendChild(hint);
 }
 
+function _triggerParallelGenerate(count, parentId) {
+    if (!State.ws || State.ws.readyState !== WebSocket.OPEN) return;
+    // Only Weave mode supports parallel branching
+    const isWeave = State.currentConv && State.currentConv.mode === 'weave';
+    const n = isWeave ? Math.max(1, Math.min(5, count)) : 1;
+    for (let i = 0; i < n; i++) {
+        const msg = { action: 'generate' };
+        if (parentId) msg.parent_id = parentId;
+        State.ws.send(JSON.stringify(msg));
+    }
+    showGenStatus(n > 1 ? `Generating ${n} branches...` : 'Sending...');
+}
+
 function showGenerateBar() {
     hideRetryBar();
     const container = document.getElementById('messages');
@@ -677,10 +878,8 @@ function showGenerateBar() {
     `;
     bar.querySelector('#btn-generate').addEventListener('click', () => {
         hideRetryBar();
-        if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-            showGenStatus('Generating...');
-            State.ws.send(JSON.stringify({ action: 'generate' }));
-        }
+        const count = State.branchCount || 1;
+        _triggerParallelGenerate(count);
     });
     container.appendChild(bar);
     scrollToBottom();
@@ -688,8 +887,9 @@ function showGenerateBar() {
 
 function createMessageElement(msg, cost) {
     const isErrorMsg = msg.role === 'assistant' && msg.content?.startsWith('[Error:');
+    const isDraft = msg.role === 'assistant' && !msg.content?.trim() && !isErrorMsg;
     const div = document.createElement('div');
-    div.className = `message ${msg.role}${isErrorMsg ? ' message-error' : ''}`;
+    div.className = `message ${msg.role}${isErrorMsg ? ' message-error' : ''}${isDraft ? ' message-generating' : ''}`;
     div.dataset.msgId = msg.id;
 
     const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
@@ -725,7 +925,10 @@ function createMessageElement(msg, cost) {
         } catch { blocks = null; }
     }
 
-    if (blocks && blocks.length > 0) {
+    if (isDraft) {
+        contentHtml = '<span class="generating-placeholder"><span class="thinking-dots"></span> Generating...</span>'
+            + ' <button onclick="cancelGeneration()" title="Cancel generation" class="cancel-draft-btn">&#x2298;</button>';
+    } else if (blocks && blocks.length > 0) {
         contentHtml = renderContentBlocks(blocks);
     } else {
         contentHtml = formatContent(msg.content);
@@ -750,8 +953,16 @@ function createMessageElement(msg, cost) {
     if (msg.image_path) {
         const paths = parseImagePaths(msg.image_path);
         if (paths.length > 0) {
+            const imageExts = ['.png', '.jpg', '.jpeg', '.gif', '.webp'];
             imgHtml = '<div class="message-images">' +
-                paths.map(p => '<img class="message-image" src="/uploads/' + p.split(/[\\/]/).pop() + '" alt="Attached image">').join('') +
+                paths.map(p => {
+                    const filename = p.split(/[\\/]/).pop();
+                    const ext = '.' + filename.split('.').pop().toLowerCase();
+                    if (imageExts.includes(ext)) {
+                        return '<img class="message-image" src="/uploads/' + filename + '" alt="Attached image">';
+                    }
+                    return '<a class="message-file-attach" href="/uploads/' + filename + '" target="_blank" title="' + escapeHtml(filename) + '">&#128196; ' + escapeHtml(ext.toUpperCase().slice(1)) + ' file attached</a>';
+                }).join('') +
                 '</div>';
         }
     }
@@ -999,8 +1210,14 @@ async function switchToBranch(leafId, scrollToMsgId) {
     try {
         if (typeof showLoading === 'function') showLoading();
         // Walk to deepest leaf from the clicked node
-        const branch = await API.post(`/api/conversations/${State.currentConvId}/switch-branch/${leafId}`);
+        const [branch, treeData] = await Promise.all([
+            API.post(`/api/conversations/${State.currentConvId}/switch-branch/${leafId}`),
+            API.get(`/api/conversations/${State.currentConvId}/tree`),
+        ]);
         State.messages = branch;
+        State.treeData = treeData;
+        hideRetryBar();
+        hideGenStatus();
         renderMessages();
         renderTree();
 
@@ -1013,13 +1230,14 @@ async function switchToBranch(leafId, scrollToMsgId) {
             // Message is above the virtual scroll window — load from that point
             const container = document.getElementById('messages');
             const scrollParent = document.getElementById('messages-container');
-            for (let i = targetIdx; i < VIRTUAL_SCROLL.renderedStart; i++) {
-                const el = createMessageElement(renderMsgs[i]);
-                const sentinel = document.getElementById('scroll-sentinel');
-                container.insertBefore(el, sentinel ? sentinel.nextSibling : container.firstChild);
-            }
-            VIRTUAL_SCROLL.renderedStart = targetIdx;
             const sentinel = document.getElementById('scroll-sentinel');
+            const refNode = sentinel ? sentinel.nextSibling : container.firstChild;
+            const fragment = document.createDocumentFragment();
+            for (let i = targetIdx; i < VIRTUAL_SCROLL.renderedStart; i++) {
+                fragment.appendChild(createMessageElement(renderMsgs[i]));
+            }
+            container.insertBefore(fragment, refNode);
+            VIRTUAL_SCROLL.renderedStart = targetIdx;
             if (sentinel) sentinel.textContent = `↑ ${targetIdx} older messages`;
             if (targetIdx <= 0 && sentinel) sentinel.remove();
         }
@@ -1139,11 +1357,10 @@ function appendStreamingMessage() {
         : getCharacterName();
     streamingDiv.innerHTML = '<div class="message-header">' +
         '<span class="message-role">' + escapeHtml(label) + '</span>' +
-        '<div class="message-actions">' +
-        '<button onclick="cancelGeneration()" title="Cancel">&#x2298;</button>' +
-        '</div></div>' +
+        '</div>' +
         '<div class="message-content"></div>' +
-        '<div class="stream-thinking-footer"><span class="thinking-dots"></span> Looming...</div>';
+        '<div class="stream-thinking-footer"><span class="thinking-dots"></span> Looming...' +
+        ' <button onclick="cancelGeneration()" title="Cancel generation" class="cancel-draft-btn">&#x2298;</button></div>';
     container.appendChild(streamingDiv);
     scrollToBottom();
 }
@@ -1340,6 +1557,10 @@ function editMessage(msgId) {
     if (!msgEl) return;
     const contentEl = msgEl.querySelector('.message-content');
 
+    // Track files for this edit: start with originals, allow adding more
+    const originalPaths = parseImagePaths(msg.image_path);
+    const editFiles = originalPaths.map(p => ({ path: p, original: true }));
+
     const textarea = document.createElement('textarea');
     textarea.className = 'edit-message-input';
     textarea.value = msg.content;
@@ -1347,19 +1568,66 @@ function editMessage(msgId) {
     contentEl.replaceWith(textarea);
     textarea.focus();
 
+    // File preview area (above buttons)
+    const filePreview = document.createElement('div');
+    filePreview.className = 'edit-file-preview';
+    textarea.after(filePreview);
+
+    function renderEditFiles() {
+        if (editFiles.length === 0) {
+            filePreview.classList.add('hidden');
+            filePreview.innerHTML = '';
+            return;
+        }
+        filePreview.classList.remove('hidden');
+        filePreview.innerHTML = editFiles.map((f, i) => {
+            const name = f.path.split('/').pop().split('\\').pop();
+            return `<span class="edit-file-chip${f.original ? '' : ' new-file'}" title="${f.original ? 'From original' : 'New attachment'}">${name}<button class="edit-file-remove" data-idx="${i}">&times;</button></span>`;
+        }).join('');
+        filePreview.querySelectorAll('.edit-file-remove').forEach(btn => {
+            btn.addEventListener('click', () => {
+                editFiles.splice(parseInt(btn.dataset.idx), 1);
+                renderEditFiles();
+            });
+        });
+    }
+    renderEditFiles();
+
+    const isWeave = State.currentConv && State.currentConv.mode === 'weave';
     const btnRow = document.createElement('div');
     btnRow.className = 'edit-message-actions';
+    const pillHtml = isWeave ? `<div class="branch-count-pill pill-compact" title="Branches to generate (click to cycle)"><span class="branch-count-icon">⑂</span><span class="branch-count-value">${State.branchCount}</span></div>` : '';
     btnRow.innerHTML = `
+        <label class="btn-small edit-attach" title="Attach file">
+            <input type="file" class="edit-file-input" accept="image/*,.md,.txt,.pdf,.json,.csv,.py,.js,.ts,.html,.css" hidden>
+            📎
+        </label>
         <button class="btn-small edit-save">Send as new branch</button>
+        ${pillHtml}
         <button class="btn-small edit-cancel">Cancel</button>
     `;
-    textarea.after(btnRow);
+    if (isWeave) _setupBranchPillClick(btnRow.querySelector('.branch-count-pill'));
+    filePreview.after(btnRow);
+
+    // File attach handler
+    const editFileInput = btnRow.querySelector('.edit-file-input');
+    editFileInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        try {
+            const result = await API.upload(file);
+            editFiles.push({ path: result.path, original: false });
+            renderEditFiles();
+        } catch { showToast('File upload failed', 'error'); }
+        e.target.value = '';
+    });
 
     btnRow.querySelector('.edit-cancel').addEventListener('click', () => {
         const newContent = document.createElement('div');
         newContent.className = 'message-content';
         newContent.innerHTML = formatContent(msg.content);
         textarea.replaceWith(newContent);
+        filePreview.remove();
         btnRow.remove();
     });
 
@@ -1368,28 +1636,22 @@ function editMessage(msgId) {
         if (!newText) return;
 
         try {
-            // Branch from the same parent as the original message
             const parentId = msg.parent_id || null;
+            const allPaths = editFiles.map(f => f.path);
 
-            // Post new user message as sibling (new branch)
-            // Carry over images from the original message
             const newMsg = await API.post(`/api/conversations/${State.currentConvId}/messages`, {
                 role: 'user',
                 content: newText,
                 parent_id: parentId,
-                image_path: msg.image_path || null,
+                image_path: allPaths.length > 0 ? allPaths : null,
             });
 
-            // Reload the branch from DB (set_active_branch already ran server-side)
             await loadMessages(State.currentConvId);
 
-            // Trigger generation
             if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-                showGenStatus('Generating...');
-                State.ws.send(JSON.stringify({
-                    action: 'generate',
-                    parent_id: newMsg.id,
-                }));
+                const count = State.branchCount || 1;
+                showGenStatus(count > 1 ? `Generating ${count} branches...` : 'Generating...');
+                _triggerParallelGenerate(count, newMsg.id);
             }
         } catch (err) {
             showToast('Failed to save edit', 'error');

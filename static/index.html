@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=70">
+    <link rel="stylesheet" href="/static/style.css?v=87">
 </head>
 <body>
     <div id="blackhole-container"></div>
@@ -23,8 +23,18 @@
                 <button id="btn-to-tree" class="hidden" title="Back to tree view">⟨ Tree</button>
             </div>
             <div id="header-right">
-                <div id="context-info" class="hidden">
-                    <span id="token-count" title="Estimated tokens">—</span>
+                <div id="notif-bell-wrap">
+                    <button id="notif-bell" title="Background generations landed">
+                        <span class="notif-bell-icon">⑂</span>
+                        <span id="notif-badge" class="notif-badge hidden">0</span>
+                    </button>
+                    <div id="notif-dropdown" class="hidden">
+                        <div class="notif-header">
+                            <span>Landed branches</span>
+                            <button id="notif-clear" title="Clear all">&#x2715;</button>
+                        </div>
+                        <div id="notif-list"></div>
+                    </div>
                 </div>
                 <button id="btn-bookmarks-global" title="Bookmarks" class="hidden">⬡</button>
                 <button id="btn-settings" title="Settings">⚙</button>
@@ -167,11 +177,18 @@
         <div id="input-area" class="hidden">
             <div id="image-preview" class="hidden"></div>
             <div id="weave-inline-controls" class="hidden">
+                <select id="weave-model-inline" title="Ollama model">
+                    <option value="">Default</option>
+                </select>
                 <label class="ooda-toggle" title="OODA Harness — cognitive scaffolding for better RP">
                     <input type="checkbox" id="ooda-toggle-inline">
                     <span class="ooda-toggle-label">OODA</span>
                 </label>
                 <button id="btn-state-panel-chat" title="View and edit state cards for this branch — character moods, scene details, and lore tracked by the OODA harness" class="hidden branch-state-btn"><span class="delta-glow">δ</span> Branch State</button>
+                <div id="branch-count-control" class="branch-count-pill" title="Number of response branches to generate. Click to cycle.">
+                    <span class="branch-count-icon">⑂</span>
+                    <span class="branch-count-value" id="branch-count-value">1</span>
+                </div>
             </div>
             <div id="cc-inline-controls" class="hidden">
                 <select id="cc-model-inline" title="Model">
@@ -457,8 +474,8 @@ assistant: *Another example response*"></textarea>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=13"></script>
-    <script src="/static/app.js?v=50"></script>
-    <script src="/static/chat.js?v=70"></script>
-    <script src="/static/tree.js?v=30"></script>
+    <script src="/static/app.js?v=60"></script>
+    <script src="/static/chat.js?v=102"></script>
+    <script src="/static/tree.js?v=31"></script>
 </body>
 </html>

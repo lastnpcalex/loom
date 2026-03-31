@@ -5,7 +5,9 @@ import json
 import time
 from typing import Optional
 
-DB_PATH = "loom.db"
+import os as _os
+from config import config as _config
+DB_PATH = _config.db_path
 
 _db: aiosqlite.Connection | None = None
 

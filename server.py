@@ -74,12 +74,14 @@ app = FastAPI(title="Ex Astris Umbra — A Loom Interface", lifespan=lifespan)
 # Ensure upload directory exists
 os.makedirs(config.upload_dir, exist_ok=True)
 
-# Active WebSocket generation tasks (for cancellation)
-_active_generations: dict[int, asyncio.Task] = {}
+# Active WebSocket generation tasks — keyed by (conv_id, parent_id, seq) for parallel support
+# CC mode only allows one per conv; Weave/OODA allow multiple (even on same parent)
+_active_generations: dict[tuple[int, int | None, int], asyncio.Task] = {}
+_gen_seq = 0  # monotonic counter for unique gen keys
 # Active Claude Code subprocesses (for cancellation)
 _active_claude_procs: dict[int, asyncio.subprocess.Process] = {}
-# Active WebSocket connections per conversation (for permission prompts)
-_active_websockets: dict[int, WebSocket] = {}
+# Active WebSocket connections per conversation — multiple clients can watch the same conv
+_active_websockets: dict[int, set[WebSocket]] = {}
 # Pending hook-based permission requests: request_id -> {event, response, conv_id}
 _pending_hook_permissions: dict[str, dict] = {}
 # Sessions where user clicked "Allow All" — auto-approve for rest of generation
@@ -870,13 +872,19 @@ async def api_import_lore(file: UploadFile = File(...)):
     return entry or {"id": filename, "name": filename}
 
 
-# ── Image Upload ──
+# ── File Upload ──
+
+_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+_TEXT_EXTS = {'.md', '.txt', '.pdf', '.json', '.csv', '.py', '.js', '.ts',
+              '.html', '.css', '.xml', '.yaml', '.yml', '.toml', '.ini',
+              '.sh', '.bat', '.ps1', '.log', '.rst', '.tex', '.r', '.sql'}
+_ALLOWED_EXTS = _IMAGE_EXTS | _TEXT_EXTS
 
 @app.post("/api/upload")
 async def api_upload(file: UploadFile = File(...)):
     ext = Path(file.filename).suffix.lower()
-    if ext not in ('.png', '.jpg', '.jpeg', '.gif', '.webp'):
-        raise HTTPException(400, "Unsupported image format")
+    if ext not in _ALLOWED_EXTS:
+        raise HTTPException(400, f"Unsupported file format: {ext}")
 
     filename = f"{uuid.uuid4().hex}{ext}"
     filepath = os.path.join(config.upload_dir, filename)
@@ -885,7 +893,9 @@ async def api_upload(file: UploadFile = File(...)):
         content = await file.read()
         f.write(content)
 
-    return {"path": filepath, "url": f"/uploads/{filename}"}
+    is_image = ext in _IMAGE_EXTS
+    return {"path": filepath, "url": f"/uploads/{filename}",
+            "is_image": is_image, "original_name": file.filename}
 
 
 # ── Config ──
@@ -1054,26 +1064,40 @@ async def handle_cc_permission(data: dict):
 # ── WebSocket Chat ──
 
 async def _ws_send(conv_id: int, data: dict):
-    """Best-effort send to the active WebSocket for a conversation.
-    Silently skips if no client is connected — generation continues regardless."""
-    ws = _active_websockets.get(conv_id)
-    if ws is None:
+    """Best-effort broadcast to ALL active WebSockets for a conversation.
+    Silently skips dead clients — generation continues regardless.
+    Auto-injects gen_id from the current task if present."""
+    # Auto-tag with gen_id so client can distinguish parallel streams
+    task = asyncio.current_task()
+    gen_key = getattr(task, '_gen_key', None)
+    if gen_key and 'gen_id' not in data:
+        data = {**data, 'gen_id': gen_key[2]}
+    clients = _active_websockets.get(conv_id)
+    if not clients:
         return
-    try:
-        await ws.send_json(data)
-    except Exception:
-        # Client gone — that's fine, generation keeps going
-        pass
+    dead = []
+    for ws in clients:
+        try:
+            await ws.send_json(data)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        clients.discard(ws)
+    if not clients:
+        _active_websockets.pop(conv_id, None)
 
 
 @app.websocket("/ws/chat/{conv_id}")
 async def ws_chat(websocket: WebSocket, conv_id: int):
     await websocket.accept()
     print(f"[WS] Connection opened for conv={conv_id}")
-    _active_websockets[conv_id] = websocket
+    if conv_id not in _active_websockets:
+        _active_websockets[conv_id] = set()
+    _active_websockets[conv_id].add(websocket)
 
     # Tell the client whether a generation is running so it can sync state
-    if conv_id in _active_generations and not _active_generations[conv_id].done():
+    conv_has_gen = any(k[0] == conv_id and not t.done() for k, t in _active_generations.items())
+    if conv_has_gen:
         await websocket.send_json({"type": "generation_active"})
         # Resend any pending permission requests that the old WS missed
         for rid, pending in list(_pending_hook_permissions.items()):
@@ -1095,9 +1119,11 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
             action = data.get("action")
 
             if action == "cancel":
-                task = _active_generations.pop(conv_id, None)
-                if task:
-                    task.cancel()
+                # Cancel all active generations for this conversation
+                for key in [k for k in _active_generations if k[0] == conv_id]:
+                    task = _active_generations.pop(key, None)
+                    if task:
+                        task.cancel()
                 proc = _active_claude_procs.pop(conv_id, None)
                 if proc:
                     await claude_client.cancel_claude(proc)
@@ -1124,20 +1150,59 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
 
             print(f"[WS] Received action={action} for conv={conv_id}")
             if action in ("generate", "regenerate"):
-                # Cancel any existing generation
-                old_task = _active_generations.pop(conv_id, None)
-                if old_task:
-                    old_task.cancel()
+                global _gen_seq
+                parent_id = data.get("parent_id")
 
+                # Check conversation mode to decide parallel policy
+                conv = await db.get_conversation(conv_id)
+                mode = conv.get("mode", "weave") if conv else "weave"
+                is_cc = mode == "claude"
+
+                if is_cc:
+                    # CC mode: only one generation per conversation
+                    cc_busy = any(
+                        k[0] == conv_id and not t.done()
+                        for k, t in _active_generations.items()
+                    )
+                    if cc_busy:
+                        # Same client retrying → cancel old; different client → reject
+                        old_key = next(k for k, t in _active_generations.items()
+                                       if k[0] == conv_id and not t.done())
+                        old_task = _active_generations[old_key]
+                        if websocket is getattr(old_task, '_origin_ws', None):
+                            old_task.cancel()
+                            _active_generations.pop(old_key, None)
+                        else:
+                            await websocket.send_json({
+                                "type": "error",
+                                "error": "Claude Code generation already running on another branch. Wait for it to finish or cancel it first.",
+                            })
+                            continue
+                elif action == "regenerate":
+                    # Regenerate: cancel any existing gen on same parent
+                    for k in [k for k in _active_generations
+                              if k[0] == conv_id and k[1] == parent_id and not _active_generations[k].done()]:
+                        _active_generations.pop(k).cancel()
+
+                # Weave/OODA generate: allow parallel, even on same parent
+                _gen_seq += 1
+                gen_key = (conv_id, parent_id, _gen_seq)
+                data["_gen_id"] = _gen_seq  # unique ID so client can filter parallel streams
                 task = asyncio.create_task(
                     _handle_generation(websocket, conv_id, data)
                 )
-                _active_generations[conv_id] = task
+                task._origin_ws = websocket
+                task._gen_key = gen_key
+                _active_generations[gen_key] = task
 
     except WebSocketDisconnect:
         print(f"[WS] Client disconnected conv={conv_id}")
-        # Remove websocket ref but do NOT cancel active generation — let it finish and save
-        _active_websockets.pop(conv_id, None)
+        # Remove this websocket but do NOT cancel active generation — let it finish and save
+        clients = _active_websockets.get(conv_id)
+        if clients:
+            clients.discard(websocket)
+            if not clients:
+                _active_websockets.pop(conv_id, None)
     except Exception as e:
         print(f"[WS] Error conv={conv_id}: {e}")
         if websocket.client_state == WebSocketState.CONNECTED:
@@ -1313,7 +1378,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
 
         # Let the client know we're launching
         launch_label = f"Launching {cc_model} via Ollama..." if use_ollama else f"Launching Claude Code ({cc_model})..."
-        await _ws_send(conv_id, {"type": "status", "text": launch_label})
+        await _ws_send(conv_id, {"type": "status", "text": launch_label, "parent_id": parent_id})
         await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id, "draft_msg_id": draft_msg_id})
 
         # Launch CC — with resume if available, with fallback on failure
@@ -1522,7 +1587,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 if etype == "session_info":
                     new_session_id = evt.get("session_id", "") or new_session_id
                     model_name = evt.get("model", cc_model)
-                    await _ws_send(conv_id, {"type": "status", "text": f"Connected — {model_name} is thinking..."})
+                    await _ws_send(conv_id, {"type": "status", "text": f"Connected — {model_name} is thinking...", "parent_id": parent_id})
                 elif etype == "text_delta":
                     full_text += evt["text"]
                     if current_block and current_block["type"] == "text":
@@ -1694,7 +1759,9 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
             print(f"[GEN] Saved partial draft {draft_msg_id} on error")
         await _ws_send(conv_id, {"type": "error", "error": str(e)})
     finally:
-        _active_generations.pop(conv_id, None)
+        _gen_key = getattr(asyncio.current_task(), '_gen_key', None)
+        if _gen_key:
+            _active_generations.pop(_gen_key, None)
         _auto_approve_sessions.discard(conv_id)
         # Clean up any pending hook permissions for this conversation
         for rid in list(_pending_hook_permissions):
@@ -1760,6 +1827,8 @@ async def _handle_local_generation(websocket: WebSocket, conv_id: int, conv: dic
 async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict, data: dict):
     """Handle OODA-enhanced Weave generation — two-pass with state card scaffolding."""
     import re as _re
+    draft_msg_id = None
+    final_prose = ""
     try:
         action = data.get("action")
         parent_id = data.get("parent_id")
@@ -1833,15 +1902,21 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
             "total_tokens": actual_tokens,
             "was_compactified": context["was_compactified"],
             "style_nudge": active_nudge["name"],
+            "parent_id": parent_id,
         })
 
+        # Create draft message in DB so it appears as ghost node on tree
+        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
+        draft_msg_id = draft_msg["id"]
+
         print(f"[OODA] System prompt: {len(ooda_system)} chars, {len(messages)} messages, {len(state_cards)} state cards")
-        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id})
+        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id, "draft_msg_id": draft_msg_id})
 
         # ── Pass 1: Orient ──
         print(f"[OODA] Pass 1: Orient...")
-        await _ws_send(conv_id, {"type": "status", "text": "OODA: Observing and orienting..."})
-        raw_pass1 = await sync_chat(messages, max_tokens=1024, think=False)
+        await _ws_send(conv_id, {"type": "status", "text": "OODA: Observing and orienting...", "parent_id": parent_id})
+        weave_model = conv.get("local_model") or None
+        raw_pass1 = await sync_chat(messages, max_tokens=2048, think=False, model=weave_model)
         # Check if cancelled during the sync call
         if asyncio.current_task().cancelled():
             raise asyncio.CancelledError()
@@ -1883,39 +1958,63 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
         if not final_prose:
             # No OODA block or no prose after it — use the whole output
             final_prose = cleaned_pass1
-            # Strip any ooda block from it
+            # Strip closed ooda blocks
             final_prose = _re.sub(r'<ooda>[\s\S]*?</ooda>\s*', '', final_prose).strip()
+            # Strip truncated/unclosed ooda blocks (model ran out of tokens)
+            final_prose = _re.sub(r'<ooda>[\s\S]*$', '', final_prose).strip()
 
         # Stream prose to client
         for i in range(0, len(final_prose), 8):
             await _ws_send(conv_id, {"type": "stream_chunk", "content": final_prose[i:i+8]})
 
         if not final_prose.strip():
-            await _ws_send(conv_id, {"type": "error", "error": "OODA: Model returned an empty response — try again"})
-            return
+            if ooda:
+                # OODA analysis succeeded but no prose — save analysis summary as content
+                summary_parts = []
+                if ooda.get("observe"): summary_parts.append(f"*{ooda['observe'][:200]}*")
+                if ooda.get("orient"): summary_parts.append(f"*{ooda['orient'][:200]}*")
+                final_prose = "\n\n".join(summary_parts) if summary_parts else "[OODA analysis completed but no prose generated — try regenerating]"
+                for i in range(0, len(final_prose), 8):
+                    await _ws_send(conv_id, {"type": "stream_chunk", "content": final_prose[i:i+8]})
+            else:
+                if draft_msg_id:
+                    await db.delete_branch(draft_msg_id)
+                await _ws_send(conv_id, {"type": "error", "error": "Model returned an empty response — try regenerating"})
+                return
 
-        # Save
-        msg = await db.add_message(conv_id, "assistant", final_prose, parent_id=parent_id)
-        await db.set_active_branch(conv_id, msg["id"])
+        # Update draft with final content
+        await db.update_message_content(draft_msg_id, content=final_prose)
+        await db.set_active_branch(conv_id, draft_msg_id)
+        msg = await db.get_message(draft_msg_id)
         # Save branch-level state deltas (Tier 3)
         if ooda and ooda.get("updates"):
-            await db.save_state_deltas(msg["id"], ooda["updates"])
-        asyncio.create_task(_background_summarize_message(msg["id"], final_prose, "assistant", conv_id=conv_id))
+            await db.save_state_deltas(draft_msg_id, ooda["updates"])
+        asyncio.create_task(_background_summarize_message(draft_msg_id, final_prose, "assistant", conv_id=conv_id))
         await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
 
     except asyncio.CancelledError:
+        if draft_msg_id:
+            await db.delete_branch(draft_msg_id)
         await _ws_send(conv_id, {"type": "cancelled"})
     except Exception as e:
+        if draft_msg_id and final_prose and final_prose.strip():
+            await db.update_message_content(draft_msg_id, content=final_prose)
+        elif draft_msg_id:
+            await db.delete_branch(draft_msg_id)
         print(f"[OODA] Generation error conv={conv_id}: {e}")
         import traceback
         traceback.print_exc()
         await _ws_send(conv_id, {"type": "error", "error": str(e)})
     finally:
-        _active_generations.pop(conv_id, None)
+        _gen_key = getattr(asyncio.current_task(), '_gen_key', None)
+        if _gen_key:
+            _active_generations.pop(_gen_key, None)
 
 
 async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dict, data: dict):
     """Handle Weave (Ollama) generation — original logic."""
+    draft_msg_id = None
+    full_response = ""
     try:
         action = data.get("action")
         parent_id = data.get("parent_id")
@@ -2012,14 +2111,20 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
             "total_tokens": actual_tokens,
             "was_compactified": context["was_compactified"],
             "style_nudge": active_nudge["name"],
+            "parent_id": parent_id,
         })
+
+        # Create draft message in DB so it appears as ghost node on tree
+        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
+        draft_msg_id = draft_msg["id"]
 
         # Stream the response
         print(f"[GEN] Starting generation for conv={conv_id} parent={parent_id} model={config.ollama_model}")
-        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id})
+        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id, "draft_msg_id": draft_msg_id})
 
         full_response = ""
-        async for token in stream_chat(messages):
+        weave_model = conv.get("local_model") or None
+        async for token in stream_chat(messages, model=weave_model):
             if isinstance(token, dict):
                 # Thinking status events
                 await _ws_send(conv_id, token)
@@ -2039,19 +2144,20 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
         # If response is empty, send error instead of saving empty message
         if not full_response.strip():
             print(f"[WARN] Empty response. Raw length={len(full_response)} Cleaned length={len(cleaned)}")
+            if draft_msg_id:
+                await db.delete_branch(draft_msg_id)
             await _ws_send(conv_id, {
                 "type": "error",
                 "error": "Model returned an empty response — try again",
             })
             return
 
-        # Save the assistant message (always, even if client disconnected)
-        msg = await db.add_message(
-            conv_id, "assistant", full_response, parent_id=parent_id
-        )
-        await db.set_active_branch(conv_id, msg["id"])
+        # Update draft with final content
+        await db.update_message_content(draft_msg_id, content=full_response)
+        await db.set_active_branch(conv_id, draft_msg_id)
+        msg = await db.get_message(draft_msg_id)
         # Background: generate Gemma summary for tree display
-        asyncio.create_task(_background_summarize_message(msg["id"], full_response, "assistant",
+        asyncio.create_task(_background_summarize_message(draft_msg_id, full_response, "assistant",
                                                               conv_id=conv_id))
 
         await _ws_send(conv_id, {
@@ -2060,12 +2166,22 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
         })
 
     except asyncio.CancelledError:
+        # Clean up draft on cancel
+        if draft_msg_id:
+            await db.delete_branch(draft_msg_id)
         await _ws_send(conv_id, {"type": "cancelled"})
     except Exception as e:
+        # Save partial content or clean up empty draft
+        if draft_msg_id and full_response.strip():
+            await db.update_message_content(draft_msg_id, content=full_response)
+        elif draft_msg_id:
+            await db.delete_branch(draft_msg_id)
         print(f"[GEN] Weave generation error conv={conv_id}: {e}")
         await _ws_send(conv_id, {"type": "error", "error": str(e)})
     finally:
-        _active_generations.pop(conv_id, None)
+        _gen_key = getattr(asyncio.current_task(), '_gen_key', None)
+        if _gen_key:
+            _active_generations.pop(_gen_key, None)
 
 
 if __name__ == "__main__":
