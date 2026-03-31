@@ -61,7 +61,11 @@ class Config:
                      "verbatim_window", "temperature", "top_p",
                      "max_tokens", "repeat_penalty"):
             if key in d:
-                setattr(self, key, type(getattr(self, key))(d[key]))
+                val = type(getattr(self, key))(d[key])
+                # Ensure ollama_host always has a protocol
+                if key == "ollama_host" and val and not val.startswith(("http://", "https://")):
+                    val = f"http://{val}"
+                setattr(self, key, val)
 
 
 config = Config()

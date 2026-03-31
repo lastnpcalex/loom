@@ -19,18 +19,26 @@ function parseImagePaths(imagePath) {
 // ── WebSocket ──
 
 let _wsReconnectDelay = 2000;
+let _wsReconnectTimer = null;
 
-function connectWebSocket(convId) {
+function connectWebSocket(convId, _attempt) {
+    // Cancel any pending reconnect timer
+    if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null; }
+
+    // Close previous WS without triggering its onclose reconnect
     if (State.ws) {
+        State.ws._replaced = true;  // flag so onclose skips reconnect
         State.ws.close();
         State.ws = null;
     }
 
     const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${protocol}://${location.host}/ws/chat/${convId}`);
+    ws._reconnectAttempt = _attempt || 0;
 
     ws.onopen = () => {
         console.log('WebSocket connected');
+        ws._reconnectAttempt = 0;
         _wsReconnectDelay = 2000; // reset backoff on success
         // Web Worker keepalive — runs at full speed even in background tabs
         // (setInterval gets throttled to ~60s by Chrome in background)
@@ -58,17 +66,26 @@ function connectWebSocket(convId) {
     ws.onclose = () => {
         console.log('WebSocket closed');
         if (ws._pingWorker) { ws._pingWorker.terminate(); ws._pingWorker = null; }
+        // If this WS was intentionally replaced, don't reconnect
+        if (ws._replaced || State.ws !== ws) return;
         // Reset streaming UI — server will keep generating and save the result.
-        // On reconnect, loadMessages() will pick up the completed response.
         if (State.isStreaming) {
             State.isStreaming = false;
             document.getElementById('btn-send').disabled = false;
             removeStreamingMessage();
             showGenStatus('Reconnecting... generation continues on server');
         }
-        // Reconnect immediately (don't rely on setTimeout which Chrome throttles)
+        // Reconnect: instant first try, then back off (cap at 8s)
         if (State.currentConvId === convId && State.currentView !== 'home') {
-            connectWebSocket(convId);
+            const attempt = (ws._reconnectAttempt || 0) + 1;
+            const delay = attempt <= 1 ? 100 : Math.min(500 * Math.pow(2, attempt - 2), 8000);
+            console.log(`[WS] Reconnecting in ${Math.round(delay)}ms (attempt ${attempt})`);
+            _wsReconnectTimer = setTimeout(() => {
+                _wsReconnectTimer = null;
+                if (State.currentConvId === convId && State.currentView !== 'home') {
+                    connectWebSocket(convId, attempt);
+                }
+            }, delay);
         }
     };
 
@@ -82,9 +99,12 @@ let _streamStartTime = 0;
 // Force reconnect when tab becomes visible again
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && State.currentConvId) {
-        if (!State.ws || State.ws.readyState !== WebSocket.OPEN) {
+        if (!State.ws || State.ws.readyState === WebSocket.CLOSED) {
             console.log('Tab visible — reconnecting WebSocket');
             connectWebSocket(State.currentConvId);
+        } else if (State.ws && State.ws.readyState === WebSocket.OPEN) {
+            // WS is open but we may have missed events while backgrounded — resync
+            loadMessages(State.currentConvId);
         }
     }
 });
@@ -441,22 +461,22 @@ function handleWSMessage(data) {
             removeStreamingMessage();
             State.isStreaming = true;
             const snapshots = data.snapshots || [];
+            const activeWs = State.ws;  // capture current WS to detect stale callbacks
             if (snapshots.length > 0) {
-                // Use the first (primary) snapshot to reconstruct streaming state
                 const snap = snapshots[0];
                 State._followingGenId = snap.gen_id ?? null;
                 State._streamIsOurBranch = true;
-                _streamStartTime = (snap.started_at || 0) * 1000; // convert to JS ms
+                _streamStartTime = (snap.started_at || 0) * 1000;
                 _streamTokenCount = 0;
-                // Load messages first, then overlay the live snapshot content
                 loadMessages(State.currentConvId).then(() => {
-                    if (!State.isStreaming) return; // generation ended during load
+                    // Bail if WS was replaced or generation ended during load
+                    if (State.ws !== activeWs || !State.isStreaming) return;
                     _reconstructFromSnapshot(snap);
                 });
             } else {
-                // No snapshot available — fall back to DB load
                 loadMessages(State.currentConvId);
             }
+            if (State.ws) State.ws._needsSync = false;
             break;
         }
 
@@ -2228,6 +2248,9 @@ function showPermissionPrompt(data) {
             prompt.querySelector('.permission-title').textContent =
                 allow ? 'Allowed' + (always ? ' (all future)' : '') : 'Denied';
             prompt.classList.add(allow ? 'resolved-allow' : 'resolved-deny');
+
+            // Also clear the notification bell
+            resolvePermissionNotification(requestId, allow);
         });
     });
 

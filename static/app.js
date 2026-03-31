@@ -340,16 +340,23 @@ async function init() {
     checkHealth();
 }
 
-async function checkHealth() {
+async function checkHealth(retries = 2) {
     try {
         const health = await API.get('/api/health');
-        if (health.status === 'error') {
+        if (health.status === 'mock') {
+            // Mock mode — Ollama not available, not an error
+            return;
+        } else if (health.status === 'error') {
             showToast(`Ollama not reachable: ${health.error}`, 'error');
-        } else if (!health.model_available) {
+        } else if (!health.model_available && health.models) {
             showToast(`Model "${health.target_model}" not found. Available: ${health.models.join(', ')}`, 'error');
         }
     } catch {
-        showToast('Cannot reach server', 'error');
+        if (retries > 0) {
+            setTimeout(() => checkHealth(retries - 1), 2000);
+        } else {
+            showToast('Cannot reach server', 'error');
+        }
     }
 }
 
