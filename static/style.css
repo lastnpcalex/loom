@@ -2685,6 +2685,15 @@ body::after {
     text-overflow: ellipsis;
     white-space: nowrap;
 }
+.slash-loading .slash-desc {
+    color: var(--cyan);
+    opacity: 0.6;
+    animation: slash-pulse 1s ease-in-out infinite;
+}
+@keyframes slash-pulse {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 0.8; }
+}
 
 #btn-send {
     background: rgba(0, 255, 255, 0.15);

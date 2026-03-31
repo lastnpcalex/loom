@@ -1023,8 +1023,9 @@ function initInlineCCControls() {
     // Notification bell for background generation landings + permission requests
     if (typeof _initNotifications === 'function') _initNotifications();
 
-    // Slash command autocomplete
+    // Slash command autocomplete — preload skills cache in background
     if (typeof _initSlashAutocomplete === 'function') _initSlashAutocomplete();
+    if (typeof _loadSkills === 'function') _loadSkills();
 
     // Chat state panel (bottom sheet)
     const statePanel = document.getElementById('state-panel');

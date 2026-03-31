@@ -703,6 +703,11 @@ function _initSlashAutocomplete() {
             return;
         }
         const query = val.slice(1).toLowerCase();
+        // Show loading spinner on first fetch
+        if (!_cachedSkills) {
+            dropdown.innerHTML = '<div class="slash-item slash-loading"><span class="slash-desc">Loading commands...</span></div>';
+            dropdown.classList.remove('hidden');
+        }
         const skills = await _loadSkills();
         const matches = query
             ? skills.filter(s =>
