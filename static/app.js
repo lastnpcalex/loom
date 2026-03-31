@@ -2454,9 +2454,14 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 
-function scrollToBottom() {
+function scrollToBottom(force) {
     const container = document.getElementById('messages-container');
-    requestAnimationFrame(() => { container.scrollTop = container.scrollHeight; });
+    if (!container) return;
+    // Only auto-scroll if user is near the bottom (within 150px) or forced
+    const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 150;
+    if (nearBottom || force) {
+        requestAnimationFrame(() => { container.scrollTop = container.scrollHeight; });
+    }
 }
 
 // "Jump to latest" button — appears when scrolled up
@@ -2469,7 +2474,7 @@ function scrollToBottom() {
         btn.id = 'jump-to-latest';
         btn.className = 'hidden';
         btn.textContent = '↓ Latest';
-        btn.addEventListener('click', scrollToBottom);
+        btn.addEventListener('click', () => scrollToBottom(true));
         container.parentElement.appendChild(btn);
 
         container.addEventListener('scroll', () => {

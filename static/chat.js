@@ -123,8 +123,12 @@ async function loadMessages(convId) {
             State.messages = [];
         }
         renderMessages();
+        // If still streaming, re-create the streaming div (renderMessages destroyed it)
+        if (State.isStreaming && !streamingDiv) {
+            appendStreamingMessage();
+        }
         scrollToBottom();
-        if (State.messages.length > prevCount && prevCount > 0) {
+        if (State.messages.length > prevCount && prevCount > 0 && !State.isStreaming) {
             showToast('Response loaded');
         }
     } catch (err) {
@@ -415,21 +419,17 @@ function handleWSMessage(data) {
         }
 
         case 'cancelled':
-            if (!_isOurBranch(data)) {
-                refreshTree();
-                // If viewing a draft that was cancelled (server deletes it), reload
-                if (data.message_id) {
-                    const viewedIds = new Set(State.messages.map(m => m.id));
-                    if (viewedIds.has(data.message_id)) loadMessages(State.currentConvId);
-                }
-                break;
-            }
+            State._reconstructing = false;
             removeStreamingMessage();
             State.isStreaming = false;
+            State._streamIsOurBranch = undefined;
             State._followingGenId = null;
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
             showRetryBar('Generation cancelled');
+            refreshTree();
+            // Reload messages to pick up any partial draft saved on cancel
+            loadMessages(State.currentConvId);
             _flushQueuedGeneration();
             break;
 
@@ -458,23 +458,38 @@ function handleWSMessage(data) {
         case 'generation_active': {
             // Reconnected while a generation is still running — use snapshot to rebuild UI
             hideRetryBar();
-            removeStreamingMessage();
             State.isStreaming = true;
             const snapshots = data.snapshots || [];
-            const activeWs = State.ws;  // capture current WS to detect stale callbacks
             if (snapshots.length > 0) {
                 const snap = snapshots[0];
+                // Check if this generation is on our current branch
+                const myMsgIds = new Set(State.messages.map(m => m.id));
+                const isOurBranch = !snap.parent_id || myMsgIds.has(snap.parent_id);
+                State._streamIsOurBranch = isOurBranch;
                 State._followingGenId = snap.gen_id ?? null;
-                State._streamIsOurBranch = true;
                 _streamStartTime = (snap.started_at || 0) * 1000;
                 _streamTokenCount = 0;
-                loadMessages(State.currentConvId).then(() => {
-                    // Bail if WS was replaced or generation ended during load
-                    if (State.ws !== activeWs || !State.isStreaming) return;
-                    _reconstructFromSnapshot(snap);
-                });
+                if (!State._reconstructing) {
+                    State._reconstructing = true;
+                    const activeWs = State.ws;
+                    loadMessages(State.currentConvId).then(() => {
+                        State._reconstructing = false;
+                        if (State.ws !== activeWs || !State.isStreaming) return;
+                        // Re-check branch after messages loaded (State.messages is now fresh)
+                        const freshIds = new Set(State.messages.map(m => m.id));
+                        const stillOurs = !snap.parent_id || freshIds.has(snap.parent_id);
+                        State._streamIsOurBranch = stillOurs;
+                        if (stillOurs) {
+                            _reconstructFromSnapshot(snap);
+                        }
+                    }).catch(() => { State._reconstructing = false; });
+                }
             } else {
-                loadMessages(State.currentConvId);
+                // No snapshot — just load messages
+                State._streamIsOurBranch = true;  // assume ours, will be corrected by stream_start
+                if (!State._reconstructing) {
+                    loadMessages(State.currentConvId);
+                }
             }
             if (State.ws) State.ws._needsSync = false;
             break;
@@ -482,8 +497,11 @@ function handleWSMessage(data) {
 
         case 'generation_idle':
             // Server confirms no generation running — reset any stuck streaming state
+            State._reconstructing = false;  // clear any stale reconstruction lock
             if (State.isStreaming || (State.ws && State.ws._needsSync)) {
                 State.isStreaming = false;
+                State._streamIsOurBranch = undefined;
+                State._followingGenId = null;
                 document.getElementById('btn-send').disabled = false;
                 removeStreamingMessage();
                 hideGenStatus();
@@ -871,12 +889,12 @@ async function sendMessage() {
             const el = createMessageElement(msg);
             el.classList.add('queued-message');
             container.appendChild(el);
-            scrollToBottom();
+            scrollToBottom(true);
             showToast('Message queued — will send after current turn');
         } else {
             State.messages.push(msg);
             renderMessages();
-            scrollToBottom();
+            scrollToBottom(true);
 
             // Request generation via WebSocket
             if (State.ws && State.ws.readyState === WebSocket.OPEN) {
@@ -1196,6 +1214,8 @@ function renderMessages() {
 
     const container = document.getElementById('messages');
     container.innerHTML = '';
+    // Clear streamingDiv reference — innerHTML='' detaches it from DOM
+    streamingDiv = null;
 
     // Clean up previous observer
     if (VIRTUAL_SCROLL.observer) {
