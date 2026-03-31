@@ -1516,6 +1516,94 @@ body::after {
     background: rgba(160, 140, 255, 0.05);
 }
 
+/* Permission notifications in bell */
+#notif-bell.notif-urgent {
+    animation: notif-pulse 1.5s ease-in-out infinite;
+}
+@keyframes notif-pulse {
+    0%, 100% { text-shadow: 0 0 8px rgba(255, 180, 0, 0.5); color: rgb(255, 200, 80); }
+    50% { text-shadow: 0 0 16px rgba(255, 180, 0, 0.8); color: rgb(255, 220, 120); }
+}
+#notif-bell.notif-urgent .notif-badge {
+    background: rgb(255, 180, 0);
+    box-shadow: 0 0 8px rgba(255, 180, 0, 0.6);
+}
+.notif-permission {
+    flex-direction: column;
+    gap: 4px;
+    border-left: 3px solid rgba(255, 180, 0, 0.6);
+    background: rgba(255, 180, 0, 0.03);
+}
+.notif-permission.notif-resolved {
+    opacity: 0.6;
+    border-left-color: rgba(160, 140, 255, 0.3);
+    background: none;
+}
+.notif-perm-header {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+.notif-perm-tool {
+    font-size: 0.8em;
+    font-weight: 600;
+    color: rgb(255, 200, 80);
+}
+.notif-perm-summary {
+    font-size: 0.75em;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 280px;
+    font-family: var(--font-mono);
+}
+.notif-perm-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 4px;
+}
+.notif-perm-btn {
+    font-size: 0.7em;
+    padding: 3px 10px;
+    border-radius: 4px;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.05);
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all 0.15s;
+}
+.notif-perm-btn:hover {
+    background: rgba(255,255,255,0.1);
+}
+.notif-perm-btn.allow {
+    border-color: rgba(0, 220, 130, 0.3);
+    color: rgb(0, 220, 130);
+}
+.notif-perm-btn.allow:hover {
+    background: rgba(0, 220, 130, 0.1);
+}
+.notif-perm-btn.deny {
+    border-color: rgba(255, 80, 80, 0.3);
+    color: rgb(255, 80, 80);
+}
+.notif-perm-btn.deny:hover {
+    background: rgba(255, 80, 80, 0.1);
+}
+.notif-perm-btn.allow-all {
+    border-color: rgba(0, 200, 255, 0.3);
+    color: rgb(0, 200, 255);
+}
+.notif-perm-btn.allow-all:hover {
+    background: rgba(0, 200, 255, 0.1);
+}
+.notif-perm-status {
+    font-size: 0.75em;
+    font-weight: 600;
+}
+.notif-perm-status.perm-allowed { color: rgb(0, 220, 130); }
+.notif-perm-status.perm-denied { color: rgb(255, 80, 80); }
+
 .tree-node-error {
     border-color: rgba(248, 81, 73, 0.4) !important;
     opacity: 0.7;
@@ -2533,6 +2621,70 @@ body::after {
 }
 
 #user-input::placeholder { color: var(--text-muted); }
+
+/* Slash command autocomplete */
+.slash-autocomplete {
+    position: absolute;
+    bottom: 100%;
+    left: 12px;
+    right: 12px;
+    max-height: min(60vh, 520px);
+    overflow-y: auto;
+    background: var(--bg-secondary);
+    border: 1px solid rgba(0, 255, 255, 0.15);
+    border-radius: 8px;
+    box-shadow: 0 -4px 16px rgba(0,0,0,0.4);
+    z-index: 50;
+    margin-bottom: 4px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(0,255,255,0.2) transparent;
+}
+.slash-item {
+    display: flex;
+    gap: 12px;
+    align-items: baseline;
+    padding: 8px 12px;
+    cursor: pointer;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+.slash-item:last-child { border-bottom: none; }
+.slash-item:hover, .slash-item.selected {
+    background: rgba(0, 255, 255, 0.06);
+}
+.slash-cmd {
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+    color: var(--cyan);
+    font-weight: 600;
+    white-space: nowrap;
+}
+.slash-source {
+    font-size: 0.6em;
+    padding: 1px 5px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    flex-shrink: 0;
+}
+.slash-source.system {
+    color: rgba(160, 140, 255, 0.7);
+    border: 1px solid rgba(160, 140, 255, 0.2);
+}
+.slash-source.user {
+    color: rgba(0, 220, 130, 0.8);
+    border: 1px solid rgba(0, 220, 130, 0.2);
+}
+.slash-source.meta {
+    color: rgba(255, 180, 50, 0.8);
+    border: 1px solid rgba(255, 180, 50, 0.25);
+}
+.slash-desc {
+    font-size: 0.75em;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 
 #btn-send {
     background: rgba(0, 255, 255, 0.15);

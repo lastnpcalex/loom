@@ -1020,8 +1020,11 @@ function initInlineCCControls() {
     // Branch count pill (Weave/OODA only)
     initBranchCountPill();
 
-    // Notification bell for background generation landings
+    // Notification bell for background generation landings + permission requests
     if (typeof _initNotifications === 'function') _initNotifications();
+
+    // Slash command autocomplete
+    if (typeof _initSlashAutocomplete === 'function') _initSlashAutocomplete();
 
     // Chat state panel (bottom sheet)
     const statePanel = document.getElementById('state-panel');

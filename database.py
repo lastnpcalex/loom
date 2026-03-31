@@ -236,6 +236,18 @@ async def _run_migrations(db):
             UNIQUE(character_id, schema_id, label)
         )""",
         "CREATE INDEX IF NOT EXISTS idx_char_state_cards ON character_state_cards(character_id)",
+        # Modules: pluggable skills, commands, and agent definitions
+        """CREATE TABLE IF NOT EXISTS modules (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL CHECK(type IN ('skill','command','agent')),
+            description TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'builtin',
+            config TEXT NOT NULL DEFAULT '{}',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            discovered_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )""",
     ]
     for sql in table_migrations:
         await db.execute(sql)
@@ -1101,6 +1113,62 @@ async def delete_bookmark(bookmark_id: int):
     await db.execute("DELETE FROM bookmarks WHERE id = ?", (bookmark_id,))
     await db.commit()
 
+
+
+# ── Modules (Skills / Commands / Agents) ──
+
+async def upsert_module(module_id: str, name: str, module_type: str,
+                        description: str = "", source: str = "builtin",
+                        config: dict = None) -> dict:
+    """Insert or update a module. Returns the module dict."""
+    import time
+    db = await get_db()
+    now = time.time()
+    config_json = json.dumps(config or {})
+    await db.execute(
+        """INSERT INTO modules (id, name, type, description, source, config, enabled, discovered_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+               name=excluded.name, description=excluded.description,
+               config=excluded.config, updated_at=excluded.updated_at""",
+        (module_id, name, module_type, description, source, config_json, now, now)
+    )
+    await db.commit()
+    row = await db.execute_fetchall("SELECT * FROM modules WHERE id = ?", (module_id,))
+    return dict(row[0]) if row else {}
+
+
+async def get_modules(module_type: str = None, enabled_only: bool = True) -> list[dict]:
+    db = await get_db()
+    sql = "SELECT * FROM modules"
+    params = []
+    conditions = []
+    if module_type:
+        conditions.append("type = ?")
+        params.append(module_type)
+    if enabled_only:
+        conditions.append("enabled = 1")
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+    sql += " ORDER BY name"
+    rows = await db.execute_fetchall(sql, params)
+    return [dict(r) for r in rows]
+
+
+async def set_module_enabled(module_id: str, enabled: bool):
+    import time
+    db = await get_db()
+    await db.execute(
+        "UPDATE modules SET enabled = ?, updated_at = ? WHERE id = ?",
+        (1 if enabled else 0, time.time(), module_id)
+    )
+    await db.commit()
+
+
+async def delete_module(module_id: str):
+    db = await get_db()
+    await db.execute("DELETE FROM modules WHERE id = ?", (module_id,))
+    await db.commit()
 
 
 # ── Helpers ──

@@ -41,13 +41,9 @@ function connectWebSocket(convId) {
                 ws.send(JSON.stringify({ action: 'ping' }));
             }
         };
-        // Reload messages on reconnect to pick up any responses that completed while away.
-        // Delay slightly so generation_active message can arrive first and set isStreaming.
-        setTimeout(() => {
-            if (State.currentConvId === convId && !State.isStreaming) {
-                loadMessages(convId);
-            }
-        }, 200);
+        // Server immediately sends generation_active (with snapshot) or generation_idle.
+        // We let those handlers trigger loadMessages — no more racy setTimeout.
+        ws._needsSync = true;
     };
 
     ws.onmessage = (event) => {
@@ -275,11 +271,27 @@ function handleWSMessage(data) {
             break;
 
         case 'permission_request':
-            showPermissionPrompt(data);
+            // Always add to notification bell (works from any conversation)
+            addPermissionNotification(data);
+            // Also render inline if we're viewing the right conversation and streaming
+            if ((!data.conv_id || data.conv_id === State.currentConvId) && streamingDiv) {
+                showPermissionPrompt(data);
+            }
+            // Push notification if tab is hidden
+            if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+                const n = new Notification('A Shadow Loom — Permission Request', {
+                    body: `${data.tool_name}: ${(data.input_summary || '').substring(0, 100)}`,
+                    icon: '/static/img/loom-ico-transparent.png',
+                    tag: 'perm-' + data.request_id,
+                    requireInteraction: true,
+                });
+                n.onclick = () => { window.focus(); n.close(); };
+            }
             break;
 
         case 'permission_resolved':
             resolvePermissionPrompt(data.request_id, data.allowed);
+            resolvePermissionNotification(data.request_id, data.allowed);
             break;
 
         case 'cc_debug_event':
@@ -423,24 +435,41 @@ function handleWSMessage(data) {
             }
             break;
 
-        case 'generation_active':
-            // Reconnected while a generation is still running
+        case 'generation_active': {
+            // Reconnected while a generation is still running — use snapshot to rebuild UI
             hideRetryBar();
             removeStreamingMessage();
             State.isStreaming = true;
-            // loadMessages + renderMessages will create streaming div from the draft
-            loadMessages(State.currentConvId);
+            const snapshots = data.snapshots || [];
+            if (snapshots.length > 0) {
+                // Use the first (primary) snapshot to reconstruct streaming state
+                const snap = snapshots[0];
+                State._followingGenId = snap.gen_id ?? null;
+                State._streamIsOurBranch = true;
+                _streamStartTime = (snap.started_at || 0) * 1000; // convert to JS ms
+                _streamTokenCount = 0;
+                // Load messages first, then overlay the live snapshot content
+                loadMessages(State.currentConvId).then(() => {
+                    if (!State.isStreaming) return; // generation ended during load
+                    _reconstructFromSnapshot(snap);
+                });
+            } else {
+                // No snapshot available — fall back to DB load
+                loadMessages(State.currentConvId);
+            }
             break;
+        }
 
         case 'generation_idle':
             // Server confirms no generation running — reset any stuck streaming state
-            if (State.isStreaming) {
+            if (State.isStreaming || (State.ws && State.ws._needsSync)) {
                 State.isStreaming = false;
                 document.getElementById('btn-send').disabled = false;
                 removeStreamingMessage();
                 hideGenStatus();
                 loadMessages(State.currentConvId);
             }
+            if (State.ws) State.ws._needsSync = false;
             break;
     }
 }
@@ -448,6 +477,301 @@ function handleWSMessage(data) {
 function updateContextInfo(data) {
     // Context token info now shown via gen status bar, not header
 }
+
+/**
+ * Reconstruct streaming UI from a server-side generation snapshot.
+ * Called on WS reconnect when a generation is mid-flight.
+ */
+function _reconstructFromSnapshot(snap) {
+    removeStreamingMessage();
+    appendStreamingMessage();
+    if (!streamingDiv) return;
+
+    const contentEl = streamingDiv.querySelector('.message-content');
+    const blocks = snap.content_blocks || [];
+
+    if (blocks.length > 0) {
+        // Replay content_blocks: render completed blocks as static HTML,
+        // and the last block as a live streaming element
+        for (let i = 0; i < blocks.length; i++) {
+            const block = blocks[i];
+            const isLast = i === blocks.length - 1;
+
+            if (block.type === 'text') {
+                if (isLast) {
+                    // Last text block — render as streaming text span (cursor shows it's live)
+                    const textSpan = document.createElement('span');
+                    textSpan.className = 'streaming-text';
+                    textSpan.dataset.rawContent = block.text || '';
+                    textSpan.innerHTML = formatContent(block.text || '') + '<span class="typing-cursor"></span>';
+                    contentEl.appendChild(textSpan);
+                } else {
+                    // Completed text block
+                    const div = document.createElement('div');
+                    div.innerHTML = formatContent(block.text || '');
+                    contentEl.appendChild(div);
+                }
+            } else if (block.type === 'tool_use') {
+                // Render tool block — if it has a result, it's finalized; otherwise still in progress
+                if (block.result) {
+                    // Completed tool — render as collapsed block
+                    const toolDiv = document.createElement('div');
+                    toolDiv.className = 'tool-block expanded';
+                    const inputPreview = (block.input || '').substring(0, 3000);
+                    const resultPreview = (block.result || '').substring(0, 2000);
+                    toolDiv.innerHTML =
+                        '<div class="tool-header" onclick="this.parentElement.classList.toggle(\'expanded\')">' +
+                        '<span class="tool-toggle">&#9656;</span> ' +
+                        '<span class="tool-name">' + escapeHtml(block.name || 'Tool') + '</span>' +
+                        '</div>' +
+                        '<div class="tool-body">' +
+                        (inputPreview ? '<pre class="tool-input">' + escapeHtml(inputPreview) + '</pre>' : '') +
+                        '<div class="tool-result"><pre>' + escapeHtml(resultPreview) + '</pre></div>' +
+                        '</div>';
+                    contentEl.appendChild(toolDiv);
+                } else {
+                    // In-progress tool — show as active
+                    appendToolBlock(block.name, block.tool_id, false);
+                    if (block.input) {
+                        appendToolInput(block.input, block.tool_id);
+                    }
+                }
+            } else if (block.type === 'thinking') {
+                // Thinking blocks — show as collapsed
+                const thinkDiv = document.createElement('div');
+                thinkDiv.className = 'thinking-block';
+                thinkDiv.innerHTML =
+                    '<div class="thinking-header" onclick="this.parentElement.classList.toggle(\'expanded\')">' +
+                    '<span class="thinking-toggle">&#9656;</span> Thinking</div>' +
+                    '<div class="thinking-content"><pre>' + escapeHtml(block.text || '') + '</pre></div>';
+                contentEl.appendChild(thinkDiv);
+            }
+        }
+    } else if (snap.full_text) {
+        // No structured blocks — just raw text (Weave mode)
+        const textSpan = document.createElement('span');
+        textSpan.className = 'streaming-text';
+        textSpan.dataset.rawContent = snap.full_text;
+        textSpan.innerHTML = formatContent(snap.full_text) + '<span class="typing-cursor"></span>';
+        contentEl.appendChild(textSpan);
+    }
+
+    // Reset stream buffer so new chunks append cleanly
+    _streamBuffer = '';
+    _streamFlushTimer = null;
+    showGenStatus('Reconnected — streaming in progress');
+    scrollToBottom();
+    console.log('[WS] Reconstructed streaming UI from snapshot:', blocks.length, 'blocks,', (snap.full_text || '').length, 'chars');
+}
+
+// ── Skills / Slash Commands ──
+
+let _cachedSkills = null;  // cached from /api/skills
+
+async function _loadSkills() {
+    if (_cachedSkills) return _cachedSkills;
+    try {
+        const convParam = State.currentConvId ? `?conv_id=${State.currentConvId}` : '';
+        _cachedSkills = await API.get(`/api/skills${convParam}`);
+    } catch {
+        _cachedSkills = [];
+    }
+    return _cachedSkills;
+}
+
+function _invalidateSkillsCache() { _cachedSkills = null; }
+
+/**
+ * Translate a /slash command into a natural language prompt for CC.
+ * Returns null if the input is not a slash command.
+ */
+function _translateSlashCommand(content, skills) {
+    if (!content.startsWith('/')) return null;
+    const match = content.match(/^\/(\S+)\s*(.*)?$/);
+    if (!match) return null;
+
+    const cmdName = match[1].toLowerCase();
+    const args = (match[2] || '').trim();
+
+    const skill = skills.find(s =>
+        s.command === `/${cmdName}` || s.name === cmdName
+    );
+
+    if (!skill) return null;
+
+    // Meta commands are handled by Loom natively, not sent to CC
+    if (skill.mode === 'meta') {
+        return { meta: true, skillName: skill.name, args };
+    }
+
+    let prompt = skill.prompt_template || `Run the ${skill.name} skill.`;
+    prompt = prompt.replace('{args}', args || '');
+
+    // If user provided args and template didn't have {args}, append them
+    if (args && !skill.prompt_template?.includes('{args}')) {
+        prompt += `\n\nAdditional context: ${args}`;
+    }
+
+    return { prompt, skillName: skill.name };
+}
+
+/**
+ * Handle meta commands that Loom processes natively (not sent to CC).
+ */
+function _handleMetaCommand(name, args) {
+    switch (name) {
+        case 'skills':
+            _loadSkills().then(skills => {
+                const lines = skills.map(s =>
+                    `${s.command}  [${s.source}/${s.mode || 'headless'}]  ${s.description || ''}`
+                );
+                showToast(`${skills.length} commands available`, 3000);
+                // Show as a system message in chat
+                const container = document.getElementById('messages-container');
+                if (container) {
+                    const el = document.createElement('div');
+                    el.className = 'system-message';
+                    el.innerHTML = `<pre style="font-size:0.85em;color:var(--text-dim);white-space:pre-wrap">`
+                        + `Available commands (${skills.length}):\n\n`
+                        + escapeHtml(lines.join('\n'))
+                        + `</pre>`;
+                    container.appendChild(el);
+                    el.scrollIntoView({ behavior: 'smooth' });
+                }
+            });
+            break;
+        case 'status':
+            showToast(State.isGenerating ? 'Generation in progress...' : 'Idle — no active generation');
+            break;
+        case 'stats':
+        case 'usage':
+            API.get('/api/health').then(h => {
+                showToast(`Uptime: ${Math.round((h.uptime || 0) / 60)}m | Conversations: ${h.conversations || '?'}`, 4000);
+            }).catch(() => showToast('Could not fetch stats'));
+            break;
+        case 'permissions':
+            showToast('Permissions are managed via the notification bell', 3000);
+            break;
+        case 'export':
+            if (State.currentConvId) {
+                window.open(`/api/conversations/${State.currentConvId}/export`, '_blank');
+                showToast('Exporting conversation...');
+            } else {
+                showToast('No conversation selected');
+            }
+            break;
+        case 'settings':
+            // Open settings panel if it exists
+            const settingsBtn = document.querySelector('[data-action="settings"]') || document.getElementById('settings-btn');
+            if (settingsBtn) settingsBtn.click();
+            else showToast('Settings panel not available');
+            break;
+        case 'fast':
+            showToast('Fast mode toggle — configure in conversation settings', 3000);
+            break;
+        case 'passes':
+            showToast('Review passes — configure in conversation settings', 3000);
+            break;
+        case 'privacy':
+            showToast('Privacy settings — configure in Claude Code directly', 3000);
+            break;
+        default:
+            showToast(`/${name} is handled locally but not yet implemented`, 3000);
+    }
+}
+
+/**
+ * Initialize slash command autocomplete on the input textarea.
+ */
+function _initSlashAutocomplete() {
+    const input = document.getElementById('user-input');
+    const container = document.getElementById('input-area') || input.parentElement;
+
+    // Create autocomplete dropdown
+    const dropdown = document.createElement('div');
+    dropdown.id = 'slash-autocomplete';
+    dropdown.className = 'slash-autocomplete hidden';
+    container.style.position = 'relative';
+    container.appendChild(dropdown);
+
+    let _selectedIdx = -1;
+
+    input.addEventListener('input', async () => {
+        const val = input.value;
+        if (!val.startsWith('/') || val.includes('\n')) {
+            dropdown.classList.add('hidden');
+            return;
+        }
+        const query = val.slice(1).toLowerCase();
+        const skills = await _loadSkills();
+        const matches = query
+            ? skills.filter(s =>
+                s.name.toLowerCase().includes(query) ||
+                (s.command || '').toLowerCase().includes('/' + query) ||
+                (s.description || '').toLowerCase().includes(query)
+              ).slice(0, 15)
+            : skills.slice(0, 31);  // Show all on bare "/"
+
+        if (matches.length === 0) {
+            dropdown.classList.add('hidden');
+            return;
+        }
+
+        _selectedIdx = -1;
+        dropdown.innerHTML = '';
+        matches.forEach((skill, i) => {
+            const item = document.createElement('div');
+            item.className = 'slash-item';
+            const sourceClass = skill.source === 'user' ? 'user' : 'system';
+            const modeClass = skill.mode === 'meta' ? 'meta' : '';
+            const sourceLabel = skill.source === 'user' ? 'user'
+                : skill.mode === 'meta' ? 'loom' : 'system';
+            const sourceTag = `<span class="slash-source ${sourceClass} ${modeClass}">${sourceLabel}</span>`;
+            item.innerHTML =
+                `<span class="slash-cmd">${escapeHtml(skill.command || '/' + skill.name)}</span>` +
+                sourceTag +
+                `<span class="slash-desc">${escapeHtml(skill.description || '').substring(0, 80)}</span>`;
+            item.addEventListener('click', () => {
+                input.value = (skill.command || '/' + skill.name) + ' ';
+                dropdown.classList.add('hidden');
+                input.focus();
+            });
+            item.addEventListener('mouseenter', () => {
+                dropdown.querySelectorAll('.slash-item').forEach(el => el.classList.remove('selected'));
+                item.classList.add('selected');
+                _selectedIdx = i;
+            });
+            dropdown.appendChild(item);
+        });
+        dropdown.classList.remove('hidden');
+    });
+
+    // Keyboard navigation
+    input.addEventListener('keydown', (e) => {
+        if (dropdown.classList.contains('hidden')) return;
+        const items = dropdown.querySelectorAll('.slash-item');
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            _selectedIdx = Math.min(_selectedIdx + 1, items.length - 1);
+            items.forEach((el, i) => el.classList.toggle('selected', i === _selectedIdx));
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            _selectedIdx = Math.max(_selectedIdx - 1, 0);
+            items.forEach((el, i) => el.classList.toggle('selected', i === _selectedIdx));
+        } else if ((e.key === 'Tab' || e.key === 'Enter') && _selectedIdx >= 0) {
+            e.preventDefault();
+            items[_selectedIdx].click();
+        } else if (e.key === 'Escape') {
+            dropdown.classList.add('hidden');
+        }
+    });
+
+    // Close on outside click
+    document.addEventListener('click', (e) => {
+        if (!container.contains(e.target)) dropdown.classList.add('hidden');
+    });
+}
+
 
 // ── Send Message ──
 
@@ -460,10 +784,25 @@ async function sendMessage() {
     }
 
     const input = document.getElementById('user-input');
-    const content = input.value.trim();
+    let content = input.value.trim();
     const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
     const hasImages = State.pendingImages.length > 0;
     if (!content && !(hasImages && !isClaudeMode)) return;
+
+    // Translate slash commands for CC mode
+    if (isClaudeMode && content.startsWith('/')) {
+        const skills = await _loadSkills();
+        const translated = _translateSlashCommand(content, skills);
+        if (translated && translated.meta) {
+            _handleMetaCommand(translated.skillName, translated.args);
+            input.value = '';
+            return;
+        }
+        if (translated) {
+            showToast(`Running skill: ${translated.skillName}`);
+            content = translated.prompt;
+        }
+    }
 
     // Add user message via REST — send image paths as JSON array
     const imagePaths = hasImages ? State.pendingImages.map(img => img.path) : null;
@@ -583,13 +922,14 @@ function cancelGeneration() {
     }
 }
 
-// ── Notifications (background generation landings) ──
+// ── Notifications (background generation landings + permission requests) ──
 
 const _notifications = [];
 
 function addNotification(message) {
     const preview = (message.content || '').replace(/[#*_`>\[\]]/g, '').trim();
     _notifications.push({
+        type: 'branch',
         id: message.id,
         convId: State.currentConvId,
         convTitle: State.currentConv?.title || 'Conversation',
@@ -600,18 +940,64 @@ function addNotification(message) {
     _renderNotifBell();
 }
 
+function addPermissionNotification(data) {
+    // Don't duplicate — check if we already have this request_id
+    if (_notifications.some(n => n.type === 'permission' && n.requestId === data.request_id)) return;
+    _notifications.unshift({  // permissions go to the top
+        type: 'permission',
+        requestId: data.request_id,
+        convId: data.conv_id || State.currentConvId,
+        toolName: data.tool_name || 'Unknown',
+        inputSummary: (data.input_summary || '').substring(0, 200),
+        resolved: false,
+        time: new Date(),
+    });
+    _renderNotifBell();
+    // Auto-open the dropdown for urgent permission requests
+    const dropdown = document.getElementById('notif-dropdown');
+    if (dropdown && dropdown.classList.contains('hidden')) {
+        dropdown.classList.remove('hidden');
+        _renderNotifDropdown();
+    }
+}
+
+function resolvePermissionNotification(requestId, allowed) {
+    const n = _notifications.find(n => n.type === 'permission' && n.requestId === requestId);
+    if (n) {
+        n.resolved = true;
+        n.allowed = allowed;
+        // Re-render if dropdown is visible
+        const dropdown = document.getElementById('notif-dropdown');
+        if (dropdown && !dropdown.classList.contains('hidden')) _renderNotifDropdown();
+        // Remove after a short delay
+        setTimeout(() => {
+            const idx = _notifications.indexOf(n);
+            if (idx !== -1) _notifications.splice(idx, 1);
+            _renderNotifBell();
+        }, 2000);
+    }
+}
+
 function _renderNotifBell() {
     const bell = document.getElementById('notif-bell');
     const badge = document.getElementById('notif-badge');
     if (!bell) return;
     bell.classList.remove('hidden');
-    if (_notifications.length > 0) {
-        badge.textContent = _notifications.length;
+    const pendingPerms = _notifications.filter(n => n.type === 'permission' && !n.resolved).length;
+    const total = _notifications.length;
+    if (total > 0) {
+        badge.textContent = total;
         badge.classList.remove('hidden');
         bell.classList.add('notif-active');
+        // Pulse the bell for pending permissions
+        if (pendingPerms > 0) {
+            bell.classList.add('notif-urgent');
+        } else {
+            bell.classList.remove('notif-urgent');
+        }
     } else {
         badge.classList.add('hidden');
-        bell.classList.remove('notif-active');
+        bell.classList.remove('notif-active', 'notif-urgent');
         document.getElementById('notif-dropdown').classList.add('hidden');
     }
 }
@@ -620,30 +1006,15 @@ function _renderNotifDropdown() {
     const list = document.getElementById('notif-list');
     list.innerHTML = '';
     if (_notifications.length === 0) {
-        list.innerHTML = '<div class="notif-empty">No new branches</div>';
+        list.innerHTML = '<div class="notif-empty">No notifications</div>';
         return;
     }
     for (const n of _notifications) {
-        const item = document.createElement('div');
-        item.className = 'notif-item';
-        const timeStr = n.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        item.innerHTML = `<span class="notif-time">${timeStr}</span>`
-            + `<span class="notif-preview">${escapeHtml(n.preview || '(empty)')}</span>`;
-        item.addEventListener('click', async () => {
-            document.getElementById('notif-dropdown').classList.add('hidden');
-            // Remove this notification
-            const idx = _notifications.indexOf(n);
-            if (idx !== -1) _notifications.splice(idx, 1);
-            _renderNotifBell();
-            // Navigate to the branch — load conversation first if needed
-            if (State.currentConvId !== n.convId) {
-                State._skipLoadOnChat = true;
-                await loadConversation(n.convId);
-            }
-            await switchToBranch(n.id);
-            switchView('chat');
-        });
-        list.appendChild(item);
+        if (n.type === 'permission') {
+            list.appendChild(_renderPermissionNotifItem(n));
+        } else {
+            list.appendChild(_renderBranchNotifItem(n));
+        }
     }
     // Clear all button at bottom
     const clearBtn = document.createElement('div');
@@ -655,6 +1026,93 @@ function _renderNotifDropdown() {
         _renderNotifBell();
     });
     list.appendChild(clearBtn);
+}
+
+function _renderBranchNotifItem(n) {
+    const item = document.createElement('div');
+    item.className = 'notif-item notif-branch';
+    const timeStr = n.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    item.innerHTML = `<span class="notif-time">${timeStr}</span>`
+        + `<span class="notif-preview">${escapeHtml(n.preview || '(empty)')}</span>`;
+    item.addEventListener('click', async () => {
+        document.getElementById('notif-dropdown').classList.add('hidden');
+        const idx = _notifications.indexOf(n);
+        if (idx !== -1) _notifications.splice(idx, 1);
+        _renderNotifBell();
+        if (State.currentConvId !== n.convId) {
+            State._skipLoadOnChat = true;
+            await loadConversation(n.convId);
+        }
+        await switchToBranch(n.id);
+        switchView('chat');
+    });
+    return item;
+}
+
+function _renderPermissionNotifItem(n) {
+    const item = document.createElement('div');
+    item.className = 'notif-item notif-permission' + (n.resolved ? ' notif-resolved' : '');
+    const timeStr = n.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    if (n.resolved) {
+        item.innerHTML =
+            `<span class="notif-time">${timeStr}</span>` +
+            `<span class="notif-perm-status ${n.allowed ? 'perm-allowed' : 'perm-denied'}">${n.allowed ? 'Allowed' : 'Denied'}</span> ` +
+            `<span class="notif-perm-tool">${escapeHtml(n.toolName)}</span>`;
+        return item;
+    }
+
+    item.innerHTML =
+        `<div class="notif-perm-header">` +
+        `<span class="notif-time">${timeStr}</span>` +
+        `<span class="notif-perm-tool">${escapeHtml(n.toolName)}</span>` +
+        `</div>` +
+        `<div class="notif-perm-summary">${escapeHtml(n.inputSummary)}</div>` +
+        `<div class="notif-perm-actions">` +
+        `<button class="notif-perm-btn allow" data-action="allow">Allow</button>` +
+        `<button class="notif-perm-btn deny" data-action="deny">Deny</button>` +
+        `<button class="notif-perm-btn allow-all" data-action="allow-all">Allow All</button>` +
+        `</div>`;
+
+    item.querySelectorAll('.notif-perm-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const action = btn.dataset.action;
+            const allow = action === 'allow' || action === 'allow-all';
+            const always = action === 'allow-all';
+            if (State.ws && State.ws.readyState === WebSocket.OPEN) {
+                State.ws.send(JSON.stringify({
+                    action: 'permission_response',
+                    request_id: n.requestId,
+                    allow, always,
+                }));
+            }
+            n.resolved = true;
+            n.allowed = allow;
+            _renderNotifDropdown();
+            _renderNotifBell();
+            // Also update the inline prompt if it exists
+            resolvePermissionPrompt(n.requestId, allow);
+            // Auto-remove after delay
+            setTimeout(() => {
+                const idx = _notifications.indexOf(n);
+                if (idx !== -1) _notifications.splice(idx, 1);
+                _renderNotifBell();
+            }, 2000);
+        });
+    });
+
+    // Click on the item body (not buttons) navigates to the conversation
+    item.addEventListener('click', async (e) => {
+        if (e.target.closest('.notif-perm-btn')) return;
+        if (State.currentConvId !== n.convId) {
+            State._skipLoadOnChat = true;
+            await loadConversation(n.convId);
+            switchView('chat');
+        }
+    });
+
+    return item;
 }
 
 // Wire up bell + clear — called once from initInlineCCControls or on DOMContentLoaded
@@ -678,6 +1136,14 @@ function _initNotifications() {
             dropdown.classList.add('hidden');
         }
     });
+    // Request notification permission early for push notifs
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+        // Don't request immediately — wait for user interaction
+        document.addEventListener('click', function _reqPerm() {
+            Notification.requestPermission();
+            document.removeEventListener('click', _reqPerm);
+        }, { once: true });
+    }
 }
 
 // ── Render Messages ──
