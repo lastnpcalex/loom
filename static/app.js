@@ -62,6 +62,7 @@ const State = {
     config: {},
     convFilter: 'all',
     convFolderCollapsed: {},
+    branchCount: 1,  // number of response branches to generate (Weave/OODA only)
 };
 
 // ── View Switching ──
@@ -78,7 +79,6 @@ function switchView(view) {
     const title = document.getElementById('conv-title');
     const breadcrumb = document.getElementById('breadcrumb-trail');
     const treeBtn = document.getElementById('btn-to-tree');
-    const contextInfo = document.getElementById('context-info');
     const globalBmBtn = document.getElementById('btn-bookmarks-global');
     const globalBmPanel = document.getElementById('bookmarks-panel-global');
     const statePanelTree = document.getElementById('btn-state-panel-tree');
@@ -95,18 +95,18 @@ function switchView(view) {
         title.classList.add('hidden');
         breadcrumb.classList.add('hidden');
         treeBtn.classList.add('hidden');
-        contextInfo.classList.add('hidden');
+
         globalBmBtn?.classList.remove('hidden');
         statePanelTree?.classList.add('hidden');
-        // Close WebSocket when leaving a conversation
-        if (State.ws) { State.ws.close(); State.ws = null; }
+        // Keep WebSocket alive so background generation notifications still arrive.
+        // WS is only closed when loading a different conversation (in connectWebSocket).
     } else if (view === 'tree') {
         sep.classList.remove('hidden');
         title.classList.remove('hidden');
         title.textContent = State.currentConv?.title || '—';
         breadcrumb.classList.add('hidden');
         treeBtn.classList.add('hidden');
-        contextInfo.classList.remove('hidden');
+
         globalBmBtn?.classList.remove('hidden');
         inputArea?.classList.remove('hidden');
         const userInput = document.getElementById('user-input');
@@ -122,7 +122,7 @@ function switchView(view) {
         breadcrumb.classList.remove('hidden');
         treeBtn.classList.remove('hidden');
         updateBreadcrumbs();
-        contextInfo.classList.remove('hidden');
+
         globalBmBtn?.classList.remove('hidden');
         inputArea?.classList.remove('hidden');
         const userInput = document.getElementById('user-input');
@@ -140,7 +140,7 @@ function switchView(view) {
         title.classList.add('hidden');
         breadcrumb.classList.add('hidden');
         treeBtn.classList.add('hidden');
-        contextInfo.classList.add('hidden');
+
         globalBmBtn?.classList.add('hidden');
         statePanelTree?.classList.add('hidden');
         inputArea?.classList.add('hidden');
@@ -527,6 +527,7 @@ function buildConvItem(conv) {
             await API.del(`/api/conversations/${conv.id}`);
             State.conversations = State.conversations.filter(c => c.id !== conv.id);
             if (State.currentConvId === conv.id) {
+                if (State.ws) { State.ws.close(); State.ws = null; }
                 State.currentConvId = null;
                 State.currentConv = null;
                 State.messages = [];
@@ -871,6 +872,7 @@ function updateInlineCCControls(conv) {
     if (conv && (conv.mode === 'claude' || conv.mode === 'local')) {
         controls.classList.remove('hidden');
         weaveControls?.classList.add('hidden');
+        setBranchCount(1);  // CC/Braid: always single branch
         const modelSel = document.getElementById('cc-model-inline');
         const effortSel = document.getElementById('cc-effort-inline');
         const permSel = document.getElementById('cc-permission-mode-inline');
@@ -890,6 +892,11 @@ function updateInlineCCControls(conv) {
         } else {
             statePanelChat?.classList.add('hidden');
         }
+        // Populate Weave model dropdown and inline settings
+        const weaveSel = document.getElementById('weave-model-inline');
+        if (weaveSel) {
+            _populateWeaveModelDropdown(weaveSel, conv.local_model || '');
+        }
     } else {
         controls.classList.add('hidden');
         weaveControls?.classList.add('hidden');
@@ -905,6 +912,50 @@ function updateInlineCCControls(conv) {
             fileInput.accept = 'image/*,.md,.txt,.pdf,.json,.csv,.py,.js,.ts,.html,.css,.yaml,.yml,.xml,.sh,.bat,.ps1,.docx,.xlsx';
         }
     }
+}
+
+let _ollamaModelsCache = null;
+async function _populateWeaveModelDropdown(select, currentModel) {
+    // Fetch models once, cache for session
+    if (!_ollamaModelsCache) {
+        try {
+            const data = await API.get('/api/ollama/models');
+            _ollamaModelsCache = (data.models || []).map(m => m.name || m);
+        } catch { _ollamaModelsCache = []; }
+    }
+    const models = _ollamaModelsCache;
+    const prev = select.value;
+    select.innerHTML = '<option value="">Default</option>';
+    for (const name of models) {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        select.appendChild(opt);
+    }
+    select.value = currentModel || prev || '';
+}
+
+function initBranchCountPill() {
+    _setupBranchPillClick(document.getElementById('branch-count-control'));
+}
+
+/** Wire up click-to-cycle on any branch count pill element */
+function _setupBranchPillClick(pill) {
+    if (!pill) return;
+    pill.addEventListener('click', () => {
+        const steps = [1, 2, 3, 4, 5];
+        const idx = steps.indexOf(State.branchCount);
+        const next = steps[(idx + 1) % steps.length];
+        setBranchCount(next);
+    });
+}
+
+function setBranchCount(n) {
+    n = Math.max(1, Math.min(5, n));
+    State.branchCount = n;
+    // Update all branch-count pills on the page
+    document.querySelectorAll('.branch-count-value').forEach(el => el.textContent = n);
+    document.querySelectorAll('.branch-count-pill').forEach(el => el.classList.toggle('active', n > 1));
 }
 
 function initInlineCCControls() {
@@ -952,6 +1003,25 @@ function initInlineCCControls() {
             } catch { showToast('Failed to toggle OODA', 'error'); }
         });
     }
+
+    // Weave model dropdown
+    const weaveSel = document.getElementById('weave-model-inline');
+    if (weaveSel) {
+        weaveSel.addEventListener('change', async () => {
+            if (!State.currentConvId || !State.currentConv) return;
+            const model = weaveSel.value || null;
+            try {
+                await API.put(`/api/conversations/${State.currentConvId}`, { local_model: model });
+                State.currentConv.local_model = model;
+            } catch { showToast('Failed to update model', 'error'); }
+        });
+    }
+
+    // Branch count pill (Weave/OODA only)
+    initBranchCountPill();
+
+    // Notification bell for background generation landings
+    if (typeof _initNotifications === 'function') _initNotifications();
 
     // Chat state panel (bottom sheet)
     const statePanel = document.getElementById('state-panel');
@@ -1766,8 +1836,13 @@ function renderImagePreviews() {
     container.classList.remove('hidden');
     container.innerHTML = State.pendingImages.map((img, i) => `
         <div class="preview-thumb">
-            <img src="${img.url}" alt="Preview ${i + 1}">
-            <button class="btn-remove-thumb" data-idx="${i}">✕</button>
+            ${img.is_image
+                ? `<img src="${img.url}" alt="Preview ${i + 1}">`
+                : `<div class="file-thumb" title="${escapeHtml(img.original_name || 'file')}">
+                       <span class="file-thumb-icon">&#128196;</span>
+                       <span class="file-thumb-name">${escapeHtml((img.original_name || 'file').slice(-20))}</span>
+                   </div>`}
+            <button class="btn-remove-thumb" data-idx="${i}">&#x2715;</button>
         </div>
     `).join('') + `<span class="preview-count">${State.pendingImages.length}/${MAX_PENDING_IMAGES}</span>`;
 
@@ -1778,15 +1853,19 @@ function renderImagePreviews() {
 
 async function attachImage(file) {
     if (State.pendingImages.length >= MAX_PENDING_IMAGES) {
-        showToast(`Max ${MAX_PENDING_IMAGES} images allowed`, 'error');
+        showToast(`Max ${MAX_PENDING_IMAGES} attachments allowed`, 'error');
         return;
     }
     try {
         const result = await API.upload(file);
-        State.pendingImages.push({ path: result.path, url: result.url });
+        State.pendingImages.push({
+            path: result.path, url: result.url,
+            is_image: result.is_image !== false,
+            original_name: result.original_name || file.name,
+        });
         renderImagePreviews();
     } catch (err) {
-        showToast('Image upload failed', 'error');
+        showToast('File upload failed', 'error');
     }
 }
 

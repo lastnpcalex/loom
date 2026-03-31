@@ -235,7 +235,7 @@ async def sync_chat(messages: list[dict],
         if think is not None:
             payload["think"] = think
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
             resp = await client.post(f"{config.ollama_host}/api/chat", json=payload)
             resp.raise_for_status()
             data = resp.json()
