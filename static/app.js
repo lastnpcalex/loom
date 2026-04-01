@@ -70,6 +70,7 @@ function switchView(view) {
     State.currentView = view;
     if (!State._restoringView) {
         localStorage.setItem('loom-last-view', view);
+        sessionStorage.setItem('loom-tab-view', view);
     }
     document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
     document.getElementById(`view-${view}`).classList.add('active');
@@ -323,13 +324,14 @@ async function init() {
     initInlineCCControls();
     // Paste handler registered in setupEventListeners
     // Restore last page: view first, then conversation if applicable
-    const lastConv = localStorage.getItem('loom-last-conv');
-    const lastView = localStorage.getItem('loom-last-view');
+    // sessionStorage is per-tab and survives refresh; localStorage is the cross-tab default
+    const lastConv = parseInt(sessionStorage.getItem('loom-tab-conv') || localStorage.getItem('loom-last-conv'));
+    const lastView = sessionStorage.getItem('loom-tab-view') || localStorage.getItem('loom-last-view');
     if (lastView === 'home' || !lastView) {
         switchView('home');
-    } else if (lastConv && State.conversations.find(c => c.id === parseInt(lastConv))) {
+    } else if (lastConv && State.conversations.find(c => c.id === lastConv)) {
         State._restoringView = true;  // prevent loadConversation from overwriting lastView
-        await loadConversation(parseInt(lastConv));
+        await loadConversation(lastConv);
         State._restoringView = false;
         if (lastView === 'tree' || lastView === 'chat') {
             switchView(lastView);
@@ -613,6 +615,7 @@ async function loadConversation(convId) {
     showLoading();
     State.currentConvId = convId;
     localStorage.setItem('loom-last-conv', convId);
+    sessionStorage.setItem('loom-tab-conv', convId);
 
     const [conv, treeData, bookmarks] = await Promise.all([
         API.get(`/api/conversations/${convId}`),
@@ -1782,7 +1785,15 @@ function setupEventListeners() {
 
     const treeLastBranch = document.getElementById('btn-tree-last-branch');
     if (treeLastBranch) {
-        treeLastBranch.addEventListener('click', () => switchView('chat'));
+        treeLastBranch.addEventListener('click', async () => {
+            // Navigate to the newest message in the conversation, not just restore chat view
+            if (State.treeData && State.treeData.length > 0) {
+                const latest = State.treeData.reduce((a, b) => (b.id > a.id ? b : a));
+                await switchToBranch(latest.id, latest.id);
+                State._skipLoadOnChat = true;
+            }
+            switchView('chat');
+        });
     }
 }
 

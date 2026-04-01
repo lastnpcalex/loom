@@ -189,6 +189,11 @@ async def stream_chat(messages: list[dict],
                         if chunk.get("error"):
                             raise RuntimeError(f"Ollama error: {chunk['error']}")
                         if chunk.get("done"):
+                            yield {
+                                "type": "usage",
+                                "input_tokens": chunk.get("prompt_eval_count", 0),
+                                "output_tokens": chunk.get("eval_count", _content_tokens),
+                            }
                             return
                         msg = chunk.get("message", {})
                         thinking = msg.get("thinking", "")

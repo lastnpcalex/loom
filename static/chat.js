@@ -183,8 +183,12 @@ function _isOurBranch(data) {
     if (State._followingGenId != null && data.gen_id != null) {
         return data.gen_id === State._followingGenId;
     }
-    // If we're not streaming, reject any gen_id-tagged events (stale parallel siblings)
-    if (!State.isStreaming && data.gen_id != null) {
+    // If we're not streaming AND we've already established branch tracking, reject stale
+    // parallel sibling events. But don't reject if tracking hasn't been set up yet —
+    // that means we're in the pre-stream window (generate sent, stream_start not yet received).
+    // Rejecting there silently drops error/status events for a generation that just failed fast.
+    if (!State.isStreaming && data.gen_id != null &&
+        (State._streamIsOurBranch !== undefined || State._followingGenId != null)) {
         return false;
     }
     // If we already determined this via stream_start, use cached result
@@ -233,6 +237,7 @@ function handleWSMessage(data) {
                 _streamBuffer = '';
                 _streamFlushTimer = null;
                 hideRetryBar();
+                hidePlanBar();
                 appendStreamingMessage();
             } else if (isOnOurBranch) {
                 // Parallel sibling — count it but don't render
@@ -285,6 +290,16 @@ function handleWSMessage(data) {
             if (!State._streamIsOurBranch) break;
             appendThinkingChunk(data.content);
             break;
+
+        case 'usage': {
+            if (!State._streamIsOurBranch || !streamingDiv) break;
+            const tokEl = streamingDiv.querySelector('.gen-token-info');
+            if (tokEl) {
+                tokEl.textContent = '↑' + _fmtTok(data.input_tokens) + ' ↓' + _fmtTok(data.output_tokens) + ' · ';
+                tokEl.dataset.hasUsage = '1';  // stop timer from overwriting with chunk count
+            }
+            break;
+        }
 
         case 'ask_user_question':
             renderAskUserQuestion(data.questions, data.tool_id);
@@ -435,6 +450,7 @@ function handleWSMessage(data) {
 
         case 'error':
             if (!_isOurBranch(data)) {
+                hideGenStatus();
                 refreshTree();
                 if (data.message_id) {
                     const viewedIds = new Set(State.messages.map(m => m.id));
@@ -444,6 +460,7 @@ function handleWSMessage(data) {
             }
             removeStreamingMessage();
             State.isStreaming = false;
+            State._streamIsOurBranch = undefined;
             State._followingGenId = null;
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
@@ -458,6 +475,7 @@ function handleWSMessage(data) {
         case 'generation_active': {
             // Reconnected while a generation is still running — use snapshot to rebuild UI
             hideRetryBar();
+            hidePlanBar();
             State.isStreaming = true;
             const snapshots = data.snapshots || [];
             if (snapshots.length > 0) {
@@ -1249,7 +1267,7 @@ function renderMessages() {
         // Set up IntersectionObserver to load more on scroll
         const scrollParent = document.getElementById('messages-container');
         VIRTUAL_SCROLL.observer = new IntersectionObserver((entries) => {
-            if (entries[0].isIntersecting) {
+            if (entries[0].isIntersecting && !VIRTUAL_SCROLL.isLoadingOlder) {
                 loadOlderMessages(renderMsgs, container, scrollParent);
             }
         }, { root: scrollParent, threshold: 0.1 });
@@ -1302,41 +1320,50 @@ function renderMessages() {
 
 function loadOlderMessages(renderMsgs, container, scrollParent) {
     const currentStart = VIRTUAL_SCROLL.renderedStart;
-    if (currentStart <= 0) return;
+    if (currentStart <= 0 || VIRTUAL_SCROLL.isLoadingOlder) return;
+    VIRTUAL_SCROLL.isLoadingOlder = true;
 
-    // Calculate new range
-    const newStart = Math.max(0, currentStart - VIRTUAL_SCROLL.batchSize);
-    const batch = renderMsgs.slice(newStart, currentStart);
+    try {
+        // Calculate new range
+        const newStart = Math.max(0, currentStart - VIRTUAL_SCROLL.batchSize);
+        const batch = renderMsgs.slice(newStart, currentStart);
 
-    // Remember scroll position
-    const scrollHeight = scrollParent.scrollHeight;
-    const scrollTop = scrollParent.scrollTop;
+        // Snapshot scroll position before DOM mutation
+        const scrollHeightBefore = scrollParent.scrollHeight;
+        const scrollTopBefore = scrollParent.scrollTop;
 
-    // Find the sentinel and insert batch after it (in correct order)
-    const sentinel = document.getElementById('scroll-sentinel');
-    const fragment = document.createDocumentFragment();
-    for (let i = 0; i < batch.length; i++) {
-        fragment.appendChild(createMessageElement(batch[i]));
-    }
-    const refNode = sentinel ? sentinel.nextSibling : container.firstChild;
-    container.insertBefore(fragment, refNode);
-
-    VIRTUAL_SCROLL.renderedStart = newStart;
-
-    // Update sentinel text or remove if no more messages
-    if (newStart <= 0) {
-        if (sentinel) sentinel.remove();
-        if (VIRTUAL_SCROLL.observer) {
-            VIRTUAL_SCROLL.observer.disconnect();
-            VIRTUAL_SCROLL.observer = null;
+        // Find the sentinel and insert batch after it (in correct order)
+        const sentinel = document.getElementById('scroll-sentinel');
+        const fragment = document.createDocumentFragment();
+        for (let i = 0; i < batch.length; i++) {
+            fragment.appendChild(createMessageElement(batch[i]));
         }
-    } else if (sentinel) {
-        sentinel.textContent = `↑ ${newStart} older messages`;
-    }
+        const refNode = sentinel ? sentinel.nextSibling : container.firstChild;
+        container.insertBefore(fragment, refNode);
 
-    // Maintain scroll position
-    const newScrollHeight = scrollParent.scrollHeight;
-    scrollParent.scrollTop = scrollTop + (newScrollHeight - scrollHeight);
+        VIRTUAL_SCROLL.renderedStart = newStart;
+
+        // Update sentinel text or remove if no more messages
+        if (newStart <= 0) {
+            if (sentinel) sentinel.remove();
+            if (VIRTUAL_SCROLL.observer) {
+                VIRTUAL_SCROLL.observer.disconnect();
+                VIRTUAL_SCROLL.observer = null;
+            }
+        } else if (sentinel) {
+            sentinel.textContent = `↑ ${newStart} older messages`;
+        }
+
+        // Restore scroll position after layout (rAF ensures reflow is done)
+        requestAnimationFrame(() => {
+            const added = scrollParent.scrollHeight - scrollHeightBefore;
+            scrollParent.scrollTop = scrollTopBefore + added;
+            VIRTUAL_SCROLL.isLoadingOlder = false;
+        });
+    } catch (e) {
+        VIRTUAL_SCROLL.isLoadingOlder = false;
+        throw e;
+    }
 }
 
 function showChildBranchHint(msgId, container) {
@@ -1753,17 +1780,17 @@ async function switchToBranch(leafId, scrollToMsgId) {
             if (targetIdx <= 0 && sentinel) sentinel.remove();
         }
 
-        // Now try to scroll to it (defer to allow DOM layout to settle)
-        setTimeout(() => {
+        // Double rAF: first frame triggers reflow, second frame has correct layout
+        requestAnimationFrame(() => requestAnimationFrame(() => {
             const targetEl = document.querySelector(`.message[data-msg-id="${targetId}"]`);
             if (targetEl) {
-                targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                targetEl.scrollIntoView({ behavior: 'instant', block: 'center' });
                 targetEl.classList.add('message-highlight');
                 setTimeout(() => targetEl.classList.remove('message-highlight'), 2000);
             } else {
                 scrollToBottom();
             }
-        }, 150);
+        }));
     } catch (err) {
         showToast('Failed to switch branch', 'error');
     } finally {
@@ -1856,6 +1883,32 @@ function hideThinkingIndicator() {
 // ── Streaming Message ──
 
 let streamingDiv = null;
+let _genTimerInterval = null;
+
+function _fmtTok(n) {
+    if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k';
+    return String(n);
+}
+
+function _startGenTimer() {
+    if (_genTimerInterval) clearInterval(_genTimerInterval);
+    _genTimerInterval = setInterval(() => {
+        if (!streamingDiv || !_streamStartTime) return;
+        const secs = Math.floor((Date.now() - _streamStartTime) / 1000);
+        const timerEl = streamingDiv.querySelector('.gen-timer');
+        if (timerEl) timerEl.textContent = Math.floor(secs / 60) + ':' + String(secs % 60).padStart(2, '0');
+        // In Ollama/weave mode each stream_chunk is one token — show live output count
+        // until a real usage event (CC mode) overwrites it with accurate input+output
+        const tokEl = streamingDiv.querySelector('.gen-token-info');
+        if (tokEl && _streamTokenCount > 0 && !tokEl.dataset.hasUsage) {
+            tokEl.textContent = '↓' + _fmtTok(_streamTokenCount) + ' · ';
+        }
+    }, 1000);
+}
+
+function _stopGenTimer() {
+    if (_genTimerInterval) { clearInterval(_genTimerInterval); _genTimerInterval = null; }
+}
 
 function appendStreamingMessage() {
     const container = document.getElementById('messages');
@@ -1871,8 +1924,11 @@ function appendStreamingMessage() {
         '</div>' +
         '<div class="message-content"></div>' +
         '<div class="stream-thinking-footer"><span class="thinking-dots"></span> Looming...' +
-        ' <button onclick="cancelGeneration()" title="Cancel generation" class="cancel-draft-btn">&#x2298;</button></div>';
+        ' <button onclick="cancelGeneration()" title="Cancel generation" class="cancel-draft-btn">&#x2298;</button>' +
+        '<span class="gen-stats"><span class="gen-token-info"></span><span class="gen-timer">0:00</span></span>' +
+        '</div>';
     container.appendChild(streamingDiv);
+    _startGenTimer();
     scrollToBottom();
 }
 
@@ -1911,6 +1967,7 @@ function _flushStreamBuffer() {
 
 function finalizeStreamingMessage(msg, cost) {
     if (!streamingDiv) return;
+    _stopGenTimer();
 
     // Flush any remaining buffered text
     if (_streamBuffer) _flushStreamBuffer();
@@ -1924,6 +1981,7 @@ function finalizeStreamingMessage(msg, cost) {
 }
 
 function removeStreamingMessage() {
+    _stopGenTimer();
     if (streamingDiv) {
         streamingDiv.remove();
         streamingDiv = null;
@@ -2157,11 +2215,13 @@ function editMessage(msgId) {
                 image_path: allPaths.length > 0 ? allPaths : null,
             });
 
-            await loadMessages(State.currentConvId);
+            // Switch to and scroll to the new branch, then kick off generation
+            await switchToBranch(newMsg.id, newMsg.id);
+            hideRetryBar();  // loadMessages inside switchToBranch re-creates generate bar; hide it
+            hidePlanBar();
 
             if (State.ws && State.ws.readyState === WebSocket.OPEN) {
                 const count = State.branchCount || 1;
-                showGenStatus(count > 1 ? `Generating ${count} branches...` : 'Generating...');
                 _triggerParallelGenerate(count, newMsg.id);
             }
         } catch (err) {
@@ -2323,30 +2383,41 @@ function renderAskUserQuestion(questions, toolId) {
 }
 
 function renderPlanReady(plan, planFile, toolId) {
-    if (!streamingDiv) return;
-    const contentEl = streamingDiv.querySelector('.message-content');
+    // Show as a persistent bar in the messages container (not inside streamingDiv which
+    // gets destroyed on stream_end — by then the user hasn't had a chance to click anything).
+    hidePlanBar();
+    const container = document.getElementById('messages');
+    const bar = document.createElement('div');
+    bar.id = 'plan-bar';
+    bar.className = 'retry-bar plan-bar';
+    bar.innerHTML =
+        '<span class="plan-bar-label">Plan ready' +
+        (planFile ? ' — <code>' + escapeHtml(planFile) + '</code>' : '') + '</span>' +
+        '<button class="btn-small plan-action-btn approve" id="btn-plan-approve">Approve</button>' +
+        '<button class="btn-small plan-action-btn revise" id="btn-plan-revise">Revise</button>';
 
-    const block = document.createElement('div');
-    block.className = 'plan-block';
-    block.innerHTML = '<div class="plan-header">Plan Ready</div>' +
-        (planFile ? '<div class="plan-file">' + escapeHtml(planFile) + '</div>' : '') +
-        '<div class="plan-actions">' +
-        '<button class="plan-action-btn approve">Approve</button>' +
-        '<button class="plan-action-btn revise">Revise</button>' +
-        '</div>';
-
-    block.querySelector('.approve').addEventListener('click', () => {
-        document.getElementById('user-input').value = 'Approved, proceed with the plan.';
-        document.getElementById('user-input').focus();
+    bar.querySelector('#btn-plan-approve').addEventListener('click', () => {
+        hidePlanBar();
+        const input = document.getElementById('user-input');
+        input.value = 'Approved, proceed with the plan.';
+        sendMessage();
     });
-    block.querySelector('.revise').addEventListener('click', () => {
+    bar.querySelector('#btn-plan-revise').addEventListener('click', () => {
+        hidePlanBar();
         const input = document.getElementById('user-input');
         input.value = "I'd like to revise the plan: ";
         input.focus();
+        // Move cursor to end
+        input.selectionStart = input.selectionEnd = input.value.length;
     });
 
-    contentEl.appendChild(block);
+    container.appendChild(bar);
     scrollToBottom();
+}
+
+function hidePlanBar() {
+    const existing = document.getElementById('plan-bar');
+    if (existing) existing.remove();
 }
 
 // ── Code Block Preview ──

@@ -86,9 +86,13 @@ def _process_event(raw: dict) -> list[dict]:
         # Extract usage if present
         usage = message.get("usage", {})
         if usage:
+            # input_tokens only counts non-cached tokens; add cache reads for the true total
+            input_tok = (usage.get("input_tokens", 0)
+                         + usage.get("cache_read_input_tokens", 0)
+                         + usage.get("cache_creation_input_tokens", 0))
             events.append({
                 "type": "usage",
-                "input_tokens": usage.get("input_tokens", 0),
+                "input_tokens": input_tok,
                 "output_tokens": usage.get("output_tokens", 0),
             })
 
@@ -136,7 +140,7 @@ def _process_event(raw: dict) -> list[dict]:
     elif etype == "result":
         events.append({
             "type": "result",
-            "cost_usd": raw.get("cost_usd", 0),
+            "cost_usd": raw.get("total_cost_usd", raw.get("cost_usd", 0)),
             "duration_ms": raw.get("duration_ms", 0),
             "duration_api_ms": raw.get("duration_api_ms", 0),
             "num_turns": raw.get("num_turns", 1),

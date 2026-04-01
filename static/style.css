@@ -1858,6 +1858,17 @@ body::after {
     font-size: 12px;
     padding: 8px 0 0;
     opacity: 0.7;
+    display: flex;
+    align-items: center;
+    gap: 0;
+}
+.gen-stats {
+    margin-left: auto;
+    font-style: normal;
+    font-family: var(--font-mono, monospace);
+    font-size: 11px;
+    opacity: 0.75;
+    white-space: nowrap;
 }
 
 .message-actions button {
@@ -3394,6 +3405,25 @@ pre.tool-output {
     box-shadow: 0 0 8px rgba(0, 255, 255, 0.15);
 }
 
+/* ── Plan Bar (persistent approve/revise bar) ── */
+.plan-bar {
+    border-color: rgba(191, 0, 255, 0.3);
+    background: rgba(20, 5, 30, 0.92);
+}
+.plan-bar-label {
+    flex: 1;
+    font-size: 13px;
+    color: var(--text-secondary);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.plan-bar-label code {
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 11px;
+    color: var(--accent);
+}
+
 /* ── Plan Ready ── */
 .plan-block {
     background: rgba(191, 0, 255, 0.04);
@@ -3619,19 +3649,43 @@ pre.tool-output {
     }
     .tree-pill { max-width: 200px; }
 
-    /* Move token count below header on mobile */
+    /* Mobile header: 2-row layout */
     #app-header {
         flex-wrap: wrap;
     }
+    #header-left {
+        display: contents;
+    }
+    #header-separator, #conv-title {
+        display: none;
+    }
+    #breadcrumb-trail {
+        order: 10;
+        flex: 1 0 calc(100% - 70px);
+        max-width: calc(100% - 70px);
+        overflow-x: auto;
+        white-space: nowrap;
+    }
+    #btn-to-tree {
+        order: 11;
+    }
     #context-info {
+        order: 20;
         width: 100%;
         justify-content: center;
         padding: 2px 0 0;
         font-size: 10px;
     }
-    #breadcrumb-trail {
-        max-width: 60%;
+    /* Notification dropdown: full-width on mobile like bookmarks panel */
+    #notif-dropdown {
+        position: fixed;
+        top: 48px;
+        right: 8px;
+        left: 8px;
+        width: auto;
+        max-height: 50vh;
     }
+
     /* Tree toolbar mobile */
     #tree-toolbar {
         top: 8px;

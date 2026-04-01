@@ -1339,7 +1339,8 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
 
             if action == "cancel":
                 # Cancel all active generations for this conversation
-                for key in [k for k in _active_generations if k[0] == conv_id]:
+                cancelled_keys = [k for k in _active_generations if k[0] == conv_id]
+                for key in cancelled_keys:
                     task = _active_generations.pop(key, None)
                     if task:
                         task.cancel()
@@ -1349,6 +1350,13 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 for rid in list(_pending_hook_permissions):
                     if _pending_hook_permissions[rid].get("conv_id") == conv_id:
                         _pending_hook_permissions.pop(rid, None)
+                # Delete empty draft messages left by cancelled generations
+                for key in cancelled_keys:
+                    snap = _generation_snapshots.pop(key, None)
+                    if snap and snap.get("draft_msg_id"):
+                        msg = await db.get_message(snap["draft_msg_id"])
+                        if msg and not (msg.get("content") or "").strip():
+                            await db.delete_branch(snap["draft_msg_id"])
                 # Send cancelled event immediately so UI responds
                 await _ws_send(conv_id, {"type": "cancelled"})
                 continue
@@ -1735,6 +1743,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
             elif etype == "usage":
                 total_input_tokens += evt.get("input_tokens", 0)
                 total_output_tokens += evt.get("output_tokens", 0)
+                await _ws_send(conv_id, {"type": "usage", "input_tokens": total_input_tokens, "output_tokens": total_output_tokens})
 
             elif etype == "cc_raw_event":
                 # Forward unknown events to UI for debugging
@@ -1898,6 +1907,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 elif etype == "usage":
                     total_input_tokens += evt.get("input_tokens", 0)
                     total_output_tokens += evt.get("output_tokens", 0)
+                    await _ws_send(conv_id, {"type": "usage", "input_tokens": total_input_tokens, "output_tokens": total_output_tokens})
                 elif etype == "result":
                     result_info = evt
                     if not full_text and evt.get("result_text"):
@@ -1988,13 +1998,16 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
 
     except asyncio.CancelledError:
         _active_claude_procs.pop(conv_id, None)
-        # Save accumulated work to draft before cancelling
         if draft_msg_id and (full_text or content_blocks):
+            # Save accumulated work to draft before cancelling
             await db.update_message_content(
                 draft_msg_id, content=full_text,
                 content_blocks=json.dumps(content_blocks) if content_blocks else None,
             )
             print(f"[GEN] Saved partial draft {draft_msg_id} on cancel")
+        elif draft_msg_id:
+            # No content produced — delete empty draft to avoid phantoms
+            await db.delete_branch(draft_msg_id)
         await _ws_send(conv_id, {"type": "cancelled"})
     except Exception as e:
         _active_claude_procs.pop(conv_id, None)
