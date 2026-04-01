@@ -388,7 +388,14 @@ function handleWSMessage(data) {
             hideGenStatus();
             // Clear ghost node before tree refresh so it doesn't persist
             // Tree refreshes on stream_end/cancel/error to replace draft with final node
-            // Browser notification if tab is hidden
+            // Bell notification if user isn't watching the stream (on tree/home view, or tab hidden)
+            if (data.message && data.message.content?.trim()) {
+                const isWatching = streamingDiv && State.currentView === 'chat' && !document.hidden;
+                if (!isWatching) {
+                    addNotification(data.message);
+                }
+            }
+            // Browser push notification if tab is hidden
             if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
                 const convTitle = State.currentConv?.title || 'Conversation';
                 new Notification('A Shadow Loom', {
