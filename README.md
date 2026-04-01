@@ -21,12 +21,21 @@ Character cards, personas, lore files, style nudges, and incremental summarizati
 - Style nudge selection and repetition detection
 - Thinking model support (`<think>` stripping, content token counting)
 - Incremental context summarization via Gemma 3 1B on CPU
+- Multi-branch generation — generate 1-5 parallel responses per turn, pick the best
+- Tree-based branching — regenerate, edit, or fork at any point in the conversation
 
-#### OODA Harness — enabled by default
+#### OODA Harness
 
 The OODA (Observe-Orient-Decide-Act) harness is cognitive scaffolding that guides the model through a structured reasoning loop before writing each response. Inspired by [metacog](https://github.com/inanna-malick/metacog) (tools as cognitive scaffolding — LLMs treat tool results as ground truth) and [popup-mcp](https://tidepool.leaflet.pub/3mcbegnuf2k2i) (amortize latency into fewer, richer passes).
 
-**How it works:** Before generating RP prose, the model emits a structured `<ooda>` block containing observations about what happened, state reads to refresh its understanding of characters and scenes, orientation reasoning about how characters would react, state updates for any changes (mood shifts, scene evolution), and a decision plan for the response. The server parses this block, executes the state operations, and the model writes its prose grounded in the analysis.
+**The loop:** Before generating RP prose, the model emits a structured `<ooda>` block. The server parses this block, executes the state operations against the database, and returns the results. The model then writes its prose grounded in fresh state reads rather than stale context.
+
+1. **Observe** — read the current state of characters, scenes, and relationships from the database
+2. **Orient** — reason about what changed, how characters would react, what the scene demands
+3. **Decide** — plan the response: what happens, who speaks, what shifts
+4. **Act** — execute state updates (mood changes, location shifts, relationship evolution) and write the prose
+
+Each step appears as a collapsible tool block in the conversation, so you can see exactly what the model observed, how it reasoned, and what state it changed.
 
 **State cards** are persistent, structured data that track the evolving state of the RP:
 
@@ -37,15 +46,13 @@ The OODA (Observe-Orient-Decide-Act) harness is cognitive scaffolding that guide
 
 **Three-tier state hierarchy:**
 
-1. **Tier 1 (Character Global)** — baseline state cards defined on the character itself. Editable from the home page via the ▣ button. These are the template that gets copied when a character enters a conversation.
+1. **Tier 1 (Character Global)** — baseline state cards defined on the character itself. Editable from the home page via the state button. These are the template that gets copied when a character enters a conversation.
 2. **Tier 2 (Conversation)** — copied from Tier 1 when OODA is enabled. Represents the starting state for the conversation. Stays pristine as the base.
 3. **Tier 3 (Branch Deltas)** — state changes are saved as deltas on each assistant message, not applied to the base. Different branches see different state. When you navigate a branch, the effective state is reconstructed: base cards + deltas along the branch path.
 
-**Visibility:** OODA steps appear as collapsible tool blocks in the conversation (Observe, Orient, Decide). The δ Branch State button in the chat view shows the effective state for the current branch. The ▣ button in the tree view shows the base conversation state.
+State cards are editable inline — click any field value to edit, changes auto-save. The model reads them on the next turn, so manual edits steer the story.
 
-**State cards are editable:** Click any field value to edit inline. Changes auto-save with a visual indicator. The model reads these on the next turn, so manual edits steer the story.
-
-### Braid — Claude Code powered by any Ollama model
+### Braid — Claude Code powered by local models
 
 The full Claude Code harness running on a local model via [`ollama launch claude`](https://docs.ollama.com/integrations/claude-code). Same tools, same permissions, same UI — just running on your hardware.
 
@@ -69,26 +76,51 @@ Connects to the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code
 - Per-turn and cumulative cost tracking
 - Image attachments via the Read tool or clipboard paste (Ctrl+V)
 
+#### Ollama model switching
+
+Loom and Braid conversations can switch between Anthropic and local Ollama models mid-conversation. The model dropdown shows both Anthropic models (Sonnet, Opus, Haiku) and available Ollama models (currently filtered to the qwen3.5 family). When an Ollama model is selected, the effort selector hides (local models don't support Anthropic's thinking effort parameter).
+
+On provider switch, the session resume is skipped for one turn to avoid thinking block signature conflicts — the Anthropic API cryptographically signs thinking blocks, and blocks from local models don't carry valid signatures. The conversation falls back to a database history rebuild for that single transition turn, then resumes normally.
+
 > **Note:** `AskUserQuestion` is disabled in Loom's CC modes. CC's headless `-p` mode has no mechanism to send user responses back to an active `AskUserQuestion` tool call — stdin is closed after the initial prompt. This is an [open feature request](https://github.com/anthropics/claude-code/issues/16712) in Claude Code. When CC adds support for `--input-format stream-json` responses to pending tool calls, Loom can re-enable interactive questions. Until then, CC proceeds with its best judgment instead of asking.
 
 ## Common features
 
 All three modes share the same conversation infrastructure:
 
-- **Tree-based conversations** — Every message is a node. Branch at any point, explore alternate paths, switch between branches. Nothing is lost. Branch names use Unicode Greek letters (`2α.4β.6`).
+- **Tree-based conversations** — Every message is a node. Branch at any point, explore alternate paths, switch between branches. Nothing is lost. Branch names use Unicode Greek letters (`2a.4b.6`).
 - **Fork and branch** — Fork from any message to create a new conversation. Regenerate creates a sibling branch, preserving the original. Edit any message to create a new branch — including the root.
 - **Ghost nodes** — Active generations appear as pulsing nodes on the tree in real time, so you always know where a response is growing.
 - **Child branch hints** — When viewing a message with responses on other branches, clickable hints show where they are.
 - **Tree visualization** — Interactive pan/zoom canvas with horizontal or vertical layout toggle (persists across reloads).
+- **Bookmarks** — Bookmark any message or branch for quick access later.
+- **Conversation filtering** — Filter conversations by mode (All / Weave / Braid / Loom) on the home page.
 - **Import / export** — Characters, personas, lore (.md) and conversations (.json).
 - **Streaming generation** — Real-time token streaming over WebSocket with live token rate and tool success/error indicators.
 - **Background generation** — Navigate away mid-generation, come back later. Responses are saved progressively and survive reconnects, tab switches, and server restarts.
-- **Browser notifications** — Get notified when a response completes while the tab is in the background.
+- **Notifications** — Bell icon with dropdown for completed generations and permission requests. Browser push notifications when the tab is in the background (plan completions, stream completions on followed conversations).
 - **Image detection** — Images referenced in responses are detected and displayed inline with filename captions and click-to-preview.
 - **Clipboard paste** — Ctrl+V to paste images directly into the chat.
 - **Message queuing** — Send your next message while the model is still responding.
-- **HTTPS / Tailscale** — Serves over HTTPS with auto-detected SSL certs for secure access across your network.
+- **Per-tab state** — Each browser tab remembers its own conversation and view, surviving refreshes without cross-tab interference.
+- **HTTPS / Tailscale** — Serves on `0.0.0.0` over HTTPS with auto-detected SSL certs for secure access across your Tailscale network.
 - **WebGL black hole** — Schwarzschild raytracer background with procedural galaxy texture and glassmorphism UI.
+
+## Session management (CC modes)
+
+Loom and Braid use Claude Code's session system for efficient multi-turn conversations:
+
+- **Fork-every-turn** — Every generation uses `--resume <parent_session> --fork-session`. Each assistant message gets its own immutable session snapshot. This means any message is forkable: branching, editing, and regenerating all work because every turn is its own snapshot.
+- **Progressive drafts** — A draft message is created in the database immediately when generation starts, updated with content blocks as tools execute, and finalized on stream end. Navigate away and come back — the draft is still there.
+- **History rebuild fallback** — When no session exists to resume (first message, or after a provider switch), the full conversation history is rebuilt from the database and sent as a single prompt. Tool call inputs and outputs are included (truncated to 2000 characters each).
+
+## Admin server
+
+A lightweight admin dashboard (`admin_server.py`) runs on port 3002 and provides:
+
+- Status monitoring for all Loom instances (main on 3000, test on 3001)
+- Graceful shutdown, start, and restart actions per instance
+- Auto-refreshing dashboard at `http://localhost:3002`
 
 ## Quick start
 
@@ -106,38 +138,45 @@ python server.py
 
 Open `https://localhost:3000` in your browser.
 
-For Claude mode, ensure the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) is installed and on PATH with an active API key.
+For Loom mode, ensure the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) is installed and on PATH with an active API key.
 
-For Local mode, ensure [Ollama](https://ollama.com) is installed with a model pulled (e.g. `ollama pull qwen3.5:9b`).
+For Braid/Weave modes, ensure [Ollama](https://ollama.com) is installed with a model pulled (e.g. `ollama pull qwen3.5:9b`).
+
+Optional: start the admin server for instance management:
+
+```bash
+python admin_server.py  # dashboard on http://localhost:3002
+```
 
 ## Project structure
 
 ```
-server.py              — FastAPI server, WebSocket streaming, REST endpoints
-database.py            — SQLite schema, message tree CRUD, branch management
-config.py              — Configuration (model, context budget, SSL, generation params)
-prompt_engine.py       — System prompt assembly, repetition detection, style nudges
-context_manager.py     — Token counting, rolling summary, context window management
-ooda_harness.py        — OODA loop: XML parser, state executors, prompt builder
-character_loader.py    — Parse/save character, persona, and lore .md files
-ollama_client.py       — Ollama API client (chat streaming, image description)
-claude_client.py       — Claude Code CLI subprocess wrapper, NDJSON stream parser
-cc_permission_hook.py  — PreToolUse hook script for browser-based permission prompts
-local_summary.py       — Gemma 3 1B via llama-cpp-python for CPU summarization
+server.py              -- FastAPI server, WebSocket streaming, REST endpoints
+database.py            -- SQLite schema, message tree CRUD, branch management
+config.py              -- Configuration (model, context budget, SSL, generation params)
+prompt_engine.py       -- System prompt assembly, repetition detection, style nudges
+context_manager.py     -- Token counting, rolling summary, context window management
+ooda_harness.py        -- OODA loop: XML parser, state executors, prompt builder
+character_loader.py    -- Parse/save character, persona, and lore .md files
+ollama_client.py       -- Ollama API client (chat streaming, image description)
+claude_client.py       -- Claude Code CLI subprocess wrapper, NDJSON stream parser
+cc_permission_hook.py  -- PreToolUse hook script for browser-based permission prompts
+admin_server.py        -- Admin dashboard for managing Loom instances
+local_summary.py       -- Gemma 3 1B via llama-cpp-python for CPU summarization
 
 static/
-  index.html           — Single-page app shell
-  app.js               — State management, home view, character/persona/lore CRUD
-  chat.js              — WebSocket chat, message rendering, streaming, branching
-  tree.js              — Interactive tree visualization (pan/zoom/expand)
-  style.css            — Acidburn aesthetic (glassmorphism, cyan/purple palette)
-  blackhole.js         — Schwarzschild raytracer (pre-compiled GLSL)
-  acidburn-galaxy.js   — Procedural galaxy texture generator
+  index.html           -- Single-page app shell
+  app.js               -- State management, home view, character/persona/lore CRUD
+  chat.js              -- WebSocket chat, message rendering, streaming, branching
+  tree.js              -- Interactive tree visualization (pan/zoom/expand)
+  style.css            -- Acidburn aesthetic (glassmorphism, cyan/purple palette)
+  blackhole.js         -- Schwarzschild raytracer (pre-compiled GLSL)
+  acidburn-galaxy.js   -- Procedural galaxy texture generator
 
-characters/            — Character definition files (.md)
-personas/              — User persona files (.md)
-lore/                  — Lore/history context files (.md)
-certs/                 — SSL certificates (auto-detected, gitignored)
+characters/            -- Character definition files (.md)
+personas/              -- User persona files (.md)
+lore/                  -- Lore/history context files (.md)
+certs/                 -- SSL certificates (auto-detected, gitignored)
 ```
 
 ## Configuration
@@ -147,7 +186,7 @@ Settings are adjustable from the UI (gear icon) or by editing `config.py`:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `ollama_host` | `http://localhost:11434` | Ollama server address |
-| `ollama_model` | `qwen3.5:9b` | Model for generation |
+| `ollama_model` | `qwen3.5:9b` | Default model for Weave generation |
 | `max_context_tokens` | `32768` | Context window budget |
 | `verbatim_window` | `6` | Recent messages kept verbatim |
 | `temperature` | `0.8` | Generation temperature |
@@ -184,7 +223,14 @@ assistant: Character responds in their style
 
 Characters, personas, and lore can also be created, edited, and imported/exported from the home page UI.
 
+## Data safety
+
+- **SQLite WAL mode** — the database uses Write-Ahead Logging for crash resilience
+- **WAL checkpoint on shutdown** — the `/shutdown` endpoint checkpoints the WAL before closing, ensuring all data is flushed to the main database file
+- **Graceful restart** — the admin server and restart script use the `/shutdown` endpoint rather than force-killing the process
+
 ## Credits
 
 - Black hole raytracer based on [pyokosmeme/black-hole](https://github.com/pyokosmeme/black-hole)
 - Summarization via [Gemma 3 1B IT](https://huggingface.co/google/gemma-3-1b-it) (abliterated Q4_K_M quantization)
+- OODA harness inspired by [metacog](https://github.com/inanna-malick/metacog) and [popup-mcp](https://tidepool.leaflet.pub/3mcbegnuf2k2i)
