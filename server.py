@@ -39,6 +39,8 @@ async def lifespan(app):
     await db.init_db()
     # Clean up stale draft messages (empty assistant msgs older than 30 min)
     await _cleanup_stale_drafts()
+    # Ensure Ollama is running (launches it if not)
+    asyncio.create_task(_ensure_ollama())
     # Preload Gemma 3 1B for CPU summarization (downloads ~806MB on first run)
     asyncio.create_task(_preload_summarizer())
     yield
@@ -60,6 +62,47 @@ async def _cleanup_stale_drafts():
         for msg_id in ids:
             await db.delete_branch(msg_id)
     await conn.close()
+
+
+async def _ensure_ollama():
+    """Check if Ollama is running; launch it in the background if not."""
+    import shutil
+    import subprocess
+    try:
+        status = await health_check()
+        if status.get("status") == "ok":
+            print(f"[STARTUP] Ollama already running — {len(status.get('models', []))} model(s) available")
+            return
+    except Exception:
+        pass
+
+    ollama_path = shutil.which("ollama")
+    if not ollama_path:
+        print("[STARTUP] Ollama not found on PATH — skipping auto-launch")
+        return
+
+    print(f"[STARTUP] Ollama not responding — launching: {ollama_path} serve")
+    try:
+        subprocess.Popen(
+            [ollama_path, "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
+                        | getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        # Wait for it to come up (up to 15s)
+        for i in range(15):
+            await asyncio.sleep(1)
+            try:
+                status = await health_check()
+                if status.get("status") == "connected":
+                    print(f"[STARTUP] Ollama ready after {i+1}s — {len(status.get('models', []))} model(s)")
+                    return
+            except Exception:
+                pass
+        print("[STARTUP] Ollama launched but not yet responding after 15s — will retry on first use")
+    except Exception as e:
+        print(f"[STARTUP] Failed to launch Ollama: {e}")
 
 
 async def _preload_summarizer():
