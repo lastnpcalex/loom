@@ -1506,6 +1506,12 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
             for msg in reversed(branch):
                 if msg["role"] == "assistant" and msg.get("cc_session_id"):
                     resume_session_id = msg["cc_session_id"]
+                    # Check if the session was created by a different provider
+                    prev_model = msg.get("cc_model_used", "")
+                    prev_was_ollama = prev_model and prev_model not in _ANTHROPIC_MODELS
+                    if prev_was_ollama != use_ollama:
+                        print(f"[CC] Provider switch ({prev_model} -> {cc_model}), skipping session resume")
+                        resume_session_id = None
                     break
 
         if resume_session_id:
@@ -1974,6 +1980,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
             turn_input_tokens=input_tokens,
             turn_output_tokens=output_tokens,
             cc_session_id=new_session_id or None,
+            cc_model_used=cc_model,
         )
         msg = await db.get_message(draft_msg_id)
 
@@ -2082,10 +2089,10 @@ def _build_claude_history_prompt(branch: list[dict]) -> str:
                     elif block.get("type") == "tool_use":
                         tool_summary = f"[Used tool: {block.get('name', 'unknown')}]"
                         if block.get("input"):
-                            inp = block["input"][:500] if len(block.get("input", "")) > 500 else block.get("input", "")
+                            inp = block["input"][:2000] if len(block.get("input", "")) > 2000 else block.get("input", "")
                             tool_summary += f"\nInput: {inp}"
                         if block.get("result"):
-                            res = block["result"][:500] if len(block.get("result", "")) > 500 else block.get("result", "")
+                            res = block["result"][:2000] if len(block.get("result", "")) > 2000 else block.get("result", "")
                             tool_summary += f"\nResult: {res}"
                         parts.append(tool_summary)
                 history_parts.append(f"Assistant: {chr(10).join(parts)}")

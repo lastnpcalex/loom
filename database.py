@@ -190,6 +190,8 @@ async def _run_migrations(db):
         "ALTER TABLE conversations ADD COLUMN ooda_enabled INTEGER DEFAULT 0",
         # Tier 3: branch-level state deltas stored per assistant message
         "ALTER TABLE messages ADD COLUMN state_deltas TEXT",
+        # Track which model generated each message (for provider switch detection)
+        "ALTER TABLE messages ADD COLUMN cc_model_used TEXT",
     ]
     for sql in migrations:
         try:
@@ -442,7 +444,8 @@ async def update_message_content(msg_id: int, content: str = None,
                                   turn_cost_usd: float = None,
                                   turn_input_tokens: int = None,
                                   turn_output_tokens: int = None,
-                                  cc_session_id: str = None):
+                                  cc_session_id: str = None,
+                                  cc_model_used: str = None):
     """Update a message's content and metadata (used for draft → final)."""
     db = await get_db()
     updates = []
@@ -467,6 +470,9 @@ async def update_message_content(msg_id: int, content: str = None,
     if cc_session_id is not None:
         updates.append("cc_session_id = ?")
         params.append(cc_session_id)
+    if cc_model_used is not None:
+        updates.append("cc_model_used = ?")
+        params.append(cc_model_used)
     if updates:
         params.append(msg_id)
         await db.execute(
