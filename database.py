@@ -141,6 +141,11 @@ async def get_db() -> aiosqlite.Connection:
 async def close_db():
     global _db
     if _db:
+        print("[DB] Checkpointing WAL before close...")
+        try:
+            await _db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception as e:
+            print(f"[DB] WAL checkpoint failed: {e}")
         print("[DB] Closing shared connection")
         await _db.close()
         _db = None

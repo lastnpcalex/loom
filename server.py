@@ -77,7 +77,8 @@ _server_ref: list = []  # holds uvicorn.Server for shutdown
 
 @app.post("/shutdown")
 async def shutdown():
-    """Gracefully stop this server instance."""
+    """Gracefully stop this server instance — checkpoints WAL first."""
+    await db.close_db()  # checkpoints WAL + closes connection
     if _server_ref:
         _server_ref[0].should_exit = True
         return JSONResponse({"status": "shutting down"})
@@ -1724,6 +1725,11 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                     "plan_file": evt.get("plan_file", ""),
                     "tool_id": evt.get("tool_id", ""),
                 })
+                # Global notification for plan completion
+                conv_title = conv.get("title", "Conversation")
+                await _ws_broadcast_all({"type": "plan_landed", "conv_id": conv_id,
+                                          "conv_title": conv_title,
+                                          "plan_file": evt.get("plan_file", "")})
 
             elif etype == "tool_result":
                 result_content = evt.get("content", "")

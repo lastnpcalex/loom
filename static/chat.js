@@ -307,6 +307,13 @@ function handleWSMessage(data) {
 
         case 'plan_ready':
             renderPlanReady(data.plan, data.plan_file, data.tool_id);
+            // Browser push if tab hidden (bell handled by plan_landed broadcast)
+            if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+                new Notification('A Shadow Loom — Plan Ready', {
+                    body: 'Plan awaiting review' + (data.plan_file ? ': ' + data.plan_file : ''),
+                    icon: '/static/img/loom-ico-transparent.png',
+                });
+            }
             break;
 
         case 'permission_request':
@@ -357,6 +364,30 @@ function handleWSMessage(data) {
             if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
                 new Notification('A Shadow Loom', {
                     body: `${data.conv_title || 'Conversation'} — response complete`,
+                    icon: '/static/img/loom-ico-transparent.png',
+                });
+            }
+            break;
+        }
+
+        case 'plan_landed': {
+            const isCurrentConv = data.conv_id === State.currentConvId;
+            const isWatching = isCurrentConv && State.currentView === 'chat' && !document.hidden;
+            if (!isWatching) {
+                _notifications.push({
+                    type: 'branch',
+                    id: Date.now(),
+                    convId: data.conv_id,
+                    convTitle: data.conv_title || 'Conversation',
+                    parentId: null,
+                    preview: 'Plan ready' + (data.plan_file ? ' — ' + data.plan_file : ''),
+                    time: new Date(),
+                });
+                _renderNotifBell();
+            }
+            if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+                new Notification('A Shadow Loom — Plan Ready', {
+                    body: `${data.conv_title || 'Conversation'} — plan awaiting review`,
                     icon: '/static/img/loom-ico-transparent.png',
                 });
             }
