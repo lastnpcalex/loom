@@ -3541,11 +3541,11 @@ pre.tool-output {
     margin-top: 4px;
     max-height: 400px;
     overflow-y: auto;
-    background: rgba(5, 5, 15, 0.95);
+    background: rgba(2, 2, 8, 0.97);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
-    backdrop-filter: var(--glass);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.8);
+    backdrop-filter: blur(16px) saturate(1.4);
 }
 .search-result-item {
     padding: 10px 14px;
@@ -3584,12 +3584,14 @@ pre.tool-output {
 }
 .search-result-badge {
     font-size: 9px;
-    padding: 1px 5px;
+    padding: 2px 6px;
     border-radius: 6px;
     text-transform: uppercase;
     font-weight: 600;
     letter-spacing: 0.5px;
     flex-shrink: 0;
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-muted);
 }
 .search-result-badge.weave { background: rgba(0,255,255,0.15); color: var(--cyan); }
 .search-result-badge.local { background: rgba(100,200,100,0.15); color: #7ddf7d; }
@@ -3837,16 +3839,56 @@ pre.tool-output {
         max-height: 50vh;
     }
 
+    /* Home search mobile */
+    #home-search-input {
+        background: rgba(2, 2, 8, 0.95);
+        font-size: 15px;
+        padding: 10px 12px;
+    }
+    #home-search-results {
+        position: fixed;
+        top: auto;
+        left: 8px;
+        right: 8px;
+        max-height: 60vh;
+        background: rgba(2, 2, 8, 0.98);
+    }
+
     /* Tree toolbar mobile */
     #tree-toolbar {
         top: 8px;
         right: 8px;
-        gap: 6px;
+        left: 8px;
+        gap: 4px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        background: rgba(2, 2, 8, 0.85);
+        padding: 6px;
+        border-radius: var(--radius);
+        border: 1px solid var(--border);
     }
     #tree-toolbar button {
         width: 32px;
         height: 32px;
         font-size: 16px;
+    }
+    #tree-search-input {
+        width: 100%;
+        order: 20;
+        height: 32px;
+        font-size: 14px;
+        background: rgba(2, 2, 8, 0.95);
+    }
+    #tree-search-input:focus {
+        width: 100%;
+    }
+    #tree-search-nav {
+        order: 21;
+        width: 100%;
+        justify-content: center;
+    }
+    #tree-search-separator {
+        display: none;
     }
     #bookmarks-panel {
         top: 48px;
