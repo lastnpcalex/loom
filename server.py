@@ -1486,7 +1486,9 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
         cc_model = conv.get("cc_model") or "sonnet"
         cc_effort = conv.get("cc_effort") or "high"
         cc_permission_mode = conv.get("cc_permission_mode") or "default"
-        use_ollama = conv.get("_use_ollama", False)
+        # Anthropic model names are short aliases; anything else is an Ollama model
+        _ANTHROPIC_MODELS = {"sonnet", "opus", "haiku"}
+        use_ollama = conv.get("_use_ollama", False) or cc_model not in _ANTHROPIC_MODELS
 
         # --- Session resume logic ---
         # Every turn uses --resume + --fork-session. Each assistant message

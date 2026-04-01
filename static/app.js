@@ -886,11 +886,13 @@ function updateInlineCCControls(conv) {
         const modelSel = document.getElementById('cc-model-inline');
         const effortSel = document.getElementById('cc-effort-inline');
         const permSel = document.getElementById('cc-permission-mode-inline');
-        modelSel.value = conv.cc_model || 'sonnet';
+        const ccModel = conv.cc_model || 'sonnet';
+        modelSel.value = ccModel;
         effortSel.value = conv.cc_effort || 'high';
         if (permSel) permSel.value = conv.cc_permission_mode || 'default';
+        const isAnthropicModel = ['sonnet', 'opus', 'haiku'].includes(ccModel);
         modelSel.style.display = conv.mode === 'local' ? 'none' : '';
-        effortSel.style.display = conv.mode === 'local' ? 'none' : '';
+        effortSel.style.display = (conv.mode === 'local' || !isAnthropicModel) ? 'none' : '';
         statePanelChat?.classList.add('hidden');
     } else if (conv && conv.mode === 'weave') {
         controls.classList.add('hidden');
@@ -981,8 +983,37 @@ function initInlineCCControls() {
         } catch { showToast('Failed to update', 'error'); }
     }
 
-    modelSel.addEventListener('change', () => saveCC('cc_model', modelSel.value));
+    const _ANTHROPIC_MODELS = new Set(['sonnet', 'opus', 'haiku']);
+
+    function _syncEffortVisibility(model) {
+        effortSel.style.display = _ANTHROPIC_MODELS.has(model) ? '' : 'none';
+    }
+
+    modelSel.addEventListener('change', () => {
+        saveCC('cc_model', modelSel.value);
+        _syncEffortVisibility(modelSel.value);
+    });
     effortSel.addEventListener('change', () => saveCC('cc_effort', effortSel.value));
+
+    // Populate Ollama models (qwen3.5 family) into the dropdown
+    (async () => {
+        try {
+            const data = await API.get('/api/ollama/models');
+            const models = (data.models || []).map(m => m.name || m);
+            const qwenModels = models.filter(m => /qwen.*3\.5/i.test(m) || /qwen3\.5/i.test(m));
+            if (qwenModels.length > 0) {
+                const grp = document.createElement('optgroup');
+                grp.label = 'Ollama';
+                for (const name of qwenModels) {
+                    const opt = document.createElement('option');
+                    opt.value = name;
+                    opt.textContent = name;
+                    grp.appendChild(opt);
+                }
+                modelSel.appendChild(grp);
+            }
+        } catch { /* Ollama not available — no local models shown */ }
+    })();
 
     const permSel = document.getElementById('cc-permission-mode-inline');
     if (permSel) permSel.addEventListener('change', () => saveCC('cc_permission_mode', permSel.value));
@@ -1659,19 +1690,47 @@ function setupEventListeners() {
         });
     });
 
-    // Model selection — disable "max" effort when not opus
+    // Model selection — disable "max" effort when not opus, hide effort for Ollama
+    const _MODAL_ANTHROPIC = new Set(['sonnet', 'opus', 'haiku']);
     document.getElementById('cc-model').addEventListener('change', () => {
         const model = document.getElementById('cc-model').value;
-        const maxOpt = document.querySelector('#cc-effort option[value="max"]');
-        if (model !== 'opus') {
-            maxOpt.disabled = true;
-            if (document.getElementById('cc-effort').value === 'max') {
-                document.getElementById('cc-effort').value = 'high';
-            }
+        const effortGroup = document.getElementById('cc-effort-group');
+        if (!_MODAL_ANTHROPIC.has(model)) {
+            effortGroup.classList.add('hidden');
         } else {
-            maxOpt.disabled = false;
+            effortGroup.classList.remove('hidden');
+            const maxOpt = document.querySelector('#cc-effort option[value="max"]');
+            if (model !== 'opus') {
+                maxOpt.disabled = true;
+                if (document.getElementById('cc-effort').value === 'max') {
+                    document.getElementById('cc-effort').value = 'high';
+                }
+            } else {
+                maxOpt.disabled = false;
+            }
         }
     });
+
+    // Populate Ollama models (qwen3.5 family) into the new-conversation modal dropdown
+    (async () => {
+        try {
+            const data = await API.get('/api/ollama/models');
+            const models = (data.models || []).map(m => m.name || m);
+            const qwenModels = models.filter(m => /qwen.*3\.5/i.test(m) || /qwen3\.5/i.test(m));
+            if (qwenModels.length > 0) {
+                const sel = document.getElementById('cc-model');
+                const grp = document.createElement('optgroup');
+                grp.label = 'Ollama';
+                for (const name of qwenModels) {
+                    const opt = document.createElement('option');
+                    opt.value = name;
+                    opt.textContent = name;
+                    grp.appendChild(opt);
+                }
+                sel.appendChild(grp);
+            }
+        } catch { /* Ollama unavailable */ }
+    })();
 
     // Browse directory button
     document.getElementById('btn-browse-dir').addEventListener('click', () => {
