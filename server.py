@@ -1270,6 +1270,19 @@ async def _ws_send(conv_id: int, data: dict):
             dead.append(ws)
     for ws in dead:
         clients.discard(ws)
+
+
+async def _ws_broadcast_all(data: dict):
+    """Broadcast to ALL active WebSockets across ALL conversations."""
+    dead_pairs = []
+    for cid, clients in _active_websockets.items():
+        for ws in clients:
+            try:
+                await ws.send_json(data)
+            except Exception:
+                dead_pairs.append((cid, ws))
+    for cid, ws in dead_pairs:
+        _active_websockets.get(cid, set()).discard(ws)
     if not clients:
         _active_websockets.pop(conv_id, None)
 
@@ -1995,6 +2008,11 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
         if detected_images:
             end_msg["images"] = detected_images
         await _ws_send(conv_id, end_msg)
+        # Notify all connected clients (cross-conversation bell)
+        conv_title = conv.get("title", "Conversation")
+        preview = (full_text or "").replace("#", "").replace("*", "").strip()[:120]
+        await _ws_broadcast_all({"type": "branch_landed", "conv_id": conv_id, "conv_title": conv_title,
+                                  "message_id": draft_msg_id, "preview": preview})
 
     except asyncio.CancelledError:
         _active_claude_procs.pop(conv_id, None)
@@ -2255,6 +2273,10 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
             await db.save_state_deltas(draft_msg_id, ooda["updates"])
         asyncio.create_task(_background_summarize_message(draft_msg_id, final_prose, "assistant", conv_id=conv_id))
         await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
+        conv_title = conv.get("title", "Conversation")
+        preview = (final_prose or "").replace("#", "").replace("*", "").strip()[:120]
+        await _ws_broadcast_all({"type": "branch_landed", "conv_id": conv_id, "conv_title": conv_title,
+                                  "message_id": draft_msg_id, "preview": preview})
 
     except asyncio.CancelledError:
         if draft_msg_id:
@@ -2444,6 +2466,10 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
             "type": "stream_end",
             "message": dict(msg),
         })
+        conv_title = conv.get("title", "Conversation")
+        preview = (full_response or "").replace("#", "").replace("*", "").strip()[:120]
+        await _ws_broadcast_all({"type": "branch_landed", "conv_id": conv_id, "conv_title": conv_title,
+                                  "message_id": draft_msg_id, "preview": preview})
 
     except asyncio.CancelledError:
         # Clean up draft on cancel

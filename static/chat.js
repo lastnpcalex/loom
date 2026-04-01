@@ -337,6 +337,32 @@ function handleWSMessage(data) {
             console.log('[CC debug]', data.event_type, data.data);
             break;
 
+        case 'branch_landed': {
+            // Global notification — a generation completed somewhere (maybe another conversation)
+            const isCurrentConv = data.conv_id === State.currentConvId;
+            const isWatching = isCurrentConv && State.currentView === 'chat' && !document.hidden;
+            if (!isWatching) {
+                _notifications.push({
+                    type: 'branch',
+                    id: data.message_id,
+                    convId: data.conv_id,
+                    convTitle: data.conv_title || 'Conversation',
+                    parentId: null,
+                    preview: (data.preview || '').slice(0, 120),
+                    time: new Date(),
+                });
+                _renderNotifBell();
+            }
+            // Browser push if tab hidden
+            if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+                new Notification('A Shadow Loom', {
+                    body: `${data.conv_title || 'Conversation'} — response complete`,
+                    icon: '/static/img/loom-ico-transparent.png',
+                });
+            }
+            break;
+        }
+
         case 'state_update':
             // OODA harness updated branch state — refresh with branch-aware data
             if (State.currentConvId) {
@@ -361,11 +387,8 @@ function handleWSMessage(data) {
             const allDone = !State._parallelCount;
 
             if (!isFollowed) {
-                // Parallel sibling finished — refresh tree, notify user
+                // Parallel sibling finished — refresh tree (bell handled by branch_landed)
                 refreshTree();
-                if (data.message && data.message.content?.trim()) {
-                    addNotification(data.message);
-                }
                 // If the completed message is on our current branch (e.g. user navigated
                 // to a draft that just finished), reload messages to show the content
                 if (data.message && data.message.id) {
@@ -388,21 +411,7 @@ function handleWSMessage(data) {
             hideGenStatus();
             // Clear ghost node before tree refresh so it doesn't persist
             // Tree refreshes on stream_end/cancel/error to replace draft with final node
-            // Bell notification if user isn't watching the stream (on tree/home view, or tab hidden)
-            if (data.message && data.message.content?.trim()) {
-                const isWatching = streamingDiv && State.currentView === 'chat' && !document.hidden;
-                if (!isWatching) {
-                    addNotification(data.message);
-                }
-            }
-            // Browser push notification if tab is hidden
-            if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-                const convTitle = State.currentConv?.title || 'Conversation';
-                new Notification('A Shadow Loom', {
-                    body: `${convTitle} — response complete`,
-                    icon: '/static/img/loom-ico-transparent.png',
-                });
-            }
+            // Bell + browser push now handled by branch_landed (global broadcast)
             if (streamingDiv) {
                 finalizeStreamingMessage(data.message, data.cost);
                 // Images are detected client-side in createMessageElement
@@ -1195,8 +1204,7 @@ function _initNotifications() {
     });
     document.getElementById('notif-clear').addEventListener('click', (e) => {
         e.stopPropagation();
-        _notifications.length = 0;
-        _renderNotifBell();
+        dropdown.classList.add('hidden');
     });
     // Close dropdown on outside click
     document.addEventListener('click', (e) => {
