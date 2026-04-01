@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=90">
+    <link rel="stylesheet" href="/static/style.css?v=91">
 </head>
 <body>
     <div id="blackhole-container"></div>
@@ -84,6 +84,10 @@
                             <button class="btn-small" id="btn-new-conv-home">+ New</button>
                         </div>
                     </div>
+                    <div id="home-search-container">
+                        <input type="text" id="home-search-input" placeholder="Search conversations..." autocomplete="off" spellcheck="false">
+                        <div id="home-search-results" class="hidden"></div>
+                    </div>
                     <div id="conv-filter-bar">
                         <button class="conv-filter-btn active" data-filter="all">All</button>
                         <button class="conv-filter-btn" data-filter="weave" title="Structured roleplay with local models">Weave</button>
@@ -141,6 +145,14 @@
                 <button id="tree-center-btn" title="Fit all nodes in view">⌖</button>
                 <button id="btn-state-panel-tree" title="State Cards" class="hidden">▣</button>
                 <button id="btn-tree-last-branch" title="Return to last branch">↩</button>
+                <div id="tree-search-separator" style="width:1px;height:20px;background:var(--border);margin:0 4px;"></div>
+                <input type="text" id="tree-search-input" placeholder="Search..." autocomplete="off" spellcheck="false" class="hidden">
+                <div id="tree-search-nav" class="hidden">
+                    <span id="tree-search-count"></span>
+                    <button id="tree-search-prev" title="Previous match">&#9650;</button>
+                    <button id="tree-search-next" title="Next match">&#9660;</button>
+                </div>
+                <button id="tree-search-btn" title="Search tree">&#8981;</button>
             </div>
             <div id="tree-state-sidebar" class="hidden">
                 <div class="tree-state-header">
@@ -478,8 +490,8 @@ assistant: *Another example response*"></textarea>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=13"></script>
-    <script src="/static/app.js?v=65"></script>
+    <script src="/static/app.js?v=66"></script>
     <script src="/static/chat.js?v=114"></script>
-    <script src="/static/tree.js?v=31"></script>
+    <script src="/static/tree.js?v=32"></script>
 </body>
 </html>

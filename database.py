@@ -348,6 +348,52 @@ async def list_conversations() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def search_conversations(query: str, limit: int = 20) -> list[dict]:
+    """Search across all conversations by title and message content."""
+    db = await get_db()
+    pattern = f"%{query}%"
+    rows = await db.execute_fetchall(
+        """SELECT c.id as conversation_id, c.title, c.mode,
+                  m.id as message_id, m.role,
+                  substr(m.content,
+                         max(1, instr(lower(m.content), lower(?)) - 80),
+                         200) as snippet
+           FROM messages m
+           JOIN conversations c ON c.id = m.conversation_id
+           WHERE m.content LIKE ?
+           UNION
+           SELECT c.id as conversation_id, c.title, c.mode,
+                  NULL as message_id, NULL as role,
+                  c.title as snippet
+           FROM conversations c
+           WHERE c.title LIKE ? AND c.id NOT IN (
+               SELECT DISTINCT m2.conversation_id FROM messages m2
+               WHERE m2.content LIKE ?
+           )
+           ORDER BY conversation_id DESC
+           LIMIT ?""",
+        (query, pattern, pattern, pattern, limit)
+    )
+    return [dict(r) for r in rows]
+
+
+async def search_conversation_messages(conv_id: int, query: str) -> list[dict]:
+    """Search messages within a single conversation."""
+    db = await get_db()
+    pattern = f"%{query}%"
+    rows = await db.execute_fetchall(
+        """SELECT id, role,
+                  substr(content,
+                         max(1, instr(lower(content), lower(?)) - 80),
+                         200) as snippet
+           FROM messages
+           WHERE conversation_id = ? AND content LIKE ?
+           ORDER BY created_at""",
+        (query, conv_id, pattern)
+    )
+    return [dict(r) for r in rows]
+
+
 async def get_conversation(conv_id: int) -> Optional[dict]:
     db = await get_db()
     rows = await db.execute_fetchall(

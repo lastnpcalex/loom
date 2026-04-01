@@ -3506,6 +3506,157 @@ pre.tool-output {
     text-shadow: 0 0 8px rgba(0, 255, 255, 0.4);
 }
 
+/* ── Home Search ── */
+#home-search-container {
+    position: relative;
+    margin-bottom: 8px;
+}
+#home-search-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px 12px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    color: var(--text-primary);
+    font-family: var(--font-main);
+    font-size: 13px;
+    outline: none;
+    transition: all var(--transition);
+    backdrop-filter: var(--glass);
+}
+#home-search-input:focus {
+    border-color: var(--cyan);
+    box-shadow: 0 0 12px rgba(0, 255, 255, 0.15);
+}
+#home-search-input::placeholder {
+    color: var(--text-muted);
+}
+#home-search-results {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    margin-top: 4px;
+    max-height: 400px;
+    overflow-y: auto;
+    background: rgba(5, 5, 15, 0.95);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+    backdrop-filter: var(--glass);
+}
+.search-result-item {
+    padding: 10px 14px;
+    cursor: pointer;
+    border-bottom: 1px solid rgba(191, 0, 255, 0.1);
+    transition: background var(--transition);
+}
+.search-result-item:last-child { border-bottom: none; }
+.search-result-item:hover {
+    background: var(--bg-hover);
+}
+.search-result-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.search-result-snippet {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.4;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+}
+.search-result-snippet mark,
+.search-result-title mark {
+    background: transparent;
+    color: var(--cyan);
+    font-weight: 600;
+    text-shadow: 0 0 6px rgba(0, 255, 255, 0.3);
+}
+.search-result-badge {
+    font-size: 9px;
+    padding: 1px 5px;
+    border-radius: 6px;
+    text-transform: uppercase;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    flex-shrink: 0;
+}
+.search-result-badge.weave { background: rgba(0,255,255,0.15); color: var(--cyan); }
+.search-result-badge.local { background: rgba(100,200,100,0.15); color: #7ddf7d; }
+.search-result-badge.claude { background: rgba(191,0,255,0.15); color: var(--purple); }
+.search-no-results {
+    padding: 16px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+/* ── Tree Search ── */
+#tree-search-input {
+    height: 36px;
+    padding: 0 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    font-family: var(--font-main);
+    font-size: 13px;
+    outline: none;
+    width: 160px;
+    transition: all var(--transition);
+}
+#tree-search-input:focus {
+    border-color: var(--cyan);
+    box-shadow: 0 0 8px rgba(0, 255, 255, 0.2);
+    width: 200px;
+}
+#tree-search-nav {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+}
+#tree-search-count {
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    padding: 0 4px;
+    min-width: 48px;
+    text-align: center;
+}
+#tree-search-nav button {
+    width: 28px;
+    height: 28px;
+    font-size: 10px;
+}
+
+/* Tree search node states */
+.tree-node-card.search-dimmed {
+    opacity: 0.2;
+    transition: opacity 0.3s ease;
+}
+.tree-node-card.search-match {
+    border-color: var(--cyan) !important;
+    box-shadow: 0 0 14px rgba(0, 255, 255, 0.3) !important;
+    transition: all 0.3s ease;
+}
+.tree-node-card.search-current {
+    border-color: var(--cyan) !important;
+    box-shadow: 0 0 24px rgba(0, 255, 255, 0.5), inset 0 0 8px rgba(0, 255, 255, 0.1) !important;
+    transform: scale(1.05);
+    transition: all 0.3s ease;
+    z-index: 10;
+}
+
 /* ── Star Button ── */
 .conv-star-btn {
     background: none;

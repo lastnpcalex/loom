@@ -1621,6 +1621,9 @@ function setupEventListeners() {
         });
     });
 
+    // Home search
+    initHomeSearch();
+
     // New conversation
     document.getElementById('btn-new-conv-home')?.addEventListener('click', openNewConvModal);
     document.getElementById('btn-create-conv').addEventListener('click', createConversation);
@@ -2514,6 +2517,102 @@ function importFile(url, accept, refreshFn) {
         }
     });
     input.click();
+}
+
+// ── Home Search ──
+function escapeRegex(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function initHomeSearch() {
+    const input = document.getElementById('home-search-input');
+    const resultsEl = document.getElementById('home-search-results');
+    if (!input || !resultsEl) return;
+    let timeout = null;
+
+    input.addEventListener('input', () => {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => performHomeSearch(), 250);
+    });
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            input.value = '';
+            resultsEl.classList.add('hidden');
+            resultsEl.innerHTML = '';
+        }
+    });
+    document.addEventListener('click', (e) => {
+        if (!e.target.closest('#home-search-container')) {
+            resultsEl.classList.add('hidden');
+        }
+    });
+}
+
+async function performHomeSearch() {
+    const input = document.getElementById('home-search-input');
+    const resultsEl = document.getElementById('home-search-results');
+    const query = input.value.trim();
+    if (query.length < 2) {
+        resultsEl.classList.add('hidden');
+        resultsEl.innerHTML = '';
+        return;
+    }
+    try {
+        const results = await API.get(`/api/search?q=${encodeURIComponent(query)}`);
+        renderSearchResults(results, query);
+    } catch (e) {
+        console.error('Home search error:', e);
+    }
+}
+
+function renderSearchResults(results, query) {
+    const resultsEl = document.getElementById('home-search-results');
+    resultsEl.innerHTML = '';
+    resultsEl.classList.remove('hidden');
+
+    if (!results || results.length === 0) {
+        resultsEl.innerHTML = '<div class="search-no-results">No results found</div>';
+        return;
+    }
+
+    const re = new RegExp('(' + escapeRegex(query) + ')', 'gi');
+
+    for (const r of results) {
+        const item = document.createElement('div');
+        item.className = 'search-result-item';
+
+        const modeClass = r.mode || 'weave';
+        const modeLabel = r.mode === 'claude' ? 'Loom' : r.mode === 'local' ? 'Braid' : 'Weave';
+        const titleHtml = escapeHtml(r.title || 'Untitled').replace(re, '<mark>$1</mark>');
+
+        let snippetHtml = '';
+        if (r.snippet && r.message_id) {
+            const roleLabel = r.role === 'user' ? 'You' : r.role === 'assistant' ? 'AI' : 'Sys';
+            snippetHtml = `<div class="search-result-snippet"><b>${roleLabel}:</b> ${escapeHtml(r.snippet).replace(re, '<mark>$1</mark>')}</div>`;
+        }
+
+        item.innerHTML = `
+            <div class="search-result-title">
+                <span class="search-result-badge ${modeClass}">${modeLabel}</span>
+                ${titleHtml}
+            </div>
+            ${snippetHtml}
+        `;
+
+        item.addEventListener('click', async () => {
+            resultsEl.classList.add('hidden');
+            document.getElementById('home-search-input').value = '';
+            await loadConversation(r.conversation_id);
+            switchView('tree');
+            if (r.message_id) {
+                requestAnimationFrame(() => {
+                    setTimeout(() => panToNode(r.message_id), 100);
+                });
+            }
+        });
+
+        resultsEl.appendChild(item);
+    }
 }
 
 // ── Helpers ──

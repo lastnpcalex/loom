@@ -28,6 +28,10 @@ const TREE = {
     dragOffsetX: 0,
     dragOffsetY: 0,
     manualPositions: {},  // id -> {x, y} for manually dragged nodes
+    // Search state
+    searchMatches: [],
+    searchIndex: -1,
+    searchQuery: '',
 };
 
 // ── Canvas Pan/Zoom ──
@@ -225,6 +229,42 @@ function centerLoom() {
     applyTransform();
 }
 
+function panToNode(msgId) {
+    const el = document.querySelector(`.tree-node-card[data-msg-id="${msgId}"]`);
+    const canvas = document.getElementById('tree-canvas');
+    if (!el || !canvas) return;
+
+    const nodeX = parseFloat(el.style.left);
+    const nodeY = parseFloat(el.style.top);
+    const nodeW = el.offsetWidth;
+    const nodeH = el.offsetHeight;
+    const canvasRect = canvas.getBoundingClientRect();
+
+    const targetZoom = Math.max(0.8, Math.min(TREE.zoom, 1.2));
+    const targetPanX = canvasRect.width / 2 - (nodeX + nodeW / 2) * targetZoom;
+    const targetPanY = canvasRect.height / 2 - (nodeY + nodeH / 2) * targetZoom;
+
+    let frame;
+    function animate() {
+        const dx = targetPanX - TREE.panX;
+        const dy = targetPanY - TREE.panY;
+        const dz = targetZoom - TREE.zoom;
+        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5 && Math.abs(dz) < 0.005) {
+            TREE.panX = targetPanX;
+            TREE.panY = targetPanY;
+            TREE.zoom = targetZoom;
+            applyTransform();
+            return;
+        }
+        TREE.panX += dx * 0.15;
+        TREE.panY += dy * 0.15;
+        TREE.zoom += dz * 0.15;
+        applyTransform();
+        frame = requestAnimationFrame(animate);
+    }
+    animate();
+}
+
 function renderBookmarksPanel(targetListId) {
     const listIds = targetListId ? [targetListId] : ['bookmarks-list-global'];
     for (const listId of listIds) {
@@ -329,7 +369,125 @@ function initTreeToolbar() {
     if (centerBtn) {
         centerBtn.addEventListener('click', centerLoom);
     }
+    initTreeSearch();
+}
 
+function initTreeSearch() {
+    const btn = document.getElementById('tree-search-btn');
+    const input = document.getElementById('tree-search-input');
+    const nav = document.getElementById('tree-search-nav');
+    if (!btn || !input) return;
+
+    let timeout = null;
+
+    btn.addEventListener('click', () => {
+        const isOpen = !input.classList.contains('hidden');
+        if (isOpen) {
+            clearTreeSearch();
+            input.classList.add('hidden');
+            if (nav) nav.classList.add('hidden');
+        } else {
+            input.classList.remove('hidden');
+            input.focus();
+        }
+    });
+
+    input.addEventListener('input', () => {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => performTreeSearch(), 250);
+    });
+
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            clearTreeSearch();
+            input.value = '';
+            input.classList.add('hidden');
+            if (nav) nav.classList.add('hidden');
+        } else if (e.key === 'Enter') {
+            e.preventDefault();
+            cycleTreeMatch(e.shiftKey ? -1 : 1);
+        }
+    });
+
+    const prevBtn = document.getElementById('tree-search-prev');
+    const nextBtn = document.getElementById('tree-search-next');
+    if (prevBtn) prevBtn.addEventListener('click', () => cycleTreeMatch(-1));
+    if (nextBtn) nextBtn.addEventListener('click', () => cycleTreeMatch(1));
+}
+
+async function performTreeSearch() {
+    const input = document.getElementById('tree-search-input');
+    const query = input.value.trim();
+    if (query.length < 2) {
+        clearTreeSearch();
+        return;
+    }
+    if (!State.currentConvId) return;
+    try {
+        const results = await API.get(`/api/conversations/${State.currentConvId}/search?q=${encodeURIComponent(query)}`);
+        TREE.searchMatches = results.map(r => r.id);
+        TREE.searchQuery = query;
+        TREE.searchIndex = TREE.searchMatches.length > 0 ? 0 : -1;
+        updateTreeSearchNav();
+        applyTreeSearchHighlight();
+        if (TREE.searchMatches.length > 0) {
+            panToNode(TREE.searchMatches[0]);
+        }
+    } catch (e) {
+        console.error('Tree search error:', e);
+    }
+}
+
+function applyTreeSearchHighlight() {
+    const allNodes = document.querySelectorAll('.tree-node-card');
+    const matchSet = new Set(TREE.searchMatches.map(String));
+    const currentId = TREE.searchIndex >= 0 ? String(TREE.searchMatches[TREE.searchIndex]) : null;
+
+    for (const node of allNodes) {
+        const id = node.dataset.msgId;
+        node.classList.remove('search-match', 'search-current', 'search-dimmed');
+        if (matchSet.size === 0) continue;
+        if (id === currentId) {
+            node.classList.add('search-current');
+        } else if (matchSet.has(id)) {
+            node.classList.add('search-match');
+        } else {
+            node.classList.add('search-dimmed');
+        }
+    }
+}
+
+function clearTreeSearch() {
+    TREE.searchMatches = [];
+    TREE.searchIndex = -1;
+    TREE.searchQuery = '';
+    const nav = document.getElementById('tree-search-nav');
+    if (nav) nav.classList.add('hidden');
+    const allNodes = document.querySelectorAll('.tree-node-card');
+    for (const node of allNodes) {
+        node.classList.remove('search-match', 'search-current', 'search-dimmed');
+    }
+}
+
+function cycleTreeMatch(direction) {
+    if (TREE.searchMatches.length === 0) return;
+    TREE.searchIndex = (TREE.searchIndex + direction + TREE.searchMatches.length) % TREE.searchMatches.length;
+    updateTreeSearchNav();
+    applyTreeSearchHighlight();
+    panToNode(TREE.searchMatches[TREE.searchIndex]);
+}
+
+function updateTreeSearchNav() {
+    const nav = document.getElementById('tree-search-nav');
+    const countEl = document.getElementById('tree-search-count');
+    if (!nav || !countEl) return;
+    if (TREE.searchMatches.length === 0) {
+        nav.classList.remove('hidden');
+        countEl.textContent = '0 matches';
+    } else {
+        nav.classList.remove('hidden');
+        countEl.textContent = `${TREE.searchIndex + 1}/${TREE.searchMatches.length}`;
+    }
 }
 
 function refreshOpenBookmarksPanels() {

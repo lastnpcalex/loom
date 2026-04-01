@@ -367,6 +367,20 @@ async def api_list_conversations():
     return await db.list_conversations()
 
 
+@app.get("/api/search")
+async def api_search(q: str = ""):
+    if len(q) < 2:
+        return []
+    return await db.search_conversations(q)
+
+
+@app.get("/api/conversations/{conv_id}/search")
+async def api_search_conversation(conv_id: int, q: str = ""):
+    if len(q) < 2:
+        return []
+    return await db.search_conversation_messages(conv_id, q)
+
+
 @app.post("/api/conversations")
 async def api_create_conversation(data: dict = None):
     data = data or {}
