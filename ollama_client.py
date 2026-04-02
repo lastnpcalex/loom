@@ -279,7 +279,7 @@ async def describe_image(image_path: str, model: str = None) -> str:
             "think": False,  # Disable thinking to avoid vision output routing bug
             "options": {
                 "temperature": 0.3,
-                "num_predict": 300,
+                "num_predict": 800,
             },
         }
 

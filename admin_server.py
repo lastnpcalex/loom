@@ -214,10 +214,16 @@ async def action_start(name: str):
     server_dir = Path(__file__).parent
     server_py = server_dir / "server.py"
 
+    log_file = server_dir / "server.log"
+    log_handle = open(log_file, "a")
     proc = subprocess.Popen(
         [sys.executable, str(server_py)],
         env=env,
         cwd=str(server_dir),
+        stdout=log_handle,
+        stderr=log_handle,
+        creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
+                    | getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     _child_procs[name] = proc
     return JSONResponse({"status": f"{name} starting on :{info['port']}", "pid": proc.pid})
@@ -243,7 +249,8 @@ async def action_restart(name: str):
     except Exception:
         pass  # Already down
 
-    # Step 2: start it back up
+    # Step 2: wait for port release, then start
+    await asyncio.sleep(2)
     return await action_start(name)
 
 

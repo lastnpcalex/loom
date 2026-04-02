@@ -349,7 +349,8 @@ async def list_conversations() -> list[dict]:
 
 
 async def search_conversations(query: str, limit: int = 20) -> list[dict]:
-    """Search across all conversations by title and message content."""
+    """Search across all conversations by title and message content.
+    Excludes orphaned messages (broken parent chain) and empty drafts."""
     db = await get_db()
     pattern = f"%{query}%"
     rows = await db.execute_fetchall(
@@ -361,6 +362,9 @@ async def search_conversations(query: str, limit: int = 20) -> list[dict]:
            FROM messages m
            JOIN conversations c ON c.id = m.conversation_id
            WHERE m.content LIKE ?
+             AND m.content IS NOT NULL AND m.content != ''
+             AND (m.parent_id IS NULL
+                  OR m.parent_id IN (SELECT id FROM messages))
            UNION
            SELECT c.id as conversation_id, c.title, c.mode,
                   NULL as message_id, NULL as role,
@@ -369,6 +373,7 @@ async def search_conversations(query: str, limit: int = 20) -> list[dict]:
            WHERE c.title LIKE ? AND c.id NOT IN (
                SELECT DISTINCT m2.conversation_id FROM messages m2
                WHERE m2.content LIKE ?
+                 AND m2.content IS NOT NULL AND m2.content != ''
            )
            ORDER BY conversation_id DESC
            LIMIT ?""",
@@ -378,7 +383,8 @@ async def search_conversations(query: str, limit: int = 20) -> list[dict]:
 
 
 async def search_conversation_messages(conv_id: int, query: str) -> list[dict]:
-    """Search messages within a single conversation."""
+    """Search messages within a single conversation.
+    Excludes orphaned messages and empty drafts."""
     db = await get_db()
     pattern = f"%{query}%"
     rows = await db.execute_fetchall(
@@ -388,8 +394,11 @@ async def search_conversation_messages(conv_id: int, query: str) -> list[dict]:
                          200) as snippet
            FROM messages
            WHERE conversation_id = ? AND content LIKE ?
+             AND content IS NOT NULL AND content != ''
+             AND (parent_id IS NULL
+                  OR parent_id IN (SELECT id FROM messages WHERE conversation_id = ?))
            ORDER BY created_at""",
-        (query, conv_id, pattern)
+        (query, conv_id, pattern, conv_id)
     )
     return [dict(r) for r in rows]
 

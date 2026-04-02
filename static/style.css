@@ -1275,6 +1275,7 @@ body::after {
     top: 0;
     left: 0;
     transform-origin: 0 0;
+    will-change: transform;
 }
 
 /* ── Tree Node Cards ── */
@@ -3682,6 +3683,87 @@ pre.tool-output {
     transform: scale(1.05);
     transition: all 0.3s ease;
     z-index: 10;
+}
+
+/* ── Tree LOD (Level of Detail) ── */
+/* Light zoom-out: keep role + branch label, hide body text + actions */
+.lod-mid .tree-node-card {
+    box-shadow: none !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    padding: 6px 8px !important;
+}
+.lod-mid .tree-node-card:hover {
+    filter: none !important;
+    transform: none !important;
+    box-shadow: none !important;
+}
+.lod-mid .tree-node-summary,
+.lod-mid .tree-node-text,
+.lod-mid .tree-node-actions,
+.lod-mid .tree-node-bookmark-btn,
+.lod-mid .tree-node-delete-btn {
+    display: none !important;
+}
+.lod-mid .tree-node-header {
+    padding: 0;
+}
+.lod-mid .tree-node-role {
+    font-size: 11px;
+}
+.lod-mid .tree-node-label {
+    font-size: 11px;
+}
+/* Deeper zoom-out: hide role, keep branch label, colored pips */
+.lod-mini .tree-node-card {
+    box-shadow: none !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    transition: none !important;
+    min-height: 20px !important;
+    padding: 4px 6px !important;
+}
+.lod-mini .tree-node-card:hover {
+    filter: none !important;
+    transform: none !important;
+}
+.lod-mini .tree-node-summary,
+.lod-mini .tree-node-text,
+.lod-mini .tree-node-actions,
+.lod-mini .tree-node-fork-indicator,
+.lod-mini .tree-node-bookmark-btn,
+.lod-mini .tree-node-delete-btn {
+    display: none !important;
+}
+.lod-mini .tree-node-header {
+    padding: 0;
+}
+.lod-mini .tree-node-role { display: none !important; }
+.lod-mini .tree-node-label {
+    font-size: 10px;
+}
+.lod-mini .tree-node-card.user {
+    background: rgba(0, 255, 255, 0.45) !important;
+    border-color: rgba(0, 255, 255, 0.6) !important;
+}
+.lod-mini .tree-node-card.assistant {
+    background: rgba(191, 0, 255, 0.45) !important;
+    border-color: rgba(191, 0, 255, 0.6) !important;
+}
+.lod-mini .tree-node-card.system {
+    background: rgba(255, 255, 255, 0.3) !important;
+}
+.lod-mini .tree-node-card.active {
+    outline: 2px solid var(--cyan);
+    outline-offset: 1px;
+}
+/* Extreme zoom: hide labels too, just pips */
+.lod-micro .tree-node-label {
+    display: none !important;
+}
+.lod-micro .tree-node-card {
+    min-height: 12px !important;
+    padding: 2px !important;
 }
 
 /* ── Star Button ── */

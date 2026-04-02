@@ -2605,8 +2605,12 @@ function renderSearchResults(results, query) {
             await loadConversation(r.conversation_id);
             switchView('tree');
             if (r.message_id) {
+                // Only pan if the message exists in the rendered tree
                 requestAnimationFrame(() => {
-                    setTimeout(() => panToNode(r.message_id), 100);
+                    setTimeout(() => {
+                        const node = document.querySelector(`.tree-node-card[data-msg-id="${r.message_id}"]`);
+                        if (node) panToNode(r.message_id);
+                    }, 150);
                 });
             }
         });

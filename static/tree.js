@@ -182,6 +182,10 @@ function applyTransform() {
     if (inner) {
         inner.style.transform = `translate(${TREE.panX}px, ${TREE.panY}px) scale(${TREE.zoom})`;
         inner.style.transformOrigin = '0 0';
+        // LOD: simplify nodes when zoomed out
+        inner.classList.toggle('lod-mid', TREE.zoom < 0.55);
+        inner.classList.toggle('lod-mini', TREE.zoom < 0.3);
+        inner.classList.toggle('lod-micro', TREE.zoom < 0.12);
     }
 }
 
@@ -658,7 +662,16 @@ async function renderTree() {
             }
         }
         drawConnectors(svg, layout.nodes, positions);
-        centerLoom();
+        // Reapply search highlights if a search is active
+        if (TREE.searchMatches.length > 0) {
+            applyTreeSearchHighlight();
+            // Pan to current match instead of centering whole tree
+            if (TREE.searchIndex >= 0) {
+                panToNode(TREE.searchMatches[TREE.searchIndex]);
+            }
+        } else {
+            centerLoom();
+        }
     });
 }
 
