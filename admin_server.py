@@ -65,14 +65,23 @@ async def check_instance(name: str, info: dict) -> dict:
             continue
 
     # Check if we have a tracked child process
+    # On Windows with DETACHED_PROCESS, poll() is unreliable — cross-check with port status
     proc = _child_procs.get(name)
-    if proc and proc.poll() is None:
-        result["pid"] = proc.pid
-        result["managed"] = True
+    if proc:
+        proc.poll()  # refresh returncode
+        if proc.returncode is not None:
+            # Process exited — clean up
+            _child_procs.pop(name, None)
+            result["managed"] = False
+        elif result["status"] == "offline":
+            # Handle says alive but port is dead — stale handle
+            _child_procs.pop(name, None)
+            result["managed"] = False
+        else:
+            result["pid"] = proc.pid
+            result["managed"] = True
     else:
         result["managed"] = False
-        if proc:
-            _child_procs.pop(name, None)
 
     return result
 
@@ -203,17 +212,32 @@ async def action_start(name: str):
     if name not in INSTANCES:
         return JSONResponse({"error": f"Unknown instance: {name}"}, status_code=404)
 
-    if name in _child_procs and _child_procs[name].poll() is None:
-        return JSONResponse({"error": f"{name} already running (PID {_child_procs[name].pid})"}, status_code=409)
-
     info = INSTANCES[name]
     port = info["port"]
+
+    # Clean up stale Popen handles (Windows DETACHED_PROCESS makes poll() unreliable)
+    proc = _child_procs.get(name)
+    if proc:
+        try:
+            proc.poll()
+        except Exception:
+            pass
+        if proc.returncode is not None:
+            _child_procs.pop(name, None)
 
     # Wait for port to be available (old process may still be releasing it)
     for attempt in range(10):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             if s.connect_ex(("127.0.0.1", port)) != 0:
                 break  # Port is free
+        if attempt == 0:
+            # First check failed — port in use. If we have a stale handle, kill it
+            if name in _child_procs:
+                try:
+                    _child_procs[name].kill()
+                except Exception:
+                    pass
+                _child_procs.pop(name, None)
         await asyncio.sleep(1)
     else:
         return JSONResponse(
@@ -274,7 +298,11 @@ async def action_restart(name: str):
     except Exception:
         pass  # Already down
 
-    # Step 2: wait for port release, then start
+    # Step 2: clear stale Popen handle — on Windows, detached processes
+    # leave zombie handles that make poll() return None forever
+    _child_procs.pop(name, None)
+
+    # Step 3: wait for port release, then start
     await asyncio.sleep(2)
     return await action_start(name)
 

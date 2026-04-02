@@ -182,72 +182,41 @@ def scan_skills_dir(project_dir: str) -> list[dict]:
     return found
 
 
-_cc_skills_cache: list[dict] | None = None
+def scan_user_commands() -> list[dict]:
+    """Scan ~/.claude/commands/ for user command .md files.
 
-
-def discover_cc_skills() -> list[dict]:
-    """Run `claude skills --output-format json` to discover pluggable CC skills.
-
-    Parses the markdown table from the result. Returns only the *discovered*
-    pluggable skills (these get merged with BUILTIN_COMMANDS in get_all_skills).
+    Direct filesystem read — no API call, no cache, no subprocess.
+    First line of each .md is the description, rest is the prompt template.
     """
-    global _cc_skills_cache
-    if _cc_skills_cache is not None:
-        return _cc_skills_cache
+    commands_dir = Path.home() / ".claude" / "commands"
+    if not commands_dir.is_dir():
+        return []
 
-    import subprocess
-    import json
-
-    discovered = []
-    try:
-        result = subprocess.run(
-            ["claude", "skills", "--output-format", "json"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            table_text = data.get("result", "")
-
-            for match in re.finditer(r'\|\s*`(/[\w-]+)`\s*\|\s*(.+?)\s*\|', table_text):
-                command = match.group(1)
-                description = match.group(2).strip()
-                name = command.lstrip("/")
-
-                # Use our hardcoded prompt_template if we have one
-                hardcoded = next((c for c in BUILTIN_COMMANDS if c["name"] == name), None)
-                prompt_template = (hardcoded or {}).get("prompt_template") or f"Run the {name} skill. {{args}}"
-
-                discovered.append({
-                    "name": name,
-                    "command": command,
-                    "description": description,
-                    "prompt_template": prompt_template,
-                })
-
-            print(f"[SKILLS] Discovered {len(discovered)} pluggable skills from CC: {[s['command'] for s in discovered]}")
-        else:
-            print(f"[SKILLS] `claude skills` exited {result.returncode}")
-
-    except FileNotFoundError:
-        print("[SKILLS] `claude` not on PATH")
-    except Exception as e:
-        print(f"[SKILLS] Discovery failed: {e}")
-
-    _cc_skills_cache = discovered
-    return _cc_skills_cache
-
-
-def invalidate_skills_cache():
-    """Clear the cached CC skills list (call after config changes)."""
-    global _cc_skills_cache
-    _cc_skills_cache = None
+    found = []
+    for md_file in sorted(commands_dir.glob("*.md")):
+        try:
+            content = md_file.read_text(encoding="utf-8")
+        except (IOError, UnicodeDecodeError):
+            continue
+        lines = content.strip().split("\n")
+        if not lines:
+            continue
+        name = md_file.stem
+        description = lines[0].strip().lstrip("# ")
+        found.append({
+            "name": name,
+            "command": f"/{name}",
+            "description": description or f"User command: {name}",
+            "prompt_template": content,
+        })
+    return found
 
 
 def get_all_skills(project_dir: str = None) -> list[dict]:
     """Get all available commands/skills from three sources:
 
     1. Built-in CC commands (headless + meta) — always present
-    2. Discovered pluggable skills from `claude skills` — merged, deduped
+    2. User commands from ~/.claude/commands/*.md — filesystem scan, no cache
     3. User skills from .claude/skills/ — project-specific
 
     Each entry gets: id, name, command, description, prompt_template,
@@ -257,22 +226,7 @@ def get_all_skills(project_dir: str = None) -> list[dict]:
     seen = set()
     skills = []
 
-    # 1) Discovered pluggable skills from CC (highest priority descriptions)
-    for s in discover_cc_skills():
-        if s["name"] in seen:
-            continue
-        seen.add(s["name"])
-        skills.append({
-            "id": f"skill:{s['name']}",
-            "name": s["name"],
-            "command": s["command"],
-            "description": s["description"],
-            "prompt_template": s["prompt_template"],
-            "source": "system",
-            "mode": "headless",
-        })
-
-    # 2) Built-in CC commands (headless + meta, skip cli-only)
+    # 1) Built-in CC commands (headless + meta, skip cli-only)
     for cmd in BUILTIN_COMMANDS:
         if cmd["name"] in seen or cmd.get("mode") == "cli-only":
             continue
@@ -287,9 +241,27 @@ def get_all_skills(project_dir: str = None) -> list[dict]:
             "mode": cmd.get("mode", "headless"),
         })
 
+    # 2) User commands from ~/.claude/commands/*.md (fresh scan every time)
+    for s in scan_user_commands():
+        if s["name"] in seen:
+            continue
+        seen.add(s["name"])
+        skills.append({
+            "id": f"user:{s['name']}",
+            "name": s["name"],
+            "command": s["command"],
+            "description": s["description"],
+            "prompt_template": s["prompt_template"],
+            "source": "user",
+            "mode": "headless",
+        })
+
     # 3) User skills from project directory
     if project_dir:
         for s in scan_skills_dir(project_dir):
+            if s["name"] in seen:
+                continue
+            seen.add(s["name"])
             s["source"] = "user"
             s["mode"] = "headless"
             skills.append(s)
