@@ -1561,17 +1561,25 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
 
         if parent_id:
             branch = await db.get_branch_to_root(parent_id)
-            # Find nearest ancestor assistant with a session ID
+            # Find nearest ancestor assistant with a session ID AND real content
+            # Skip empty drafts, error messages, and broken sessions
             for msg in reversed(branch):
-                if msg["role"] == "assistant" and msg.get("cc_session_id"):
-                    resume_session_id = msg["cc_session_id"]
-                    # Check if the session was created by a different provider
-                    prev_model = msg.get("cc_model_used", "")
-                    prev_was_ollama = prev_model and prev_model not in _ANTHROPIC_MODELS
-                    if prev_was_ollama != use_ollama:
-                        print(f"[CC] Provider switch ({prev_model} -> {cc_model}), skipping session resume")
-                        resume_session_id = None
-                    break
+                if msg["role"] != "assistant":
+                    continue
+                if not msg.get("cc_session_id"):
+                    continue
+                content = msg.get("content") or ""
+                if not content.strip() or content.startswith("[Error:"):
+                    print(f"[CC] Skipping empty/error session on msg {msg['id']}")
+                    continue
+                resume_session_id = msg["cc_session_id"]
+                # Check if the session was created by a different provider
+                prev_model = msg.get("cc_model_used", "")
+                prev_was_ollama = prev_model and prev_model not in _ANTHROPIC_MODELS
+                if prev_was_ollama != use_ollama:
+                    print(f"[CC] Provider switch ({prev_model} -> {cc_model}), skipping session resume")
+                    resume_session_id = None
+                break
 
         if resume_session_id:
             use_resume = True
