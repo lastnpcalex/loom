@@ -1359,12 +1359,28 @@ body::after {
     border-style: dashed !important;
 }
 .queued-message::after {
+    content: none;  /* replaced by queue-actions bar */
+}
+.queue-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 6px;
+    align-items: center;
+}
+.queue-actions::before {
     content: 'queued';
-    display: block;
     font-size: 10px;
     color: var(--text-muted);
     font-style: italic;
-    margin-top: 4px;
+    margin-right: auto;
+}
+.queue-actions .btn-small {
+    font-size: 11px;
+    padding: 2px 10px;
+    opacity: 0.9;
+}
+.queue-cancel-btn {
+    color: var(--error) !important;
 }
 
 /* Error messages in chat */

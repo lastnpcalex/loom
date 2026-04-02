@@ -721,6 +721,23 @@ async def api_get_tree(conv_id: int):
     return tree
 
 
+@app.put("/api/conversations/{conv_id}/messages/{msg_id}")
+async def api_update_message(conv_id: int, msg_id: int, data: dict):
+    """Update a user message's content in-place (no new branch)."""
+    content = data.get("content", "").strip()
+    if not content:
+        return {"ok": False, "error": "Content cannot be empty"}
+    image_path = data.get("image_path")
+    await db.update_message_content(msg_id, content=content)
+    if image_path is not None:
+        d = await get_db()
+        ip = json.dumps(image_path) if isinstance(image_path, list) else image_path
+        await d.execute("UPDATE messages SET image_path = ? WHERE id = ?", (ip, msg_id))
+        await d.commit()
+    msg = await db.get_message(msg_id)
+    return msg
+
+
 @app.delete("/api/conversations/{conv_id}/messages/{msg_id}")
 async def api_delete_branch(conv_id: int, msg_id: int):
     """Delete a message and its entire subtree."""

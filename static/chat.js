@@ -994,6 +994,14 @@ async function sendMessage() {
             const container = document.getElementById('messages');
             const el = createMessageElement(msg);
             el.classList.add('queued-message');
+            // Add cancel/edit bar to the queued message
+            const queueBar = document.createElement('div');
+            queueBar.className = 'queue-actions';
+            queueBar.innerHTML = `<button class="btn-small queue-edit-btn" title="Edit queued message">Edit</button>`
+                + `<button class="btn-small queue-cancel-btn" title="Cancel queued message">Cancel</button>`;
+            queueBar.querySelector('.queue-cancel-btn').addEventListener('click', () => cancelQueuedMessage(msg));
+            queueBar.querySelector('.queue-edit-btn').addEventListener('click', () => editQueuedMessage(msg));
+            el.appendChild(queueBar);
             container.appendChild(el);
             scrollToBottom(true);
             showToast('Message queued — will send after current turn');
@@ -1016,14 +1024,102 @@ async function sendMessage() {
     }
 }
 
+async function cancelQueuedMessage(msg) {
+    _queuedGeneration = null;
+    // Remove from DB
+    try {
+        await API.del(`/api/conversations/${State.currentConvId}/messages/${msg.id}`);
+    } catch { /* already gone */ }
+    // Remove from local state
+    State.messages = State.messages.filter(m => m.id !== msg.id);
+    const el = document.querySelector(`.message[data-msg-id="${msg.id}"]`);
+    if (el) el.remove();
+    showToast('Queued message cancelled');
+}
+
+async function editQueuedMessage(msg) {
+    const msgEl = document.querySelector(`.message[data-msg-id="${msg.id}"]`);
+    if (!msgEl) return;
+    const contentEl = msgEl.querySelector('.message-content');
+    const queueBar = msgEl.querySelector('.queue-actions');
+
+    const textarea = document.createElement('textarea');
+    textarea.className = 'edit-message-input';
+    textarea.value = msg.content;
+    textarea.rows = Math.max(3, msg.content.split('\n').length);
+    contentEl.replaceWith(textarea);
+    textarea.focus();
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'edit-message-actions';
+    btnRow.innerHTML = `<button class="btn-small edit-save">Save</button>`
+        + `<button class="btn-small edit-cancel">Cancel edit</button>`;
+    if (queueBar) queueBar.replaceWith(btnRow);
+    else textarea.after(btnRow);
+
+    btnRow.querySelector('.edit-cancel').addEventListener('click', () => {
+        const newContent = document.createElement('div');
+        newContent.className = 'message-content';
+        newContent.innerHTML = formatContent(msg.content);
+        textarea.replaceWith(newContent);
+        // Restore queue bar
+        const bar = document.createElement('div');
+        bar.className = 'queue-actions';
+        bar.innerHTML = `<button class="btn-small queue-edit-btn" title="Edit queued message">Edit</button>`
+            + `<button class="btn-small queue-cancel-btn" title="Cancel queued message">Cancel</button>`;
+        bar.querySelector('.queue-cancel-btn').addEventListener('click', () => cancelQueuedMessage(msg));
+        bar.querySelector('.queue-edit-btn').addEventListener('click', () => editQueuedMessage(msg));
+        btnRow.replaceWith(bar);
+    });
+
+    btnRow.querySelector('.edit-save').addEventListener('click', async () => {
+        const newText = textarea.value.trim();
+        if (!newText) return;
+        try {
+            const updated = await API.put(
+                `/api/conversations/${State.currentConvId}/messages/${msg.id}`,
+                { content: newText }
+            );
+            // Update local references
+            msg.content = updated.content || newText;
+            if (_queuedGeneration && _queuedGeneration.id === msg.id) {
+                _queuedGeneration = msg;
+            }
+            const stateMsg = State.messages.find(m => m.id === msg.id);
+            if (stateMsg) stateMsg.content = msg.content;
+
+            // Replace textarea with rendered content
+            const newContent = document.createElement('div');
+            newContent.className = 'message-content';
+            newContent.innerHTML = formatContent(msg.content);
+            textarea.replaceWith(newContent);
+            // Restore queue bar
+            const bar = document.createElement('div');
+            bar.className = 'queue-actions';
+            bar.innerHTML = `<button class="btn-small queue-edit-btn" title="Edit queued message">Edit</button>`
+                + `<button class="btn-small queue-cancel-btn" title="Cancel queued message">Cancel</button>`;
+            bar.querySelector('.queue-cancel-btn').addEventListener('click', () => cancelQueuedMessage(msg));
+            bar.querySelector('.queue-edit-btn').addEventListener('click', () => editQueuedMessage(msg));
+            btnRow.replaceWith(bar);
+            showToast('Queued message updated');
+        } catch {
+            showToast('Failed to update message', 'error');
+        }
+    });
+}
+
 function _flushQueuedGeneration() {
     if (!_queuedGeneration) return;
     const msg = _queuedGeneration;
     _queuedGeneration = null;
     // Message already in State.messages and rendered — just trigger generation
-    // Remove queued styling
+    // Remove queued styling and action bar
     const queuedEl = document.querySelector('.queued-message');
-    if (queuedEl) queuedEl.classList.remove('queued-message');
+    if (queuedEl) {
+        queuedEl.classList.remove('queued-message');
+        const bar = queuedEl.querySelector('.queue-actions');
+        if (bar) bar.remove();
+    }
     if (State.ws && State.ws.readyState === WebSocket.OPEN) {
         showGenStatus('Sending queued message...');
         State.ws.send(JSON.stringify({
