@@ -899,7 +899,7 @@ async function sendMessage() {
     const hasImages = State.pendingImages.length > 0;
     if (!content && !(hasImages && !isClaudeMode)) return;
 
-    // Translate slash commands for CC mode
+    // Handle slash commands for CC mode
     if (isClaudeMode && content.startsWith('/')) {
         const skills = await _loadSkills();
         const translated = _translateSlashCommand(content, skills);
@@ -908,9 +908,9 @@ async function sendMessage() {
             input.value = '';
             return;
         }
+        // Pass slash commands directly to CC — it handles skills natively
         if (translated) {
             showToast(`Running skill: ${translated.skillName}`);
-            content = translated.prompt;
         }
     }
 
