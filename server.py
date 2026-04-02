@@ -715,10 +715,81 @@ async def api_seed_state_cards(conv_id: int):
 
 # ── Tree ──
 
+GREEK = ['α','β','γ','δ','ε','ζ','η','θ','ι','κ','λ','μ','ν','ξ','ο','π','ρ','σ','τ','υ','φ','χ','ψ','ω']
+
+def _compute_branch_names(tree: list[dict]) -> dict[int, str]:
+    """Compute branch position labels (matching tree.js UI) for all nodes."""
+    node_map = {n["id"]: n for n in tree}
+    children_map: dict[int | None, list[int]] = {}
+    roots = []
+    for n in tree:
+        pid = n.get("parent_id")
+        if pid is None:
+            roots.append(n["id"])
+        else:
+            children_map.setdefault(pid, []).append(n["id"])
+    # Sort children by id (creation order) to match JS
+    for k in children_map:
+        children_map[k].sort()
+    roots.sort()
+
+    names = {}
+    def _get_label(depth):
+        return GREEK[depth] if depth < len(GREEK) else f"branch{depth}"
+
+    def walk(node_id, prefix, pos, fork_depth):
+        label = f"{prefix}{pos}" if prefix else f"{pos}"
+        names[node_id] = label
+        kids = children_map.get(node_id, [])
+        if len(kids) == 1:
+            walk(kids[0], prefix, pos + 1, fork_depth)
+        elif len(kids) > 1:
+            for i, kid in enumerate(kids):
+                fl = _get_label(i)
+                new_prefix = f"{prefix}{pos}.{fl}" if prefix else f"{pos}.{fl}"
+                walk(kid, new_prefix, 1, fork_depth + 1)
+
+    for i, root in enumerate(roots):
+        root_label = _get_label(i) if len(roots) > 1 else ""
+        walk(root, root_label, 1, 0)
+    return names
+
+
 @app.get("/api/conversations/{conv_id}/tree")
 async def api_get_tree(conv_id: int):
     tree = await db.get_conversation_tree(conv_id)
     return tree
+
+
+@app.get("/api/conversations/{conv_id}/tree/map")
+async def api_get_tree_map(conv_id: int):
+    """Return tree with branch position labels and session info for debugging."""
+    d = await db.get_db()
+    rows = await d.execute_fetchall(
+        """SELECT id, parent_id, role, cc_session_id,
+                  length(content) as content_len,
+                  length(content_blocks) as blocks_len,
+                  summary
+           FROM messages WHERE conversation_id = ?
+           ORDER BY created_at""",
+        (conv_id,)
+    )
+    nodes = [dict(r) for r in rows]
+    names = _compute_branch_names(nodes)
+    result = []
+    for n in nodes:
+        sess = n.get("cc_session_id")
+        result.append({
+            "pos": names.get(n["id"], "?"),
+            "id": n["id"],
+            "parent": n.get("parent_id"),
+            "role": n["role"][0],  # u/a
+            "session": sess[:8] if sess else None,
+            "content": n.get("content_len") or 0,
+            "blocks": n.get("blocks_len") or 0,
+            "summary": (n.get("summary") or "")[:50],
+        })
+    return result
 
 
 @app.put("/api/conversations/{conv_id}/messages/{msg_id}")
@@ -1139,14 +1210,24 @@ async def handle_cc_permission(data: dict):
     elif isinstance(tool_input, str):
         input_summary = tool_input[:500]
 
+    # Sanitize strings — tool_input can contain surrogate characters that crash WS send
+    def _sanitize(obj):
+        if isinstance(obj, str):
+            return obj.encode('utf-8', errors='replace').decode('utf-8')
+        if isinstance(obj, dict):
+            return {k: _sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_sanitize(v) for v in obj]
+        return obj
+
     # Build permission message once — broadcast to all active WebSockets globally
     perm_msg = {
         "type": "permission_request",
         "request_id": request_id,
         "conv_id": conv_id,
         "tool_name": tool_name,
-        "tool_input": tool_input,
-        "input_summary": input_summary,
+        "tool_input": _sanitize(tool_input),
+        "input_summary": _sanitize(input_summary),
     }
 
     # Wait for at least one WebSocket anywhere (user may need to open the app)
@@ -1161,12 +1242,16 @@ async def handle_cc_permission(data: dict):
 
     # Broadcast to ALL active WebSockets across ALL conversations
     dead_pairs = []
+    sent_count = 0
     for cid, clients in list(_active_websockets.items()):
         for ws in list(clients):
             try:
                 await ws.send_json(perm_msg)
-            except Exception:
+                sent_count += 1
+            except Exception as e:
+                print(f"[PERM] Failed to send to conv={cid}: {e}")
                 dead_pairs.append((cid, ws))
+    print(f"[PERM] Broadcast permission_request to {sent_count} websocket(s)")
     for cid, ws in dead_pairs:
         _active_websockets.get(cid, set()).discard(ws)
 
@@ -1397,7 +1482,7 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
         })
         # Resend ALL pending permission requests (broadcast globally now)
         for rid, pending in list(_pending_hook_permissions.items()):
-            if "response" not in pending:
+            if not pending.get("response"):
                 print(f"[WS] Resending pending permission request {rid} on reconnect")
                 await websocket.send_json({
                     "type": "permission_request",
@@ -1411,7 +1496,7 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
         await websocket.send_json({"type": "generation_idle"})
         # Even when idle, resend any pending permissions from other conversations
         for rid, pending in list(_pending_hook_permissions.items()):
-            if "response" not in pending:
+            if not pending.get("response"):
                 await websocket.send_json({
                     "type": "permission_request",
                     "request_id": rid,
