@@ -1144,8 +1144,8 @@ async def handle_cc_permission(data: dict):
 
     # Broadcast to ALL active WebSockets across ALL conversations
     dead_pairs = []
-    for cid, clients in _active_websockets.items():
-        for ws in clients:
+    for cid, clients in list(_active_websockets.items()):
+        for ws in list(clients):
             try:
                 await ws.send_json(perm_msg)
             except Exception:
@@ -1321,7 +1321,7 @@ async def _ws_send(conv_id: int, data: dict):
     if not clients:
         return
     dead = []
-    for ws in clients:
+    for ws in list(clients):
         try:
             await ws.send_json(data)
         except Exception:
@@ -1333,8 +1333,8 @@ async def _ws_send(conv_id: int, data: dict):
 async def _ws_broadcast_all(data: dict):
     """Broadcast to ALL active WebSockets across ALL conversations."""
     dead_pairs = []
-    for cid, clients in _active_websockets.items():
-        for ws in clients:
+    for cid, clients in list(_active_websockets.items()):
+        for ws in list(clients):
             try:
                 await ws.send_json(data)
             except Exception:
@@ -1542,9 +1542,15 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
         if project_dir != "." and not os.path.isdir(project_dir):
             await _ws_send(conv_id, {"type": "error", "error": f"Working directory not found: {project_dir}"})
             return
-        cc_model = conv.get("cc_model") or "sonnet"
-        cc_effort = conv.get("cc_effort") or "high"
-        cc_permission_mode = conv.get("cc_permission_mode") or "default"
+        # Prefer model from the generate message (client's current UI state)
+        # over the DB value, which may have been overwritten by another server.
+        cc_model = data.get("cc_model") or conv.get("cc_model") or "sonnet"
+        cc_effort = data.get("cc_effort") or conv.get("cc_effort") or "high"
+        cc_permission_mode = data.get("cc_permission_mode") or conv.get("cc_permission_mode") or "default"
+        # Persist client-provided settings back to DB for reload continuity
+        if data.get("cc_model") and data["cc_model"] != conv.get("cc_model"):
+            await db.update_conversation_fields(conv_id, cc_model=cc_model)
+
         # Anthropic model names are short aliases; anything else is an Ollama model
         _ANTHROPIC_MODELS = {"sonnet", "opus", "haiku"}
         use_ollama = conv.get("_use_ollama", False) or cc_model not in _ANTHROPIC_MODELS

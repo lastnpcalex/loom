@@ -227,10 +227,11 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     _configure_permission_hook(cwd)
 
     # Build the Claude Code arguments (common to both launch methods)
+    disallowed = "AskUserQuestion,WebSearch,WebFetch" if use_ollama else "AskUserQuestion"
     cc_args = ["-p", prompt,
                "--output-format", "stream-json",
                "--verbose",
-               "--disallowedTools", "AskUserQuestion"]
+               "--disallowedTools", disallowed]
 
     if not use_ollama:
         # Direct claude launch — model and effort are CC flags
