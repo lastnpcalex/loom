@@ -1468,7 +1468,7 @@ body::after {
     width: 320px;
     max-height: 400px;
     overflow-y: auto;
-    background: var(--bg-secondary);
+    background: rgba(5, 5, 15, 0.95);
     border: 1px solid rgba(160, 140, 255, 0.2);
     border-radius: 8px;
     box-shadow: 0 8px 24px rgba(0,0,0,0.4), 0 0 12px rgba(160, 140, 255, 0.05);
