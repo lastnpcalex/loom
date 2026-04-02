@@ -662,6 +662,19 @@ function _reconstructFromSnapshot(snap) {
     // Reset stream buffer so new chunks append cleanly
     _streamBuffer = '';
     _streamFlushTimer = null;
+
+    // Re-render any pending permission prompts that were lost when we rebuilt the streaming div
+    for (const n of _notifications) {
+        if (n.type === 'permission' && !n.resolved) {
+            showPermissionPrompt({
+                request_id: n.requestId,
+                conv_id: n.convId,
+                tool_name: n.toolName,
+                input_summary: n.inputSummary,
+            });
+        }
+    }
+
     showGenStatus('Reconnected — streaming in progress');
     scrollToBottom();
     console.log('[WS] Reconstructed streaming UI from snapshot:', blocks.length, 'blocks,', (snap.full_text || '').length, 'chars');
