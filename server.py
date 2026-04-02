@@ -1340,9 +1340,11 @@ async def _ws_broadcast_all(data: dict):
             except Exception:
                 dead_pairs.append((cid, ws))
     for cid, ws in dead_pairs:
-        _active_websockets.get(cid, set()).discard(ws)
-    if not clients:
-        _active_websockets.pop(conv_id, None)
+        remaining = _active_websockets.get(cid)
+        if remaining:
+            remaining.discard(ws)
+            if not remaining:
+                _active_websockets.pop(cid, None)
 
 
 @app.websocket("/ws/chat/{conv_id}")
