@@ -916,12 +916,15 @@ async function sendMessage() {
         }
         if (translated) {
             showToast(`Running skill: ${translated.skillName}`);
-            // Local models don't resolve /slash as skills automatically —
-            // wrap as explicit Skill tool instruction so CC invokes it properly
+            // Local models can't reliably use the Skill tool indirection —
+            // expand the template and tell the model to execute it directly
             const ccModel = State.currentConv?.cc_model || 'sonnet';
             const isLocal = !['sonnet', 'opus', 'haiku'].includes(ccModel);
             if (isLocal) {
-                content = `Use the Skill tool to invoke /${translated.skillName}. Arguments: ${content.replace(/^\/\S+\s*/, '') || 'none'}`;
+                const args = content.replace(/^\/\S+\s*/, '').trim() || '';
+                let tmpl = translated.prompt || `Run the ${translated.skillName} skill.`;
+                tmpl = tmpl.replace('{args}', args);
+                content = `Follow these instructions exactly and execute any commands they contain:\n\n${tmpl}`;
             }
         }
     }
