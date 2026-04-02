@@ -627,7 +627,9 @@ body::after {
     right: 12px;
     z-index: 20;
     display: flex;
+    align-items: center;
     gap: 8px;
+    max-width: calc(100% - 24px);
 }
 #tree-toolbar button {
     background: var(--surface);
@@ -2507,6 +2509,13 @@ body::after {
     background: #1a1a2e;
     color: var(--text-primary);
 }
+#cc-inline-controls select optgroup {
+    background: #0d0d1f;
+    color: var(--text-muted);
+    font-style: normal;
+    font-weight: 600;
+    font-size: 11px;
+}
 
 #image-preview {
     display: flex;
@@ -2882,6 +2891,13 @@ body::after {
 .form-select option {
     background: #0a0a1a;
     color: var(--text-primary);
+}
+.form-select optgroup {
+    background: #0d0d1f;
+    color: var(--text-muted);
+    font-style: normal;
+    font-weight: 600;
+    font-size: 11px;
 }
 
 .form-select:focus {
@@ -3614,13 +3630,22 @@ pre.tool-output {
     font-family: var(--font-main);
     font-size: 13px;
     outline: none;
-    width: 160px;
-    transition: all var(--transition);
+    width: 180px;
+    min-width: 0;
+    flex-shrink: 1;
+    transition: all 0.3s ease;
 }
 #tree-search-input:focus {
     border-color: var(--cyan);
     box-shadow: 0 0 8px rgba(0, 255, 255, 0.2);
-    width: 200px;
+    width: 220px;
+}
+#tree-search-separator {
+    width: 1px;
+    height: 20px;
+    background: var(--border);
+    margin: 0 2px;
+    flex-shrink: 0;
 }
 #tree-search-nav {
     display: flex;
@@ -3858,14 +3883,7 @@ pre.tool-output {
     #tree-toolbar {
         top: 8px;
         right: 8px;
-        left: 8px;
         gap: 4px;
-        flex-wrap: wrap;
-        justify-content: flex-end;
-        background: rgba(2, 2, 8, 0.85);
-        padding: 6px;
-        border-radius: var(--radius);
-        border: 1px solid var(--border);
     }
     #tree-toolbar button {
         width: 32px;
@@ -3873,22 +3891,22 @@ pre.tool-output {
         font-size: 16px;
     }
     #tree-search-input {
-        width: 100%;
-        order: 20;
+        width: 100px;
         height: 32px;
-        font-size: 14px;
-        background: rgba(2, 2, 8, 0.95);
+        font-size: 12px;
+        padding: 0 8px;
     }
     #tree-search-input:focus {
-        width: 100%;
+        width: 140px;
     }
-    #tree-search-nav {
-        order: 21;
-        width: 100%;
-        justify-content: center;
+    #tree-search-nav button {
+        width: 24px;
+        height: 24px;
+        font-size: 9px;
     }
-    #tree-search-separator {
-        display: none;
+    #tree-search-count {
+        font-size: 10px;
+        min-width: 36px;
     }
     #bookmarks-panel {
         top: 48px;

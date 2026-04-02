@@ -102,7 +102,7 @@ function initCanvas() {
     canvas.addEventListener('wheel', (e) => {
         e.preventDefault();
         const delta = e.deltaY > 0 ? 0.9 : 1.1;
-        const newZoom = Math.max(0.2, Math.min(3, TREE.zoom * delta));
+        const newZoom = Math.max(0.05, Math.min(3, TREE.zoom * delta));
 
         // Zoom toward mouse position
         const rect = canvas.getBoundingClientRect();
@@ -156,7 +156,7 @@ function initCanvas() {
             const dist = Math.hypot(dx, dy);
             if (_lastPinchDist > 0) {
                 const scale = dist / _lastPinchDist;
-                const newZoom = Math.max(0.2, Math.min(3, TREE.zoom * scale));
+                const newZoom = Math.max(0.05, Math.min(3, TREE.zoom * scale));
                 const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
                 const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
                 const rect = canvas.getBoundingClientRect();
@@ -219,7 +219,7 @@ function centerLoom() {
     const availW = canvasRect.width - padding * 2;
     const availH = canvasRect.height - padding * 2;
 
-    const zoom = Math.min(1.5, Math.max(0.2, Math.min(availW / contentW, availH / contentH)));
+    const zoom = Math.min(1.5, Math.max(0.05, Math.min(availW / contentW, availH / contentH)));
     const panX = padding + (availW - contentW * zoom) / 2 - minX * zoom;
     const panY = padding + (availH - contentH * zoom) / 2 - minY * zoom;
 
@@ -376,6 +376,7 @@ function initTreeSearch() {
     const btn = document.getElementById('tree-search-btn');
     const input = document.getElementById('tree-search-input');
     const nav = document.getElementById('tree-search-nav');
+    const sep = document.getElementById('tree-search-separator');
     if (!btn || !input) return;
 
     let timeout = null;
@@ -384,10 +385,13 @@ function initTreeSearch() {
         const isOpen = !input.classList.contains('hidden');
         if (isOpen) {
             clearTreeSearch();
+            input.value = '';
             input.classList.add('hidden');
             if (nav) nav.classList.add('hidden');
+            if (sep) sep.classList.add('hidden');
         } else {
             input.classList.remove('hidden');
+            if (sep) sep.classList.remove('hidden');
             input.focus();
         }
     });
@@ -403,6 +407,7 @@ function initTreeSearch() {
             input.value = '';
             input.classList.add('hidden');
             if (nav) nav.classList.add('hidden');
+            if (sep) sep.classList.add('hidden');
         } else if (e.key === 'Enter') {
             e.preventDefault();
             cycleTreeMatch(e.shiftKey ? -1 : 1);
@@ -633,7 +638,18 @@ async function renderTree() {
         };
     }
 
-    // Measure actual heights after DOM insertion
+    container.insertBefore(svg, container.firstChild);
+
+    // Initialize canvas if first render
+    const isFirstRender = !TREE._initialized;
+    if (isFirstRender) {
+        initCanvas();
+        initLayoutToggle();
+        initTreeToolbar();
+        TREE._initialized = true;
+    }
+
+    // Measure actual heights after DOM insertion, then draw connectors and center
     requestAnimationFrame(() => {
         for (const node of layout.nodes) {
             const el = pillEls[node.data.id];
@@ -641,20 +657,9 @@ async function renderTree() {
                 positions[node.data.id].height = el.offsetHeight;
             }
         }
-        // Draw connectors after measuring
         drawConnectors(svg, layout.nodes, positions);
+        centerLoom();
     });
-
-    container.insertBefore(svg, container.firstChild);
-
-    // Initialize canvas if first render
-    if (!TREE._initialized) {
-        initCanvas();
-        initLayoutToggle();
-        initTreeToolbar();
-        resetCanvasView();
-        TREE._initialized = true;
-    }
 }
 
 function createNode(node, branchNames) {
