@@ -885,7 +885,9 @@ function _initSlashAutocomplete() {
 
 let _queuedGeneration = null;  // queued message to generate after current stream ends
 
+let _sendInFlight = false;
 async function sendMessage() {
+    if (_sendInFlight) return;
     if (!State.currentConvId) {
         showToast('Create or select a conversation first', 'error');
         return;
@@ -925,6 +927,7 @@ async function sendMessage() {
         msgData.parent_id = null;
     }
 
+    _sendInFlight = true;
     try {
         const msg = await API.post(`/api/conversations/${State.currentConvId}/messages`, msgData);
 
@@ -970,6 +973,8 @@ async function sendMessage() {
         }
     } catch (err) {
         showToast('Failed to send message', 'error');
+    } finally {
+        _sendInFlight = false;
     }
 }
 
