@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -206,15 +207,29 @@ async def action_start(name: str):
         return JSONResponse({"error": f"{name} already running (PID {_child_procs[name].pid})"}, status_code=409)
 
     info = INSTANCES[name]
+    port = info["port"]
+
+    # Wait for port to be available (old process may still be releasing it)
+    for attempt in range(10):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                break  # Port is free
+        await asyncio.sleep(1)
+    else:
+        return JSONResponse(
+            {"error": f"Port {port} still in use after 10s — old process may be stuck"},
+            status_code=409,
+        )
+
     env = os.environ.copy()
-    env["LOOM_PORT"] = str(info["port"])
+    env["LOOM_PORT"] = str(port)
     env["LOOM_DB"] = info["db"]
 
     # Determine the server.py path — for test, use worktree if available
     server_dir = Path(__file__).parent
     server_py = server_dir / "server.py"
 
-    log_file = server_dir / "server.log"
+    log_file = server_dir / f"{name}_server.log"
     log_handle = open(log_file, "a")
     proc = subprocess.Popen(
         [sys.executable, str(server_py)],
@@ -226,7 +241,17 @@ async def action_start(name: str):
                     | getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     _child_procs[name] = proc
-    return JSONResponse({"status": f"{name} starting on :{info['port']}", "pid": proc.pid})
+
+    # Verify the process didn't crash immediately
+    await asyncio.sleep(2)
+    if proc.poll() is not None:
+        log_handle.close()
+        return JSONResponse(
+            {"error": f"{name} crashed on startup (exit code {proc.returncode}). Check {log_file.name}"},
+            status_code=500,
+        )
+
+    return JSONResponse({"status": f"{name} starting on :{port}", "pid": proc.pid})
 
 
 @app.post("/action/{name}/restart")
