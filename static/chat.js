@@ -798,11 +798,13 @@ function _initSlashAutocomplete() {
     container.appendChild(dropdown);
 
     let _selectedIdx = -1;
+    let _currentMatches = [];
 
     input.addEventListener('input', async () => {
         const val = input.value;
         if (!val.startsWith('/') || val.includes('\n')) {
             dropdown.classList.add('hidden');
+            _currentMatches = [];
             return;
         }
         const query = val.slice(1).toLowerCase();
@@ -812,13 +814,22 @@ function _initSlashAutocomplete() {
             dropdown.classList.remove('hidden');
         }
         const skills = await _loadSkills();
-        const matches = query
+        // Filter by prefix first (for Tab completion), then fuzzy
+        const prefixMatches = skills.filter(s =>
+            s.name.toLowerCase().startsWith(query) ||
+            (s.command || '').toLowerCase().startsWith('/' + query)
+        );
+        const fuzzyMatches = query
             ? skills.filter(s =>
-                s.name.toLowerCase().includes(query) ||
-                (s.command || '').toLowerCase().includes('/' + query) ||
-                (s.description || '').toLowerCase().includes(query)
-              ).slice(0, 15)
-            : skills.slice(0, 31);  // Show all on bare "/"
+                !prefixMatches.includes(s) && (
+                    s.name.toLowerCase().includes(query) ||
+                    (s.description || '').toLowerCase().includes(query)
+                )
+              )
+            : [];
+        const matches = [...prefixMatches, ...fuzzyMatches].slice(0, 15);
+        if (!query) matches.splice(0, matches.length, ...skills.slice(0, 31));
+        _currentMatches = matches;
 
         if (matches.length === 0) {
             dropdown.classList.add('hidden');
@@ -867,11 +878,32 @@ function _initSlashAutocomplete() {
             _selectedIdx = Math.max(_selectedIdx - 1, 0);
             items.forEach((el, i) => el.classList.toggle('selected', i === _selectedIdx));
         } else if (e.key === 'Tab') {
-            // Always prevent Tab from moving focus when dropdown is open
+            // CLI-style tab completion: fill to longest common prefix
             e.preventDefault();
-            if (items.length === 0) return;
-            const idx = _selectedIdx >= 0 ? _selectedIdx : 0;
-            items[idx].click();
+            if (_currentMatches.length === 0) return;
+            if (_selectedIdx >= 0) {
+                // Item highlighted — select it directly
+                items[_selectedIdx].click();
+                return;
+            }
+            // Find longest common prefix among match names
+            const names = _currentMatches.map(s => s.name.toLowerCase());
+            let prefix = names[0];
+            for (let i = 1; i < names.length; i++) {
+                while (!names[i].startsWith(prefix)) {
+                    prefix = prefix.slice(0, -1);
+                }
+                if (!prefix) break;
+            }
+            if (_currentMatches.length === 1) {
+                // Single match — complete fully with trailing space
+                input.value = '/' + _currentMatches[0].name + ' ';
+                dropdown.classList.add('hidden');
+            } else if (prefix.length > input.value.length - 1) {
+                // Extend to common prefix
+                input.value = '/' + prefix;
+                input.dispatchEvent(new Event('input'));
+            }
         } else if (e.key === 'Enter' && _selectedIdx >= 0) {
             e.preventDefault();
             items[_selectedIdx].click();
@@ -914,16 +946,9 @@ async function sendMessage() {
             input.value = '';
             return;
         }
+        // Pass slash commands directly to CC — it handles skills natively
         if (translated) {
             showToast(`Running skill: ${translated.skillName}`);
-            // Local models don't resolve /slash as skills automatically —
-            // tell them to use the Skill tool explicitly
-            const ccModel = State.currentConv?.cc_model || 'sonnet';
-            const isLocal = !['sonnet', 'opus', 'haiku'].includes(ccModel);
-            if (isLocal) {
-                const args = content.replace(/^\/\S+\s*/, '').trim() || 'none';
-                content = `Use the Skill tool to invoke /${translated.skillName}. Arguments: ${args}. After the skill returns instructions, follow them exactly — execute any commands it specifies using Bash.`;
-            }
         }
     }
 
