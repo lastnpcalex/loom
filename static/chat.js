@@ -908,9 +908,15 @@ async function sendMessage() {
             input.value = '';
             return;
         }
-        // Pass slash commands directly to CC — it handles skills natively
         if (translated) {
             showToast(`Running skill: ${translated.skillName}`);
+            // Local models don't resolve /slash as skills automatically —
+            // wrap as explicit Skill tool instruction so CC invokes it properly
+            const ccModel = State.currentConv?.cc_model || 'sonnet';
+            const isLocal = !['sonnet', 'opus', 'haiku'].includes(ccModel);
+            if (isLocal) {
+                content = `Use the Skill tool to invoke /${translated.skillName}. Arguments: ${content.replace(/^\/\S+\s*/, '') || 'none'}`;
+            }
         }
     }
 
