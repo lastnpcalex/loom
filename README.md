@@ -56,7 +56,8 @@ State cards are editable inline — click any field value to edit, changes auto-
 
 The full Claude Code harness running on a local model via [`ollama launch claude`](https://docs.ollama.com/integrations/claude-code). Same tools, same permissions, same UI — just running on your hardware.
 
-- Full Claude Code tool suite (Bash, Read, Write, Edit, Grep, WebSearch, etc.)
+- Full Claude Code tool suite (Bash, Read, Write, Edit, Grep, etc.)
+- Web search and page fetch via local DuckDuckGo/trafilatura MCP server (see setup below)
 - Permission prompts proxied through the browser UI
 - Generated image display inline in responses
 - Works with any Ollama model with sufficient context (64k+ recommended)
@@ -142,6 +143,14 @@ For Loom mode, ensure the [Claude Code CLI](https://docs.anthropic.com/en/docs/c
 
 For Braid/Weave modes, ensure [Ollama](https://ollama.com) is installed with a model pulled (e.g. `ollama pull qwen3.5:9b`).
 
+For web search in Braid/Loom with local models, register the bundled MCP server once after cloning:
+
+```bash
+claude mcp add --scope user --transport stdio web-tools -- python /absolute/path/to/mcp_web_tools.py
+```
+
+This gives local models access to `web_search` (DuckDuckGo) and `web_fetch` (trafilatura) as CC tools. The MCP server is launched automatically by Claude Code when needed — no separate process to manage.
+
 Optional: start the admin server for instance management:
 
 ```bash
@@ -161,6 +170,7 @@ character_loader.py    -- Parse/save character, persona, and lore .md files
 ollama_client.py       -- Ollama API client (chat streaming, image description)
 claude_client.py       -- Claude Code CLI subprocess wrapper, NDJSON stream parser
 cc_permission_hook.py  -- PreToolUse hook script for browser-based permission prompts
+mcp_web_tools.py       -- MCP stdio server: web_search (DuckDuckGo) + web_fetch (trafilatura) for local models
 admin_server.py        -- Admin dashboard for managing Loom instances
 local_summary.py       -- Gemma 3 1B via llama-cpp-python for CPU summarization
 
