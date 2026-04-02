@@ -866,7 +866,13 @@ function _initSlashAutocomplete() {
             e.preventDefault();
             _selectedIdx = Math.max(_selectedIdx - 1, 0);
             items.forEach((el, i) => el.classList.toggle('selected', i === _selectedIdx));
-        } else if ((e.key === 'Tab' || e.key === 'Enter') && _selectedIdx >= 0) {
+        } else if (e.key === 'Tab') {
+            // Always prevent Tab from moving focus when dropdown is open
+            e.preventDefault();
+            if (items.length === 0) return;
+            const idx = _selectedIdx >= 0 ? _selectedIdx : 0;
+            items[idx].click();
+        } else if (e.key === 'Enter' && _selectedIdx >= 0) {
             e.preventDefault();
             items[_selectedIdx].click();
         } else if (e.key === 'Escape') {
