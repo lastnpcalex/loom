@@ -4,9 +4,23 @@
 
 # Ex Astris Umbra: A Loom Interface
 
-A multi-modal conversation interface with tree-based branching, local and cloud AI backends, tool-calling agents, and a WebGL black hole.
-
 ![Python](https://img.shields.io/badge/python-3.12+-blue) ![License](https://img.shields.io/badge/license-MIT-green)
+
+## What is a loom?
+
+An LLM loom treats every conversation as a **tree, not a thread**. Each message is a node. At any point you can branch — regenerate, edit, fork — and explore alternate paths without losing the originals. The metaphor comes from weaving: every response is a thread, and the loom holds them all in tension so you can compare, backtrack, and choose.
+
+This matters because LLM output is non-deterministic. The same prompt can produce a brilliant answer on one roll and a mediocre one on the next. A linear chat hides that variance — you see one path and lose the rest. A loom preserves them all. Regenerate five times, keep the best, branch from the second-best later. Edit a message from ten turns ago and watch the conversation diverge. The tree is the conversation's real shape; a single thread is just one path through it.
+
+A Shadow Loom applies this to three backends — Anthropic's Claude API, local Ollama models, and Claude Code as a subprocess — with a shared branching infrastructure, persistent storage, and full-text search across everything.
+
+## Search
+
+Every message across every conversation is searchable from the home page. Type a query, get highlighted snippet results grouped by conversation, click to jump directly to the matching message on its branch.
+
+This is particularly useful for **Claude Code sessions**. Loom mode runs CC as a subprocess and stores every tool call, every thinking block, every response in SQLite. That means you can search across months of CC sessions — find that one-off bash command from two weeks ago, locate the conversation where you debugged that migration, pull up every time Claude touched a specific file. It's an indexed, searchable archive of your entire CC history that you can branch from at any point.
+
+There's also **per-conversation search** and **tree search** (find and navigate between matching nodes on the visual tree).
 
 ## Three modes, one loom
 
