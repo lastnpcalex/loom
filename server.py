@@ -2620,7 +2620,7 @@ if __name__ == "__main__":
 
     uv_config = uvicorn.Config(
         app, host=config.host, port=config.port,
-        ws_ping_interval=None, ws_ping_timeout=None,
+        ws_ping_interval=20, ws_ping_timeout=20,
         **ssl_kwargs,
     )
     server = uvicorn.Server(uv_config)
