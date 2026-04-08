@@ -3933,7 +3933,7 @@ pre.tool-output {
     }
     .tree-pill { max-width: 200px; }
 
-    /* Mobile header: show conversation space name next to Shadow Loom */
+    /* Mobile header: wrap icon container to left of conversation name */
     #app-header {
         flex-wrap: wrap;
     }
@@ -3943,9 +3943,18 @@ pre.tool-output {
     #header-separator {
         display: none;
     }
-    #conv-title {
+
+    /* Icons wrapper: settings, notif-dropdown, bookmarks - placed left of conversation name */
+    #header-icons {
+        display: flex;
+        align-items: center;
+        gap: 6px;
         order: 1;
-        margin-left: 4px;
+        margin-right: 8px;
+    }
+
+    #conv-title {
+        order: 2;
         font-size: 13px;
         color: var(--text-secondary);
         white-space: nowrap;
@@ -3953,6 +3962,7 @@ pre.tool-output {
     #conv-title:hover {
         color: var(--text-primary);
     }
+
     #breadcrumb-trail {
         order: 10;
         flex: 1 0 calc(100% - 70px);
@@ -3964,11 +3974,12 @@ pre.tool-output {
         order: 11;
     }
     #context-info {
-        order: 20;
-        width: 100%;
-        justify-content: center;
         padding: 2px 0 0;
         font-size: 10px;
+    }
+    /* Hide the old #header-right - icons are now in #header-icons */
+    #header-right {
+        display: none;
     }
     /* Notification dropdown: full-width on mobile like bookmarks panel */
     #notif-dropdown {
