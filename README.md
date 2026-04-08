@@ -12,7 +12,7 @@ An LLM loom treats every conversation as a **tree, not a thread**. Each message 
 
 This matters because LLM output is non-deterministic. The same prompt can produce a brilliant answer on one roll and a mediocre one on the next. A linear chat hides that variance — you see one path and lose the rest. A loom preserves them all. Regenerate five times, keep the best, branch from the second-best later. Edit a message from ten turns ago and watch the conversation diverge. The tree is the conversation's real shape; a single thread is just one path through it.
 
-A Shadow Loom applies this to three backends — Anthropic's Claude API, local Ollama models, and Claude Code as a subprocess — with a shared branching infrastructure, persistent storage, and full-text search across everything.
+A Shadow Loom applies this to four backends — Anthropic's Claude API, Google's Gemini CLI, local Ollama models, and Claude Code as a subprocess — with a shared branching infrastructure, persistent storage, and full-text search across everything.
 
 ## Search
 
@@ -91,11 +91,17 @@ Connects to the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code
 - Per-turn and cumulative cost tracking
 - Image attachments via the Read tool or clipboard paste (Ctrl+V)
 
-#### Ollama model switching
+### Gemini — Gemini CLI in the browser
 
-Loom and Braid conversations can switch between Anthropic and local Ollama models mid-conversation. The model dropdown shows both Anthropic models (Sonnet, Opus, Haiku) and available Ollama models (currently filtered to the qwen3.5 family). When an Ollama model is selected, the effort selector hides (local models don't support Anthropic's thinking effort parameter).
+Connects to the [Gemini CLI](https://github.com/google-gemini/gemini-cli) as a subprocess, using the same loom infrastructure as Claude Code. Supports Gemini 2.5 and 3.x model families.
 
-On provider switch, the session resume is skipped for one turn to avoid thinking block signature conflicts — the Anthropic API cryptographically signs thinking blocks, and blocks from local models don't carry valid signatures. The conversation falls back to a database history rebuild for that single transition turn, then resumes normally.
+- Same tool call rendering, streaming, and permission proxying as Loom mode
+- Model selection: Gemini 2.5 Pro/Flash/Flash Lite, Gemini 3 Flash Preview, Gemini 3.1 Pro/Flash Lite Preview
+- Permission hook handles both Claude (`PreToolUse`) and Gemini (`BeforeTool`) formats
+
+#### Cross-provider switching
+
+Loom conversations can switch between Anthropic, Gemini, and local Ollama models mid-conversation. The model dropdown shows all three provider groups. When switching providers, the session resume is skipped for one turn — each provider's session format is incompatible with the others. The conversation falls back to a full database history rebuild for that single transition turn, then resumes normally with the new provider.
 
 > **Note:** `AskUserQuestion` is disabled in Loom's CC modes. CC's headless `-p` mode has no mechanism to send user responses back to an active `AskUserQuestion` tool call — stdin is closed after the initial prompt. This is an [open feature request](https://github.com/anthropics/claude-code/issues/16712) in Claude Code. When CC adds support for `--input-format stream-json` responses to pending tool calls, Loom can re-enable interactive questions. Until then, CC proceeds with its best judgment instead of asking.
 
@@ -135,6 +141,7 @@ A lightweight admin dashboard (`admin_server.py`) runs on port 3002 and provides
 
 - Status monitoring for all Loom instances (main on 3000, test on 3001)
 - Graceful shutdown, start, and restart actions per instance
+- Admin tools: auth status/refresh, VRAM cleanup, Ollama model management, disk usage
 - Auto-refreshing dashboard at `http://localhost:3002`
 
 ## Quick start
@@ -153,7 +160,9 @@ python server.py
 
 Open `https://localhost:3000` in your browser.
 
-For Loom mode, ensure the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) is installed and on PATH with an active API key.
+For Loom mode, ensure the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) is installed and on PATH with an active subscription or API key.
+
+For Gemini mode, ensure the [Gemini CLI](https://github.com/google-gemini/gemini-cli) is installed and on PATH with authentication configured.
 
 For Braid/Weave modes, ensure [Ollama](https://ollama.com) is installed with a model pulled (e.g. `ollama pull qwen3.5:9b`).
 
@@ -183,7 +192,8 @@ ooda_harness.py        -- OODA loop: XML parser, state executors, prompt builder
 character_loader.py    -- Parse/save character, persona, and lore .md files
 ollama_client.py       -- Ollama API client (chat streaming, image description)
 claude_client.py       -- Claude Code CLI subprocess wrapper, NDJSON stream parser
-cc_permission_hook.py  -- PreToolUse hook script for browser-based permission prompts
+gemini_client.py       -- Gemini CLI subprocess wrapper, NDJSON stream parser
+cc_permission_hook.py  -- PreToolUse/BeforeTool hook script for browser-based permission prompts
 mcp_web_tools.py       -- MCP stdio server: web_search (DuckDuckGo) + web_fetch (trafilatura) for local models
 admin_server.py        -- Admin dashboard for managing Loom instances
 local_summary.py       -- Gemma 3 1B via llama-cpp-python for CPU summarization

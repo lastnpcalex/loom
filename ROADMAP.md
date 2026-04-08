@@ -26,5 +26,7 @@ Support for spawning subagents using local models or Gemini CLI alongside the ma
 ### Automatic Git-Tree Loom
 Visualize git history as a loom. Branches, merges, and commits rendered as a tree with the same pan/zoom canvas. Navigate code changes the same way you navigate conversations.
 
-### Gemini CLI Loom Options
-Integration with Gemini CLI as a conversation backend (alongside Ollama and Claude Code). Same loom UI, different model provider.
+### ~~Gemini CLI Loom Options~~ (Done)
+~~Integration with Gemini CLI as a conversation backend (alongside Ollama and Claude Code). Same loom UI, different model provider.~~
+
+Shipped: `gemini_client.py` wraps Gemini CLI as a subprocess with NDJSON stream parsing. Model dropdown includes Gemini 2.5 and 3.x families. Permission hook handles both Claude and Gemini formats. Cross-provider switching (Claude/Gemini/Ollama) works mid-conversation with automatic history rebuild on provider transitions.
