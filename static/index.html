@@ -16,32 +16,28 @@
         <!-- Top bar (always visible) -->
         <header id="app-header">
             <div id="header-left">
-                <!-- Row 1: Shadow Loom + colon + conversation name -->
-                <div id="header-icon-row">
-                    <button id="btn-home" title="Return to all conversations">A Shadow Loom ◈</button>
-                    <span id="conv-title" class="hidden"></span>
-                </div>
-                <!-- Row 2: breadcrumbs/tree + right-side icons -->
-                <div id="header-icon-row-2">
-                    <span id="breadcrumb-trail" class="hidden"></span>
-                    <button id="btn-to-tree" class="hidden" title="Back to tree view">⟨ Tree</button>
-                    <!-- Right-side icons (moved here for mobile) -->
-                    <div id="notif-bell-wrap">
-                        <button id="notif-bell" title="Background generations landed">
-                            <span class="notif-bell-icon">⑂</span>
-                            <span id="notif-badge" class="notif-badge hidden">0</span>
-                        </button>
-                        <div id="notif-dropdown" class="hidden">
-                            <div class="notif-header">
-                                <span>Landed branches</span>
-                                <button id="notif-clear" title="Close">&#x2715;</button>
-                            </div>
-                            <div id="notif-list"></div>
+                <button id="btn-home" title="Return to all conversations">A Shadow Loom ◈</button>
+                <span id="header-separator" class="hidden">/</span>
+                <span id="conv-title" class="hidden"></span>
+                <span id="breadcrumb-trail" class="hidden"></span>
+                <button id="btn-to-tree" class="hidden" title="Back to tree view">⟨ Tree</button>
+            </div>
+            <div id="header-right">
+                <div id="notif-bell-wrap">
+                    <button id="notif-bell" title="Background generations landed">
+                        <span class="notif-bell-icon">⑂</span>
+                        <span id="notif-badge" class="notif-badge hidden">0</span>
+                    </button>
+                    <div id="notif-dropdown" class="hidden">
+                        <div class="notif-header">
+                            <span>Landed branches</span>
+                            <button id="notif-clear" title="Close">&#x2715;</button>
                         </div>
+                        <div id="notif-list"></div>
                     </div>
-                    <button id="btn-bookmarks-global" title="Bookmarks" class="hidden">⬡</button>
-                    <button id="btn-settings" title="Settings">⚙</button>
                 </div>
+                <button id="btn-bookmarks-global" title="Bookmarks" class="hidden">⬡</button>
+                <button id="btn-settings" title="Settings">⚙</button>
             </div>
         </header>
 

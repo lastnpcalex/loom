@@ -3933,35 +3933,28 @@ pre.tool-output {
     }
     .tree-pill { max-width: 200px; }
 
-    /* Mobile header: two-row layout */
+    /* Mobile header: 2-row layout */
     #app-header {
         flex-wrap: wrap;
     }
     #header-left {
         display: contents;
     }
-
-    /* Row 1: Shadow Loom icon + colon + conversation name */
-    #btn-home {
-        margin-right: 4px;
-    }
     #header-separator {
-        display: none; /* use inline "—" or colon */
+        display: none;
     }
     #conv-title {
-        order: 1;
         font-size: 13px;
         color: var(--text-secondary);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        max-width: 60%; /* leave room for icons */
+        flex: 0 1 auto;
+        max-width: 40vw;
     }
     #conv-title:hover {
         color: var(--text-primary);
     }
-
-    /* Row 2: breadcrumbs/tree + right-side icons */
     #breadcrumb-trail {
         order: 10;
         flex: 1 0 calc(100% - 70px);
@@ -3971,49 +3964,11 @@ pre.tool-output {
     }
     #btn-to-tree {
         order: 11;
-        margin-left: 4px;
     }
-
-    /* Row 1: Shadow Loom + colon + conversation name */
-    #header-icon-row {
-        display: flex;
-        align-items: center;
-        gap: 2px;
-        margin-bottom: 4px;
-    }
-    #header-icon-row #btn-home {
-        margin-right: 2px;
-    }
-    #header-icon-row #conv-title {
-        font-size: 13px;
-        color: var(--text-secondary);
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        max-width: 55%; /* leave room for right-side icons */
-    }
-    #header-icon-row #conv-title:hover {
-        color: var(--text-primary);
-    }
-
-    /* Row 2: breadcrumbs/tree + right-side icons */
-    #header-icon-row-2 {
-        display: flex;
-        align-items: center;
-        gap: 4px;
-        padding-top: 4px;
-    }
-    #header-icon-row-2 #breadcrumb-trail {
-        flex: 1 0 calc(100% - 70px);
-        max-width: calc(100% - 70px);
-        overflow-x: auto;
-        white-space: nowrap;
-    }
-    #header-icon-row-2 #btn-to-tree {
-        margin-left: 4px;
-    }
-    /* Right-side icons (settings/notifs/bookmarks) in Row 2 */
-    #header-icon-row-2 #context-info {
+    #context-info {
+        order: 20;
+        width: 100%;
+        justify-content: center;
         padding: 2px 0 0;
         font-size: 10px;
     }
