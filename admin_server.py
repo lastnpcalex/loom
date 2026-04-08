@@ -4,6 +4,7 @@ Runs on its own port (default 3002) and provides:
   - Status dashboard showing all Loom instances
   - Graceful shutdown for any instance
   - Restart capability (stop + relaunch)
+  - Admin tools: auth refresh, VRAM cleanup, etc.
 
 Usage:
     python admin_server.py                  # port 3002
@@ -86,6 +87,238 @@ async def check_instance(name: str, info: dict) -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Admin tools — each returns {status, output} JSON
+# ---------------------------------------------------------------------------
+
+@app.post("/tools/auth-status")
+async def tool_auth_status():
+    """Check Claude auth status."""
+    try:
+        proc = subprocess.run(
+            ["claude", "-p", "respond with only: auth ok"],
+            capture_output=True, text=True, timeout=15,
+            cwd=str(Path(__file__).parent),
+        )
+        output = (proc.stdout or "") + (proc.stderr or "")
+        ok = proc.returncode == 0
+        return JSONResponse({
+            "status": "ok" if ok else "error",
+            "output": output.strip() or "(no output)",
+            "exit_code": proc.returncode,
+        })
+    except subprocess.TimeoutExpired:
+        return JSONResponse({"status": "error", "output": "Timed out after 15s"})
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": str(e)})
+
+
+# Holds the running `claude auth login` process while waiting for OAuth
+_auth_login_proc: subprocess.Popen | None = None
+
+
+@app.post("/tools/auth-refresh")
+async def tool_auth_refresh():
+    """Start the OAuth login flow — returns a clickable link."""
+    global _auth_login_proc
+    import re, threading
+
+    # Kill any previous login attempt
+    if _auth_login_proc and _auth_login_proc.poll() is None:
+        _auth_login_proc.kill()
+        _auth_login_proc = None
+
+    # First check if auth already works
+    try:
+        r = subprocess.run(
+            ["claude", "-p", "respond with only: ok"],
+            capture_output=True, text=True, timeout=15,
+            cwd=str(Path(__file__).parent),
+        )
+        if r.returncode == 0 and (r.stdout or "").strip():
+            return JSONResponse({
+                "status": "ok",
+                "output": f"Auth is already working. Claude responded: {(r.stdout or '').strip()[:100]}\n\nNo refresh needed.",
+            })
+    except Exception:
+        pass  # Auth is broken, proceed with login
+
+    # Start `claude auth login` and capture the URL
+    proc = subprocess.Popen(
+        ["claude", "auth", "login"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.PIPE,
+        text=True,
+    )
+    _auth_login_proc = proc
+
+    # Read output lines in a thread to avoid blocking
+    captured = []
+    def reader():
+        for line in proc.stdout:
+            captured.append(line.strip())
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
+    # Wait up to 8s for the URL to appear
+    for _ in range(16):
+        await asyncio.sleep(0.5)
+        if len(captured) >= 2:
+            break
+
+    # Extract the URL
+    url = None
+    for line in captured:
+        match = re.search(r'https://claude\.com/\S+', line)
+        if match:
+            url = match.group(0)
+            break
+
+    if not url:
+        proc.kill()
+        _auth_login_proc = None
+        return JSONResponse({
+            "status": "error",
+            "output": "Could not get login URL.\n\nOutput:\n" + "\n".join(captured),
+        })
+
+    return JSONResponse({
+        "status": "login_started",
+        "output": "Login flow started. Tap the link below to authenticate:\n\n"
+                  "(The process is waiting — once you complete login in the browser, it will finish automatically.)",
+        "url": url,
+    })
+
+
+@app.get("/tools/auth-login-status")
+async def tool_auth_login_status():
+    """Check if the running auth login process has completed."""
+    global _auth_login_proc
+    if _auth_login_proc is None:
+        return JSONResponse({"status": "idle", "output": "No login in progress."})
+
+    rc = _auth_login_proc.poll()
+    if rc is None:
+        return JSONResponse({"status": "waiting", "output": "Still waiting for you to authenticate..."})
+
+    # Process finished
+    _auth_login_proc = None
+    if rc == 0:
+        return JSONResponse({"status": "ok", "output": "Login successful!"})
+    else:
+        return JSONResponse({"status": "error", "output": f"Login failed (exit code {rc})."})
+
+
+@app.post("/tools/clear-vram")
+async def tool_clear_vram():
+    """Unload all Ollama models from VRAM."""
+    lines = []
+    try:
+        r = subprocess.run(
+            ["ollama", "ps"],
+            capture_output=True, text=True, timeout=10,
+        )
+        ps_output = r.stdout.strip()
+        lines.append(f"Before:\n{ps_output or '(no models loaded)'}")
+
+        # Parse loaded model names from 'ollama ps' output
+        models = []
+        for line in ps_output.split("\n")[1:]:  # skip header
+            parts = line.split()
+            if parts:
+                models.append(parts[0])
+
+        if not models:
+            lines.append("\nNo models loaded in VRAM.")
+        else:
+            for model in models:
+                try:
+                    # Generate with keep_alive=0 tells Ollama to unload immediately
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        resp = await client.post(
+                            "http://127.0.0.1:11434/api/generate",
+                            json={"model": model, "keep_alive": 0},
+                        )
+                        lines.append(f"Unloaded {model}: {resp.status_code}")
+                except Exception as e:
+                    lines.append(f"Failed to unload {model}: {e}")
+
+        # Show state after
+        r2 = subprocess.run(
+            ["ollama", "ps"],
+            capture_output=True, text=True, timeout=10,
+        )
+        lines.append(f"\nAfter:\n{r2.stdout.strip() or '(no models loaded)'}")
+
+    except FileNotFoundError:
+        lines.append("ollama not found on PATH")
+    except Exception as e:
+        lines.append(f"Error: {e}")
+
+    return JSONResponse({"status": "ok", "output": "\n".join(lines)})
+
+
+@app.post("/tools/ollama-ps")
+async def tool_ollama_ps():
+    """Show currently loaded Ollama models."""
+    try:
+        r = subprocess.run(
+            ["ollama", "ps"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return JSONResponse({
+            "status": "ok",
+            "output": (r.stdout or r.stderr or "(no output)").strip(),
+        })
+    except FileNotFoundError:
+        return JSONResponse({"status": "error", "output": "ollama not found on PATH"})
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": str(e)})
+
+
+@app.post("/tools/ollama-models")
+async def tool_ollama_models():
+    """List available Ollama models."""
+    try:
+        r = subprocess.run(
+            ["ollama", "list"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return JSONResponse({
+            "status": "ok",
+            "output": (r.stdout or r.stderr or "(no output)").strip(),
+        })
+    except FileNotFoundError:
+        return JSONResponse({"status": "error", "output": "ollama not found on PATH"})
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": str(e)})
+
+
+@app.post("/tools/disk-usage")
+async def tool_disk_usage():
+    """Show disk usage for the Loom directory and DB files."""
+    cwd = Path(__file__).parent
+    lines = []
+    for db in sorted(cwd.glob("*.db")):
+        size_mb = db.stat().st_size / (1024 * 1024)
+        lines.append(f"{db.name}: {size_mb:.1f} MB")
+    for wal in sorted(cwd.glob("*.db-wal")):
+        size_mb = wal.stat().st_size / (1024 * 1024)
+        lines.append(f"{wal.name}: {size_mb:.1f} MB")
+    for log in sorted(cwd.glob("*_server.log")):
+        size_mb = log.stat().st_size / (1024 * 1024)
+        lines.append(f"{log.name}: {size_mb:.1f} MB")
+    return JSONResponse({
+        "status": "ok",
+        "output": "\n".join(lines) or "(no files found)",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     statuses = await asyncio.gather(
@@ -97,7 +330,7 @@ async def dashboard():
         color = "#0f6" if s["status"] == "online" else "#f44"
         dot = f'<span style="color:{color}; font-size:20px;">&#9679;</span>'
         managed_tag = ' <span class="tag">managed</span>' if s.get("managed") else ""
-        pid_info = f"PID {s['pid']}" if s.get("pid") else "—"
+        pid_info = f"PID {s['pid']}" if s.get("pid") else "\u2014"
 
         actions = ""
         if s["status"] == "online":
@@ -122,6 +355,7 @@ async def dashboard():
 <style>
     body {{ font-family: 'Segoe UI', sans-serif; background: #0a0a19; color: #ddd; margin: 0; padding: 24px; }}
     h1 {{ color: #0ff; font-size: 22px; margin-bottom: 20px; }}
+    h2 {{ color: #0ff; font-size: 16px; margin: 24px 0 12px 0; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th {{ text-align: left; color: #888; font-size: 12px; text-transform: uppercase; padding: 8px; border-bottom: 1px solid #333; }}
     td {{ padding: 12px 8px; border-bottom: 1px solid #1a1a2e; }}
@@ -133,8 +367,22 @@ async def dashboard():
     .btn-green {{ color: #0f6; border-color: #0f6; }}
     .btn-green:hover {{ background: rgba(0,255,102,0.15); }}
     .tag {{ font-size: 10px; background: rgba(0,255,255,0.15); color: #0ff; padding: 2px 6px; border-radius: 3px; }}
-    #toast {{ position: fixed; bottom: 20px; right: 20px; padding: 12px 20px; background: #1a1a2e; border: 1px solid #0ff; border-radius: 6px; display: none; }}
+    #toast {{ position: fixed; bottom: 20px; right: 20px; padding: 12px 20px; background: #1a1a2e; border: 1px solid #0ff; border-radius: 6px; display: none; z-index: 100; }}
     .refresh-note {{ color: #666; font-size: 12px; margin-top: 16px; }}
+    .tools-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; margin-bottom: 12px; }}
+    .tool-btn {{ padding: 10px 14px; border: 1px solid #444; border-radius: 6px; cursor: pointer;
+        font-size: 13px; background: rgba(255,255,255,0.03); color: #ccc; transition: 0.2s; text-align: left; }}
+    .tool-btn:hover {{ background: rgba(0,255,255,0.08); border-color: #0ff; color: #fff; }}
+    .tool-btn .icon {{ font-size: 18px; display: block; margin-bottom: 4px; }}
+    .tool-btn .label {{ font-size: 12px; color: #888; }}
+    #tool-output {{ font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; padding: 12px;
+        background: #000; border-radius: 6px; min-height: 60px; max-height: 300px; overflow-y: auto;
+        white-space: pre-wrap; color: #0f6; border: 1px solid #1a1a2e; display: none; }}
+    #tool-output.visible {{ display: block; }}
+    #tool-output.error {{ color: #f66; }}
+    .spinner {{ display: inline-block; width: 14px; height: 14px; border: 2px solid #0ff;
+        border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; }}
+    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
 </style>
 </head>
 <body>
@@ -143,7 +391,37 @@ async def dashboard():
     <tr><th>Instance</th><th>Port</th><th>Database</th><th>PID</th><th>Actions</th></tr>
     {rows}
 </table>
-<p class="refresh-note">Auto-refreshes every 5s &mdash; admin running on :{ADMIN_PORT}</p>
+
+<h2>Tools</h2>
+<div class="tools-grid">
+    <button class="tool-btn" onclick="runTool('auth-status')">
+        <span class="icon">&#128273;</span> Auth Status
+        <span class="label">Check Claude login</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('auth-refresh')">
+        <span class="icon">&#128260;</span> Auth Check/Fix
+        <span class="label">Test auth, show fix steps</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('clear-vram')">
+        <span class="icon">&#128165;</span> Clear VRAM
+        <span class="label">Unload all models</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('ollama-ps')">
+        <span class="icon">&#128202;</span> Ollama PS
+        <span class="label">Loaded models</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('ollama-models')">
+        <span class="icon">&#128451;</span> Model List
+        <span class="label">Available models</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('disk-usage')">
+        <span class="icon">&#128190;</span> Disk Usage
+        <span class="label">DB &amp; log sizes</span>
+    </button>
+</div>
+<div id="tool-output"></div>
+
+<p class="refresh-note">Auto-refreshes every 10s &mdash; admin running on :{ADMIN_PORT}</p>
 <div id="toast"></div>
 <script>
     function showToast(msg) {{
@@ -157,9 +435,70 @@ async def dashboard():
         const r = await fetch('/action/' + name + '/' + action, {{method: 'POST'}});
         const d = await r.json();
         showToast(d.status || d.error || 'done');
-        setTimeout(() => location.reload(), 1500);
+        setTimeout(() => location.reload(), 2000);
     }}
-    setTimeout(() => location.reload(), 5000);
+
+    let refreshTimer = setTimeout(() => location.reload(), 10000);
+
+    async function runTool(name) {{
+        // Pause auto-refresh while a tool is running
+        clearTimeout(refreshTimer);
+
+        const out = document.getElementById('tool-output');
+        out.className = 'visible';
+        out.innerHTML = '<span class="spinner"></span> Running ' + name + '...';
+
+        try {{
+            const r = await fetch('/tools/' + name, {{method: 'POST'}});
+            const d = await r.json();
+
+            if (d.status === 'login_started' && d.url) {{
+                // Show clickable login link + poll for completion
+                out.innerHTML = d.output.replace(/\\n/g, '<br>') +
+                    '<br><br><a href="' + d.url + '" target="_blank" ' +
+                    'style="color:#0ff; font-size:14px; word-break:break-all;">' +
+                    d.url + '</a>' +
+                    '<br><br><span id="login-poll" style="color:#888;">Waiting for login to complete...</span>';
+                out.className = 'visible';
+                pollLoginStatus();
+                return;
+            }}
+
+            out.textContent = d.output || '(no output)';
+            out.className = d.status === 'error' ? 'visible error' : 'visible';
+        }} catch (e) {{
+            out.textContent = 'Request failed: ' + e;
+            out.className = 'visible error';
+        }}
+
+        // Resume auto-refresh after 30s
+        refreshTimer = setTimeout(() => location.reload(), 30000);
+    }}
+
+    async function pollLoginStatus() {{
+        const poll = document.getElementById('login-poll');
+        if (!poll) return;
+
+        try {{
+            const r = await fetch('/tools/auth-login-status');
+            const d = await r.json();
+            if (d.status === 'waiting') {{
+                poll.innerHTML = '<span class="spinner"></span> ' + d.output;
+                setTimeout(pollLoginStatus, 3000);
+            }} else if (d.status === 'ok') {{
+                poll.style.color = '#0f6';
+                poll.textContent = d.output;
+                refreshTimer = setTimeout(() => location.reload(), 5000);
+            }} else {{
+                poll.style.color = '#f66';
+                poll.textContent = d.output;
+                refreshTimer = setTimeout(() => location.reload(), 10000);
+            }}
+        }} catch (e) {{
+            poll.textContent = 'Poll failed: ' + e;
+            refreshTimer = setTimeout(() => location.reload(), 10000);
+        }}
+    }}
 </script>
 </body>
 </html>"""
