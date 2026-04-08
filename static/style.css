@@ -3933,50 +3933,89 @@ pre.tool-output {
     }
     .tree-pill { max-width: 200px; }
 
-    /* Mobile header: icons pushed right, conversation name after Shadow Loom */
+    /* Mobile header: two-row layout */
     #app-header {
         flex-wrap: wrap;
     }
     #header-left {
         display: contents;
     }
+
+    /* Row 1: Shadow Loom icon + colon + conversation name */
+    #btn-home {
+        margin-right: 4px;
+    }
     #header-separator {
-        display: none;
+        display: none; /* use inline "—" or colon */
     }
-
-    /* Icons wrapper: push to right with margin-left: auto */
-    #header-icons {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        margin-left: auto;
-    }
-
     #conv-title {
+        order: 1;
         font-size: 13px;
         color: var(--text-secondary);
         white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 60%; /* leave room for icons */
     }
     #conv-title:hover {
         color: var(--text-primary);
     }
 
+    /* Row 2: breadcrumbs/tree + right-side icons */
     #breadcrumb-trail {
+        order: 10;
         flex: 1 0 calc(100% - 70px);
         max-width: calc(100% - 70px);
         overflow-x: auto;
         white-space: nowrap;
     }
     #btn-to-tree {
+        order: 11;
         margin-left: 4px;
     }
-    #context-info {
+
+    /* Row 1: Shadow Loom + colon + conversation name */
+    #header-icon-row {
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        margin-bottom: 4px;
+    }
+    #header-icon-row #btn-home {
+        margin-right: 2px;
+    }
+    #header-icon-row #conv-title {
+        font-size: 13px;
+        color: var(--text-secondary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 55%; /* leave room for right-side icons */
+    }
+    #header-icon-row #conv-title:hover {
+        color: var(--text-primary);
+    }
+
+    /* Row 2: breadcrumbs/tree + right-side icons */
+    #header-icon-row-2 {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding-top: 4px;
+    }
+    #header-icon-row-2 #breadcrumb-trail {
+        flex: 1 0 calc(100% - 70px);
+        max-width: calc(100% - 70px);
+        overflow-x: auto;
+        white-space: nowrap;
+    }
+    #header-icon-row-2 #btn-to-tree {
+        margin-left: 4px;
+    }
+    /* Right-side icons (settings/notifs/bookmarks) in Row 2 */
+    #header-icon-row-2 #context-info {
         padding: 2px 0 0;
         font-size: 10px;
-    }
-    /* Hide the old #header-right - icons are now in #header-icons */
-    #header-right {
-        display: none;
     }
     /* Notification dropdown: full-width on mobile like bookmarks panel */
     #notif-dropdown {
