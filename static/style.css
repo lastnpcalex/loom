@@ -3933,7 +3933,7 @@ pre.tool-output {
     }
     .tree-pill { max-width: 200px; }
 
-    /* Mobile header: wrap icon container to left of conversation name */
+    /* Mobile header: icons pushed right, conversation name after Shadow Loom */
     #app-header {
         flex-wrap: wrap;
     }
@@ -3944,17 +3944,15 @@ pre.tool-output {
         display: none;
     }
 
-    /* Icons wrapper: settings, notif-dropdown, bookmarks - placed left of conversation name */
+    /* Icons wrapper: push to right with margin-left: auto */
     #header-icons {
         display: flex;
         align-items: center;
         gap: 6px;
-        order: 1;
-        margin-right: 8px;
+        margin-left: auto;
     }
 
     #conv-title {
-        order: 2;
         font-size: 13px;
         color: var(--text-secondary);
         white-space: nowrap;
@@ -3964,14 +3962,13 @@ pre.tool-output {
     }
 
     #breadcrumb-trail {
-        order: 10;
         flex: 1 0 calc(100% - 70px);
         max-width: calc(100% - 70px);
         overflow-x: auto;
         white-space: nowrap;
     }
     #btn-to-tree {
-        order: 11;
+        margin-left: 4px;
     }
     #context-info {
         padding: 2px 0 0;
