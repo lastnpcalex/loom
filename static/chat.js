@@ -1638,6 +1638,8 @@ function createMessageElement(msg, cost) {
         : isClaudeMode ? 'Claude'
         : isLocalMode ? (State.currentConv.local_model || 'Local')
         : getCharacterName();
+    // Local model tag to show alongside Claude label
+    const localModelTag = isLocalMode ? `<span class="local-model-tag">({${escapeHtml(State.currentConv.local_model || 'local')} model})</span>` : '';
     const branchLabel = State.branchNames?.[msg.id] || '';
 
     const isBm = State.bookmarks?.some(b => b.message_id === msg.id);
@@ -1751,7 +1753,7 @@ function createMessageElement(msg, cost) {
     div.innerHTML = '<div class="message-header">' +
         '<div class="message-header-left">' +
             '<span class="message-role">' + escapeHtml(roleLabel) + '</span>' +
-            (branchLabel ? '<span class="message-branch-label" title="Click to copy branch path">' + escapeHtml(branchLabel) + '</span>' : '') +
+            (localModelTag ? `<span class="local-model-label">${localModelTag}</span>` : '') + (branchLabel ? '<span class="message-branch-label" title="Click to copy branch path">' + escapeHtml(branchLabel) + '</span>' : '') +
         '</div>' +
         '<div class="message-actions">' + branchPlaceholder + actionsHtml + '</div>' +
         '</div>' +

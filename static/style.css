@@ -1852,6 +1852,14 @@ body::after {
 .message.user .message-role { color: var(--cyan); text-shadow: 0 0 8px rgba(0, 255, 255, 0.4); }
 .message.assistant .message-role { color: var(--purple); text-shadow: 0 0 8px rgba(191, 0, 255, 0.4); }
 
+.local-model-label {
+    font-family: var(--font-display);
+    font-size: 11px;
+    margin-left: 6px;
+    color: var(--text-muted);
+    opacity: 0.85;
+}
+
 .message-actions {
     display: flex;
     align-items: center;
@@ -3925,15 +3933,25 @@ pre.tool-output {
     }
     .tree-pill { max-width: 200px; }
 
-    /* Mobile header: 2-row layout */
+    /* Mobile header: show conversation space name next to Shadow Loom */
     #app-header {
         flex-wrap: wrap;
     }
     #header-left {
         display: contents;
     }
-    #header-separator, #conv-title {
+    #header-separator {
         display: none;
+    }
+    #conv-title {
+        order: 1;
+        margin-left: 4px;
+        font-size: 13px;
+        color: var(--text-secondary);
+        white-space: nowrap;
+    }
+    #conv-title:hover {
+        color: var(--text-primary);
     }
     #breadcrumb-trail {
         order: 10;
