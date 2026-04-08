@@ -1630,8 +1630,11 @@ function createMessageElement(msg, cost) {
     div.dataset.msgId = msg.id;
 
     const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
+    const msgModel = msg.cc_model_used || State.currentConv?.cc_model || '';
+    const isGemini = isClaudeMode && msgModel.startsWith('gemini');
     const isLocalMode = State.currentConv && State.currentConv.mode === 'local';
     const roleLabel = msg.role === 'user' ? 'You'
+        : isGemini ? 'Gemini'
         : isClaudeMode ? 'Claude'
         : isLocalMode ? (State.currentConv.local_model || 'Local')
         : getCharacterName();
@@ -2114,8 +2117,10 @@ function appendStreamingMessage() {
     streamingDiv = document.createElement('div');
     streamingDiv.className = 'message assistant streaming';
     const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
+    const isGemini = isClaudeMode && State.currentConv.cc_model && State.currentConv.cc_model.startsWith('gemini');
     const isLocalMode = State.currentConv && State.currentConv.mode === 'local';
-    const label = isClaudeMode ? 'Claude'
+    const label = isGemini ? 'Gemini'
+        : isClaudeMode ? 'Claude'
         : isLocalMode ? (State.currentConv.local_model || 'Local')
         : getCharacterName();
     streamingDiv.innerHTML = '<div class="message-header">' +

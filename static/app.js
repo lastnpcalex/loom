@@ -436,13 +436,16 @@ function buildConvItem(conv) {
     div.className = 'conv-item';
 
     const isCC = conv.mode === 'claude';
+    const isGemini = isCC && conv.cc_model && conv.cc_model.startsWith('gemini');
     const isLocal = conv.mode === 'local';
-    const charName = isCC ? (conv.cc_model || 'Claude')
+    const charName = isGemini ? (conv.cc_model || 'Gemini')
+        : isCC ? (conv.cc_model || 'Claude')
         : isLocal ? (conv.local_model || 'Ollama')
         : conv.character_id
         ? (State.characters.find(c => c.id === conv.character_id)?.name || conv.character_id)
         : 'Freeform';
-    const modeBadge = isCC ? '<span class="mode-badge" title="Claude Code in the browser">Loom {Claude}</span>'
+    const modeBadge = isGemini ? '<span class="mode-badge" title="Gemini CLI in the browser">Loom {Gemini}</span>'
+        : isCC ? '<span class="mode-badge" title="Claude Code in the browser">Loom {Claude}</span>'
         : isLocal ? '<span class="mode-badge" title="Claude Code powered by a local Ollama model">Braid {Local}</span>'
         : '<span class="mode-badge" title="Structured roleplay with local models">Weave</span>';
     const starred = conv.starred ? 1 : 0;
@@ -984,6 +987,7 @@ function initInlineCCControls() {
     }
 
     const _ANTHROPIC_MODELS = new Set(['sonnet', 'opus', 'haiku']);
+    const _GEMINI_MODELS = new Set(['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview', 'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite']);
 
     function _syncEffortVisibility(model) {
         effortSel.style.display = _ANTHROPIC_MODELS.has(model) ? '' : 'none';

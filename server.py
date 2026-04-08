@@ -30,6 +30,7 @@ from prompt_engine import (
 from context_manager import get_context_for_generation, update_rolling_summary
 import local_summary
 import claude_client
+import gemini_client
 from skill_scanner import get_all_skills, BUILTIN_COMMANDS
 
 from contextlib import asynccontextmanager
@@ -1653,9 +1654,11 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
         if data.get("cc_model") and data["cc_model"] != conv.get("cc_model"):
             await db.update_conversation_fields(conv_id, cc_model=cc_model)
 
-        # Anthropic model names are short aliases; anything else is an Ollama model
+        # Identify provider based on model name
         _ANTHROPIC_MODELS = {"sonnet", "opus", "haiku"}
-        use_ollama = conv.get("_use_ollama", False) or cc_model not in _ANTHROPIC_MODELS
+        is_anthropic = cc_model in _ANTHROPIC_MODELS
+        is_gemini = cc_model.startswith("gemini")
+        use_ollama = conv.get("_use_ollama", False) or not (is_anthropic or is_gemini)
 
         # --- Session resume logic ---
         # Every turn uses --resume + --fork-session. Each assistant message
@@ -1683,8 +1686,10 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 resume_session_id = msg["cc_session_id"]
                 # Check if the session was created by a different provider
                 prev_model = msg.get("cc_model_used", "")
-                prev_was_ollama = prev_model and prev_model not in _ANTHROPIC_MODELS
-                if prev_was_ollama != use_ollama:
+                prev_is_anthropic = prev_model in _ANTHROPIC_MODELS
+                prev_is_gemini = prev_model.startswith("gemini")
+                prev_is_ollama = bool(prev_model) and not (prev_is_anthropic or prev_is_gemini)
+                if (prev_is_anthropic != is_anthropic) or (prev_is_gemini != is_gemini) or (prev_is_ollama != use_ollama):
                     print(f"[CC] Provider switch ({prev_model} -> {cc_model}), skipping session resume")
                     resume_session_id = None
                 break
@@ -1810,36 +1815,57 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 started_at=_time.time(),
                 draft_msg_id=draft_msg_id,
                 parent_id=parent_id,
-                mode="local" if use_ollama else "claude",
+                mode="gemini" if is_gemini else ("local" if use_ollama else "claude"),
             )
 
         # Let the client know we're launching
-        launch_label = f"Launching {cc_model} via Ollama..." if use_ollama else f"Launching Claude Code ({cc_model})..."
+        if is_gemini:
+            launch_label = f"Launching Gemini CLI ({cc_model})..."
+        elif use_ollama:
+            launch_label = f"Launching {cc_model} via Ollama..."
+        else:
+            launch_label = f"Launching Claude Code ({cc_model})..."
         await _ws_send(conv_id, {"type": "status", "text": launch_label, "parent_id": parent_id})
         await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id, "draft_msg_id": draft_msg_id})
 
         # Launch CC — with resume if available, with fallback on failure
         try:
-            proc, event_stream = await claude_client.run_claude(
-                prompt, project_dir, conv_id=conv_id, server_port=config.port,
-                model=cc_model, effort=cc_effort,
-                permission_mode=cc_permission_mode,
-                resume_session_id=resume_session_id if use_resume else None,
-                fork_session=fork_session,
-                use_ollama=use_ollama,
-            )
+            if is_gemini:
+                proc, event_stream = await gemini_client.run_gemini(
+                    prompt, project_dir, conv_id=conv_id, server_port=config.port,
+                    model=cc_model, effort=cc_effort,
+                    permission_mode=cc_permission_mode,
+                    resume_session_id=resume_session_id if use_resume else None,
+                    fork_session=fork_session,
+                )
+            else:
+                proc, event_stream = await claude_client.run_claude(
+                    prompt, project_dir, conv_id=conv_id, server_port=config.port,
+                    model=cc_model, effort=cc_effort,
+                    permission_mode=cc_permission_mode,
+                    resume_session_id=resume_session_id if use_resume else None,
+                    fork_session=fork_session,
+                    use_ollama=use_ollama,
+                )
         except Exception as e:
             if use_resume:
                 # Fallback: retry without --resume (session may be stale/deleted)
                 print(f"[CC] Resume failed ({e}), falling back to full history")
                 branch = await db.get_branch_to_root(parent_id) if parent_id else []
                 prompt = _build_claude_history_prompt(branch) or "(continue)"
-                proc, event_stream = await claude_client.run_claude(
-                    prompt, project_dir, conv_id=conv_id, server_port=config.port,
-                    model=cc_model, effort=cc_effort,
-                    permission_mode=cc_permission_mode,
-                    use_ollama=use_ollama,
-                )
+                if is_gemini:
+                    proc, event_stream = await gemini_client.run_gemini(
+                        prompt, project_dir, conv_id=conv_id, server_port=config.port,
+                        model=cc_model, effort=cc_effort,
+                        permission_mode=cc_permission_mode,
+                    )
+                else:
+                    proc, event_stream = await claude_client.run_claude(
+                        prompt, project_dir, conv_id=conv_id, server_port=config.port,
+                        model=cc_model, effort=cc_effort,
+                        permission_mode=cc_permission_mode,
+                        use_ollama=use_ollama,
+                    )
                 use_resume = False
             else:
                 raise
@@ -2129,7 +2155,8 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
 
         # If CC produced no output at all, mark draft as error (don't delete)
         if not full_text and not any(b["type"] == "tool_use" for b in content_blocks):
-            error_msg = result_info.get("error") or "Claude Code exited with no response"
+            provider_name = "Gemini CLI" if is_gemini else ("Ollama" if use_ollama else "Claude Code")
+            error_msg = result_info.get("error") or f"{provider_name} exited with no response"
             if use_ollama:
                 error_msg += f" — check that '{cc_model}' is available in Ollama"
             await db.update_message_content(
