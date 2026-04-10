@@ -29,12 +29,12 @@ READ_ONLY = {
     "Read", "Glob", "Grep", "WebSearch", "WebFetch", "Task",
     "TaskGet", "TaskList", "TaskUpdate", "TaskCreate", "TaskStop",
     "TaskOutput", "AskUserQuestion", "TodoWrite", "Skill",
-    "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+    "EnterPlanMode", "EnterWorktree", "ExitWorktree",
     "Explore", "CronList", "ToolSearch", "Agent",
     # Gemini CLI tools (snake_case)
     "read_file", "read_many_files", "glob", "grep_search",
     "list_directory", "google_web_search", "web_fetch",
-    "ask_user", "write_todos", "enter_plan_mode", "exit_plan_mode",
+    "ask_user", "write_todos", "enter_plan_mode",
     "cli_help", "codebase_investigator", "get_internal_docs",
 }
 

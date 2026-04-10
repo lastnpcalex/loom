@@ -307,8 +307,8 @@ function handleWSMessage(data) {
             break;
 
         case 'plan_ready':
-            renderPlanReady(data.plan, data.plan_file, data.tool_id);
-            // Browser push if tab hidden (bell handled by plan_landed broadcast)
+            // Plan display is handled by the ExitPlanMode permission prompt.
+            // Just fire a browser push if tab is hidden.
             if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
                 new Notification('A Shadow Loom — Plan Ready', {
                     body: 'Plan awaiting review' + (data.plan_file ? ': ' + data.plan_file : ''),
@@ -1323,17 +1323,31 @@ function _renderPermissionNotifItem(n) {
         return item;
     }
 
-    item.innerHTML =
-        `<div class="notif-perm-header">` +
-        `<span class="notif-time">${timeStr}</span>` +
-        `<span class="notif-perm-tool">${escapeHtml(n.toolName)}</span>` +
-        `</div>` +
-        `<div class="notif-perm-summary">${escapeHtml(n.inputSummary)}</div>` +
-        `<div class="notif-perm-actions">` +
-        `<button class="notif-perm-btn allow" data-action="allow">Allow</button>` +
-        `<button class="notif-perm-btn deny" data-action="deny">Deny</button>` +
-        `<button class="notif-perm-btn allow-all" data-action="allow-all">Allow All</button>` +
-        `</div>`;
+    const isPlanNotif = n.toolName === 'ExitPlanMode' || n.toolName === 'exit_plan_mode';
+    if (isPlanNotif) {
+        item.classList.add('notif-plan');
+        item.innerHTML =
+            `<div class="notif-perm-header">` +
+            `<span class="notif-time">${timeStr}</span>` +
+            `<span class="notif-perm-tool">&#x1F9F5; Plan Ready</span>` +
+            `</div>` +
+            `<div class="notif-perm-actions">` +
+            `<button class="notif-perm-btn plan-approve" data-action="allow">Approve</button>` +
+            `<button class="notif-perm-btn plan-revise" data-action="deny">Revise</button>` +
+            `</div>`;
+    } else {
+        item.innerHTML =
+            `<div class="notif-perm-header">` +
+            `<span class="notif-time">${timeStr}</span>` +
+            `<span class="notif-perm-tool">${escapeHtml(n.toolName)}</span>` +
+            `</div>` +
+            `<div class="notif-perm-summary">${escapeHtml(n.inputSummary)}</div>` +
+            `<div class="notif-perm-actions">` +
+            `<button class="notif-perm-btn allow" data-action="allow">Allow</button>` +
+            `<button class="notif-perm-btn deny" data-action="deny">Deny</button>` +
+            `<button class="notif-perm-btn allow-all" data-action="allow-all">Allow All</button>` +
+            `</div>`;
+    }
 
     item.querySelectorAll('.notif-perm-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
@@ -2556,25 +2570,42 @@ function showPermissionPrompt(data) {
     const contentEl = streamingDiv.querySelector('.message-content');
 
     const prompt = document.createElement('div');
-    prompt.className = 'permission-prompt';
     prompt.dataset.requestId = data.request_id;
 
     const toolName = escapeHtml(data.tool_name || 'Unknown');
-    const inputSummary = escapeHtml(data.input_summary || JSON.stringify(data.tool_input || {}).substring(0, 300));
+    const isPlan = data.tool_name === 'ExitPlanMode' || data.tool_name === 'exit_plan_mode';
 
-    prompt.innerHTML = '<div class="permission-header">' +
-        '<span class="permission-icon">&#x1f512;</span>' +
-        '<span class="permission-title">Permission Request</span>' +
-        '</div>' +
-        '<div class="permission-body">' +
-        '<div class="permission-tool">Tool: <strong>' + toolName + '</strong></div>' +
-        (inputSummary ? '<div class="permission-input"><pre>' + inputSummary + '</pre></div>' : '') +
-        '</div>' +
-        '<div class="permission-actions">' +
-        '<button class="btn-permission allow" data-perm-action="allow" data-request-id="' + data.request_id + '">Allow</button>' +
-        '<button class="btn-permission deny" data-perm-action="deny" data-request-id="' + data.request_id + '">Deny</button>' +
-        '<button class="btn-permission allow-all" data-perm-action="allow-all" data-request-id="' + data.request_id + '">Allow All</button>' +
-        '</div>';
+    if (isPlan) {
+        prompt.className = 'permission-prompt plan-prompt';
+        let planInput = data.tool_input || {};
+        if (typeof planInput === 'string') try { planInput = JSON.parse(planInput); } catch {}
+        const planText = escapeHtml(planInput.plan || planInput.planFilePath || data.input_summary || '');
+        prompt.innerHTML = '<div class="permission-header">' +
+            '<span class="permission-icon">&#x1F9F5;</span>' +
+            '<span class="permission-title">Plan Ready for Review</span>' +
+            '</div>' +
+            (planText ? '<div class="permission-body"><div class="permission-input"><pre>' + planText + '</pre></div></div>' : '') +
+            '<div class="permission-actions">' +
+            '<button class="btn-permission allow plan-approve" data-perm-action="allow" data-request-id="' + data.request_id + '">Approve Plan</button>' +
+            '<button class="btn-permission deny plan-revise" data-perm-action="deny" data-request-id="' + data.request_id + '">Revise</button>' +
+            '</div>';
+    } else {
+        prompt.className = 'permission-prompt';
+        const inputSummary = escapeHtml(data.input_summary || JSON.stringify(data.tool_input || {}).substring(0, 300));
+        prompt.innerHTML = '<div class="permission-header">' +
+            '<span class="permission-icon">&#x1f512;</span>' +
+            '<span class="permission-title">Permission Request</span>' +
+            '</div>' +
+            '<div class="permission-body">' +
+            '<div class="permission-tool">Tool: <strong>' + toolName + '</strong></div>' +
+            (inputSummary ? '<div class="permission-input"><pre>' + inputSummary + '</pre></div>' : '') +
+            '</div>' +
+            '<div class="permission-actions">' +
+            '<button class="btn-permission allow" data-perm-action="allow" data-request-id="' + data.request_id + '">Allow</button>' +
+            '<button class="btn-permission deny" data-perm-action="deny" data-request-id="' + data.request_id + '">Deny</button>' +
+            '<button class="btn-permission allow-all" data-perm-action="allow-all" data-request-id="' + data.request_id + '">Allow All</button>' +
+            '</div>';
+    }
 
     // Attach button handlers
     prompt.querySelectorAll('.btn-permission').forEach(btn => {

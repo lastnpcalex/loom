@@ -3409,6 +3409,49 @@ pre.tool-output {
 }
 .permission-prompt.resolved-deny .permission-title { color: var(--danger); }
 
+/* ── Plan Prompt (ExitPlanMode) ── */
+.plan-prompt {
+    border-color: rgba(180, 130, 255, 0.3) !important;
+    background: rgba(180, 130, 255, 0.06) !important;
+}
+.plan-prompt .permission-icon { font-size: 18px; }
+.plan-prompt .permission-title { color: rgb(180, 130, 255); }
+.plan-prompt .permission-input pre {
+    max-height: 300px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+}
+.plan-approve {
+    background: rgba(180, 130, 255, 0.15) !important;
+    border-color: rgba(180, 130, 255, 0.4) !important;
+    color: rgb(180, 130, 255) !important;
+}
+.plan-approve:hover {
+    background: rgba(180, 130, 255, 0.3) !important;
+}
+.plan-revise {
+    background: rgba(255, 200, 50, 0.1) !important;
+    border-color: rgba(255, 200, 50, 0.3) !important;
+    color: rgb(255, 200, 50) !important;
+}
+.plan-revise:hover {
+    background: rgba(255, 200, 50, 0.2) !important;
+}
+
+.notif-plan .notif-perm-tool { color: rgb(180, 130, 255); }
+.notif-perm-btn.plan-approve {
+    background: rgba(180, 130, 255, 0.15);
+    border-color: rgba(180, 130, 255, 0.4);
+    color: rgb(180, 130, 255);
+}
+.notif-perm-btn.plan-approve:hover { background: rgba(180, 130, 255, 0.3); }
+.notif-perm-btn.plan-revise {
+    background: rgba(255, 200, 50, 0.1);
+    border-color: rgba(255, 200, 50, 0.3);
+    color: rgb(255, 200, 50);
+}
+.notif-perm-btn.plan-revise:hover { background: rgba(255, 200, 50, 0.2); }
+
 /* ── AskUserQuestion ── */
 .ask-question-block {
     background: rgba(0, 255, 255, 0.04);
