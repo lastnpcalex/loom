@@ -507,7 +507,15 @@ function refreshOpenBookmarksPanels() {
 // ── Branch Naming ──
 
 function getBranchLabel(depth) {
-    return depth < GREEK.length ? GREEK[depth] : `branch${depth}`;
+    // α-ω for 0-23, then αα, αβ, ... αω, βα, ... ωω, ααα, ...
+    if (depth < GREEK.length) return GREEK[depth];
+    let label = '';
+    let n = depth;
+    while (n >= 0) {
+        label = GREEK[n % GREEK.length] + label;
+        n = Math.floor(n / GREEK.length) - 1;
+    }
+    return label;
 }
 
 // Superscript helpers removed — using position.fork dot notation instead
