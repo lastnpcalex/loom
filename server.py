@@ -1917,6 +1917,7 @@ async def _handle_claude_generation(
             branch = await db.get_branch_to_root(parent_id)
             # Find nearest ancestor assistant with a session ID AND real content
             # Skip empty drafts, error messages, and broken sessions
+            crossed_provider = False
             for msg in reversed(branch):
                 if msg["role"] != "assistant":
                     continue
@@ -1938,12 +1939,16 @@ async def _handle_claude_generation(
                     or (prev_is_gemini != is_gemini)
                     or (prev_is_ollama != use_ollama)
                 ):
-                    # Different provider — skip this session, keep searching
-                    # for an older session from the same provider
                     print(
-                        f"[CC] Skipping msg {msg['id']} session (provider {prev_model} != {cc_model})"
+                        f"[CC] Cross-provider turn at msg {msg['id']} ({prev_model}), will rebuild full history"
                     )
-                    continue
+                    crossed_provider = True
+                    break
+                # Gemini CLI doesn't support --fork-session, so resuming
+                # mutates the session in place. Skip resume for Gemini.
+                if is_gemini:
+                    print(f"[CC] Gemini has no --fork-session, skipping resume for branch safety")
+                    break
                 resume_session_id = msg["cc_session_id"]
                 break
 
