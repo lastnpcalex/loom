@@ -1926,7 +1926,6 @@ async def _handle_claude_generation(
                 if not content.strip() or content.startswith("[Error:"):
                     print(f"[CC] Skipping empty/error session on msg {msg['id']}")
                     continue
-                resume_session_id = msg["cc_session_id"]
                 # Check if the session was created by a different provider
                 prev_model = msg.get("cc_model_used", "")
                 prev_is_anthropic = prev_model in _ANTHROPIC_MODELS
@@ -1939,10 +1938,13 @@ async def _handle_claude_generation(
                     or (prev_is_gemini != is_gemini)
                     or (prev_is_ollama != use_ollama)
                 ):
+                    # Different provider — skip this session, keep searching
+                    # for an older session from the same provider
                     print(
-                        f"[CC] Provider switch ({prev_model} -> {cc_model}), skipping session resume"
+                        f"[CC] Skipping msg {msg['id']} session (provider {prev_model} != {cc_model})"
                     )
-                    resume_session_id = None
+                    continue
+                resume_session_id = msg["cc_session_id"]
                 break
 
         if resume_session_id:
@@ -2076,6 +2078,10 @@ async def _handle_claude_generation(
             launch_label = f"Launching {cc_model} via Ollama..."
         else:
             launch_label = f"Launching Claude Code ({cc_model})..."
+        if use_resume:
+            launch_label += " (resuming session)"
+        else:
+            launch_label += " (building history)"
         await _ws_send(
             conv_id, {"type": "status", "text": launch_label, "parent_id": parent_id}
         )
@@ -2123,6 +2129,7 @@ async def _handle_claude_generation(
             if use_resume:
                 # Fallback: retry without --resume (session may be stale/deleted)
                 print(f"[CC] Resume failed ({e}), falling back to full history")
+                await _ws_send(conv_id, {"type": "status", "text": "Session resume failed — rebuilding from history..."})
                 branch = await db.get_branch_to_root(parent_id) if parent_id else []
                 prompt = _build_claude_history_prompt(branch) or "(continue)"
                 if is_gemini:
@@ -2304,7 +2311,8 @@ async def _handle_claude_generation(
                 result_info = evt
                 got_error = evt.get("is_error", False)
                 # Use result text as fallback if no text came from assistant events
-                if not full_text and evt.get("result_text"):
+                # Don't adopt error text as full_text — it would block the retry fallback
+                if not full_text and evt.get("result_text") and not got_error:
                     full_text = evt["result_text"]
                     content_blocks.append({"type": "text", "text": full_text})
 
@@ -2320,9 +2328,13 @@ async def _handle_claude_generation(
 
         _active_claude_procs.pop(conv_id, None)
 
-        # If --resume failed (is_error), retry with full history fallback
-        if got_error and use_resume and not full_text:
-            print(f"[CC] Resume returned error, retrying with full history")
+        # If --resume failed (is_error), retry with full history fallback.
+        # CC may emit the error as assistant text before the result event,
+        # so don't gate on `not full_text` — always retry on resume errors.
+        if got_error and use_resume:
+            error_detail = result_info.get("result_text", "") or result_info.get("error", "")
+            print(f"[CC] Resume returned error, retrying with full history: {error_detail[:200]}")
+            await _ws_send(conv_id, {"type": "status", "text": f"Session error — retrying with full history..."})
             branch = await db.get_branch_to_root(parent_id) if parent_id else []
             fallback_prompt = _build_claude_history_prompt(branch) or "(continue)"
             # Re-attach images

@@ -161,28 +161,22 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     if resume_session_id:
         cc_args.extend(["--resume", resume_session_id])
     
-    cc_args.extend(["-p", prompt])
-
     gemini_exe = "gemini.cmd" if sys.platform == "win32" else "gemini"
-    cmd = [gemini_exe] + cc_args
 
     env = {**os.environ, "LOOM_CONV_ID": str(conv_id), "LOOM_PORT": str(server_port)}
 
-    # If the prompt is too long for a command-line arg (Windows ~32K limit),
-    # pipe it via stdin instead of -p
-    use_stdin = len(prompt) > 20000
+    # Always pipe prompt via stdin on Windows — newlines in command-line args
+    # get mangled by CreateProcess, causing Gemini to see only the first line.
+    use_stdin = sys.platform == "win32" or len(prompt) > 20000
     if use_stdin:
-        try:
-            p_idx = cc_args.index("-p")
-            cc_args.pop(p_idx)      # remove -p
-            cc_args.pop(p_idx)      # remove the prompt value
-            cc_args.insert(0, "-p")
-            cc_args.insert(1, "-")  # read from stdin
-        except (ValueError, IndexError):
-            use_stdin = False
-        cmd = [gemini_exe] + cc_args
+        cc_args.extend(["-p", "-"])  # read prompt from stdin
+    else:
+        cc_args.extend(["-p", prompt])
 
-    log.info(f"[GEMINI] Prompt length: {len(prompt)} chars (stdin={use_stdin})")
+    cmd = [gemini_exe] + cc_args
+
+    print(f"[GEMINI] Prompt length: {len(prompt)} chars (stdin={use_stdin})")
+    print(f"[GEMINI] Prompt preview: {repr(prompt[:200])}")
 
     proc = await asyncio.create_subprocess_exec(
         *cmd, cwd=cwd, env=env,
