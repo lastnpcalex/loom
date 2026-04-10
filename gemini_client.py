@@ -168,11 +168,33 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
 
     env = {**os.environ, "LOOM_CONV_ID": str(conv_id), "LOOM_PORT": str(server_port)}
 
+    # If the prompt is too long for a command-line arg (Windows ~32K limit),
+    # pipe it via stdin instead of -p
+    use_stdin = len(prompt) > 20000
+    if use_stdin:
+        try:
+            p_idx = cc_args.index("-p")
+            cc_args.pop(p_idx)      # remove -p
+            cc_args.pop(p_idx)      # remove the prompt value
+            cc_args.insert(0, "-p")
+            cc_args.insert(1, "-")  # read from stdin
+        except (ValueError, IndexError):
+            use_stdin = False
+        cmd = [gemini_exe] + cc_args
+
+    log.info(f"[GEMINI] Prompt length: {len(prompt)} chars (stdin={use_stdin})")
+
     proc = await asyncio.create_subprocess_exec(
         *cmd, cwd=cwd, env=env,
+        stdin=asyncio.subprocess.PIPE if use_stdin else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         limit=16 * 1024 * 1024
     )
+
+    # Feed prompt via stdin if needed
+    if use_stdin and proc.stdin:
+        proc.stdin.write(prompt.encode("utf-8"))
+        proc.stdin.close()
 
     async def _read_stderr():
         async for line in proc.stderr:

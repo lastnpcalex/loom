@@ -2220,6 +2220,10 @@ async def _handle_claude_generation(
             },
         )
 
+        # Initialize accumulation vars before try so error handlers can reference them
+        full_text = ""
+        content_blocks = []
+
         # Launch CC — with resume if available, with fallback on failure
         try:
             if is_gemini:
