@@ -2101,69 +2101,6 @@ async def _handle_claude_generation(
                         else:
                             files_str = ", ".join(file_notes)
                             prompt += f"\n\n[User attached {len(file_notes)} file(s): {files_str}. Use the Read tool to view them.]"
-        else:
-            # No session to resume — fall back to full history rebuild
-            branch = await db.get_branch_to_root(parent_id) if parent_id else []
-            prompt = _build_claude_history_prompt(branch)
-            if not prompt:
-                await _ws_send(
-                    conv_id, {"type": "error", "error": "No message to send to Claude"}
-                )
-                return
-
-            # Attach images
-            if branch:
-                last_user_msg = None
-                for msg in reversed(branch):
-                    if msg["role"] == "user":
-                        last_user_msg = msg
-                        break
-                if last_user_msg and last_user_msg.get("image_path"):
-                    img_paths = _parse_image_paths(last_user_msg["image_path"])
-                    import shutil
-
-                    file_notes = []
-                    for ip in img_paths:
-                        src = Path(ip).resolve()
-                        dest = Path(project_dir) / src.name
-                        copied = False
-                        try:
-                            shutil.copy2(str(src), str(dest))
-                            copied = True
-                            # For local mode, describe from project_dir where CC can access it
-                            if use_ollama and copied:
-                                src = dest
-                        except Exception as e:
-                            print(
-                                f"[UPLOAD] Failed to copy image {src.name} to project_dir: {e}"
-                            )
-                        if use_ollama:
-                            # Local mode: describe image via Ollama's native multimodal API
-                            try:
-                                desc = await describe_image(str(src))
-                                file_notes.append(f"{src.name} — {desc}")
-                            except Exception as e:
-                                print(
-                                    f"[DESCRIBE] Failed to describe image {src.name}: {e}"
-                                )
-                                file_notes.append(
-                                    f"{src.name} — (image description unavailable)"
-                                )
-                        else:
-                            if copied:
-                                file_notes.append(
-                                    f"{src.name} (placed in working directory)"
-                                )
-                            else:
-                                file_notes.append(str(src).replace("\\", "/"))
-                    if file_notes:
-                        if use_ollama:
-                            files_str = "\n".join(f"  • {note}" for note in file_notes)
-                            prompt += f"\n\n[User attached {len(file_notes)} image(s):\n{files_str}\nThe image files are also in the working directory if you need to reference them by path.]"
-                        else:
-                            files_str = ", ".join(file_notes)
-                            prompt += f"\n\n[User attached {len(file_notes)} file(s): {files_str}. Use the Read tool to view them.]"
-
         # Create draft message in DB immediately so it survives navigation/restarts.
         # If parent already has an empty assistant child (stale draft), reuse it.
         draft_msg = None
