@@ -21,10 +21,11 @@ import sys
 import time
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 import httpx
+import io
 
 ADMIN_PORT = int(os.getenv("ADMIN_PORT", "3002"))
 
@@ -315,6 +316,52 @@ async def tool_disk_usage():
     })
 
 
+@app.websocket("/ws/terminal")
+async def terminal_ws(websocket: WebSocket):
+    """Interactive terminal — launches Claude Code and streams output."""
+    await websocket.accept()
+
+    cwd = Path(__file__).parent
+    proc = subprocess.Popen(
+        ["claude"],
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.PIPE,
+        bufsize=0,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    _child_procs["claude_term"] = proc
+
+    # Read output and forward input
+    try:
+        while proc.poll() is None:
+            # Read output
+            data = proc.stdout.read(4096)
+            if data:
+                try:
+                    await websocket.send_text(data.decode("utf-8", errors="replace"))
+                except Exception:
+                    break
+
+            # Forward input from client
+            try:
+                msg = await websocket.receive_text()
+                if proc.stdin:
+                    proc.stdin.write(msg.encode("utf-8"))
+                    proc.stdin.flush()
+            except Exception:
+                break
+
+            await asyncio.sleep(0.01)
+    except Exception as e:
+        pass
+    finally:
+        proc.terminate()
+        proc.wait()
+        _child_procs.pop("claude_term", None)
+
+
 # ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
@@ -348,6 +395,32 @@ async def dashboard():
             <td>{actions}</td>
         </tr>"""
 
+    # Check terminal status
+    term_proc = _child_procs.get("claude_term")
+    term_status = "online" if term_proc and term_proc.poll() is None else "offline"
+    term_pid = term_proc.pid if term_proc and term_proc.poll() is None else None
+
+    # Terminal section HTML
+    if term_status == "online":
+        terminal_html = f"""
+<h2>Terminal</h2>
+<div style="margin-bottom: 12px;">
+    <button onclick="doAction('claude_term', 'shutdown')" class="btn btn-warn">Stop Terminal</button>
+</div>
+<div style="margin-bottom: 8px;">
+    <div style="font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; padding: 10px; background: #000; border-radius: 6px; height: 200px; overflow-y: auto; white-space: pre-wrap; color: #0f6;">
+        {""}
+    </div>
+    <textarea id="term-input" style="width: 100%; box-sizing: border-box; font-family: 'Consolas', monospace; font-size: 12px; padding: 8px; background: #111; border: 1px solid #0ff; color: #0f6; border-radius: 4px;" placeholder="Type commands here (e.g., claude auth status, /auth refresh)..."></textarea>
+    <div style="font-size: 11px; color: #666; margin-top: 6px;">Commands execute in Claude Code. Press Ctrl+C in the terminal to exit.</div>
+</div>
+"""
+    else:
+        terminal_html = """
+<h2>Terminal</h2>
+<button onclick="doAction('claude_term', 'start')" class="btn btn-green">Start Terminal</button>
+"""
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -370,19 +443,16 @@ async def dashboard():
     #toast {{ position: fixed; bottom: 20px; right: 20px; padding: 12px 20px; background: #1a1a2e; border: 1px solid #0ff; border-radius: 6px; display: none; z-index: 100; }}
     .refresh-note {{ color: #666; font-size: 12px; margin-top: 16px; }}
     .tools-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; margin-bottom: 12px; }}
-    .tool-btn {{ padding: 10px 14px; border: 1px solid #444; border-radius: 6px; cursor: pointer;
-        font-size: 13px; background: rgba(255,255,255,0.03); color: #ccc; transition: 0.2s; text-align: left; }}
+    .tool-btn {{ padding: 10px 14px; border: 1px solid #444; border-radius: 6px; cursor: pointer; font-size: 13px; background: rgba(255,255,255,0.03); color: #ccc; transition: 0.2s; text-align: left; }}
     .tool-btn:hover {{ background: rgba(0,255,255,0.08); border-color: #0ff; color: #fff; }}
     .tool-btn .icon {{ font-size: 18px; display: block; margin-bottom: 4px; }}
     .tool-btn .label {{ font-size: 12px; color: #888; }}
-    #tool-output {{ font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; padding: 12px;
-        background: #000; border-radius: 6px; min-height: 60px; max-height: 300px; overflow-y: auto;
-        white-space: pre-wrap; color: #0f6; border: 1px solid #1a1a2e; display: none; }}
+    #tool-output {{ font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; padding: 12px; background: #000; border-radius: 6px; min-height: 60px; max-height: 300px; overflow-y: auto; white-space: pre-wrap; color: #0f6; border: 1px solid #1a1a2e; display: none; }}
     #tool-output.visible {{ display: block; }}
     #tool-output.error {{ color: #f66; }}
-    .spinner {{ display: inline-block; width: 14px; height: 14px; border: 2px solid #0ff;
-        border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; }}
+    .spinner {{ display: inline-block; width: 14px; height: 14px; border: 2px solid #0ff; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; }}
     @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+    .terminal-input {{ width: 100%; box-sizing: border-box; font-family: 'Consolas', monospace; font-size: 12px; padding: 8px; background: #111; border: 1px solid #0ff; color: #0f6; border-radius: 4px; }}
 </style>
 </head>
 <body>
@@ -391,7 +461,7 @@ async def dashboard():
     <tr><th>Instance</th><th>Port</th><th>Database</th><th>PID</th><th>Actions</th></tr>
     {rows}
 </table>
-
+{terminal_html}
 <h2>Tools</h2>
 <div class="tools-grid">
     <button class="tool-btn" onclick="runTool('auth-status')">
@@ -441,44 +511,32 @@ async def dashboard():
     let refreshTimer = setTimeout(() => location.reload(), 10000);
 
     async function runTool(name) {{
-        // Pause auto-refresh while a tool is running
         clearTimeout(refreshTimer);
-
         const out = document.getElementById('tool-output');
         out.className = 'visible';
         out.innerHTML = '<span class="spinner"></span> Running ' + name + '...';
-
         try {{
             const r = await fetch('/tools/' + name, {{method: 'POST'}});
             const d = await r.json();
-
             if (d.status === 'login_started' && d.url) {{
-                // Show clickable login link + poll for completion
                 out.innerHTML = d.output.replace(/\\n/g, '<br>') +
-                    '<br><br><a href="' + d.url + '" target="_blank" ' +
-                    'style="color:#0ff; font-size:14px; word-break:break-all;">' +
-                    d.url + '</a>' +
+                    '<br><br><a href="' + d.url + '" target="_blank" style="color:#0ff; font-size:14px; word-break:break-all;">' + d.url + '</a>' +
                     '<br><br><span id="login-poll" style="color:#888;">Waiting for login to complete...</span>';
-                out.className = 'visible';
                 pollLoginStatus();
                 return;
             }}
-
             out.textContent = d.output || '(no output)';
             out.className = d.status === 'error' ? 'visible error' : 'visible';
         }} catch (e) {{
             out.textContent = 'Request failed: ' + e;
             out.className = 'visible error';
         }}
-
-        // Resume auto-refresh after 30s
         refreshTimer = setTimeout(() => location.reload(), 30000);
     }}
 
     async function pollLoginStatus() {{
         const poll = document.getElementById('login-poll');
         if (!poll) return;
-
         try {{
             const r = await fetch('/tools/auth-login-status');
             const d = await r.json();
@@ -499,6 +557,33 @@ async def dashboard():
             refreshTimer = setTimeout(() => location.reload(), 10000);
         }}
     }}
+
+    // Terminal WebSocket
+    const termSocket = new WebSocket(`ws://localhost:{{ ADMIN_PORT }}/ws/terminal`);
+    termSocket.onopen = () => {{
+        document.getElementById('term-input')?.focus();
+    }};
+    termSocket.onmessage = (event) => {{
+        const output = document.querySelector('.terminal-output');
+        if (output) {{
+            output.textContent = output.textContent + event.data;
+            output.scrollTop = output.scrollHeight;
+        }}
+    }};
+    termSocket.onerror = () => {{
+        // Terminal may not have started yet
+    }};
+    // Enter key handler
+    document.getElementById('term-input')?.addEventListener('keydown', (e) => {{
+        if (e.key === 'Enter') {{
+            const input = document.getElementById('term-input');
+            const cmd = input.value.trim();
+            if (cmd && termSocket.readyState === WebSocket.OPEN) {{
+                termSocket.send(cmd);
+                input.value = '';
+            }}
+        }}
+    }});
 </script>
 </body>
 </html>"""

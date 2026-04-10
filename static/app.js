@@ -92,7 +92,7 @@ function switchView(view) {
 
     if (view === 'home') {
         inputArea?.classList.add('hidden');
-        sep.classList.add('hidden');
+        sep?.classList.add('hidden');
         title.classList.add('hidden');
         breadcrumb.classList.add('hidden');
         treeBtn.classList.add('hidden');
@@ -102,7 +102,7 @@ function switchView(view) {
         // Keep WebSocket alive so background generation notifications still arrive.
         // WS is only closed when loading a different conversation (in connectWebSocket).
     } else if (view === 'tree') {
-        sep.classList.remove('hidden');
+        sep?.classList.remove('hidden');
         title.classList.remove('hidden');
         title.textContent = State.currentConv?.title || '—';
         breadcrumb.classList.add('hidden');
@@ -117,7 +117,7 @@ function switchView(view) {
         if (isOodaWeave) statePanelTree?.classList.remove('hidden');
         else statePanelTree?.classList.add('hidden');
     } else if (view === 'chat') {
-        sep.classList.remove('hidden');
+        sep?.classList.remove('hidden');
         title.classList.remove('hidden');
         title.textContent = State.currentConv?.title || '—';
         breadcrumb.classList.remove('hidden');
@@ -137,7 +137,7 @@ function switchView(view) {
             loadMessages(State.currentConvId);
         }
     } else if (view === 'char-state') {
-        sep.classList.add('hidden');
+        sep?.classList.add('hidden');
         title.classList.add('hidden');
         breadcrumb.classList.add('hidden');
         treeBtn.classList.add('hidden');
