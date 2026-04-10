@@ -165,22 +165,17 @@ def _process_event(raw: dict) -> list[dict]:
     return events
 
 
-def _configure_permission_hook(cwd: str):
-    """Write a PermissionRequest hook to the project's .claude/settings.local.json.
+def _configure_permission_hook(cwd: str) -> bool:
+    """Write a PreToolUse hook to the project's .claude/settings.local.json.
 
     The hook routes permission requests through Loom's HTTP API so the user
     can approve/deny them in the browser UI.
+
+    Returns True if file was written, False if already configured (idempotent).
+    This avoids the ~2s file I/O delay on Windows when called on every turn.
     """
     claude_dir = Path(cwd) / ".claude"
     settings_path = claude_dir / "settings.local.json"
-
-    # Read existing settings (preserve other config)
-    existing = {}
-    if settings_path.exists():
-        try:
-            existing = json.loads(settings_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, IOError):
-            existing = {}
 
     # Build hook command using the same Python interpreter running Loom
     python_exe = sys.executable.replace("\\", "/")
@@ -189,24 +184,48 @@ def _configure_permission_hook(cwd: str):
 
     # Use PreToolUse (not PermissionRequest — that doesn't fire in -p mode)
     # Matcher ".*" catches all tools; nested hooks array is required
-    existing.setdefault("hooks", {})
-    existing["hooks"].pop("PermissionRequest", None)  # Remove old hook
-    existing["hooks"]["PreToolUse"] = [
-        {
-            "matcher": ".*",
-            "hooks": [
+    new_config = {
+        "hooks": {
+            "PreToolUse": [
                 {
-                    "type": "command",
-                    "command": hook_command,
+                    "matcher": ".*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                        }
+                    ]
                 }
             ]
         }
-    ]
+    }
+
+    # Read existing settings (preserve other config if file exists)
+    existing = {}
+    if settings_path.exists():
+        try:
+            existing = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, IOError):
+            existing = {}
+
+    # Only write if the hooks section differs (idempotent check)
+    existing_hooks = existing.get("hooks", {})
+
+    # Compare: skip write if PreToolUse exists and command is unchanged
+    # The command is nested at PreToolUse[0].hooks[0].command
+    if "PreToolUse" in existing_hooks:
+        existing_item = existing_hooks["PreToolUse"][0]
+        existing_cmd = existing_item.get("command", "") or existing_item.get("hooks", [{}])[0].get("command", "")
+        if existing_cmd == hook_command:
+            print(f"[CC] Skipping write: command unchanged")
+            return False  # Already configured, skip write
 
     # Write settings
     claude_dir.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-    print(f"[CC] Configured permission hook in {settings_path}")
+    settings_path.write_text(json.dumps(new_config, indent=2), encoding="utf-8")
+    print(f"[CC] Hook configured/updated in {settings_path}")
+
+    return True
 
 
 async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
@@ -223,8 +242,9 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     so that Claude Code runs against a local Ollama model.
     Permission hooks route tool approvals through Loom's HTTP API.
     """
-    # Configure the permission hook in the project directory
-    _configure_permission_hook(cwd)
+    # Configure the permission hook in the project directory (idempotent, skips if already set)
+    # Skip on resume since the original session already configured the hook
+    _configure_permission_hook(cwd) if not resume_session_id else None
 
     # Build the Claude Code arguments (common to both launch methods)
     disallowed = "AskUserQuestion,WebSearch,WebFetch" if use_ollama else "AskUserQuestion"
