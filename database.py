@@ -7,6 +7,7 @@ from typing import Optional
 
 import os as _os
 from config import config as _config
+
 DB_PATH = _config.db_path
 
 _db: aiosqlite.Connection | None = None
@@ -108,6 +109,19 @@ CREATE TABLE IF NOT EXISTS character_state_cards (
     UNIQUE(character_id, schema_id, label)
 );
 CREATE INDEX IF NOT EXISTS idx_char_state_cards ON character_state_cards(character_id);
+
+CREATE TABLE IF NOT EXISTS pending_permissions (
+    request_id TEXT PRIMARY KEY,
+    conv_id INTEGER NOT NULL,
+    tool_name TEXT NOT NULL,
+    tool_input TEXT,
+    input_summary TEXT,
+    started_at REAL NOT NULL,
+    broadcast_sent INTEGER DEFAULT 0,
+    FOREIGN KEY (conv_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_pending_conv ON pending_permissions(conv_id);
+CREATE INDEX IF NOT EXISTS idx_pending_started ON pending_permissions(started_at);
 """
 
 
@@ -151,12 +165,127 @@ async def close_db():
         _db = None
 
 
+async def save_pending_permission(
+    request_id: str,
+    conv_id: int,
+    tool_name: str,
+    tool_input: dict,
+    input_summary: str,
+    started_at: float = None,
+) -> bool:
+    """Insert a new pending permission request."""
+    db = await get_db()
+    if started_at is None:
+        started_at = time.time()
+    tool_input_json = json.dumps(tool_input) if tool_input else None
+    input_summary_json = json.dumps(input_summary) if input_summary else None
+    await db.execute(
+        "INSERT INTO pending_permissions (request_id, conv_id, tool_name, tool_input, input_summary, started_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            request_id,
+            conv_id,
+            tool_name,
+            tool_input_json,
+            input_summary_json,
+            started_at,
+        ),
+    )
+    await db.commit()
+    return True
+
+
+async def get_pending_permission(request_id: str) -> dict | None:
+    """Get a pending permission request by ID."""
+
+    db = await get_db()
+    row = await db.execute_fetchone(
+        "SELECT conv_id, tool_name, tool_input, input_summary, started_at FROM pending_permissions WHERE request_id = ?",
+        (request_id,),
+    )
+    if row:
+        tool_input = json.loads(row["tool_input"]) if row["tool_input"] else None
+        input_summary = (
+            json.loads(row["input_summary"]) if row["input_summary"] else None
+        )
+        return {
+            "conv_id": row["conv_id"],
+            "tool_name": row["tool_name"],
+            "tool_input": tool_input,
+            "input_summary": input_summary,
+            "started_at": row["started_at"],
+        }
+    return None
+
+
+async def delete_pending_permission(request_id: str) -> bool:
+    """Delete a pending permission request."""
+    db = await get_db()
+    await db.execute(
+        "DELETE FROM pending_permissions WHERE request_id = ?", (request_id,)
+    )
+    await db.commit()
+    return True
+
+
+async def delete_old_pending_permissions(before: float) -> int:
+    """Delete pending permissions older than before timestamp."""
+    db = await get_db()
+    await db.execute("DELETE FROM pending_permissions WHERE started_at < ?", (before,))
+    deleted = db.total_changes  # aiosqlite tracks changes in connection
+    await db.commit()
+    return deleted
+
+
+async def get_pending_permissions_for_conv(conv_id: int) -> list[dict]:
+    """Get all pending permissions for a conversation."""
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT request_id, tool_name, tool_input, input_summary, started_at FROM pending_permissions WHERE conv_id = ? ORDER BY started_at",
+        (conv_id,),
+    )
+    result = []
+    for row in rows:
+        result.append(
+            {
+                "request_id": row["request_id"],
+                "tool_name": row["tool_name"],
+                "tool_input": (
+                    json.loads(row["tool_input"]) if row["tool_input"] else None
+                ),
+                "input_summary": (
+                    json.loads(row["input_summary"]) if row["input_summary"] else None
+                ),
+                "started_at": row["started_at"],
+            }
+        )
+    return result
+
+
+async def mark_permission_broadcasted(request_id: str) -> bool:
+    """Mark that a permission request has been broadcast."""
+    db = await get_db()
+    await db.execute(
+        "UPDATE pending_permissions SET broadcast_sent = 1 WHERE request_id = ?",
+        (request_id,),
+    )
+    await db.commit()
+    return True
+
+
+async def delete_old_pending_permissions(before: float) -> int:
+    """Delete pending permissions older than before timestamp."""
+    db = await get_db()
+    await db.execute("DELETE FROM pending_permissions WHERE started_at < ?", (before,))
+    deleted = db.total_changes  # aiosqlite tracks changes in connection
+    await db.commit()
+    return deleted
+
+
 async def init_db():
     db = await get_db()
     await db.executescript(SCHEMA)
     await _run_migrations(db)
     await db.commit()
-
 
 
 async def _run_migrations(db):
@@ -267,41 +396,97 @@ BUILTIN_SCHEMAS = [
     {
         "id": "character_state",
         "name": "Character State",
-        "fields": json.dumps([
-            {"name": "personality", "type": "text", "description": "Core personality traits"},
-            {"name": "appearance", "type": "text", "description": "Physical appearance"},
-            {"name": "current_mood", "type": "text", "description": "Current emotional state"},
-            {"name": "goals", "type": "text", "description": "Active goals and motivations"},
-            {"name": "relationships", "type": "text", "description": "Key relationships"},
-            {"name": "physical_situation", "type": "text", "description": "Current physical state and location"},
-        ]),
+        "fields": json.dumps(
+            [
+                {
+                    "name": "personality",
+                    "type": "text",
+                    "description": "Core personality traits",
+                },
+                {
+                    "name": "appearance",
+                    "type": "text",
+                    "description": "Physical appearance",
+                },
+                {
+                    "name": "current_mood",
+                    "type": "text",
+                    "description": "Current emotional state",
+                },
+                {
+                    "name": "goals",
+                    "type": "text",
+                    "description": "Active goals and motivations",
+                },
+                {
+                    "name": "relationships",
+                    "type": "text",
+                    "description": "Key relationships",
+                },
+                {
+                    "name": "physical_situation",
+                    "type": "text",
+                    "description": "Current physical state and location",
+                },
+            ]
+        ),
     },
     {
         "id": "scene_state",
         "name": "Scene State",
-        "fields": json.dumps([
-            {"name": "location", "type": "text", "description": "Current location"},
-            {"name": "time_of_day", "type": "text", "description": "Time of day"},
-            {"name": "atmosphere", "type": "text", "description": "Mood and atmosphere"},
-            {"name": "present_characters", "type": "text", "description": "Characters in the scene"},
-            {"name": "recent_events", "type": "text", "description": "What just happened"},
-        ]),
+        "fields": json.dumps(
+            [
+                {"name": "location", "type": "text", "description": "Current location"},
+                {"name": "time_of_day", "type": "text", "description": "Time of day"},
+                {
+                    "name": "atmosphere",
+                    "type": "text",
+                    "description": "Mood and atmosphere",
+                },
+                {
+                    "name": "present_characters",
+                    "type": "text",
+                    "description": "Characters in the scene",
+                },
+                {
+                    "name": "recent_events",
+                    "type": "text",
+                    "description": "What just happened",
+                },
+            ]
+        ),
     },
     {
         "id": "lore",
         "name": "Lore",
-        "fields": json.dumps([
-            {"name": "content", "type": "text", "description": "Background information"},
-        ]),
+        "fields": json.dumps(
+            [
+                {
+                    "name": "content",
+                    "type": "text",
+                    "description": "Background information",
+                },
+            ]
+        ),
     },
     {
         "id": "persona_state",
         "name": "Persona State",
-        "fields": json.dumps([
-            {"name": "description", "type": "text", "description": "Who you are in this RP"},
-            {"name": "appearance", "type": "text", "description": "Your physical appearance"},
-            {"name": "goals", "type": "text", "description": "Your active goals"},
-        ]),
+        "fields": json.dumps(
+            [
+                {
+                    "name": "description",
+                    "type": "text",
+                    "description": "Who you are in this RP",
+                },
+                {
+                    "name": "appearance",
+                    "type": "text",
+                    "description": "Your physical appearance",
+                },
+                {"name": "goals", "type": "text", "description": "Your active goals"},
+            ]
+        ),
     },
 ]
 
@@ -312,25 +497,25 @@ async def _seed_builtin_schemas(db):
     for schema in BUILTIN_SCHEMAS:
         await db.execute(
             "INSERT OR IGNORE INTO state_schemas (id, name, fields, is_builtin, created_at) VALUES (?, ?, ?, 1, ?)",
-            (schema["id"], schema["name"], schema["fields"], now)
+            (schema["id"], schema["name"], schema["fields"], now),
         )
 
 
 # ── Conversations ──
 
-async def create_conversation(title: str, character_id: str = None,
-                              mode: str = "weave", project_dir: str = None) -> dict:
+
+async def create_conversation(
+    title: str, character_id: str = None, mode: str = "weave", project_dir: str = None
+) -> dict:
     db = await get_db()
     now = time.time()
     cursor = await db.execute(
         "INSERT INTO conversations (title, character_id, mode, project_dir, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (title, character_id, mode, project_dir, now, now)
+        (title, character_id, mode, project_dir, now, now),
     )
     conv_id = cursor.lastrowid
     # Init style state
-    await db.execute(
-        "INSERT INTO style_state (conversation_id) VALUES (?)", (conv_id,)
-    )
+    await db.execute("INSERT INTO style_state (conversation_id) VALUES (?)", (conv_id,))
     await db.commit()
     row = await db.execute_fetchall(
         "SELECT * FROM conversations WHERE id = ?", (conv_id,)
@@ -377,7 +562,7 @@ async def search_conversations(query: str, limit: int = 20) -> list[dict]:
            )
            ORDER BY conversation_id DESC
            LIMIT ?""",
-        (query, pattern, pattern, pattern, limit)
+        (query, pattern, pattern, pattern, limit),
     )
     return [dict(r) for r in rows]
 
@@ -398,7 +583,7 @@ async def search_conversation_messages(conv_id: int, query: str) -> list[dict]:
              AND (parent_id IS NULL
                   OR parent_id IN (SELECT id FROM messages WHERE conversation_id = ?))
            ORDER BY created_at""",
-        (query, conv_id, pattern, conv_id)
+        (query, conv_id, pattern, conv_id),
     )
     return [dict(r) for r in rows]
 
@@ -418,34 +603,41 @@ async def delete_conversation(conv_id: int):
     await db.commit()
 
 
-
 async def touch_conversation(conv_id: int):
     db = await get_db()
     await db.execute(
-        "UPDATE conversations SET updated_at = ? WHERE id = ?",
-        (time.time(), conv_id)
+        "UPDATE conversations SET updated_at = ? WHERE id = ?", (time.time(), conv_id)
     )
     await db.commit()
-
 
 
 async def save_custom_scene(conv_id: int, scene: str):
     db = await get_db()
     await db.execute(
-        "UPDATE conversations SET custom_scene = ? WHERE id = ?",
-        (scene, conv_id)
+        "UPDATE conversations SET custom_scene = ? WHERE id = ?", (scene, conv_id)
     )
     await db.commit()
-
 
 
 async def update_conversation_fields(conv_id: int, **fields):
     """Update arbitrary fields on a conversation."""
     db = await get_db()
-    allowed = {"persona_id", "lore_ids", "style_nudge", "custom_scene", "title",
-                "claude_session_id", "total_cost_usd", "cc_model", "cc_effort",
-                "starred", "folder", "local_model", "cc_permission_mode",
-                "ooda_enabled"}
+    allowed = {
+        "persona_id",
+        "lore_ids",
+        "style_nudge",
+        "custom_scene",
+        "title",
+        "claude_session_id",
+        "total_cost_usd",
+        "cc_model",
+        "cc_effort",
+        "starred",
+        "folder",
+        "local_model",
+        "cc_permission_mode",
+        "ooda_enabled",
+    }
     updates = []
     params = []
     for key, val in fields.items():
@@ -455,21 +647,27 @@ async def update_conversation_fields(conv_id: int, **fields):
     if updates:
         params.append(conv_id)
         await db.execute(
-            f"UPDATE conversations SET {', '.join(updates)} WHERE id = ?",
-            params
+            f"UPDATE conversations SET {', '.join(updates)} WHERE id = ?", params
         )
         await db.commit()
 
 
-
 # ── Messages ──
 
-async def add_message(conversation_id: int, role: str, content: str,
-                      parent_id: int = None, image_path: str = None,
-                      is_active: bool = True, content_blocks: str = None,
-                      turn_cost_usd: float = None, turn_input_tokens: int = None,
-                      turn_output_tokens: int = None,
-                      cc_session_id: str = None) -> dict:
+
+async def add_message(
+    conversation_id: int,
+    role: str,
+    content: str,
+    parent_id: int = None,
+    image_path: str = None,
+    is_active: bool = True,
+    content_blocks: str = None,
+    turn_cost_usd: float = None,
+    turn_input_tokens: int = None,
+    turn_output_tokens: int = None,
+    cc_session_id: str = None,
+) -> dict:
     db = await get_db()
     token_est = len(content) // 3
     now = time.time()
@@ -479,14 +677,25 @@ async def add_message(conversation_id: int, role: str, content: str,
             is_active, content_blocks, turn_cost_usd, turn_input_tokens, turn_output_tokens,
             cc_session_id, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (conversation_id, parent_id, role, content, image_path, token_est,
-         int(is_active), content_blocks, turn_cost_usd, turn_input_tokens, turn_output_tokens,
-         cc_session_id, now)
+        (
+            conversation_id,
+            parent_id,
+            role,
+            content,
+            image_path,
+            token_est,
+            int(is_active),
+            content_blocks,
+            turn_cost_usd,
+            turn_input_tokens,
+            turn_output_tokens,
+            cc_session_id,
+            now,
+        ),
     )
     msg_id = cursor.lastrowid
     await db.execute(
-        "UPDATE conversations SET updated_at = ? WHERE id = ?",
-        (now, conversation_id)
+        "UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id)
     )
     await db.commit()
     row = await db.execute_fetchall("SELECT * FROM messages WHERE id = ?", (msg_id,))
@@ -494,13 +703,16 @@ async def add_message(conversation_id: int, role: str, content: str,
     return dict(row[0])
 
 
-async def update_message_content(msg_id: int, content: str = None,
-                                  content_blocks: str = None,
-                                  turn_cost_usd: float = None,
-                                  turn_input_tokens: int = None,
-                                  turn_output_tokens: int = None,
-                                  cc_session_id: str = None,
-                                  cc_model_used: str = None):
+async def update_message_content(
+    msg_id: int,
+    content: str = None,
+    content_blocks: str = None,
+    turn_cost_usd: float = None,
+    turn_input_tokens: int = None,
+    turn_output_tokens: int = None,
+    cc_session_id: str = None,
+    cc_model_used: str = None,
+):
     """Update a message's content and metadata (used for draft → final)."""
     db = await get_db()
     updates = []
@@ -531,11 +743,9 @@ async def update_message_content(msg_id: int, content: str = None,
     if updates:
         params.append(msg_id)
         await db.execute(
-            f"UPDATE messages SET {', '.join(updates)} WHERE id = ?",
-            params
+            f"UPDATE messages SET {', '.join(updates)} WHERE id = ?", params
         )
         await db.commit()
-
 
 
 async def get_message(msg_id: int) -> Optional[dict]:
@@ -547,30 +757,23 @@ async def get_message(msg_id: int) -> Optional[dict]:
 
 async def update_message_summary(msg_id: int, summary: str):
     db = await get_db()
-    await db.execute(
-        "UPDATE messages SET summary = ? WHERE id = ?",
-        (summary, msg_id)
-    )
+    await db.execute("UPDATE messages SET summary = ? WHERE id = ?", (summary, msg_id))
     await db.commit()
-
 
 
 async def update_message_image_alt(msg_id: int, image_alt: str):
     db = await get_db()
     await db.execute(
-        "UPDATE messages SET image_alt = ? WHERE id = ?",
-        (image_alt, msg_id)
+        "UPDATE messages SET image_alt = ? WHERE id = ?", (image_alt, msg_id)
     )
     await db.commit()
-
 
 
 async def get_children(msg_id: int) -> list[dict]:
     """Get all direct children of a message."""
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT * FROM messages WHERE parent_id = ? ORDER BY created_at",
-        (msg_id,)
+        "SELECT * FROM messages WHERE parent_id = ? ORDER BY created_at", (msg_id,)
     )
 
     return [dict(r) for r in rows]
@@ -587,12 +790,12 @@ async def get_siblings(msg_id: int) -> list[dict]:
             """SELECT * FROM messages
                WHERE conversation_id = ? AND parent_id IS NULL AND role = ?
                ORDER BY created_at""",
-            (msg["conversation_id"], msg["role"])
+            (msg["conversation_id"], msg["role"]),
         )
     else:
         rows = await db.execute_fetchall(
             "SELECT * FROM messages WHERE parent_id = ? ORDER BY created_at",
-            (msg["parent_id"],)
+            (msg["parent_id"],),
         )
 
     return [dict(r) for r in rows]
@@ -638,10 +841,9 @@ async def set_active_branch(conv_id: int, leaf_id: int):
         placeholders = ",".join("?" * len(ids_to_activate))
         await db.execute(
             f"UPDATE messages SET is_active = 1 WHERE id IN ({placeholders})",
-            ids_to_activate
+            ids_to_activate,
         )
     await db.commit()
-
 
 
 async def get_active_branch(conv_id: int) -> list[dict]:
@@ -651,7 +853,7 @@ async def get_active_branch(conv_id: int) -> list[dict]:
         """SELECT * FROM messages
            WHERE conversation_id = ? AND is_active = 1
            ORDER BY created_at""",
-        (conv_id,)
+        (conv_id,),
     )
 
     return [dict(r) for r in rows]
@@ -668,7 +870,7 @@ async def get_active_leaf(conv_id: int) -> Optional[dict]:
                SELECT 1 FROM messages c WHERE c.parent_id = m.id AND c.is_active = 1
            )
            ORDER BY m.created_at DESC LIMIT 1""",
-        (conv_id,)
+        (conv_id,),
     )
 
     return dict(rows[0]) if rows else None
@@ -694,7 +896,7 @@ async def delete_branch(msg_id: int) -> dict:
         "SELECT conversation_id, parent_id FROM messages WHERE id = ?", (msg_id,)
     )
     if not rows:
-    
+
         return {"deleted": 0}
 
     conv_id = rows[0]["conversation_id"]
@@ -702,11 +904,8 @@ async def delete_branch(msg_id: int) -> dict:
 
     # Delete all collected IDs
     placeholders = ",".join("?" * len(to_delete))
-    await db.execute(
-        f"DELETE FROM messages WHERE id IN ({placeholders})", to_delete
-    )
+    await db.execute(f"DELETE FROM messages WHERE id IN ({placeholders})", to_delete)
     await db.commit()
-
 
     return {
         "deleted": len(to_delete),
@@ -715,14 +914,18 @@ async def delete_branch(msg_id: int) -> dict:
     }
 
 
-async def fork_conversation(conv_id: int, from_msg_id: int, new_title: str = None) -> dict:
+async def fork_conversation(
+    conv_id: int, from_msg_id: int, new_title: str = None
+) -> dict:
     """Fork a conversation: create a new conversation with messages up to from_msg_id."""
     db = await get_db()
 
     # Get original conversation
-    rows = await db.execute_fetchall("SELECT * FROM conversations WHERE id = ?", (conv_id,))
+    rows = await db.execute_fetchall(
+        "SELECT * FROM conversations WHERE id = ?", (conv_id,)
+    )
     if not rows:
-    
+
         return None
     orig = dict(rows[0])
 
@@ -730,7 +933,9 @@ async def fork_conversation(conv_id: int, from_msg_id: int, new_title: str = Non
     branch = []
     current_id = from_msg_id
     while current_id is not None:
-        msg_rows = await db.execute_fetchall("SELECT * FROM messages WHERE id = ?", (current_id,))
+        msg_rows = await db.execute_fetchall(
+            "SELECT * FROM messages WHERE id = ?", (current_id,)
+        )
         if not msg_rows:
             break
         msg = dict(msg_rows[0])
@@ -745,14 +950,26 @@ async def fork_conversation(conv_id: int, from_msg_id: int, new_title: str = Non
            style_nudge, custom_scene, mode, project_dir, cc_model, cc_effort,
            local_model, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (title, orig.get("character_id"), orig.get("persona_id"), orig.get("lore_ids"),
-         orig.get("style_nudge"), orig.get("custom_scene"),
-         orig.get("mode", "weave"), orig.get("project_dir"),
-         orig.get("cc_model"), orig.get("cc_effort"), orig.get("local_model"),
-         now, now)
+        (
+            title,
+            orig.get("character_id"),
+            orig.get("persona_id"),
+            orig.get("lore_ids"),
+            orig.get("style_nudge"),
+            orig.get("custom_scene"),
+            orig.get("mode", "weave"),
+            orig.get("project_dir"),
+            orig.get("cc_model"),
+            orig.get("cc_effort"),
+            orig.get("local_model"),
+            now,
+            now,
+        ),
     )
     new_conv_id = cursor.lastrowid
-    await db.execute("INSERT INTO style_state (conversation_id) VALUES (?)", (new_conv_id,))
+    await db.execute(
+        "INSERT INTO style_state (conversation_id) VALUES (?)", (new_conv_id,)
+    )
 
     # Copy messages, mapping old IDs to new IDs
     id_map = {}
@@ -763,16 +980,26 @@ async def fork_conversation(conv_id: int, from_msg_id: int, new_title: str = Non
                token_estimate, is_active, summary, image_path, image_alt,
                cc_session_id, content_blocks, created_at)
                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)""",
-            (new_conv_id, new_parent, msg["role"], msg["content"],
-             msg.get("token_estimate", 0), msg.get("summary"),
-             msg.get("image_path"), msg.get("image_alt"),
-             msg.get("cc_session_id"), msg.get("content_blocks"),
-             msg["created_at"])
+            (
+                new_conv_id,
+                new_parent,
+                msg["role"],
+                msg["content"],
+                msg.get("token_estimate", 0),
+                msg.get("summary"),
+                msg.get("image_path"),
+                msg.get("image_alt"),
+                msg.get("cc_session_id"),
+                msg.get("content_blocks"),
+                msg["created_at"],
+            ),
         )
         id_map[msg["id"]] = cursor.lastrowid
 
     await db.commit()
-    row = await db.execute_fetchall("SELECT * FROM conversations WHERE id = ?", (new_conv_id,))
+    row = await db.execute_fetchall(
+        "SELECT * FROM conversations WHERE id = ?", (new_conv_id,)
+    )
 
     return dict(row[0])
 
@@ -785,7 +1012,7 @@ async def get_conversation_tree(conv_id: int) -> list[dict]:
                   is_active, created_at, token_estimate, summary, image_path, image_alt
            FROM messages WHERE conversation_id = ?
            ORDER BY created_at""",
-        (conv_id,)
+        (conv_id,),
     )
 
     return [dict(r) for r in rows]
@@ -793,8 +1020,10 @@ async def get_conversation_tree(conv_id: int) -> list[dict]:
 
 # ── Summaries ──
 
-async def save_summary(conv_id: int, branch_path: list[int], content: str,
-                       covers_up_to: int) -> dict:
+
+async def save_summary(
+    conv_id: int, branch_path: list[int], content: str, covers_up_to: int
+) -> dict:
     db = await get_db()
     now = time.time()
     token_est = len(content) // 3
@@ -804,12 +1033,12 @@ async def save_summary(conv_id: int, branch_path: list[int], content: str,
         """INSERT OR REPLACE INTO summaries
            (conversation_id, branch_path, content, covers_up_to, token_estimate, created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
-        (conv_id, path_json, content, covers_up_to, token_est, now)
+        (conv_id, path_json, content, covers_up_to, token_est, now),
     )
     await db.commit()
     rows = await db.execute_fetchall(
         "SELECT * FROM summaries WHERE conversation_id = ? AND branch_path = ?",
-        (conv_id, path_json)
+        (conv_id, path_json),
     )
 
     return dict(rows[0]) if rows else {}
@@ -822,13 +1051,14 @@ async def get_summary(conv_id: int, branch_path: list[int] = None) -> Optional[d
         """SELECT * FROM summaries
            WHERE conversation_id = ? AND branch_path = ?
            ORDER BY created_at DESC LIMIT 1""",
-        (conv_id, path_json)
+        (conv_id, path_json),
     )
 
     return dict(rows[0]) if rows else None
 
 
 # ── Style State ──
+
 
 async def get_style_state(conv_id: int) -> dict:
     db = await get_db()
@@ -847,8 +1077,12 @@ async def get_style_state(conv_id: int) -> dict:
     return dict(rows[0])
 
 
-async def update_style_state(conv_id: int, nudge_index: int = None,
-                             alert_level: int = None, ngram_snapshot: dict = None):
+async def update_style_state(
+    conv_id: int,
+    nudge_index: int = None,
+    alert_level: int = None,
+    ngram_snapshot: dict = None,
+):
     db = await get_db()
     updates = []
     params = []
@@ -865,17 +1099,19 @@ async def update_style_state(conv_id: int, nudge_index: int = None,
         params.append(conv_id)
         await db.execute(
             f"UPDATE style_state SET {', '.join(updates)} WHERE conversation_id = ?",
-            params
+            params,
         )
         await db.commit()
 
 
-
 # ── State Cards ──
+
 
 async def get_state_schemas() -> list[dict]:
     db = await get_db()
-    rows = await db.execute_fetchall("SELECT * FROM state_schemas ORDER BY is_builtin DESC, name")
+    rows = await db.execute_fetchall(
+        "SELECT * FROM state_schemas ORDER BY is_builtin DESC, name"
+    )
 
     return [dict(r) for r in rows]
 
@@ -885,12 +1121,12 @@ async def get_state_cards(conv_id: int, schema_id: str = None) -> list[dict]:
     if schema_id:
         rows = await db.execute_fetchall(
             "SELECT * FROM state_cards WHERE conversation_id = ? AND schema_id = ? ORDER BY label",
-            (conv_id, schema_id)
+            (conv_id, schema_id),
         )
     else:
         rows = await db.execute_fetchall(
             "SELECT * FROM state_cards WHERE conversation_id = ? ORDER BY schema_id, label",
-            (conv_id,)
+            (conv_id,),
         )
 
     return [dict(r) for r in rows]
@@ -900,25 +1136,30 @@ async def get_state_card_by_label(conv_id: int, schema_id: str, label: str):
     db = await get_db()
     rows = await db.execute_fetchall(
         "SELECT * FROM state_cards WHERE conversation_id = ? AND schema_id = ? AND label = ?",
-        (conv_id, schema_id, label)
+        (conv_id, schema_id, label),
     )
 
     return dict(rows[0]) if rows else None
 
 
-async def create_state_card(conv_id: int, schema_id: str, label: str,
-                            data: dict = None, is_readonly: bool = False) -> dict:
+async def create_state_card(
+    conv_id: int,
+    schema_id: str,
+    label: str,
+    data: dict = None,
+    is_readonly: bool = False,
+) -> dict:
     db = await get_db()
     now = time.time()
     data_json = json.dumps(data or {})
     await db.execute(
         "INSERT OR IGNORE INTO state_cards (conversation_id, schema_id, label, data, is_readonly, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (conv_id, schema_id, label, data_json, int(is_readonly), now)
+        (conv_id, schema_id, label, data_json, int(is_readonly), now),
     )
     await db.commit()
     rows = await db.execute_fetchall(
         "SELECT * FROM state_cards WHERE conversation_id = ? AND schema_id = ? AND label = ?",
-        (conv_id, schema_id, label)
+        (conv_id, schema_id, label),
     )
 
     return dict(rows[0]) if rows else {}
@@ -928,48 +1169,53 @@ async def update_state_card(card_id: int, data: dict) -> dict:
     db = await get_db()
     now = time.time()
     # Merge: load existing data, update fields
-    rows = await db.execute_fetchall("SELECT * FROM state_cards WHERE id = ?", (card_id,))
+    rows = await db.execute_fetchall(
+        "SELECT * FROM state_cards WHERE id = ?", (card_id,)
+    )
     if not rows:
-    
+
         return {}
     existing = json.loads(rows[0]["data"] or "{}")
     existing.update(data)
     await db.execute(
         "UPDATE state_cards SET data = ?, updated_at = ? WHERE id = ?",
-        (json.dumps(existing), now, card_id)
+        (json.dumps(existing), now, card_id),
     )
     await db.commit()
-    rows = await db.execute_fetchall("SELECT * FROM state_cards WHERE id = ?", (card_id,))
+    rows = await db.execute_fetchall(
+        "SELECT * FROM state_cards WHERE id = ?", (card_id,)
+    )
 
     return dict(rows[0]) if rows else {}
 
 
-async def update_state_card_field(conv_id: int, schema_id: str, label: str,
-                                  field: str, value: str) -> dict:
+async def update_state_card_field(
+    conv_id: int, schema_id: str, label: str, field: str, value: str
+) -> dict:
     """Update a single field on a state card, creating the card if it doesn't exist."""
     db = await get_db()
     now = time.time()
     rows = await db.execute_fetchall(
         "SELECT * FROM state_cards WHERE conversation_id = ? AND schema_id = ? AND label = ?",
-        (conv_id, schema_id, label)
+        (conv_id, schema_id, label),
     )
     if rows:
         existing = json.loads(rows[0]["data"] or "{}")
         existing[field] = value
         await db.execute(
             "UPDATE state_cards SET data = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(existing), now, rows[0]["id"])
+            (json.dumps(existing), now, rows[0]["id"]),
         )
     else:
         data = {field: value}
         await db.execute(
             "INSERT INTO state_cards (conversation_id, schema_id, label, data, is_readonly, updated_at) VALUES (?, ?, ?, ?, 0, ?)",
-            (conv_id, schema_id, label, json.dumps(data), now)
+            (conv_id, schema_id, label, json.dumps(data), now),
         )
     await db.commit()
     rows = await db.execute_fetchall(
         "SELECT * FROM state_cards WHERE conversation_id = ? AND schema_id = ? AND label = ?",
-        (conv_id, schema_id, label)
+        (conv_id, schema_id, label),
     )
 
     return dict(rows[0]) if rows else {}
@@ -981,8 +1227,8 @@ async def delete_state_card(card_id: int):
     await db.commit()
 
 
-
 # ── Branch State (Tier 3 — Deltas per message) ──
+
 
 async def save_state_deltas(msg_id: int, deltas: list[dict]):
     """Save state deltas on an assistant message.
@@ -991,10 +1237,9 @@ async def save_state_deltas(msg_id: int, deltas: list[dict]):
     db = await get_db()
     await db.execute(
         "UPDATE messages SET state_deltas = ? WHERE id = ?",
-        (json.dumps(deltas), msg_id)
+        (json.dumps(deltas), msg_id),
     )
     await db.commit()
-
 
 
 async def get_branch_state(conv_id: int, leaf_msg_id: int) -> list[dict]:
@@ -1013,7 +1258,9 @@ async def get_branch_state(conv_id: int, leaf_msg_id: int) -> list[dict]:
     # Index base cards by (schema_id, label)
     effective = {}
     for card in base_cards:
-        data = json.loads(card["data"]) if isinstance(card["data"], str) else card["data"]
+        data = (
+            json.loads(card["data"]) if isinstance(card["data"], str) else card["data"]
+        )
         effective[(card["schema_id"], card["label"])] = {**card, "data": data}
 
     # Walk branch in chronological order (branch_to_root returns root-first)
@@ -1040,35 +1287,43 @@ async def get_branch_state(conv_id: int, leaf_msg_id: int) -> list[dict]:
 
 # ── Character State Cards (Tier 1 — Global) ──
 
-async def get_character_state_cards(character_id: str, schema_id: str = None) -> list[dict]:
+
+async def get_character_state_cards(
+    character_id: str, schema_id: str = None
+) -> list[dict]:
     db = await get_db()
     if schema_id:
         rows = await db.execute_fetchall(
             "SELECT * FROM character_state_cards WHERE character_id = ? AND schema_id = ? ORDER BY label",
-            (character_id, schema_id)
+            (character_id, schema_id),
         )
     else:
         rows = await db.execute_fetchall(
             "SELECT * FROM character_state_cards WHERE character_id = ? ORDER BY schema_id, label",
-            (character_id,)
+            (character_id,),
         )
 
     return [dict(r) for r in rows]
 
 
-async def create_character_state_card(character_id: str, schema_id: str, label: str,
-                                      data: dict = None, is_readonly: bool = False) -> dict:
+async def create_character_state_card(
+    character_id: str,
+    schema_id: str,
+    label: str,
+    data: dict = None,
+    is_readonly: bool = False,
+) -> dict:
     db = await get_db()
     now = time.time()
     data_json = json.dumps(data or {})
     await db.execute(
         "INSERT OR IGNORE INTO character_state_cards (character_id, schema_id, label, data, is_readonly, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (character_id, schema_id, label, data_json, int(is_readonly), now)
+        (character_id, schema_id, label, data_json, int(is_readonly), now),
     )
     await db.commit()
     rows = await db.execute_fetchall(
         "SELECT * FROM character_state_cards WHERE character_id = ? AND schema_id = ? AND label = ?",
-        (character_id, schema_id, label)
+        (character_id, schema_id, label),
     )
 
     return dict(rows[0]) if rows else {}
@@ -1077,18 +1332,22 @@ async def create_character_state_card(character_id: str, schema_id: str, label: 
 async def update_character_state_card(card_id: int, data: dict) -> dict:
     db = await get_db()
     now = time.time()
-    rows = await db.execute_fetchall("SELECT * FROM character_state_cards WHERE id = ?", (card_id,))
+    rows = await db.execute_fetchall(
+        "SELECT * FROM character_state_cards WHERE id = ?", (card_id,)
+    )
     if not rows:
-    
+
         return {}
     existing = json.loads(rows[0]["data"] or "{}")
     existing.update(data)
     await db.execute(
         "UPDATE character_state_cards SET data = ?, updated_at = ? WHERE id = ?",
-        (json.dumps(existing), now, card_id)
+        (json.dumps(existing), now, card_id),
     )
     await db.commit()
-    rows = await db.execute_fetchall("SELECT * FROM character_state_cards WHERE id = ?", (card_id,))
+    rows = await db.execute_fetchall(
+        "SELECT * FROM character_state_cards WHERE id = ?", (card_id,)
+    )
 
     return dict(rows[0]) if rows else {}
 
@@ -1097,7 +1356,6 @@ async def delete_character_state_card(card_id: int):
     db = await get_db()
     await db.execute("DELETE FROM character_state_cards WHERE id = ?", (card_id,))
     await db.commit()
-
 
 
 async def copy_character_state_to_conversation(character_id: str, conv_id: int) -> int:
@@ -1111,7 +1369,14 @@ async def copy_character_state_to_conversation(character_id: str, conv_id: int) 
     for row in rows:
         await db.execute(
             "INSERT OR IGNORE INTO state_cards (conversation_id, schema_id, label, data, is_readonly, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (conv_id, row["schema_id"], row["label"], row["data"], row["is_readonly"], now)
+            (
+                conv_id,
+                row["schema_id"],
+                row["label"],
+                row["data"],
+                row["is_readonly"],
+                now,
+            ),
         )
         count += 1
     await db.commit()
@@ -1121,11 +1386,12 @@ async def copy_character_state_to_conversation(character_id: str, conv_id: int) 
 
 # ── Bookmarks ──
 
+
 async def get_bookmarks(conv_id: int) -> list[dict]:
     db = await get_db()
     rows = await db.execute_fetchall(
         "SELECT * FROM bookmarks WHERE conversation_id = ? ORDER BY created_at DESC",
-        (conv_id,)
+        (conv_id,),
     )
 
     return [dict(r) for r in rows]
@@ -1143,18 +1409,19 @@ async def get_all_bookmarks() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-async def add_bookmark(conv_id: int, message_id: int,
-                       branch_name: str = '', description: str = '') -> dict:
+async def add_bookmark(
+    conv_id: int, message_id: int, branch_name: str = "", description: str = ""
+) -> dict:
     db = await get_db()
     now = time.time()
     cursor = await db.execute(
         "INSERT OR IGNORE INTO bookmarks (conversation_id, message_id, branch_name, description, created_at) VALUES (?, ?, ?, ?, ?)",
-        (conv_id, message_id, branch_name, description, now)
+        (conv_id, message_id, branch_name, description, now),
     )
     await db.commit()
     rows = await db.execute_fetchall(
         "SELECT * FROM bookmarks WHERE conversation_id = ? AND message_id = ?",
-        (conv_id, message_id)
+        (conv_id, message_id),
     )
 
     return dict(rows[0]) if rows else {}
@@ -1163,8 +1430,7 @@ async def add_bookmark(conv_id: int, message_id: int,
 async def update_bookmark(bookmark_id: int, description: str) -> dict:
     db = await get_db()
     await db.execute(
-        "UPDATE bookmarks SET description = ? WHERE id = ?",
-        (description, bookmark_id)
+        "UPDATE bookmarks SET description = ? WHERE id = ?", (description, bookmark_id)
     )
     await db.commit()
     rows = await db.execute_fetchall(
@@ -1180,14 +1446,20 @@ async def delete_bookmark(bookmark_id: int):
     await db.commit()
 
 
-
 # ── Modules (Skills / Commands / Agents) ──
 
-async def upsert_module(module_id: str, name: str, module_type: str,
-                        description: str = "", source: str = "builtin",
-                        config: dict = None) -> dict:
+
+async def upsert_module(
+    module_id: str,
+    name: str,
+    module_type: str,
+    description: str = "",
+    source: str = "builtin",
+    config: dict = None,
+) -> dict:
     """Insert or update a module. Returns the module dict."""
     import time
+
     db = await get_db()
     now = time.time()
     config_json = json.dumps(config or {})
@@ -1197,7 +1469,7 @@ async def upsert_module(module_id: str, name: str, module_type: str,
            ON CONFLICT(id) DO UPDATE SET
                name=excluded.name, description=excluded.description,
                config=excluded.config, updated_at=excluded.updated_at""",
-        (module_id, name, module_type, description, source, config_json, now, now)
+        (module_id, name, module_type, description, source, config_json, now, now),
     )
     await db.commit()
     row = await db.execute_fetchall("SELECT * FROM modules WHERE id = ?", (module_id,))
@@ -1223,10 +1495,11 @@ async def get_modules(module_type: str = None, enabled_only: bool = True) -> lis
 
 async def set_module_enabled(module_id: str, enabled: bool):
     import time
+
     db = await get_db()
     await db.execute(
         "UPDATE modules SET enabled = ?, updated_at = ? WHERE id = ?",
-        (1 if enabled else 0, time.time(), module_id)
+        (1 if enabled else 0, time.time(), module_id),
     )
     await db.commit()
 
@@ -1239,11 +1512,12 @@ async def delete_module(module_id: str):
 
 # ── Helpers ──
 
+
 async def count_conversation_tokens(conv_id: int) -> int:
     db = await get_db()
     rows = await db.execute_fetchall(
         "SELECT COALESCE(SUM(token_estimate), 0) as total FROM messages WHERE conversation_id = ? AND is_active = 1",
-        (conv_id,)
+        (conv_id,),
     )
 
     return rows[0]["total"] if rows else 0

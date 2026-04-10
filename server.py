@@ -6,7 +6,14 @@ import os
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
+from fastapi import (
+    FastAPI,
+    WebSocket,
+    WebSocketDisconnect,
+    UploadFile,
+    File,
+    HTTPException,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.websockets import WebSocketState
@@ -14,18 +21,33 @@ from starlette.websockets import WebSocketState
 import database as db
 from config import config
 from character_loader import (
-    load_all_characters, load_character, save_character, delete_character,
-    load_all_personas, load_persona, save_persona, delete_persona,
-    load_all_lore, load_lore_entry, save_lore, delete_lore,
+    load_all_characters,
+    load_character,
+    save_character,
+    delete_character,
+    load_all_personas,
+    load_persona,
+    save_persona,
+    delete_persona,
+    load_all_lore,
+    load_lore_entry,
+    save_lore,
+    delete_lore,
 )
 from ollama_client import health_check, stream_chat, sync_chat, describe_image
 from ooda_harness import (
-    build_ooda_system_prompt, parse_ooda_block, extract_post_ooda_prose,
-    execute_ooda_reads, execute_ooda_updates, build_pass2_context,
+    build_ooda_system_prompt,
+    parse_ooda_block,
+    extract_post_ooda_prose,
+    execute_ooda_reads,
+    execute_ooda_updates,
+    build_pass2_context,
 )
 from prompt_engine import (
-    build_system_prompt, assemble_prompt,
-    get_style_nudge, STYLE_NUDGES
+    build_system_prompt,
+    assemble_prompt,
+    get_style_nudge,
+    STYLE_NUDGES,
 )
 from context_manager import get_context_for_generation, update_rolling_summary
 import local_summary
@@ -35,11 +57,14 @@ from skill_scanner import get_all_skills, BUILTIN_COMMANDS
 
 from contextlib import asynccontextmanager
 
+
 @asynccontextmanager
 async def lifespan(app):
     await db.init_db()
     # Clean up stale draft messages (empty assistant msgs older than 30 min)
     await _cleanup_stale_drafts()
+    # Re-broadcast pending permission requests from DB (server restart)
+    await _reload_pending_permissions()
     # Ensure Ollama is running (launches it if not)
     asyncio.create_task(_ensure_ollama())
     # Preload Gemma 3 1B for CPU summarization (downloads ~806MB on first run)
@@ -51,11 +76,12 @@ async def lifespan(app):
 async def _cleanup_stale_drafts():
     """Remove empty assistant draft messages older than 30 minutes on startup."""
     import time
+
     cutoff = time.time() - 1800  # 30 minutes
     conn = await db.get_db()
     rows = await conn.execute_fetchall(
         "SELECT id FROM messages WHERE role='assistant' AND (content IS NULL OR content='') AND content_blocks IS NULL AND created_at < ?",
-        (cutoff,)
+        (cutoff,),
     )
     if rows:
         ids = [r["id"] for r in rows]
@@ -65,14 +91,67 @@ async def _cleanup_stale_drafts():
     await conn.close()
 
 
+async def _reload_pending_permissions():
+    """Load pending permissions from DB and re-broadcast to WebSockets."""
+    import time
+
+    # Clean up very old permissions (1 hour+) before reloading
+    await db.delete_old_pending_permissions(time.time() - 3600)
+    print(f"[STARTUP] Cleaned up permissions older than 1 hour")
+
+    # Load pending permissions for all conversations
+    conn = await db.get_db()
+    rows = await conn.execute_fetchall(
+        "SELECT request_id, conv_id, tool_name, tool_input, input_summary, started_at FROM pending_permissions ORDER BY started_at"
+    )
+
+    # Build permission messages
+    perm_messages = {}
+    for row in rows:
+        perm_msg = {
+            "type": "permission_request",
+            "request_id": row["request_id"],
+            "conv_id": row["conv_id"],
+            "tool_name": row["tool_name"],
+            "tool_input": row["tool_input"],
+            "input_summary": row["input_summary"],
+        }
+        perm_messages[row["conv_id"]] = perm_msg
+        print(
+            f"[STARTUP] Reloading pending permission: {row['request_id']} for conv={row['conv_id']} tool={row['tool_name']}"
+        )
+
+    # Broadcast to active WebSockets
+    dead_pairs = []
+    sent_count = 0
+    for cid, clients in list(_active_websockets.items()):
+        for ws in list(clients):
+            try:
+                if cid in perm_messages:
+                    await ws.send_json(perm_messages[cid])
+                    sent_count += 1
+            except Exception as e:
+                print(f"[STARTUP] Failed to reload perm to conv={cid}: {e}")
+                dead_pairs.append((cid, ws))
+    print(f"[STARTUP] Reloaded {sent_count} permission(s) to active WebSockets")
+
+    # Clean up from DB
+    for row in rows:
+        await db.delete_pending_permission(row["request_id"])
+    print(f"[STARTUP] Cleared {len(rows)} pending permissions from DB")
+
+
 async def _ensure_ollama():
     """Check if Ollama is running; launch it in the background if not."""
     import shutil
     import subprocess
+
     try:
         status = await health_check()
         if status.get("status") == "ok":
-            print(f"[STARTUP] Ollama already running — {len(status.get('models', []))} model(s) available")
+            print(
+                f"[STARTUP] Ollama already running — {len(status.get('models', []))} model(s) available"
+            )
             return
     except Exception:
         pass
@@ -89,7 +168,7 @@ async def _ensure_ollama():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
-                        | getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         # Wait for it to come up (up to 15s)
         for i in range(15):
@@ -97,11 +176,15 @@ async def _ensure_ollama():
             try:
                 status = await health_check()
                 if status.get("status") == "connected":
-                    print(f"[STARTUP] Ollama ready after {i+1}s — {len(status.get('models', []))} model(s)")
+                    print(
+                        f"[STARTUP] Ollama ready after {i+1}s — {len(status.get('models', []))} model(s)"
+                    )
                     return
             except Exception:
                 pass
-        print("[STARTUP] Ollama launched but not yet responding after 15s — will retry on first use")
+        print(
+            "[STARTUP] Ollama launched but not yet responding after 15s — will retry on first use"
+        )
     except Exception as e:
         print(f"[STARTUP] Failed to launch Ollama: {e}")
 
@@ -112,12 +195,17 @@ async def _preload_summarizer():
         await local_summary.preload()
     except Exception as e:
         import logging
-        logging.getLogger(__name__).warning(f"Gemma preload failed (will retry on first use): {e}")
+
+        logging.getLogger(__name__).warning(
+            f"Gemma preload failed (will retry on first use): {e}"
+        )
+
 
 app = FastAPI(title="Ex Astris Umbra — A Loom Interface", lifespan=lifespan)
 
 # --- Graceful shutdown endpoint ---
 _server_ref: list = []  # holds uvicorn.Server for shutdown
+
 
 @app.post("/shutdown")
 async def shutdown():
@@ -128,8 +216,10 @@ async def shutdown():
         return JSONResponse({"status": "shutting down"})
     # Fallback: signal the process
     import signal
+
     os.kill(os.getpid(), signal.SIGINT)
     return JSONResponse({"status": "shutting down (signal)"})
+
 
 # Ensure upload directory exists
 os.makedirs(config.upload_dir, exist_ok=True)
@@ -185,8 +275,9 @@ def _parse_image_paths(image_path) -> list[str]:
     return [image_path]
 
 
-async def _background_summarize_message(msg_id: int, content: str, role: str,
-                                         conv_id: int = None, image_path: str = None):
+async def _background_summarize_message(
+    msg_id: int, content: str, role: str, conv_id: int = None, image_path: str = None
+):
     """Generate a short Gemma summary for a message (tree pill) and update
     the rolling context summary if needed."""
     try:
@@ -213,7 +304,10 @@ async def _background_summarize_message(msg_id: int, content: str, role: str,
 
     except Exception as e:
         import logging
-        logging.getLogger(__name__).warning(f"Background summary failed for msg {msg_id}: {e}")
+
+        logging.getLogger(__name__).warning(
+            f"Background summary failed for msg {msg_id}: {e}"
+        )
 
 
 # ── Static files ──
@@ -228,6 +322,7 @@ async def index():
 
 
 # ── Health ──
+
 
 @app.get("/api/health")
 async def api_health():
@@ -247,6 +342,7 @@ async def api_ollama_models():
 
 
 # ── Characters ──
+
 
 @app.get("/api/characters")
 async def api_characters():
@@ -285,6 +381,7 @@ async def api_delete_character(char_id: str):
 
 # ── Character State Cards (Tier 1) ──
 
+
 @app.get("/api/characters/{char_id}/state")
 async def api_get_character_state(char_id: str):
     return await db.get_character_state_cards(char_id)
@@ -293,8 +390,11 @@ async def api_get_character_state(char_id: str):
 @app.post("/api/characters/{char_id}/state")
 async def api_create_character_state(char_id: str, data: dict):
     return await db.create_character_state_card(
-        char_id, data["schema_id"], data["label"],
-        data.get("data", {}), data.get("is_readonly", False),
+        char_id,
+        data["schema_id"],
+        data["label"],
+        data.get("data", {}),
+        data.get("is_readonly", False),
     )
 
 
@@ -324,15 +424,21 @@ async def api_duplicate_character(char_id: str):
     # Copy global state cards
     old_cards = await db.get_character_state_cards(char_id)
     for card in old_cards:
-        card_data = json.loads(card["data"]) if isinstance(card["data"], str) else card["data"]
+        card_data = (
+            json.loads(card["data"]) if isinstance(card["data"], str) else card["data"]
+        )
         await db.create_character_state_card(
-            new_char["id"], card["schema_id"], card["label"],
-            card_data, card.get("is_readonly", False),
+            new_char["id"],
+            card["schema_id"],
+            card["label"],
+            card_data,
+            card.get("is_readonly", False),
         )
     return new_char
 
 
 # ── Personas ──
+
 
 @app.get("/api/personas")
 async def api_personas():
@@ -370,6 +476,7 @@ async def api_delete_persona(persona_id: str):
 
 # ── Lore ──
 
+
 @app.get("/api/lore")
 async def api_lore():
     return load_all_lore("lore")
@@ -405,6 +512,7 @@ async def api_delete_lore(lore_id: str):
 
 
 # ── Conversations ──
+
 
 @app.get("/api/conversations")
 async def api_list_conversations():
@@ -443,10 +551,13 @@ async def api_create_conversation(data: dict = None):
     cc_effort = data.get("cc_effort", "high")
     local_model = data.get("local_model")
 
-    conv = await db.create_conversation(title, character_id, mode=mode, project_dir=project_dir)
+    conv = await db.create_conversation(
+        title, character_id, mode=mode, project_dir=project_dir
+    )
 
     # Store additional fields
     import json as _json
+
     fields = dict(
         persona_id=persona_id,
         lore_ids=_json.dumps(lore_ids),
@@ -468,37 +579,65 @@ async def api_create_conversation(data: dict = None):
         if global_cards:
             await db.copy_character_state_to_conversation(character_id, conv["id"])
         else:
-            char = load_character(os.path.join(config.characters_dir, f"{character_id}.md"))
+            char = load_character(
+                os.path.join(config.characters_dir, f"{character_id}.md")
+            )
             if char:
-                await db.create_state_card(conv["id"], "character_state", char.get("name", "Character"), {
-                    "personality": char.get("personality", ""),
-                    "appearance": "",
-                    "current_mood": "",
-                    "current_goal": "",
-                    "physical_state": "",
-                    "speech_pattern": "",
-                    "relationship_to_player": "",
-                    "secrets": "",
-                })
+                await db.create_state_card(
+                    conv["id"],
+                    "character_state",
+                    char.get("name", "Character"),
+                    {
+                        "personality": char.get("personality", ""),
+                        "appearance": "",
+                        "current_mood": "",
+                        "current_goal": "",
+                        "physical_state": "",
+                        "speech_pattern": "",
+                        "relationship_to_player": "",
+                        "secrets": "",
+                    },
+                )
                 if char.get("scenario"):
-                    await db.create_state_card(conv["id"], "scene_state", "current", {
-                        "location": "", "time_of_day": "", "atmosphere": "",
-                        "characters_present": "", "recent_events": char["scenario"],
-                        "tension_level": "",
-                    })
+                    await db.create_state_card(
+                        conv["id"],
+                        "scene_state",
+                        "current",
+                        {
+                            "location": "",
+                            "time_of_day": "",
+                            "atmosphere": "",
+                            "characters_present": "",
+                            "recent_events": char["scenario"],
+                            "tension_level": "",
+                        },
+                    )
         if persona_id:
             persona = load_persona(os.path.join("personas", f"{persona_id}.md"))
             if persona:
-                await db.create_state_card(conv["id"], "persona_state", persona["name"], {
-                    "description": persona.get("content", ""), "appearance": "", "goals": "",
-                })
+                await db.create_state_card(
+                    conv["id"],
+                    "persona_state",
+                    persona["name"],
+                    {
+                        "description": persona.get("content", ""),
+                        "appearance": "",
+                        "goals": "",
+                    },
+                )
         if lore_ids:
             for lid in lore_ids:
                 entry = load_lore_entry(os.path.join("lore", f"{lid}.md"))
                 if entry:
-                    await db.create_state_card(conv["id"], "lore", entry["name"], {
-                        "content": entry["content"],
-                    }, is_readonly=True)
+                    await db.create_state_card(
+                        conv["id"],
+                        "lore",
+                        entry["name"],
+                        {
+                            "content": entry["content"],
+                        },
+                        is_readonly=True,
+                    )
 
     # If character goes first:
     #   - Custom scene → add it as a user message so the model responds to it
@@ -510,16 +649,24 @@ async def api_create_conversation(data: dict = None):
             # Add custom scene as a user message for the model to respond to
             scene_msg = await db.add_message(conv["id"], "user", custom_scene)
             await db.set_active_branch(conv["id"], scene_msg["id"])
-            asyncio.create_task(_background_summarize_message(
-                scene_msg["id"], custom_scene, "user", conv_id=conv["id"]
-            ))
+            asyncio.create_task(
+                _background_summarize_message(
+                    scene_msg["id"], custom_scene, "user", conv_id=conv["id"]
+                )
+            )
         elif char and char.get("greeting"):
-            greeting_msg = await db.add_message(conv["id"], "assistant", char["greeting"])
+            greeting_msg = await db.add_message(
+                conv["id"], "assistant", char["greeting"]
+            )
             await db.set_active_branch(conv["id"], greeting_msg["id"])
-            asyncio.create_task(_background_summarize_message(
-                greeting_msg["id"], char["greeting"], "assistant",
-                conv_id=conv["id"]
-            ))
+            asyncio.create_task(
+                _background_summarize_message(
+                    greeting_msg["id"],
+                    char["greeting"],
+                    "assistant",
+                    conv_id=conv["id"],
+                )
+            )
 
     return conv
 
@@ -536,6 +683,7 @@ async def api_get_conversation(conv_id: int):
 async def api_update_conversation(conv_id: int, data: dict):
     """Update conversation settings (style_nudge, persona_id, lore_ids, etc.)."""
     import json as _json
+
     fields = {}
     if "style_nudge" in data:
         fields["style_nudge"] = data["style_nudge"]
@@ -570,6 +718,7 @@ async def api_delete_conversation(conv_id: int):
 
 # ── Bookmarks ──
 
+
 @app.get("/api/bookmarks")
 async def api_get_all_bookmarks():
     return await db.get_all_bookmarks()
@@ -603,6 +752,7 @@ async def api_delete_bookmark(bookmark_id: int):
 
 # ── State Cards ──
 
+
 @app.get("/api/state-schemas")
 async def api_get_state_schemas():
     return await db.get_state_schemas()
@@ -616,8 +766,11 @@ async def api_get_state_cards(conv_id: int, schema_id: str = None):
 @app.post("/api/conversations/{conv_id}/state")
 async def api_create_state_card(conv_id: int, data: dict):
     return await db.create_state_card(
-        conv_id, data["schema_id"], data["label"],
-        data.get("data", {}), data.get("is_readonly", False),
+        conv_id,
+        data["schema_id"],
+        data["label"],
+        data.get("data", {}),
+        data.get("is_readonly", False),
     )
 
 
@@ -660,27 +813,37 @@ async def api_seed_state_cards(conv_id: int):
             # Fallback: extract from character text
             char = load_character(os.path.join(config.characters_dir, f"{char_id}.md"))
             if char:
-                card = await db.create_state_card(conv_id, "character_state", char.get("name", "Character"), {
-                    "personality": char.get("personality", ""),
-                    "appearance": "",
-                    "current_mood": "",
-                    "current_goal": "",
-                    "physical_state": "",
-                    "speech_pattern": "",
-                    "relationship_to_player": "",
-                    "secrets": "",
-                })
+                card = await db.create_state_card(
+                    conv_id,
+                    "character_state",
+                    char.get("name", "Character"),
+                    {
+                        "personality": char.get("personality", ""),
+                        "appearance": "",
+                        "current_mood": "",
+                        "current_goal": "",
+                        "physical_state": "",
+                        "speech_pattern": "",
+                        "relationship_to_player": "",
+                        "secrets": "",
+                    },
+                )
                 if card:
                     cards_created.append(card)
                 if char.get("scenario"):
-                    scene = await db.create_state_card(conv_id, "scene_state", "current", {
-                        "location": "",
-                        "time_of_day": "",
-                        "atmosphere": "",
-                        "characters_present": "",
-                        "recent_events": char["scenario"],
-                        "tension_level": "",
-                    })
+                    scene = await db.create_state_card(
+                        conv_id,
+                        "scene_state",
+                        "current",
+                        {
+                            "location": "",
+                            "time_of_day": "",
+                            "atmosphere": "",
+                            "characters_present": "",
+                            "recent_events": char["scenario"],
+                            "tension_level": "",
+                        },
+                    )
                     if scene:
                         cards_created.append(scene)
 
@@ -688,26 +851,41 @@ async def api_seed_state_cards(conv_id: int):
     if conv.get("persona_id"):
         persona = load_persona(os.path.join("personas", f"{conv['persona_id']}.md"))
         if persona:
-            card = await db.create_state_card(conv_id, "persona_state", persona["name"], {
-                "description": persona.get("content", ""),
-                "appearance": "",
-                "goals": "",
-            })
+            card = await db.create_state_card(
+                conv_id,
+                "persona_state",
+                persona["name"],
+                {
+                    "description": persona.get("content", ""),
+                    "appearance": "",
+                    "goals": "",
+                },
+            )
             if card:
                 cards_created.append(card)
 
     # Seed from lore
     if conv.get("lore_ids"):
         try:
-            lore_ids = json.loads(conv["lore_ids"]) if isinstance(conv["lore_ids"], str) else conv["lore_ids"]
+            lore_ids = (
+                json.loads(conv["lore_ids"])
+                if isinstance(conv["lore_ids"], str)
+                else conv["lore_ids"]
+            )
         except (ValueError, TypeError):
             lore_ids = []
         for lid in lore_ids:
             entry = load_lore_entry(os.path.join("lore", f"{lid}.md"))
             if entry:
-                card = await db.create_state_card(conv_id, "lore", entry["name"], {
-                    "content": entry["content"],
-                }, is_readonly=True)
+                card = await db.create_state_card(
+                    conv_id,
+                    "lore",
+                    entry["name"],
+                    {
+                        "content": entry["content"],
+                    },
+                    is_readonly=True,
+                )
                 if card:
                     cards_created.append(card)
 
@@ -716,7 +894,33 @@ async def api_seed_state_cards(conv_id: int):
 
 # ── Tree ──
 
-GREEK = ['α','β','γ','δ','ε','ζ','η','θ','ι','κ','λ','μ','ν','ξ','ο','π','ρ','σ','τ','υ','φ','χ','ψ','ω']
+GREEK = [
+    "α",
+    "β",
+    "γ",
+    "δ",
+    "ε",
+    "ζ",
+    "η",
+    "θ",
+    "ι",
+    "κ",
+    "λ",
+    "μ",
+    "ν",
+    "ξ",
+    "ο",
+    "π",
+    "ρ",
+    "σ",
+    "τ",
+    "υ",
+    "φ",
+    "χ",
+    "ψ",
+    "ω",
+]
+
 
 def _compute_branch_names(tree: list[dict]) -> dict[int, str]:
     """Compute branch position labels (matching tree.js UI) for all nodes."""
@@ -735,6 +939,7 @@ def _compute_branch_names(tree: list[dict]) -> dict[int, str]:
     roots.sort()
 
     names = {}
+
     def _get_label(depth):
         return GREEK[depth] if depth < len(GREEK) else f"branch{depth}"
 
@@ -773,23 +978,25 @@ async def api_get_tree_map(conv_id: int):
                   summary
            FROM messages WHERE conversation_id = ?
            ORDER BY created_at""",
-        (conv_id,)
+        (conv_id,),
     )
     nodes = [dict(r) for r in rows]
     names = _compute_branch_names(nodes)
     result = []
     for n in nodes:
         sess = n.get("cc_session_id")
-        result.append({
-            "pos": names.get(n["id"], "?"),
-            "id": n["id"],
-            "parent": n.get("parent_id"),
-            "role": n["role"][0],  # u/a
-            "session": sess[:8] if sess else None,
-            "content": n.get("content_len") or 0,
-            "blocks": n.get("blocks_len") or 0,
-            "summary": (n.get("summary") or "")[:50],
-        })
+        result.append(
+            {
+                "pos": names.get(n["id"], "?"),
+                "id": n["id"],
+                "parent": n.get("parent_id"),
+                "role": n["role"][0],  # u/a
+                "session": sess[:8] if sess else None,
+                "content": n.get("content_len") or 0,
+                "blocks": n.get("blocks_len") or 0,
+                "summary": (n.get("summary") or "")[:50],
+            }
+        )
     return result
 
 
@@ -836,6 +1043,7 @@ async def api_delete_branch(conv_id: int, msg_id: int):
 
 # ── Branch ──
 
+
 @app.get("/api/conversations/{conv_id}/branch/{leaf_id}")
 async def api_get_branch(conv_id: int, leaf_id: int):
     branch = await db.get_branch_to_root(leaf_id)
@@ -857,6 +1065,7 @@ async def api_switch_branch(conv_id: int, leaf_id: int):
 
 
 # ── Messages ──
+
 
 @app.post("/api/conversations/{conv_id}/messages")
 async def api_add_message(conv_id: int, data: dict):
@@ -884,12 +1093,16 @@ async def api_add_message(conv_id: int, data: dict):
         leaf = await db.get_active_leaf(conv_id)
         parent_id = leaf["id"] if leaf else None
 
-    msg = await db.add_message(conv_id, role, content, parent_id=parent_id,
-                               image_path=image_path)
+    msg = await db.add_message(
+        conv_id, role, content, parent_id=parent_id, image_path=image_path
+    )
     await db.set_active_branch(conv_id, msg["id"])
     # Background: generate Gemma summary for tree display
-    asyncio.create_task(_background_summarize_message(msg["id"], content, role,
-                                                      conv_id=conv_id, image_path=image_path))
+    asyncio.create_task(
+        _background_summarize_message(
+            msg["id"], content, role, conv_id=conv_id, image_path=image_path
+        )
+    )
     return msg
 
 
@@ -906,6 +1119,7 @@ async def api_get_children(conv_id: int, msg_id: int):
 
 
 # ── Regenerate (branch) ──
+
 
 @app.post("/api/conversations/{conv_id}/regenerate/{msg_id}")
 async def api_regenerate(conv_id: int, msg_id: int):
@@ -928,6 +1142,7 @@ async def api_fork_conversation(conv_id: int, msg_id: int):
 
 # ── Export / Import ──
 
+
 @app.get("/api/conversations/{conv_id}/export")
 async def api_export_conversation(conv_id: int):
     """Export a conversation with all messages as JSON."""
@@ -939,7 +1154,7 @@ async def api_export_conversation(conv_id: int):
     full_db = await db.get_db()
     rows = await full_db.execute_fetchall(
         "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at",
-        (conv_id,)
+        (conv_id,),
     )
     await full_db.close()
     messages = [dict(r) for r in rows]
@@ -951,11 +1166,15 @@ async def api_export_conversation(conv_id: int):
     }
     # Sanitize filename for HTTP header (ASCII only)
     import unicodedata
+
     safe_title = unicodedata.normalize("NFKD", conv["title"] or "conversation")
-    safe_title = safe_title.encode("ascii", "ignore").decode("ascii").strip() or "conversation"
-    return JSONResponse(export, headers={
-        "Content-Disposition": f'attachment; filename="{safe_title}.json"'
-    })
+    safe_title = (
+        safe_title.encode("ascii", "ignore").decode("ascii").strip() or "conversation"
+    )
+    return JSONResponse(
+        export,
+        headers={"Content-Disposition": f'attachment; filename="{safe_title}.json"'},
+    )
 
 
 @app.post("/api/conversations/import")
@@ -988,8 +1207,11 @@ async def api_import_conversation(file: UploadFile = File(...)):
     for msg in data.get("messages", []):
         new_parent = id_map.get(msg.get("parent_id")) if msg.get("parent_id") else None
         new_msg = await db.add_message(
-            new_conv["id"], msg["role"], msg.get("content", ""),
-            parent_id=new_parent, image_path=msg.get("image_path"),
+            new_conv["id"],
+            msg["role"],
+            msg.get("content", ""),
+            parent_id=new_parent,
+            image_path=msg.get("image_path"),
         )
         id_map[msg["id"]] = new_msg["id"]
         if msg.get("summary"):
@@ -1027,7 +1249,9 @@ async def api_export_persona(persona_id: str):
     filepath = os.path.join("personas", f"{persona_id}.md")
     if not os.path.exists(filepath):
         raise HTTPException(404, "Persona not found")
-    return FileResponse(filepath, filename=f"{persona_id}.md", media_type="text/markdown")
+    return FileResponse(
+        filepath, filename=f"{persona_id}.md", media_type="text/markdown"
+    )
 
 
 @app.post("/api/personas/import")
@@ -1064,11 +1288,34 @@ async def api_import_lore(file: UploadFile = File(...)):
 
 # ── File Upload ──
 
-_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
-_TEXT_EXTS = {'.md', '.txt', '.pdf', '.json', '.csv', '.py', '.js', '.ts',
-              '.html', '.css', '.xml', '.yaml', '.yml', '.toml', '.ini',
-              '.sh', '.bat', '.ps1', '.log', '.rst', '.tex', '.r', '.sql'}
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+_TEXT_EXTS = {
+    ".md",
+    ".txt",
+    ".pdf",
+    ".json",
+    ".csv",
+    ".py",
+    ".js",
+    ".ts",
+    ".html",
+    ".css",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".sh",
+    ".bat",
+    ".ps1",
+    ".log",
+    ".rst",
+    ".tex",
+    ".r",
+    ".sql",
+}
 _ALLOWED_EXTS = _IMAGE_EXTS | _TEXT_EXTS
+
 
 @app.post("/api/upload")
 async def api_upload(file: UploadFile = File(...)):
@@ -1084,11 +1331,20 @@ async def api_upload(file: UploadFile = File(...)):
         f.write(content)
 
     is_image = ext in _IMAGE_EXTS
-    return {"path": filepath, "url": f"/uploads/{filename}",
-            "is_image": is_image, "original_name": file.filename}
+
+    # For local/braid mode: also copy to project_dir so CC can read it
+    # We'll determine project_dir later from the message context
+    # For now, store the relative path so we can resolve it when needed
+    return {
+        "path": filepath,
+        "url": f"/uploads/{filename}",
+        "is_image": is_image,
+        "original_name": file.filename,
+    }
 
 
 # ── Config ──
+
 
 @app.get("/api/config")
 async def api_get_config():
@@ -1102,6 +1358,7 @@ async def api_update_config(data: dict):
 
 
 # ── Directory Browser (for Claude mode project picker) ──
+
 
 @app.get("/api/browse-dirs")
 async def api_browse_dirs(path: str = ""):
@@ -1133,16 +1390,26 @@ async def api_browse_dirs(path: str = ""):
                 entries.append({"name": entry.name, "path": entry.path})
         return {"parent": parent, "dirs": entries, "current": path}
     except PermissionError:
-        return {"parent": parent, "dirs": [], "current": path, "error": "Permission denied"}
+        return {
+            "parent": parent,
+            "dirs": [],
+            "current": path,
+            "error": "Permission denied",
+        }
 
 
 # ── Serve Project Files (images, etc.) ──
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
 _MIME_MAP = {
-    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-    ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
-    ".bmp": "image/bmp", ".ico": "image/x-icon",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".bmp": "image/bmp",
+    ".ico": "image/x-icon",
 }
 
 
@@ -1171,11 +1438,16 @@ async def serve_project_file(conv_id: int, path: str = ""):
         # Allow text files too for previews
         media_type = "text/plain"
 
-    return FileResponse(target, media_type=media_type, filename=target.name,
-                        content_disposition_type="inline")
+    return FileResponse(
+        target,
+        media_type=media_type,
+        filename=target.name,
+        content_disposition_type="inline",
+    )
 
 
 # ── Claude Code Permission Hook Endpoint ──
+
 
 @app.post("/api/cc-permission")
 async def handle_cc_permission(data: dict):
@@ -1190,7 +1462,9 @@ async def handle_cc_permission(data: dict):
     tool_name = data.get("tool_name", "Unknown")
     tool_input = data.get("tool_input", {})
 
-    print(f"[PERM] Hook request: conv={conv_id} tool={tool_name} request_id={request_id}")
+    print(
+        f"[PERM] Hook request: conv={conv_id} tool={tool_name} request_id={request_id}"
+    )
 
     # Auto-approve if user previously clicked "Allow All" for this session
     if conv_id in _auto_approve_sessions:
@@ -1214,7 +1488,7 @@ async def handle_cc_permission(data: dict):
     # Sanitize strings — tool_input can contain surrogate characters that crash WS send
     def _sanitize(obj):
         if isinstance(obj, str):
-            return obj.encode('utf-8', errors='replace').decode('utf-8')
+            return obj.encode("utf-8", errors="replace").decode("utf-8")
         if isinstance(obj, dict):
             return {k: _sanitize(v) for k, v in obj.items()}
         if isinstance(obj, list):
@@ -1231,17 +1505,14 @@ async def handle_cc_permission(data: dict):
         "input_summary": _sanitize(input_summary),
     }
 
-    # Wait for at least one WebSocket anywhere (user may need to open the app)
-    while True:
-        any_ws = any(
-            ws.client_state == WebSocketState.CONNECTED
-            for clients in _active_websockets.values() for ws in clients
-        )
-        if any_ws:
-            break
-        await asyncio.sleep(1)
+    # Persist to DB first (survives server restart)
+    await db.save_pending_permission(
+        request_id, conv_id, tool_name, tool_input, input_summary
+    )
+    print(f"[PERM] Persisted permission request to DB: {request_id}")
 
-    # Broadcast to ALL active WebSockets across ALL conversations
+    # Broadcast permission request to any connected WebSockets (for real-time notifications)
+    # Don't block or deny if none are connected — let the user respond when they return
     dead_pairs = []
     sent_count = 0
     for cid, clients in list(_active_websockets.items()):
@@ -1256,10 +1527,12 @@ async def handle_cc_permission(data: dict):
     for cid, ws in dead_pairs:
         _active_websockets.get(cid, set()).discard(ws)
 
-    # Wait for user response
-    event = asyncio.Event()
+    # Mark as broadcasted
+    await db.mark_permission_broadcasted(request_id)
+
+    # Store in memory dict for fast retrieval (will be loaded from DB on restart)
     _pending_hook_permissions[request_id] = {
-        "event": event,
+        "event": asyncio.Event(),
         "response": None,
         "conv_id": conv_id,
         "tool_name": tool_name,
@@ -1267,8 +1540,10 @@ async def handle_cc_permission(data: dict):
         "input_summary": input_summary,
     }
 
-    await event.wait()
-    user_response = _pending_hook_permissions.pop(request_id, {}).get("response", {})
+    # Wait for user response (no timeout - CC waits indefinitely)
+    await _pending_hook_permissions[request_id]["event"].wait()
+    perm_data = _pending_hook_permissions.pop(request_id, {})
+    user_response = perm_data.get("response", {})
 
     allowed = user_response.get("allow", False)
     print(f"[PERM] User decision: {'allow' if allowed else 'deny'}")
@@ -1280,6 +1555,7 @@ async def handle_cc_permission(data: dict):
 
 
 # ── Skills & Modules ──
+
 
 @app.get("/api/skills")
 async def list_skills(conv_id: int = None):
@@ -1385,6 +1661,7 @@ async def create_user_skill(data: dict):
 async def list_user_skills(conv_id: int = None):
     """List only user-created custom skills (from .claude/skills/)."""
     from skill_scanner import scan_skills_dir
+
     project_dir = "."
     if conv_id:
         conv = await db.get_conversation(conv_id)
@@ -1397,6 +1674,7 @@ async def list_user_skills(conv_id: int = None):
 async def delete_user_skill(skill_name: str, conv_id: int = None):
     """Delete a user-created skill by removing its directory."""
     import shutil
+
     project_dir = "."
     if conv_id:
         conv = await db.get_conversation(conv_id)
@@ -1411,15 +1689,16 @@ async def delete_user_skill(skill_name: str, conv_id: int = None):
 
 # ── WebSocket Chat ──
 
+
 async def _ws_send(conv_id: int, data: dict):
     """Best-effort broadcast to ALL active WebSockets for a conversation.
     Silently skips dead clients — generation continues regardless.
     Auto-injects gen_id from the current task if present."""
     # Auto-tag with gen_id so client can distinguish parallel streams
     task = asyncio.current_task()
-    gen_key = getattr(task, '_gen_key', None)
-    if gen_key and 'gen_id' not in data:
-        data = {**data, 'gen_id': gen_key[2]}
+    gen_key = getattr(task, "_gen_key", None)
+    if gen_key and "gen_id" not in data:
+        data = {**data, "gen_id": gen_key[2]}
     clients = _active_websockets.get(conv_id)
     if not clients:
         return
@@ -1459,53 +1738,63 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
     _active_websockets[conv_id].add(websocket)
 
     # Tell the client whether a generation is running — include live snapshot if available
-    active_gen_keys = [k for k, t in _active_generations.items() if k[0] == conv_id and not t.done()]
+    active_gen_keys = [
+        k for k, t in _active_generations.items() if k[0] == conv_id and not t.done()
+    ]
     if active_gen_keys:
         # Find the snapshot for the active generation(s)
         snapshots = []
         for gk in active_gen_keys:
             snap = _generation_snapshots.get(gk)
             if snap:
-                snapshots.append({
-                    "gen_id": gk[2],
-                    "parent_id": snap.get("parent_id"),
-                    "draft_msg_id": snap.get("draft_msg_id"),
-                    "full_text": snap.get("full_text", ""),
-                    "content_blocks": snap.get("content_blocks", []),
-                    "input_tokens": snap.get("input_tokens", 0),
-                    "output_tokens": snap.get("output_tokens", 0),
-                    "started_at": snap.get("started_at", 0),
-                    "mode": snap.get("mode", "claude"),
-                })
-        await websocket.send_json({
-            "type": "generation_active",
-            "snapshots": snapshots,
-        })
+                snapshots.append(
+                    {
+                        "gen_id": gk[2],
+                        "parent_id": snap.get("parent_id"),
+                        "draft_msg_id": snap.get("draft_msg_id"),
+                        "full_text": snap.get("full_text", ""),
+                        "content_blocks": snap.get("content_blocks", []),
+                        "input_tokens": snap.get("input_tokens", 0),
+                        "output_tokens": snap.get("output_tokens", 0),
+                        "started_at": snap.get("started_at", 0),
+                        "mode": snap.get("mode", "claude"),
+                    }
+                )
+        await websocket.send_json(
+            {
+                "type": "generation_active",
+                "snapshots": snapshots,
+            }
+        )
         # Resend ALL pending permission requests (broadcast globally now)
         for rid, pending in list(_pending_hook_permissions.items()):
             if not pending.get("response"):
                 print(f"[WS] Resending pending permission request {rid} on reconnect")
-                await websocket.send_json({
-                    "type": "permission_request",
-                    "request_id": rid,
-                    "conv_id": pending.get("conv_id"),
-                    "tool_name": pending.get("tool_name", ""),
-                    "tool_input": pending.get("tool_input", ""),
-                    "input_summary": pending.get("input_summary", ""),
-                })
+                await websocket.send_json(
+                    {
+                        "type": "permission_request",
+                        "request_id": rid,
+                        "conv_id": pending.get("conv_id"),
+                        "tool_name": pending.get("tool_name", ""),
+                        "tool_input": pending.get("tool_input", ""),
+                        "input_summary": pending.get("input_summary", ""),
+                    }
+                )
     else:
         await websocket.send_json({"type": "generation_idle"})
         # Even when idle, resend any pending permissions from other conversations
         for rid, pending in list(_pending_hook_permissions.items()):
             if not pending.get("response"):
-                await websocket.send_json({
-                    "type": "permission_request",
-                    "request_id": rid,
-                    "conv_id": pending.get("conv_id"),
-                    "tool_name": pending.get("tool_name", ""),
-                    "tool_input": pending.get("tool_input", ""),
-                    "input_summary": pending.get("input_summary", ""),
-                })
+                await websocket.send_json(
+                    {
+                        "type": "permission_request",
+                        "request_id": rid,
+                        "conv_id": pending.get("conv_id"),
+                        "tool_name": pending.get("tool_name", ""),
+                        "tool_input": pending.get("tool_input", ""),
+                        "input_summary": pending.get("input_summary", ""),
+                    }
+                )
 
     try:
         while True:
@@ -1523,9 +1812,11 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 proc = _active_claude_procs.pop(conv_id, None)
                 if proc:
                     await claude_client.cancel_claude(proc)
+                # Clean up pending permissions from memory and DB
                 for rid in list(_pending_hook_permissions):
                     if _pending_hook_permissions[rid].get("conv_id") == conv_id:
                         _pending_hook_permissions.pop(rid, None)
+                        await db.delete_pending_permission(rid)
                 # Delete empty draft messages left by cancelled generations
                 for key in cancelled_keys:
                     snap = _generation_snapshots.pop(key, None)
@@ -1549,6 +1840,8 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                         "always": data.get("always", False),
                     }
                     pending["event"].set()
+                    # Also clean up from DB
+                    await db.delete_pending_permission(request_id)
                 continue
 
             print(f"[WS] Received action={action} for conv={conv_id}")
@@ -1569,31 +1862,41 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                     )
                     if cc_busy:
                         # Same client retrying → cancel old; different client → reject
-                        old_key = next(k for k, t in _active_generations.items()
-                                       if k[0] == conv_id and not t.done())
+                        old_key = next(
+                            k
+                            for k, t in _active_generations.items()
+                            if k[0] == conv_id and not t.done()
+                        )
                         old_task = _active_generations[old_key]
-                        if websocket is getattr(old_task, '_origin_ws', None):
+                        if websocket is getattr(old_task, "_origin_ws", None):
                             old_task.cancel()
                             _active_generations.pop(old_key, None)
                         else:
-                            await websocket.send_json({
-                                "type": "error",
-                                "error": "Claude Code generation already running on another branch. Wait for it to finish or cancel it first.",
-                            })
+                            await websocket.send_json(
+                                {
+                                    "type": "error",
+                                    "error": "Claude Code generation already running on another branch. Wait for it to finish or cancel it first.",
+                                }
+                            )
                             continue
                 elif action == "regenerate":
                     # Regenerate: cancel any existing gen on same parent
-                    for k in [k for k in _active_generations
-                              if k[0] == conv_id and k[1] == parent_id and not _active_generations[k].done()]:
+                    for k in [
+                        k
+                        for k in _active_generations
+                        if k[0] == conv_id
+                        and k[1] == parent_id
+                        and not _active_generations[k].done()
+                    ]:
                         _active_generations.pop(k).cancel()
 
                 # Weave/OODA generate: allow parallel, even on same parent
                 _gen_seq += 1
                 gen_key = (conv_id, parent_id, _gen_seq)
-                data["_gen_id"] = _gen_seq  # unique ID so client can filter parallel streams
-                task = asyncio.create_task(
-                    _handle_generation(websocket, conv_id, data)
+                data["_gen_id"] = (
+                    _gen_seq  # unique ID so client can filter parallel streams
                 )
+                task = asyncio.create_task(_handle_generation(websocket, conv_id, data))
                 task._origin_ws = websocket
                 task._gen_key = gen_key
                 _active_generations[gen_key] = task
@@ -1631,7 +1934,9 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
         await _handle_weave_generation(websocket, conv_id, conv, data)
 
 
-async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: dict, data: dict):
+async def _handle_claude_generation(
+    websocket: WebSocket, conv_id: int, conv: dict, data: dict
+):
     """Handle Claude Code CLI generation with session resume support."""
     try:
         action = data.get("action")
@@ -1643,13 +1948,23 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
 
         project_dir = conv.get("project_dir") or "."
         if project_dir != "." and not os.path.isdir(project_dir):
-            await _ws_send(conv_id, {"type": "error", "error": f"Working directory not found: {project_dir}"})
+            await _ws_send(
+                conv_id,
+                {
+                    "type": "error",
+                    "error": f"Working directory not found: {project_dir}",
+                },
+            )
             return
         # Prefer model from the generate message (client's current UI state)
         # over the DB value, which may have been overwritten by another server.
         cc_model = data.get("cc_model") or conv.get("cc_model") or "sonnet"
         cc_effort = data.get("cc_effort") or conv.get("cc_effort") or "high"
-        cc_permission_mode = data.get("cc_permission_mode") or conv.get("cc_permission_mode") or "default"
+        cc_permission_mode = (
+            data.get("cc_permission_mode")
+            or conv.get("cc_permission_mode")
+            or "default"
+        )
         # Persist client-provided settings back to DB for reload continuity
         if data.get("cc_model") and data["cc_model"] != conv.get("cc_model"):
             await db.update_conversation_fields(conv_id, cc_model=cc_model)
@@ -1688,9 +2003,17 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 prev_model = msg.get("cc_model_used", "")
                 prev_is_anthropic = prev_model in _ANTHROPIC_MODELS
                 prev_is_gemini = prev_model.startswith("gemini")
-                prev_is_ollama = bool(prev_model) and not (prev_is_anthropic or prev_is_gemini)
-                if (prev_is_anthropic != is_anthropic) or (prev_is_gemini != is_gemini) or (prev_is_ollama != use_ollama):
-                    print(f"[CC] Provider switch ({prev_model} -> {cc_model}), skipping session resume")
+                prev_is_ollama = bool(prev_model) and not (
+                    prev_is_anthropic or prev_is_gemini
+                )
+                if (
+                    (prev_is_anthropic != is_anthropic)
+                    or (prev_is_gemini != is_gemini)
+                    or (prev_is_ollama != use_ollama)
+                ):
+                    print(
+                        f"[CC] Provider switch ({prev_model} -> {cc_model}), skipping session resume"
+                    )
                     resume_session_id = None
                 break
 
@@ -1719,6 +2042,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 if last_user_msg and last_user_msg.get("image_path"):
                     img_paths = _parse_image_paths(last_user_msg["image_path"])
                     import shutil
+
                     file_notes = []
                     for ip in img_paths:
                         src = Path(ip).resolve()
@@ -1727,16 +2051,31 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                         try:
                             shutil.copy2(str(src), str(dest))
                             copied = True
-                        except Exception:
-                            pass
+                            # For local mode, describe from project_dir where CC can access it
+                            if use_ollama and copied:
+                                src = dest
+                        except Exception as e:
+                            print(
+                                f"[UPLOAD] Failed to copy image {src.name} to project_dir: {e}"
+                            )
                         if use_ollama:
                             # Local mode: describe image via Ollama's native multimodal API
                             # since CC's Read tool dumps base64 text that local models can't parse
-                            desc = await describe_image(str(src))
-                            file_notes.append(f"{src.name} — {desc}")
+                            try:
+                                desc = await describe_image(str(src))
+                                file_notes.append(f"{src.name} — {desc}")
+                            except Exception as e:
+                                print(
+                                    f"[DESCRIBE] Failed to describe image {src.name}: {e}"
+                                )
+                                file_notes.append(
+                                    f"{src.name} — (image description unavailable)"
+                                )
                         else:
                             if copied:
-                                file_notes.append(f"{src.name} (placed in working directory)")
+                                file_notes.append(
+                                    f"{src.name} (placed in working directory)"
+                                )
                             else:
                                 file_notes.append(str(src).replace("\\", "/"))
                     if file_notes:
@@ -1751,7 +2090,9 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
             branch = await db.get_branch_to_root(parent_id) if parent_id else []
             prompt = _build_claude_history_prompt(branch)
             if not prompt:
-                await _ws_send(conv_id, {"type": "error", "error": "No message to send to Claude"})
+                await _ws_send(
+                    conv_id, {"type": "error", "error": "No message to send to Claude"}
+                )
                 return
 
             # Attach images
@@ -1764,6 +2105,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 if last_user_msg and last_user_msg.get("image_path"):
                     img_paths = _parse_image_paths(last_user_msg["image_path"])
                     import shutil
+
                     file_notes = []
                     for ip in img_paths:
                         src = Path(ip).resolve()
@@ -1772,14 +2114,30 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                         try:
                             shutil.copy2(str(src), str(dest))
                             copied = True
-                        except Exception:
-                            pass
+                            # For local mode, describe from project_dir where CC can access it
+                            if use_ollama and copied:
+                                src = dest
+                        except Exception as e:
+                            print(
+                                f"[UPLOAD] Failed to copy image {src.name} to project_dir: {e}"
+                            )
                         if use_ollama:
-                            desc = await describe_image(str(src))
-                            file_notes.append(f"{src.name} — {desc}")
+                            # Local mode: describe image via Ollama's native multimodal API
+                            try:
+                                desc = await describe_image(str(src))
+                                file_notes.append(f"{src.name} — {desc}")
+                            except Exception as e:
+                                print(
+                                    f"[DESCRIBE] Failed to describe image {src.name}: {e}"
+                                )
+                                file_notes.append(
+                                    f"{src.name} — (image description unavailable)"
+                                )
                         else:
                             if copied:
-                                file_notes.append(f"{src.name} (placed in working directory)")
+                                file_notes.append(
+                                    f"{src.name} (placed in working directory)"
+                                )
                             else:
                                 file_notes.append(str(src).replace("\\", "/"))
                     if file_notes:
@@ -1796,22 +2154,31 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
         if parent_id:
             existing_children = await db.get_children(parent_id)
             for child in existing_children:
-                if child["role"] == "assistant" and not child.get("content", "").strip():
+                if (
+                    child["role"] == "assistant"
+                    and not child.get("content", "").strip()
+                ):
                     draft_msg = child
                     print(f"[CC] Reusing stale draft msg {child['id']}")
                     break
         if not draft_msg:
-            draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
+            draft_msg = await db.add_message(
+                conv_id, "assistant", "", parent_id=parent_id
+            )
         draft_msg_id = draft_msg["id"]
         await db.set_active_branch(conv_id, draft_msg_id)
 
         # Initialize live snapshot for this generation (survives WS disconnects)
         import time as _time
-        _gen_key_local = getattr(asyncio.current_task(), '_gen_key', None)
+
+        _gen_key_local = getattr(asyncio.current_task(), "_gen_key", None)
         if _gen_key_local:
-            _update_gen_snapshot(_gen_key_local,
-                full_text="", content_blocks=[],
-                input_tokens=0, output_tokens=0,
+            _update_gen_snapshot(
+                _gen_key_local,
+                full_text="",
+                content_blocks=[],
+                input_tokens=0,
+                output_tokens=0,
                 started_at=_time.time(),
                 draft_msg_id=draft_msg_id,
                 parent_id=parent_id,
@@ -1825,23 +2192,40 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
             launch_label = f"Launching {cc_model} via Ollama..."
         else:
             launch_label = f"Launching Claude Code ({cc_model})..."
-        await _ws_send(conv_id, {"type": "status", "text": launch_label, "parent_id": parent_id})
-        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id, "draft_msg_id": draft_msg_id})
+        await _ws_send(
+            conv_id, {"type": "status", "text": launch_label, "parent_id": parent_id}
+        )
+        await _ws_send(
+            conv_id,
+            {
+                "type": "stream_start",
+                "parent_id": parent_id,
+                "draft_msg_id": draft_msg_id,
+            },
+        )
 
         # Launch CC — with resume if available, with fallback on failure
         try:
             if is_gemini:
                 proc, event_stream = await gemini_client.run_gemini(
-                    prompt, project_dir, conv_id=conv_id, server_port=config.port,
-                    model=cc_model, effort=cc_effort,
+                    prompt,
+                    project_dir,
+                    conv_id=conv_id,
+                    server_port=config.port,
+                    model=cc_model,
+                    effort=cc_effort,
                     permission_mode=cc_permission_mode,
                     resume_session_id=resume_session_id if use_resume else None,
                     fork_session=fork_session,
                 )
             else:
                 proc, event_stream = await claude_client.run_claude(
-                    prompt, project_dir, conv_id=conv_id, server_port=config.port,
-                    model=cc_model, effort=cc_effort,
+                    prompt,
+                    project_dir,
+                    conv_id=conv_id,
+                    server_port=config.port,
+                    model=cc_model,
+                    effort=cc_effort,
                     permission_mode=cc_permission_mode,
                     resume_session_id=resume_session_id if use_resume else None,
                     fork_session=fork_session,
@@ -1855,14 +2239,22 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 prompt = _build_claude_history_prompt(branch) or "(continue)"
                 if is_gemini:
                     proc, event_stream = await gemini_client.run_gemini(
-                        prompt, project_dir, conv_id=conv_id, server_port=config.port,
-                        model=cc_model, effort=cc_effort,
+                        prompt,
+                        project_dir,
+                        conv_id=conv_id,
+                        server_port=config.port,
+                        model=cc_model,
+                        effort=cc_effort,
                         permission_mode=cc_permission_mode,
                     )
                 else:
                     proc, event_stream = await claude_client.run_claude(
-                        prompt, project_dir, conv_id=conv_id, server_port=config.port,
-                        model=cc_model, effort=cc_effort,
+                        prompt,
+                        project_dir,
+                        conv_id=conv_id,
+                        server_port=config.port,
+                        model=cc_model,
+                        effort=cc_effort,
                         permission_mode=cc_permission_mode,
                         use_ollama=use_ollama,
                     )
@@ -1894,7 +2286,9 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 else:
                     current_block = {"type": "text", "text": evt["text"]}
                     content_blocks.append(current_block)
-                await _ws_send(conv_id, {"type": "stream_chunk", "content": evt["text"]})
+                await _ws_send(
+                    conv_id, {"type": "stream_chunk", "content": evt["text"]}
+                )
 
             elif etype == "tool_start":
                 current_block = {
@@ -1905,40 +2299,57 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                     "result": "",
                 }
                 content_blocks.append(current_block)
-                await _ws_send(conv_id, {
-                    "type": "tool_start",
-                    "name": evt["name"],
-                    "tool_id": evt.get("tool_id", ""),
-                })
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "tool_start",
+                        "name": evt["name"],
+                        "tool_id": evt.get("tool_id", ""),
+                    },
+                )
 
             elif etype == "tool_input_delta":
                 if current_block and current_block["type"] == "tool_use":
                     current_block["input"] += evt["json"]
-                await _ws_send(conv_id, {
-                    "type": "tool_input_chunk",
-                    "content": evt["json"],
-                    "tool_id": evt.get("tool_id", ""),
-                })
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "tool_input_chunk",
+                        "content": evt["json"],
+                        "tool_id": evt.get("tool_id", ""),
+                    },
+                )
 
             elif etype == "ask_user_question":
-                await _ws_send(conv_id, {
-                    "type": "ask_user_question",
-                    "questions": evt.get("questions", []),
-                    "tool_id": evt.get("tool_id", ""),
-                })
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "ask_user_question",
+                        "questions": evt.get("questions", []),
+                        "tool_id": evt.get("tool_id", ""),
+                    },
+                )
 
             elif etype == "plan_ready":
-                await _ws_send(conv_id, {
-                    "type": "plan_ready",
-                    "plan": evt.get("plan", ""),
-                    "plan_file": evt.get("plan_file", ""),
-                    "tool_id": evt.get("tool_id", ""),
-                })
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "plan_ready",
+                        "plan": evt.get("plan", ""),
+                        "plan_file": evt.get("plan_file", ""),
+                        "tool_id": evt.get("tool_id", ""),
+                    },
+                )
                 # Global notification for plan completion
                 conv_title = conv.get("title", "Conversation")
-                await _ws_broadcast_all({"type": "plan_landed", "conv_id": conv_id,
-                                          "conv_title": conv_title,
-                                          "plan_file": evt.get("plan_file", "")})
+                await _ws_broadcast_all(
+                    {
+                        "type": "plan_landed",
+                        "conv_id": conv_id,
+                        "conv_title": conv_title,
+                        "plan_file": evt.get("plan_file", ""),
+                    }
+                )
 
             elif etype == "tool_result":
                 result_content = evt.get("content", "")
@@ -1948,11 +2359,14 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                         block["result"] = result_content
                         break
                 current_block = None
-                await _ws_send(conv_id, {
-                    "type": "tool_result",
-                    "content": result_content,
-                    "tool_id": tool_id,
-                })
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "tool_result",
+                        "content": result_content,
+                        "tool_id": tool_id,
+                    },
+                )
                 # Progressive save: update draft with accumulated content_blocks
                 await db.update_message_content(
                     draft_msg_id,
@@ -1966,23 +2380,37 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 else:
                     current_block = {"type": "thinking", "text": evt["text"]}
                     content_blocks.append(current_block)
-                await _ws_send(conv_id, {"type": "thinking_chunk", "content": evt["text"]})
+                await _ws_send(
+                    conv_id, {"type": "thinking_chunk", "content": evt["text"]}
+                )
 
             elif etype == "usage":
                 total_input_tokens += evt.get("input_tokens", 0)
                 total_output_tokens += evt.get("output_tokens", 0)
-                await _ws_send(conv_id, {"type": "usage", "input_tokens": total_input_tokens, "output_tokens": total_output_tokens})
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "usage",
+                        "input_tokens": total_input_tokens,
+                        "output_tokens": total_output_tokens,
+                    },
+                )
 
             elif etype == "cc_raw_event":
                 # Forward unknown events to UI for debugging
                 raw_data = evt.get("data", {})
                 raw_type = evt.get("event_type", "")
-                print(f"[CC] Unknown event type={raw_type}: {json.dumps(raw_data, default=str)[:300]}")
-                await _ws_send(conv_id, {
-                    "type": "cc_debug_event",
-                    "event_type": raw_type,
-                    "data": raw_data,
-                })
+                print(
+                    f"[CC] Unknown event type={raw_type}: {json.dumps(raw_data, default=str)[:300]}"
+                )
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "cc_debug_event",
+                        "event_type": raw_type,
+                        "data": raw_data,
+                    },
+                )
 
             elif etype == "result":
                 result_info = evt
@@ -1994,7 +2422,8 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
 
             # Keep live snapshot in sync (reconnecting clients read this)
             if _gen_key_local:
-                _update_gen_snapshot(_gen_key_local,
+                _update_gen_snapshot(
+                    _gen_key_local,
                     full_text=full_text,
                     content_blocks=content_blocks,
                     input_tokens=total_input_tokens,
@@ -2018,6 +2447,7 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 if last_user_msg and last_user_msg.get("image_path"):
                     img_paths = _parse_image_paths(last_user_msg["image_path"])
                     import shutil
+
                     file_notes = []
                     for ip in img_paths:
                         src = Path(ip).resolve()
@@ -2026,14 +2456,30 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                         try:
                             shutil.copy2(str(src), str(dest))
                             copied = True
-                        except Exception:
-                            pass
+                            # For local mode, describe from project_dir where CC can access it
+                            if use_ollama and copied:
+                                src = dest
+                        except Exception as e:
+                            print(
+                                f"[UPLOAD] Failed to copy image {src.name} to project_dir: {e}"
+                            )
                         if use_ollama:
-                            desc = await describe_image(str(src))
-                            file_notes.append(f"{src.name} — {desc}")
+                            # Local mode: describe image via Ollama's native multimodal API
+                            try:
+                                desc = await describe_image(str(src))
+                                file_notes.append(f"{src.name} — {desc}")
+                            except Exception as e:
+                                print(
+                                    f"[DESCRIBE] Failed to describe image {src.name}: {e}"
+                                )
+                                file_notes.append(
+                                    f"{src.name} — (image description unavailable)"
+                                )
                         else:
                             if copied:
-                                file_notes.append(f"{src.name} (placed in working directory)")
+                                file_notes.append(
+                                    f"{src.name} (placed in working directory)"
+                                )
                             else:
                                 file_notes.append(str(src).replace("\\", "/"))
                     if file_notes:
@@ -2045,8 +2491,12 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                             fallback_prompt += f"\n\n[User attached {len(file_notes)} file(s): {files_str}. Use the Read tool to view them.]"
 
             proc, event_stream = await claude_client.run_claude(
-                fallback_prompt, project_dir, conv_id=conv_id, server_port=config.port,
-                model=cc_model, effort=cc_effort,
+                fallback_prompt,
+                project_dir,
+                conv_id=conv_id,
+                server_port=config.port,
+                model=cc_model,
+                effort=cc_effort,
                 permission_mode=cc_permission_mode,
                 use_ollama=use_ollama,
             )
@@ -2065,7 +2515,14 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                 if etype == "session_info":
                     new_session_id = evt.get("session_id", "") or new_session_id
                     model_name = evt.get("model", cc_model)
-                    await _ws_send(conv_id, {"type": "status", "text": f"Connected — {model_name} is thinking...", "parent_id": parent_id})
+                    await _ws_send(
+                        conv_id,
+                        {
+                            "type": "status",
+                            "text": f"Connected — {model_name} is thinking...",
+                            "parent_id": parent_id,
+                        },
+                    )
                 elif etype == "text_delta":
                     full_text += evt["text"]
                     if current_block and current_block["type"] == "text":
@@ -2073,22 +2530,47 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                     else:
                         current_block = {"type": "text", "text": evt["text"]}
                         content_blocks.append(current_block)
-                    await _ws_send(conv_id, {"type": "stream_chunk", "content": evt["text"]})
+                    await _ws_send(
+                        conv_id, {"type": "stream_chunk", "content": evt["text"]}
+                    )
                 elif etype == "tool_start":
-                    current_block = {"type": "tool_use", "name": evt["name"], "tool_id": evt.get("tool_id", ""), "input": "", "result": ""}
+                    current_block = {
+                        "type": "tool_use",
+                        "name": evt["name"],
+                        "tool_id": evt.get("tool_id", ""),
+                        "input": "",
+                        "result": "",
+                    }
                     content_blocks.append(current_block)
-                    await _ws_send(conv_id, {"type": "tool_start", "name": evt["name"], "tool_id": evt.get("tool_id", "")})
+                    await _ws_send(
+                        conv_id,
+                        {
+                            "type": "tool_start",
+                            "name": evt["name"],
+                            "tool_id": evt.get("tool_id", ""),
+                        },
+                    )
                 elif etype == "tool_input_delta":
                     if current_block and current_block["type"] == "tool_use":
                         current_block["input"] += evt["json"]
-                    await _ws_send(conv_id, {"type": "tool_input_chunk", "content": evt["json"], "tool_id": evt.get("tool_id", "")})
+                    await _ws_send(
+                        conv_id,
+                        {
+                            "type": "tool_input_chunk",
+                            "content": evt["json"],
+                            "tool_id": evt.get("tool_id", ""),
+                        },
+                    )
                 elif etype == "tool_result":
                     result_content = evt.get("content", "")
                     tool_id = evt.get("tool_id", "")
                     # Find the matching tool_use block to get tool name + input
                     matched_block = None
                     for block in reversed(content_blocks):
-                        if block["type"] == "tool_use" and block.get("tool_id") == tool_id:
+                        if (
+                            block["type"] == "tool_use"
+                            and block.get("tool_id") == tool_id
+                        ):
                             block["result"] = result_content
                             matched_block = block
                             break
@@ -2101,20 +2583,35 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                         tool_name = matched_block.get("name", "")
                         # Scan tool input for image paths
                         import re as _re
-                        for candidate in _re.findall(r'[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)', tool_input_str, _re.IGNORECASE):
+
+                        for candidate in _re.findall(
+                            r"[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)",
+                            tool_input_str,
+                            _re.IGNORECASE,
+                        ):
                             candidate_path = (Path(project_dir) / candidate).resolve()
                             if candidate_path.exists() and candidate_path.is_file():
                                 image_url = f"/api/conversations/{conv_id}/file?path={candidate}"
                                 break
                         # Also check the result text for image paths
                         if not image_url:
-                            for candidate in _re.findall(r'[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)', result_content, _re.IGNORECASE):
-                                candidate_path = (Path(project_dir) / candidate).resolve()
+                            for candidate in _re.findall(
+                                r"[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)",
+                                result_content,
+                                _re.IGNORECASE,
+                            ):
+                                candidate_path = (
+                                    Path(project_dir) / candidate
+                                ).resolve()
                                 if candidate_path.exists() and candidate_path.is_file():
                                     image_url = f"/api/conversations/{conv_id}/file?path={candidate}"
                                     break
 
-                    tool_result_msg = {"type": "tool_result", "content": result_content, "tool_id": tool_id}
+                    tool_result_msg = {
+                        "type": "tool_result",
+                        "content": result_content,
+                        "tool_id": tool_id,
+                    }
                     if evt.get("is_error"):
                         tool_result_msg["is_error"] = True
                     if image_url:
@@ -2122,7 +2619,8 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                     await _ws_send(conv_id, tool_result_msg)
                     # Progressive save
                     await db.update_message_content(
-                        draft_msg_id, content=full_text,
+                        draft_msg_id,
+                        content=full_text,
                         content_blocks=json.dumps(content_blocks),
                     )
                 elif etype == "thinking_delta":
@@ -2131,11 +2629,20 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
                     else:
                         current_block = {"type": "thinking", "text": evt["text"]}
                         content_blocks.append(current_block)
-                    await _ws_send(conv_id, {"type": "thinking_chunk", "content": evt["text"]})
+                    await _ws_send(
+                        conv_id, {"type": "thinking_chunk", "content": evt["text"]}
+                    )
                 elif etype == "usage":
                     total_input_tokens += evt.get("input_tokens", 0)
                     total_output_tokens += evt.get("output_tokens", 0)
-                    await _ws_send(conv_id, {"type": "usage", "input_tokens": total_input_tokens, "output_tokens": total_output_tokens})
+                    await _ws_send(
+                        conv_id,
+                        {
+                            "type": "usage",
+                            "input_tokens": total_input_tokens,
+                            "output_tokens": total_output_tokens,
+                        },
+                    )
                 elif etype == "result":
                     result_info = evt
                     if not full_text and evt.get("result_text"):
@@ -2144,7 +2651,8 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
 
                 # Keep live snapshot in sync (fallback retry loop)
                 if _gen_key_local:
-                    _update_gen_snapshot(_gen_key_local,
+                    _update_gen_snapshot(
+                        _gen_key_local,
                         full_text=full_text,
                         content_blocks=content_blocks,
                         input_tokens=total_input_tokens,
@@ -2155,15 +2663,25 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
 
         # If CC produced no output at all, mark draft as error (don't delete)
         if not full_text and not any(b["type"] == "tool_use" for b in content_blocks):
-            provider_name = "Gemini CLI" if is_gemini else ("Ollama" if use_ollama else "Claude Code")
-            error_msg = result_info.get("error") or f"{provider_name} exited with no response"
+            provider_name = (
+                "Gemini CLI"
+                if is_gemini
+                else ("Ollama" if use_ollama else "Claude Code")
+            )
+            error_msg = (
+                result_info.get("error") or f"{provider_name} exited with no response"
+            )
             if use_ollama:
                 error_msg += f" — check that '{cc_model}' is available in Ollama"
             await db.update_message_content(
-                draft_msg_id, content=f"[Error: {error_msg}]",
+                draft_msg_id,
+                content=f"[Error: {error_msg}]",
             )
             await _ws_send(conv_id, {"type": "error", "error": error_msg})
-            await _ws_send(conv_id, {"type": "stream_end", "message": await db.get_message(draft_msg_id)})
+            await _ws_send(
+                conv_id,
+                {"type": "stream_end", "message": await db.get_message(draft_msg_id)},
+            )
             return
 
         # Extract cost info
@@ -2203,19 +2721,33 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
 
         # Detect image paths in the response text and tool blocks
         import re as _re
+
         detected_images = []
         seen_paths = set()
-        all_text = full_text + " " + " ".join(
-            b.get("input", "") + " " + b.get("result", "")
-            for b in content_blocks if b.get("type") == "tool_use"
+        all_text = (
+            full_text
+            + " "
+            + " ".join(
+                b.get("input", "") + " " + b.get("result", "")
+                for b in content_blocks
+                if b.get("type") == "tool_use"
+            )
         )
         base_path = Path(project_dir).resolve()
-        for candidate in _re.findall(r'[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)', all_text, _re.IGNORECASE):
+        for candidate in _re.findall(
+            r"[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)", all_text, _re.IGNORECASE
+        ):
             candidate_path = (base_path / candidate).resolve()
-            if str(candidate_path).startswith(str(base_path)) and candidate_path.exists() and candidate_path.is_file():
+            if (
+                str(candidate_path).startswith(str(base_path))
+                and candidate_path.exists()
+                and candidate_path.is_file()
+            ):
                 if candidate_path not in seen_paths:
                     seen_paths.add(candidate_path)
-                    detected_images.append(f"/api/conversations/{conv_id}/file?path={candidate}")
+                    detected_images.append(
+                        f"/api/conversations/{conv_id}/file?path={candidate}"
+                    )
 
         end_msg = {
             "type": "stream_end",
@@ -2228,15 +2760,23 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
         # Notify all connected clients (cross-conversation bell)
         conv_title = conv.get("title", "Conversation")
         preview = (full_text or "").replace("#", "").replace("*", "").strip()[:120]
-        await _ws_broadcast_all({"type": "branch_landed", "conv_id": conv_id, "conv_title": conv_title,
-                                  "message_id": draft_msg_id, "preview": preview})
+        await _ws_broadcast_all(
+            {
+                "type": "branch_landed",
+                "conv_id": conv_id,
+                "conv_title": conv_title,
+                "message_id": draft_msg_id,
+                "preview": preview,
+            }
+        )
 
     except asyncio.CancelledError:
         _active_claude_procs.pop(conv_id, None)
         if draft_msg_id and (full_text or content_blocks):
             # Save accumulated work to draft before cancelling
             await db.update_message_content(
-                draft_msg_id, content=full_text,
+                draft_msg_id,
+                content=full_text,
                 content_blocks=json.dumps(content_blocks) if content_blocks else None,
             )
             print(f"[GEN] Saved partial draft {draft_msg_id} on cancel")
@@ -2247,25 +2787,29 @@ async def _handle_claude_generation(websocket: WebSocket, conv_id: int, conv: di
     except Exception as e:
         _active_claude_procs.pop(conv_id, None)
         print(f"[GEN] Claude generation error conv={conv_id}: {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+
+        traceback.print_exc()
         # Save accumulated work to draft so it's not lost
         if draft_msg_id and (full_text or content_blocks):
             await db.update_message_content(
-                draft_msg_id, content=full_text or "[Generation interrupted]",
+                draft_msg_id,
+                content=full_text or "[Generation interrupted]",
                 content_blocks=json.dumps(content_blocks) if content_blocks else None,
             )
             print(f"[GEN] Saved partial draft {draft_msg_id} on error")
         await _ws_send(conv_id, {"type": "error", "error": str(e)})
     finally:
-        _gen_key = getattr(asyncio.current_task(), '_gen_key', None)
+        _gen_key = getattr(asyncio.current_task(), "_gen_key", None)
         if _gen_key:
             _active_generations.pop(_gen_key, None)
             _generation_snapshots.pop(_gen_key, None)
         _auto_approve_sessions.discard(conv_id)
-        # Clean up any pending hook permissions for this conversation
+        # Clean up any pending hook permissions for this conversation (memory + DB)
         for rid in list(_pending_hook_permissions):
             if _pending_hook_permissions[rid].get("conv_id") == conv_id:
                 _pending_hook_permissions.pop(rid, None)
+                await db.delete_pending_permission(rid)
 
 
 def _build_claude_history_prompt(branch: list[dict]) -> str:
@@ -2280,7 +2824,11 @@ def _build_claude_history_prompt(branch: list[dict]) -> str:
             blocks = None
             if msg.get("content_blocks"):
                 try:
-                    blocks = json.loads(msg["content_blocks"]) if isinstance(msg["content_blocks"], str) else msg["content_blocks"]
+                    blocks = (
+                        json.loads(msg["content_blocks"])
+                        if isinstance(msg["content_blocks"], str)
+                        else msg["content_blocks"]
+                    )
                 except (json.JSONDecodeError, TypeError):
                     blocks = None
             if blocks:
@@ -2291,10 +2839,18 @@ def _build_claude_history_prompt(branch: list[dict]) -> str:
                     elif block.get("type") == "tool_use":
                         tool_summary = f"[Used tool: {block.get('name', 'unknown')}]"
                         if block.get("input"):
-                            inp = block["input"][:2000] if len(block.get("input", "")) > 2000 else block.get("input", "")
+                            inp = (
+                                block["input"][:2000]
+                                if len(block.get("input", "")) > 2000
+                                else block.get("input", "")
+                            )
                             tool_summary += f"\nInput: {inp}"
                         if block.get("result"):
-                            res = block["result"][:2000] if len(block.get("result", "")) > 2000 else block.get("result", "")
+                            res = (
+                                block["result"][:2000]
+                                if len(block.get("result", "")) > 2000
+                                else block.get("result", "")
+                            )
                             tool_summary += f"\nResult: {res}"
                         parts.append(tool_summary)
                 history_parts.append(f"Assistant: {chr(10).join(parts)}")
@@ -2312,7 +2868,9 @@ def _build_claude_history_prompt(branch: list[dict]) -> str:
         return history_parts[0].removeprefix("Human: ")
 
 
-async def _handle_local_generation(websocket: WebSocket, conv_id: int, conv: dict, data: dict):
+async def _handle_local_generation(
+    websocket: WebSocket, conv_id: int, conv: dict, data: dict
+):
     """Handle Local mode: Claude Code launched via 'ollama launch claude'."""
     # Local mode = Claude Code powered by a local Ollama model.
     # Reuse the full CC handler but with use_ollama=True.
@@ -2323,15 +2881,20 @@ async def _handle_local_generation(websocket: WebSocket, conv_id: int, conv: dic
     await _handle_claude_generation(websocket, conv_id, conv, data)
 
 
-async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict, data: dict):
+async def _handle_ooda_generation(
+    websocket: WebSocket, conv_id: int, conv: dict, data: dict
+):
     """Handle OODA-enhanced Weave generation — two-pass with state card scaffolding."""
     import re as _re
+
     draft_msg_id = None
     final_prose = ""
     try:
         action = data.get("action")
         parent_id = data.get("parent_id")
-        print(f"[OODA] Starting ooda_generation conv={conv_id} action={action} parent={parent_id}")
+        print(
+            f"[OODA] Starting ooda_generation conv={conv_id} action={action} parent={parent_id}"
+        )
 
         if action == "generate" and parent_id is None:
             leaf = await db.get_active_leaf(conv_id)
@@ -2340,7 +2903,9 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
         # ── Setup (same as weave) ──
         character = None
         if conv and conv.get("character_id"):
-            char_path = os.path.join(config.characters_dir, f"{conv['character_id']}.md")
+            char_path = os.path.join(
+                config.characters_dir, f"{conv['character_id']}.md"
+            )
             character = load_character(char_path)
 
         style_nudge_name = conv.get("style_nudge", "Natural") if conv else "Natural"
@@ -2357,7 +2922,11 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
         lore_entries = []
         if conv and conv.get("lore_ids"):
             try:
-                lore_ids = json.loads(conv["lore_ids"]) if isinstance(conv["lore_ids"], str) else conv["lore_ids"]
+                lore_ids = (
+                    json.loads(conv["lore_ids"])
+                    if isinstance(conv["lore_ids"], str)
+                    else conv["lore_ids"]
+                )
             except (ValueError, TypeError):
                 lore_ids = []
             for lid in lore_ids:
@@ -2373,7 +2942,9 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
 
         custom_scene = conv.get("custom_scene") if conv else None
         base_system = build_system_prompt(
-            character=character, style_nudge_index=nudge_index, scenario_override=custom_scene,
+            character=character,
+            style_nudge_index=nudge_index,
+            scenario_override=custom_scene,
         )
 
         # ── OODA enhancement: build system prompt with branch-aware state ──
@@ -2381,8 +2952,14 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
             state_cards = await db.get_branch_state(conv_id, parent_id)
         else:
             state_cards = await db.get_state_cards(conv_id)
-        global_cards = await db.get_character_state_cards(conv.get("character_id", "")) if conv.get("character_id") else []
-        ooda_system = build_ooda_system_prompt(base_system, state_cards, global_cards=global_cards)
+        global_cards = (
+            await db.get_character_state_cards(conv.get("character_id", ""))
+            if conv.get("character_id")
+            else []
+        )
+        ooda_system = build_ooda_system_prompt(
+            base_system, state_cards, global_cards=global_cards
+        )
 
         example_msgs = character.get("example_messages", []) if character else []
         messages = assemble_prompt(
@@ -2396,30 +2973,51 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
 
         actual_tokens = sum(len(m["content"]) // 3 for m in messages)
         active_nudge = get_style_nudge(nudge_index)
-        await _ws_send(conv_id, {
-            "type": "context_info",
-            "total_tokens": actual_tokens,
-            "was_compactified": context["was_compactified"],
-            "style_nudge": active_nudge["name"],
-            "parent_id": parent_id,
-        })
+        await _ws_send(
+            conv_id,
+            {
+                "type": "context_info",
+                "total_tokens": actual_tokens,
+                "was_compactified": context["was_compactified"],
+                "style_nudge": active_nudge["name"],
+                "parent_id": parent_id,
+            },
+        )
 
         # Create draft message in DB so it appears as ghost node on tree
         draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
         draft_msg_id = draft_msg["id"]
 
-        print(f"[OODA] System prompt: {len(ooda_system)} chars, {len(messages)} messages, {len(state_cards)} state cards")
-        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id, "draft_msg_id": draft_msg_id})
+        print(
+            f"[OODA] System prompt: {len(ooda_system)} chars, {len(messages)} messages, {len(state_cards)} state cards"
+        )
+        await _ws_send(
+            conv_id,
+            {
+                "type": "stream_start",
+                "parent_id": parent_id,
+                "draft_msg_id": draft_msg_id,
+            },
+        )
 
         # ── Pass 1: Orient ──
         print(f"[OODA] Pass 1: Orient...")
-        await _ws_send(conv_id, {"type": "status", "text": "OODA: Observing and orienting...", "parent_id": parent_id})
+        await _ws_send(
+            conv_id,
+            {
+                "type": "status",
+                "text": "OODA: Observing and orienting...",
+                "parent_id": parent_id,
+            },
+        )
         weave_model = conv.get("local_model") or None
-        raw_pass1 = await sync_chat(messages, max_tokens=2048, think=False, model=weave_model)
+        raw_pass1 = await sync_chat(
+            messages, max_tokens=2048, think=False, model=weave_model
+        )
         # Check if cancelled during the sync call
         if asyncio.current_task().cancelled():
             raise asyncio.CancelledError()
-        cleaned_pass1 = _re.sub(r'<think>[\s\S]*?</think>\s*', '', raw_pass1).strip()
+        cleaned_pass1 = _re.sub(r"<think>[\s\S]*?</think>\s*", "", raw_pass1).strip()
         print(f"[OODA] Pass 1 done: {len(cleaned_pass1)} chars")
         print(f"[OODA] Raw OODA output:\n{cleaned_pass1[:1500]}")
 
@@ -2430,25 +3028,74 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
             # Emit OODA steps as tool blocks for visibility
             if ooda["observe"]:
                 tool_id = f"ooda-observe-{conv_id}"
-                await _ws_send(conv_id, {"type": "tool_start", "name": "OODA: Observe", "tool_id": tool_id, "ooda": True})
-                await _ws_send(conv_id, {"type": "tool_result", "content": ooda["observe"], "tool_id": tool_id})
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "tool_start",
+                        "name": "OODA: Observe",
+                        "tool_id": tool_id,
+                        "ooda": True,
+                    },
+                )
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "tool_result",
+                        "content": ooda["observe"],
+                        "tool_id": tool_id,
+                    },
+                )
             if ooda["orient"]:
                 tool_id = f"ooda-orient-{conv_id}"
-                await _ws_send(conv_id, {"type": "tool_start", "name": "OODA: Orient", "tool_id": tool_id, "ooda": True})
-                await _ws_send(conv_id, {"type": "tool_result", "content": ooda["orient"], "tool_id": tool_id})
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "tool_start",
+                        "name": "OODA: Orient",
+                        "tool_id": tool_id,
+                        "ooda": True,
+                    },
+                )
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "tool_result",
+                        "content": ooda["orient"],
+                        "tool_id": tool_id,
+                    },
+                )
             if ooda["decide"]:
                 tool_id = f"ooda-decide-{conv_id}"
-                await _ws_send(conv_id, {"type": "tool_start", "name": "OODA: Decide", "tool_id": tool_id, "ooda": True})
-                await _ws_send(conv_id, {"type": "tool_result", "content": ooda["decide"], "tool_id": tool_id})
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "tool_start",
+                        "name": "OODA: Decide",
+                        "tool_id": tool_id,
+                        "ooda": True,
+                    },
+                )
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "tool_result",
+                        "content": ooda["decide"],
+                        "tool_id": tool_id,
+                    },
+                )
 
             # Execute state reads
             resolved = await execute_ooda_reads(conv_id, ooda["reads"])
-            print(f"[OODA] Resolved {len(resolved)} reads, applying {len(ooda['updates'])} updates, {len(ooda['creates'])} creates")
+            print(
+                f"[OODA] Resolved {len(resolved)} reads, applying {len(ooda['updates'])} updates, {len(ooda['creates'])} creates"
+            )
 
             # State updates saved as branch deltas only (Tier 3) — base cards stay pristine
             # Notify client of the effective state change for this branch
             if ooda["updates"] or ooda["creates"]:
-                await _ws_send(conv_id, {"type": "state_update", "updates": ooda["updates"]})
+                await _ws_send(
+                    conv_id, {"type": "state_update", "updates": ooda["updates"]}
+                )
 
         # ── Extract prose (single-pass: prose comes after </ooda> tag) ──
         final_prose = ""
@@ -2458,27 +3105,44 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
             # No OODA block or no prose after it — use the whole output
             final_prose = cleaned_pass1
             # Strip closed ooda blocks
-            final_prose = _re.sub(r'<ooda>[\s\S]*?</ooda>\s*', '', final_prose).strip()
+            final_prose = _re.sub(r"<ooda>[\s\S]*?</ooda>\s*", "", final_prose).strip()
             # Strip truncated/unclosed ooda blocks (model ran out of tokens)
-            final_prose = _re.sub(r'<ooda>[\s\S]*$', '', final_prose).strip()
+            final_prose = _re.sub(r"<ooda>[\s\S]*$", "", final_prose).strip()
 
         # Stream prose to client
         for i in range(0, len(final_prose), 8):
-            await _ws_send(conv_id, {"type": "stream_chunk", "content": final_prose[i:i+8]})
+            await _ws_send(
+                conv_id, {"type": "stream_chunk", "content": final_prose[i : i + 8]}
+            )
 
         if not final_prose.strip():
             if ooda:
                 # OODA analysis succeeded but no prose — save analysis summary as content
                 summary_parts = []
-                if ooda.get("observe"): summary_parts.append(f"*{ooda['observe'][:200]}*")
-                if ooda.get("orient"): summary_parts.append(f"*{ooda['orient'][:200]}*")
-                final_prose = "\n\n".join(summary_parts) if summary_parts else "[OODA analysis completed but no prose generated — try regenerating]"
+                if ooda.get("observe"):
+                    summary_parts.append(f"*{ooda['observe'][:200]}*")
+                if ooda.get("orient"):
+                    summary_parts.append(f"*{ooda['orient'][:200]}*")
+                final_prose = (
+                    "\n\n".join(summary_parts)
+                    if summary_parts
+                    else "[OODA analysis completed but no prose generated — try regenerating]"
+                )
                 for i in range(0, len(final_prose), 8):
-                    await _ws_send(conv_id, {"type": "stream_chunk", "content": final_prose[i:i+8]})
+                    await _ws_send(
+                        conv_id,
+                        {"type": "stream_chunk", "content": final_prose[i : i + 8]},
+                    )
             else:
                 if draft_msg_id:
                     await db.delete_branch(draft_msg_id)
-                await _ws_send(conv_id, {"type": "error", "error": "Model returned an empty response — try regenerating"})
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "error",
+                        "error": "Model returned an empty response — try regenerating",
+                    },
+                )
                 return
 
         # Update draft with final content
@@ -2488,12 +3152,23 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
         # Save branch-level state deltas (Tier 3)
         if ooda and ooda.get("updates"):
             await db.save_state_deltas(draft_msg_id, ooda["updates"])
-        asyncio.create_task(_background_summarize_message(draft_msg_id, final_prose, "assistant", conv_id=conv_id))
+        asyncio.create_task(
+            _background_summarize_message(
+                draft_msg_id, final_prose, "assistant", conv_id=conv_id
+            )
+        )
         await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
         conv_title = conv.get("title", "Conversation")
         preview = (final_prose or "").replace("#", "").replace("*", "").strip()[:120]
-        await _ws_broadcast_all({"type": "branch_landed", "conv_id": conv_id, "conv_title": conv_title,
-                                  "message_id": draft_msg_id, "preview": preview})
+        await _ws_broadcast_all(
+            {
+                "type": "branch_landed",
+                "conv_id": conv_id,
+                "conv_title": conv_title,
+                "message_id": draft_msg_id,
+                "preview": preview,
+            }
+        )
 
     except asyncio.CancelledError:
         if draft_msg_id:
@@ -2506,23 +3181,28 @@ async def _handle_ooda_generation(websocket: WebSocket, conv_id: int, conv: dict
             await db.delete_branch(draft_msg_id)
         print(f"[OODA] Generation error conv={conv_id}: {e}")
         import traceback
+
         traceback.print_exc()
         await _ws_send(conv_id, {"type": "error", "error": str(e)})
     finally:
-        _gen_key = getattr(asyncio.current_task(), '_gen_key', None)
+        _gen_key = getattr(asyncio.current_task(), "_gen_key", None)
         if _gen_key:
             _active_generations.pop(_gen_key, None)
             _generation_snapshots.pop(_gen_key, None)
 
 
-async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dict, data: dict):
+async def _handle_weave_generation(
+    websocket: WebSocket, conv_id: int, conv: dict, data: dict
+):
     """Handle Weave (Ollama) generation — original logic."""
     draft_msg_id = None
     full_response = ""
     try:
         action = data.get("action")
         parent_id = data.get("parent_id")
-        print(f"[GEN] _handle_weave_generation called: action={action} parent_id={parent_id} conv_id={conv_id}")
+        print(
+            f"[GEN] _handle_weave_generation called: action={action} parent_id={parent_id} conv_id={conv_id}"
+        )
         print(f"[GEN] conv={conv}")
 
         # For regenerate, parent_id should be provided
@@ -2532,12 +3212,20 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
             parent_id = leaf["id"] if leaf else None
         character = None
         if conv and conv.get("character_id"):
-            char_path = os.path.join(config.characters_dir, f"{conv['character_id']}.md")
-            print(f"[GEN] Loading character from: {char_path} (exists={os.path.exists(char_path)})")
+            char_path = os.path.join(
+                config.characters_dir, f"{conv['character_id']}.md"
+            )
+            print(
+                f"[GEN] Loading character from: {char_path} (exists={os.path.exists(char_path)})"
+            )
             character = load_character(char_path)
-            print(f"[GEN] Character loaded: name={character.get('name') if character else 'NONE'}, personality_len={len(character.get('personality','')) if character else 0}, scenario_len={len(character.get('scenario','')) if character else 0}")
+            print(
+                f"[GEN] Character loaded: name={character.get('name') if character else 'NONE'}, personality_len={len(character.get('personality','')) if character else 0}, scenario_len={len(character.get('scenario','')) if character else 0}"
+            )
         else:
-            print(f"[GEN] No character_id on conv! character_id={conv.get('character_id') if conv else 'NO CONV'}")
+            print(
+                f"[GEN] No character_id on conv! character_id={conv.get('character_id') if conv else 'NO CONV'}"
+            )
 
         # Get style nudge from conversation settings (user-selected, not rotating)
         style_nudge_name = conv.get("style_nudge", "Natural") if conv else "Natural"
@@ -2552,7 +3240,9 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
         if conv and conv.get("persona_id"):
             persona_path = os.path.join("personas", f"{conv['persona_id']}.md")
             persona = load_persona(persona_path)
-            print(f"[GEN] Persona: id={conv['persona_id']} path={persona_path} loaded={'yes' if persona else 'NO'}")
+            print(
+                f"[GEN] Persona: id={conv['persona_id']} path={persona_path} loaded={'yes' if persona else 'NO'}"
+            )
         else:
             print(f"[GEN] No persona_id set on conversation")
 
@@ -2560,8 +3250,13 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
         lore_entries = []
         if conv and conv.get("lore_ids"):
             import json as _json
+
             try:
-                lore_ids = _json.loads(conv["lore_ids"]) if isinstance(conv["lore_ids"], str) else conv["lore_ids"]
+                lore_ids = (
+                    _json.loads(conv["lore_ids"])
+                    if isinstance(conv["lore_ids"], str)
+                    else conv["lore_ids"]
+                )
             except (ValueError, TypeError):
                 lore_ids = []
             for lid in lore_ids:
@@ -2575,8 +3270,7 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
         context = await get_context_for_generation(conv_id, character)
         if action == "regenerate" and parent_id is not None:
             context["verbatim_messages"] = [
-                m for m in context["verbatim_messages"]
-                if m["id"] <= parent_id
+                m for m in context["verbatim_messages"] if m["id"] <= parent_id
             ]
 
         # Run repetition analysis on recent assistant messages
@@ -2603,35 +3297,52 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
         print(f"[GEN] System prompt length: {len(system_prompt)}")
         print(f"[GEN] System prompt preview: {system_prompt[:300]}...")
         print(f"[GEN] Total messages in prompt: {len(messages)}")
-        print(f"[GEN] Context verbatim_messages count: {len(context['verbatim_messages'])}")
+        print(
+            f"[GEN] Context verbatim_messages count: {len(context['verbatim_messages'])}"
+        )
         for i, m in enumerate(messages):
             print(f"[GEN]   msg[{i}] role={m['role']} len={len(m['content'])}")
 
         # Send context info — use actual assembled prompt token count
         actual_tokens = sum(len(m["content"]) // 3 for m in messages)
         active_nudge = get_style_nudge(nudge_index)
-        await _ws_send(conv_id, {
-            "type": "context_info",
-            "total_tokens": actual_tokens,
-            "was_compactified": context["was_compactified"],
-            "style_nudge": active_nudge["name"],
-            "parent_id": parent_id,
-        })
+        await _ws_send(
+            conv_id,
+            {
+                "type": "context_info",
+                "total_tokens": actual_tokens,
+                "was_compactified": context["was_compactified"],
+                "style_nudge": active_nudge["name"],
+                "parent_id": parent_id,
+            },
+        )
 
         # Create draft message in DB so it appears as ghost node on tree
         draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
         draft_msg_id = draft_msg["id"]
 
         # Stream the response
-        print(f"[GEN] Starting generation for conv={conv_id} parent={parent_id} model={config.ollama_model}")
-        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id, "draft_msg_id": draft_msg_id})
+        print(
+            f"[GEN] Starting generation for conv={conv_id} parent={parent_id} model={config.ollama_model}"
+        )
+        await _ws_send(
+            conv_id,
+            {
+                "type": "stream_start",
+                "parent_id": parent_id,
+                "draft_msg_id": draft_msg_id,
+            },
+        )
 
         # Initialize live snapshot for Weave generation
         import time as _time
-        _gen_key_local = getattr(asyncio.current_task(), '_gen_key', None)
+
+        _gen_key_local = getattr(asyncio.current_task(), "_gen_key", None)
         if _gen_key_local:
-            _update_gen_snapshot(_gen_key_local,
-                full_text="", content_blocks=[],
+            _update_gen_snapshot(
+                _gen_key_local,
+                full_text="",
+                content_blocks=[],
                 started_at=_time.time(),
                 draft_msg_id=draft_msg_id,
                 parent_id=parent_id,
@@ -2646,29 +3357,38 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
                 await _ws_send(conv_id, token)
                 continue
             full_response += token
-            await _ws_send(conv_id, {
-                "type": "stream_chunk",
-                "content": token,
-            })
+            await _ws_send(
+                conv_id,
+                {
+                    "type": "stream_chunk",
+                    "content": token,
+                },
+            )
             # Keep live snapshot in sync
             if _gen_key_local:
                 _update_gen_snapshot(_gen_key_local, full_text=full_response)
 
         # Strip <think>...</think> blocks (thinking models like qwen3)
         import re as _re
-        cleaned = _re.sub(r'<think>[\s\S]*?</think>\s*', '', full_response).strip()
+
+        cleaned = _re.sub(r"<think>[\s\S]*?</think>\s*", "", full_response).strip()
         if cleaned:
             full_response = cleaned
 
         # If response is empty, send error instead of saving empty message
         if not full_response.strip():
-            print(f"[WARN] Empty response. Raw length={len(full_response)} Cleaned length={len(cleaned)}")
+            print(
+                f"[WARN] Empty response. Raw length={len(full_response)} Cleaned length={len(cleaned)}"
+            )
             if draft_msg_id:
                 await db.delete_branch(draft_msg_id)
-            await _ws_send(conv_id, {
-                "type": "error",
-                "error": "Model returned an empty response — try again",
-            })
+            await _ws_send(
+                conv_id,
+                {
+                    "type": "error",
+                    "error": "Model returned an empty response — try again",
+                },
+            )
             return
 
         # Update draft with final content
@@ -2676,17 +3396,30 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
         await db.set_active_branch(conv_id, draft_msg_id)
         msg = await db.get_message(draft_msg_id)
         # Background: generate Gemma summary for tree display
-        asyncio.create_task(_background_summarize_message(draft_msg_id, full_response, "assistant",
-                                                              conv_id=conv_id))
+        asyncio.create_task(
+            _background_summarize_message(
+                draft_msg_id, full_response, "assistant", conv_id=conv_id
+            )
+        )
 
-        await _ws_send(conv_id, {
-            "type": "stream_end",
-            "message": dict(msg),
-        })
+        await _ws_send(
+            conv_id,
+            {
+                "type": "stream_end",
+                "message": dict(msg),
+            },
+        )
         conv_title = conv.get("title", "Conversation")
         preview = (full_response or "").replace("#", "").replace("*", "").strip()[:120]
-        await _ws_broadcast_all({"type": "branch_landed", "conv_id": conv_id, "conv_title": conv_title,
-                                  "message_id": draft_msg_id, "preview": preview})
+        await _ws_broadcast_all(
+            {
+                "type": "branch_landed",
+                "conv_id": conv_id,
+                "conv_title": conv_title,
+                "message_id": draft_msg_id,
+                "preview": preview,
+            }
+        )
 
     except asyncio.CancelledError:
         # Clean up draft on cancel
@@ -2702,7 +3435,7 @@ async def _handle_weave_generation(websocket: WebSocket, conv_id: int, conv: dic
         print(f"[GEN] Weave generation error conv={conv_id}: {e}")
         await _ws_send(conv_id, {"type": "error", "error": str(e)})
     finally:
-        _gen_key = getattr(asyncio.current_task(), '_gen_key', None)
+        _gen_key = getattr(asyncio.current_task(), "_gen_key", None)
         if _gen_key:
             _active_generations.pop(_gen_key, None)
             _generation_snapshots.pop(_gen_key, None)
@@ -2714,12 +3447,15 @@ if __name__ == "__main__":
     # Suppress Windows ProactorEventLoop pipe errors from CC subprocess cleanup.
     # Patch at startup so it applies to whatever event loop uvicorn creates.
     import asyncio.proactor_events as _pe
+
     _orig_call_connection_lost = _pe._ProactorBasePipeTransport._call_connection_lost
+
     def _safe_call_connection_lost(self, exc=None):
         try:
             _orig_call_connection_lost(self, exc)
         except (ConnectionResetError, BrokenPipeError, OSError):
             pass
+
     _pe._ProactorBasePipeTransport._call_connection_lost = _safe_call_connection_lost
 
     ssl_kwargs = {}
@@ -2731,8 +3467,11 @@ if __name__ == "__main__":
         print("[SSL] No certs found — running plain HTTP")
 
     uv_config = uvicorn.Config(
-        app, host=config.host, port=config.port,
-        ws_ping_interval=20, ws_ping_timeout=20,
+        app,
+        host=config.host,
+        port=config.port,
+        ws_ping_interval=20,
+        ws_ping_timeout=20,
         **ssl_kwargs,
     )
     server = uvicorn.Server(uv_config)
