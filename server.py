@@ -2031,6 +2031,22 @@ async def _handle_claude_generation(
                         break
 
             prompt = latest_user_content or "(continue)"
+        else:
+            # No session resume — build full history from branch
+            print(f"[CC] No session resume, building full history from branch, parent_id={parent_id}, is_gemini={is_gemini}")
+            if parent_id:
+                branch = await db.get_branch_to_root(parent_id)
+                print(f"[CC] Retrieved branch with {len(branch)} messages")
+                if is_gemini:
+                    # For Gemini, we need to ensure the prompt has actual content
+                    # Build the history prompt from the branch
+                    prompt = _build_claude_history_prompt(branch)
+                    if not prompt:
+                        print(f"[CC] WARNING: Empty prompt from branch for Gemini!")
+                        prompt = "(continue)"
+            else:
+                print(f"[CC] No parent_id, no branch to retrieve")
+                prompt = "(continue)"
 
             # Attach images if present on the latest user message
             if branch:
