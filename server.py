@@ -49,8 +49,7 @@ from prompt_engine import (
     get_style_nudge,
     STYLE_NUDGES,
 )
-from context_manager import get_context_for_generation, update_rolling_summary
-import local_summary
+from context_manager import get_context_for_generation
 import claude_client
 import gemini_client
 from skill_scanner import get_all_skills, BUILTIN_COMMANDS
@@ -67,8 +66,6 @@ async def lifespan(app):
     await _reload_pending_permissions()
     # Ensure Ollama is running (launches it if not)
     asyncio.create_task(_ensure_ollama())
-    # Preload Gemma 3 1B for CPU summarization (downloads ~806MB on first run)
-    asyncio.create_task(_preload_summarizer())
     yield
     await db.close_db()
 
@@ -189,17 +186,6 @@ async def _ensure_ollama():
         print(f"[STARTUP] Failed to launch Ollama: {e}")
 
 
-async def _preload_summarizer():
-    """Background preload — doesn't block server startup."""
-    try:
-        await local_summary.preload()
-    except Exception as e:
-        import logging
-
-        logging.getLogger(__name__).warning(
-            f"Gemma preload failed (will retry on first use): {e}"
-        )
-
 
 app = FastAPI(title="Ex Astris Umbra — A Loom Interface", lifespan=lifespan)
 
@@ -275,40 +261,6 @@ def _parse_image_paths(image_path) -> list[str]:
     return [image_path]
 
 
-async def _background_summarize_message(
-    msg_id: int, content: str, role: str, conv_id: int = None, image_path: str = None
-):
-    """Generate a short Gemma summary for a message (tree pill) and update
-    the rolling context summary if needed."""
-    try:
-        summary_content = content
-        paths = _parse_image_paths(image_path)
-
-        if paths:
-            alts = []
-            for p in paths:
-                alt = await describe_image(p)
-                alts.append(alt)
-            combined_alt = "; ".join(alts)
-            await db.update_message_image_alt(msg_id, combined_alt)
-            summary_content = f"{content}\n[Attached images: {combined_alt}]"
-
-        # Tree pill summary
-        summary = await local_summary.summarize_message(summary_content, role)
-        await db.update_message_summary(msg_id, summary)
-
-        # Rolling context summary — incrementally summarize messages that aged
-        # out of the verbatim window
-        if conv_id:
-            await update_rolling_summary(conv_id)
-
-    except Exception as e:
-        import logging
-
-        logging.getLogger(__name__).warning(
-            f"Background summary failed for msg {msg_id}: {e}"
-        )
-
 
 # ── Static files ──
 
@@ -327,11 +279,6 @@ async def index():
 @app.get("/api/health")
 async def api_health():
     ollama_status = await health_check()
-    ollama_status["local_summarizer"] = {
-        "model": "gemma-3-1b-it-abliterated-Q4_K_M",
-        "loaded": local_summary.is_loaded(),
-        "loading": local_summary.is_loading(),
-    }
     return ollama_status
 
 
@@ -649,24 +596,11 @@ async def api_create_conversation(data: dict = None):
             # Add custom scene as a user message for the model to respond to
             scene_msg = await db.add_message(conv["id"], "user", custom_scene)
             await db.set_active_branch(conv["id"], scene_msg["id"])
-            asyncio.create_task(
-                _background_summarize_message(
-                    scene_msg["id"], custom_scene, "user", conv_id=conv["id"]
-                )
-            )
         elif char and char.get("greeting"):
             greeting_msg = await db.add_message(
                 conv["id"], "assistant", char["greeting"]
             )
             await db.set_active_branch(conv["id"], greeting_msg["id"])
-            asyncio.create_task(
-                _background_summarize_message(
-                    greeting_msg["id"],
-                    char["greeting"],
-                    "assistant",
-                    conv_id=conv["id"],
-                )
-            )
 
     return conv
 
@@ -1097,12 +1031,6 @@ async def api_add_message(conv_id: int, data: dict):
         conv_id, role, content, parent_id=parent_id, image_path=image_path
     )
     await db.set_active_branch(conv_id, msg["id"])
-    # Background: generate Gemma summary for tree display
-    asyncio.create_task(
-        _background_summarize_message(
-            msg["id"], content, role, conv_id=conv_id, image_path=image_path
-        )
-    )
     return msg
 
 
@@ -2037,13 +1965,16 @@ async def _handle_claude_generation(
             if parent_id:
                 branch = await db.get_branch_to_root(parent_id)
                 print(f"[CC] Retrieved branch with {len(branch)} messages")
-                if is_gemini:
-                    # For Gemini, we need to ensure the prompt has actual content
-                    # Build the history prompt from the branch
-                    prompt = _build_claude_history_prompt(branch)
-                    if not prompt:
+                prompt = _build_claude_history_prompt(branch)
+                if not prompt:
+                    if is_gemini:
                         print(f"[CC] WARNING: Empty prompt from branch for Gemini!")
                         prompt = "(continue)"
+                    else:
+                        await _ws_send(
+                            conv_id, {"type": "error", "error": "No message to send to Claude"}
+                        )
+                        return
             else:
                 print(f"[CC] No parent_id, no branch to retrieve")
                 prompt = "(continue)"
@@ -3109,11 +3040,6 @@ async def _handle_ooda_generation(
         # Save branch-level state deltas (Tier 3)
         if ooda and ooda.get("updates"):
             await db.save_state_deltas(draft_msg_id, ooda["updates"])
-        asyncio.create_task(
-            _background_summarize_message(
-                draft_msg_id, final_prose, "assistant", conv_id=conv_id
-            )
-        )
         await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
         conv_title = conv.get("title", "Conversation")
         preview = (final_prose or "").replace("#", "").replace("*", "").strip()[:120]
@@ -3352,13 +3278,6 @@ async def _handle_weave_generation(
         await db.update_message_content(draft_msg_id, content=full_response)
         await db.set_active_branch(conv_id, draft_msg_id)
         msg = await db.get_message(draft_msg_id)
-        # Background: generate Gemma summary for tree display
-        asyncio.create_task(
-            _background_summarize_message(
-                draft_msg_id, full_response, "assistant", conv_id=conv_id
-            )
-        )
-
         await _ws_send(
             conv_id,
             {
