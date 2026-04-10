@@ -12,7 +12,7 @@ An LLM loom treats every conversation as a **tree, not a thread**. Each message 
 
 This matters because LLM output is non-deterministic. The same prompt can produce a brilliant answer on one roll and a mediocre one on the next. A linear chat hides that variance — you see one path and lose the rest. A loom preserves them all. Regenerate five times, keep the best, branch from the second-best later. Edit a message from ten turns ago and watch the conversation diverge. The tree is the conversation's real shape; a single thread is just one path through it.
 
-A Shadow Loom applies this to four backends — Anthropic's Claude API, Google's Gemini CLI, local Ollama models, and Claude Code as a subprocess — with a shared branching infrastructure, persistent storage, and full-text search across everything.
+A Shadow Loom applies this to four backends — Claude Code, Gemini CLI, local Ollama models, and Ollama-powered Claude Code (Braid) — with a shared branching infrastructure, persistent storage, and full-text search across everything.
 
 ## Search
 
@@ -22,9 +22,9 @@ This is particularly useful for **Claude Code sessions**. Loom mode runs CC as a
 
 There's also **per-conversation search** and **tree search** (find and navigate between matching nodes on the visual tree).
 
-## Three modes, one loom
+## Four modes, one loom
 
-The Loom weaves conversations across three modes — pick the thread that fits the task.
+The Loom weaves conversations across four modes — pick the thread that fits the task.
 
 ### Weave — structured roleplay and creative writing
 
@@ -34,7 +34,6 @@ Character cards, personas, lore files, style nudges, and incremental summarizati
 - Personas (player characters) and lore for richer world-building context
 - Style nudge selection and repetition detection
 - Thinking model support (`<think>` stripping, content token counting)
-- Incremental context summarization via Gemma 3 1B on CPU
 - Multi-branch generation — generate 1-5 parallel responses per turn, pick the best
 - Tree-based branching — regenerate, edit, or fork at any point in the conversation
 
@@ -196,8 +195,6 @@ gemini_client.py       -- Gemini CLI subprocess wrapper, NDJSON stream parser
 cc_permission_hook.py  -- PreToolUse/BeforeTool hook script for browser-based permission prompts
 mcp_web_tools.py       -- MCP stdio server: web_search (DuckDuckGo) + web_fetch (trafilatura) for local models
 admin_server.py        -- Admin dashboard for managing Loom instances
-local_summary.py       -- Gemma 3 1B via llama-cpp-python for CPU summarization
-
 static/
   index.html           -- Single-page app shell
   app.js               -- State management, home view, character/persona/lore CRUD
@@ -266,5 +263,4 @@ Characters, personas, and lore can also be created, edited, and imported/exporte
 ## Credits
 
 - Black hole raytracer based on [pyokosmeme/black-hole](https://github.com/pyokosmeme/black-hole)
-- Summarization via [Gemma 3 1B IT](https://huggingface.co/google/gemma-3-1b-it) (abliterated Q4_K_M quantization)
 - OODA harness inspired by [metacog](https://github.com/inanna-malick/metacog) and [popup-mcp](https://tidepool.leaflet.pub/3mcbegnuf2k2i)
