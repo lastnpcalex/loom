@@ -2088,6 +2088,62 @@ function hideThinkingIndicator() {
 
 let streamingDiv = null;
 let _genTimerInterval = null;
+let _loomAnimInterval = null;
+const _loomFrames = [
+    "╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴",
+    "╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴",
+    "╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴",
+    "╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴",
+    "─╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    "─╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    "─╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    "◆╼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    "╾◆╼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    "═╾◆╼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    "══╾◆╼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    "═══╾◆╼╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    "════╾◆╼╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    "═════╾◆╼╌╌╌╌╌╌╌╌╌╌╌╌",
+    "══════╾◆╼╌╌╌╌╌╌╌╌╌╌╌",
+    "═══════╾◆╼╌╌╌╌╌╌╌╌╌╌",
+    "════════╾◆╼╌╌╌╌╌╌╌╌╌",
+    "═════════╾◆╼╌╌╌╌╌╌╌╌",
+    "══════════╾◆╼╌╌╌╌╌╌╌",
+    "═══════════╾◆╼╌╌╌╌╌╌",
+    "════════════╾◆╼╌╌╌╌╌",
+    "═════════════╾◆╼╌╌╌╌",
+    "══════════════╾◆╼╌╌╌",
+    "═══════════════╾◆╼╌╌",
+    "════════════════╾◆╼╌",
+    "═════════════════╾◆╼",
+    "══════════════════╾◆",
+    "════════════════════",
+    "════════════════════",
+    "════════════════════",
+    "══════════✂═════════",
+    "══════════✂═════════",
+    "══════════✂═════════",
+    "≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼",
+    "∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈",
+    "≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼",
+    "∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈",
+    "≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼",
+    "∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈∼≈",
+    "────────────────────",
+    "╌──────────────────╌",
+    "╌╌────────────────╌╌",
+    "╌╌╌──────────────╌╌╌",
+    "╌╌╌╌────────────╌╌╌╌",
+    "╌╌╌╌╌──────────╌╌╌╌╌",
+    "╌╌╌╌╌╌────────╌╌╌╌╌╌",
+    "╌╌╌╌╌╌╌──────╌╌╌╌╌╌╌",
+    "╌╌╌╌╌╌╌╌────╌╌╌╌╌╌╌╌",
+    "╌╌╌╌╌╌╌╌╌──╌╌╌╌╌╌╌╌╌",
+    "╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+    "╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴",
+    "╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴",
+    "╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴",
+];
 
 function _fmtTok(n) {
     if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k';
@@ -2101,17 +2157,25 @@ function _startGenTimer() {
         const secs = Math.floor((Date.now() - _streamStartTime) / 1000);
         const timerEl = streamingDiv.querySelector('.gen-timer');
         if (timerEl) timerEl.textContent = Math.floor(secs / 60) + ':' + String(secs % 60).padStart(2, '0');
-        // In Ollama/weave mode each stream_chunk is one token — show live output count
-        // until a real usage event (CC mode) overwrites it with accurate input+output
         const tokEl = streamingDiv.querySelector('.gen-token-info');
         if (tokEl && _streamTokenCount > 0 && !tokEl.dataset.hasUsage) {
             tokEl.textContent = '↓' + _fmtTok(_streamTokenCount) + ' · ';
         }
     }, 1000);
+    // Start loom animation
+    if (_loomAnimInterval) clearInterval(_loomAnimInterval);
+    let frame = 0;
+    _loomAnimInterval = setInterval(() => {
+        if (!streamingDiv) return;
+        const el = streamingDiv.querySelector('.loom-anim');
+        if (el) el.textContent = _loomFrames[frame];
+        frame = (frame + 1) % _loomFrames.length;
+    }, 120);
 }
 
 function _stopGenTimer() {
     if (_genTimerInterval) { clearInterval(_genTimerInterval); _genTimerInterval = null; }
+    if (_loomAnimInterval) { clearInterval(_loomAnimInterval); _loomAnimInterval = null; }
 }
 
 function appendStreamingMessage() {
@@ -2129,7 +2193,7 @@ function appendStreamingMessage() {
         '<span class="message-role">' + escapeHtml(label) + '</span>' +
         '</div>' +
         '<div class="message-content"></div>' +
-        '<div class="stream-thinking-footer"><span class="thinking-dots"></span> Looming...' +
+        '<div class="stream-thinking-footer"><span class="loom-anim"></span> Looming...' +
         ' <button onclick="cancelGeneration()" title="Cancel generation" class="cancel-draft-btn">&#x2298;</button>' +
         '<span class="gen-stats"><span class="gen-token-info"></span><span class="gen-timer">0:00</span></span>' +
         '</div>';

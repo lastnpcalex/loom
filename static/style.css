@@ -2453,6 +2453,19 @@ body::after {
     75% { content: '...'; }
 }
 
+.loom-anim {
+    display: inline-block;
+    font-family: monospace;
+    font-size: 12px;
+    letter-spacing: 0.5px;
+    color: var(--cyan);
+    white-space: pre;
+    vertical-align: middle;
+    margin-right: 6px;
+    min-width: 13em;
+    text-align: left;
+}
+
 /* ── Input Area ── */
 #input-area {
     flex-shrink: 0;
