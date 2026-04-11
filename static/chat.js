@@ -164,7 +164,9 @@ function showRetryBar(errorMsg) {
         // Retry: send generate for the current active leaf
         if (State.ws && State.ws.readyState === WebSocket.OPEN) {
             showGenStatus('Retrying...');
-            State.ws.send(JSON.stringify({ action: 'generate' }));
+            const retryMsg = { action: 'generate' };
+            _attachCCSettings(retryMsg);
+            State.ws.send(JSON.stringify(retryMsg));
         }
     });
     bar.querySelector('.retry-dismiss').addEventListener('click', () => {
@@ -1136,10 +1138,9 @@ function _flushQueuedGeneration() {
     }
     if (State.ws && State.ws.readyState === WebSocket.OPEN) {
         showGenStatus('Sending queued message...');
-        State.ws.send(JSON.stringify({
-            action: 'generate',
-            parent_id: msg.id,
-        }));
+        const queueMsg = { action: 'generate', parent_id: msg.id };
+        _attachCCSettings(queueMsg);
+        State.ws.send(JSON.stringify(queueMsg));
     }
 }
 
@@ -1160,10 +1161,9 @@ async function regenerateMessage(msgId) {
 
         if (State.ws && State.ws.readyState === WebSocket.OPEN) {
             showGenStatus('Regenerating...');
-            State.ws.send(JSON.stringify({
-                action: 'regenerate',
-                parent_id: result.parent_id,
-            }));
+            const regenMsg = { action: 'regenerate', parent_id: result.parent_id };
+            _attachCCSettings(regenMsg);
+            State.ws.send(JSON.stringify(regenMsg));
         }
     } catch (err) {
         showToast('Regeneration failed', 'error');
@@ -1612,9 +1612,23 @@ function _triggerParallelGenerate(count, parentId) {
     for (let i = 0; i < n; i++) {
         const msg = { action: 'generate' };
         if (parentId) msg.parent_id = parentId;
+        // Include current model settings so the server doesn't rely on stale DB
+        _attachCCSettings(msg);
         State.ws.send(JSON.stringify(msg));
     }
     showGenStatus(n > 1 ? `Generating ${n} branches...` : 'Sending...');
+}
+
+/** Attach cc_model/effort/permission to a WS message from current UI state */
+function _attachCCSettings(msg) {
+    const conv = State.currentConv;
+    if (!conv || (conv.mode !== 'claude' && conv.mode !== 'local')) return;
+    const modelSel = document.getElementById('cc-model-inline');
+    const effortSel = document.getElementById('cc-effort-inline');
+    const permSel = document.getElementById('cc-permission-mode-inline');
+    if (modelSel && modelSel.value) msg.cc_model = modelSel.value;
+    if (effortSel && effortSel.value) msg.cc_effort = effortSel.value;
+    if (permSel && permSel.value) msg.cc_permission_mode = permSel.value;
 }
 
 function showGenerateBar() {

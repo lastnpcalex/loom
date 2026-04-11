@@ -773,7 +773,9 @@ async function createConversation() {
             showGenStatus('Generating first response...');
             const sendGenerate = () => {
                 if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-                    State.ws.send(JSON.stringify({ action: 'generate' }));
+                    const genMsg = { action: 'generate' };
+                    if (typeof _attachCCSettings === 'function') _attachCCSettings(genMsg);
+                    State.ws.send(JSON.stringify(genMsg));
                 } else {
                     hideGenStatus();
                     showRetryBar('WebSocket not connected');
@@ -996,6 +998,8 @@ function initInlineCCControls() {
     modelSel.addEventListener('change', () => {
         saveCC('cc_model', modelSel.value);
         _syncEffortVisibility(modelSel.value);
+        // Update local state immediately so generate messages include the new model
+        if (State.currentConv) State.currentConv.cc_model = modelSel.value;
     });
     effortSel.addEventListener('change', () => saveCC('cc_effort', effortSel.value));
 

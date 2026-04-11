@@ -514,7 +514,7 @@ async def api_create_conversation(data: dict = None):
         cc_effort=cc_effort,
         ooda_enabled=1 if mode == "weave" else 0,
     )
-    if local_model:
+    if mode == "local" and local_model:
         fields["local_model"] = local_model
     await db.update_conversation_fields(conv["id"], **fields)
     # Refresh conv data
@@ -1901,7 +1901,14 @@ async def _handle_claude_generation(
         _ANTHROPIC_MODELS = {"sonnet", "opus", "haiku"}
         is_anthropic = cc_model in _ANTHROPIC_MODELS
         is_gemini = cc_model.startswith("gemini")
+        # Only use Ollama when explicitly flagged (local mode) or when the model
+        # is not a known Anthropic/Gemini model.  The _use_ollama flag is set by
+        # _handle_local_generation on a shallow copy — it is never in the DB.
         use_ollama = conv.get("_use_ollama", False) or not (is_anthropic or is_gemini)
+        # Belt-and-suspenders: NEVER route Anthropic/Gemini through Ollama
+        if is_anthropic or is_gemini:
+            use_ollama = False
+        print(f"[CC] Model routing: cc_model={cc_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} use_ollama={use_ollama} conv._use_ollama={conv.get('_use_ollama')} conv.mode={conv.get('mode')}")
 
         # --- Session resume logic ---
         # Every turn uses --resume + --fork-session. Each assistant message
@@ -2609,7 +2616,7 @@ async def _handle_claude_generation(
             turn_input_tokens=input_tokens,
             turn_output_tokens=output_tokens,
             cc_session_id=new_session_id or None,
-            cc_model_used=cc_model,
+            cc_model_used=cc_model if not use_ollama else f"{cc_model}@ollama",
         )
         msg = await db.get_message(draft_msg_id)
 
