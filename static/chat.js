@@ -73,7 +73,7 @@ function connectWebSocket(convId, _attempt) {
             State.isStreaming = false;
             document.getElementById('btn-send').disabled = false;
             removeStreamingMessage();
-            showGenStatus('Reconnecting... generation continues on server');
+            showGenStatus('Reconnecting... generation continues on server', true);
         }
         // Reconnect: instant first try, then back off (cap at 8s)
         if (State.currentConvId === convId && State.currentView !== 'home') {
@@ -137,15 +137,18 @@ async function loadMessages(convId) {
     }
 }
 
-function showGenStatus(text) {
+function showGenStatus(text, reconnecting = false) {
     const el = document.getElementById('generation-status');
     document.getElementById('gen-status-text').textContent = text;
+    el.classList.toggle('reconnecting', reconnecting);
     el.classList.remove('hidden');
     scrollToBottom();
 }
 
 function hideGenStatus() {
-    document.getElementById('generation-status').classList.add('hidden');
+    const el = document.getElementById('generation-status');
+    el.classList.add('hidden');
+    el.classList.remove('reconnecting');
 }
 
 function showRetryBar(errorMsg) {
@@ -678,7 +681,7 @@ function _reconstructFromSnapshot(snap) {
         }
     }
 
-    showGenStatus('Reconnected — streaming in progress');
+    showGenStatus('Reconnected — streaming in progress', true);
     scrollToBottom();
     console.log('[WS] Reconstructed streaming UI from snapshot:', blocks.length, 'blocks,', (snap.full_text || '').length, 'chars');
 }
