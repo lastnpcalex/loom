@@ -2221,8 +2221,9 @@ function appendStreamingMessage() {
         '<span class="message-role">' + escapeHtml(label) + '</span>' +
         '</div>' +
         '<div class="message-content"></div>' +
-        '<div class="stream-thinking-footer"><span class="loom-anim"></span><span class="looming-text"> Looming...</span>' +
-        ' <button onclick="cancelGeneration()" title="Cancel generation" class="cancel-draft-btn">&#x2298;</button>' +
+        '<div class="stream-thinking-footer">' +
+        '<button onclick="cancelGeneration()" title="Cancel generation" class="cancel-draft-btn">&#x2298;</button>' +
+        '<span class="loom-anim"></span><span class="looming-text"> Looming...</span>' +
         '<span class="gen-stats"><span class="gen-token-info"></span><span class="gen-timer">0:00</span></span>' +
         '</div>';
     container.appendChild(streamingDiv);
