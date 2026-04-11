@@ -1972,7 +1972,7 @@ async def _handle_claude_generation(
             if parent_id:
                 branch = await db.get_branch_to_root(parent_id)
                 print(f"[CC] Retrieved branch with {len(branch)} messages")
-                prompt = _build_claude_history_prompt(branch)
+                prompt = _build_claude_history_prompt(branch, project_dir)
                 if not prompt:
                     if is_gemini:
                         print(f"[CC] WARNING: Empty prompt from branch for Gemini!")
@@ -2000,7 +2000,9 @@ async def _handle_claude_generation(
                     file_notes = []
                     for ip in img_paths:
                         src = Path(ip).resolve()
-                        dest = Path(project_dir) / src.name
+                        # Use attached_files subfolder for all attached files
+                        attached_files_dir = Path(project_dir) / "attached_files"
+                        dest = attached_files_dir / src.name
                         copied = False
                         try:
                             shutil.copy2(str(src), str(dest))
@@ -2010,35 +2012,34 @@ async def _handle_claude_generation(
                                 src = dest
                         except Exception as e:
                             print(
-                                f"[UPLOAD] Failed to copy image {src.name} to project_dir: {e}"
+                                f"[UPLOAD] Failed to copy file {src.name} to attached_files/: {e}"
                             )
                         if use_ollama:
                             # Local mode: describe image via Ollama's native multimodal API
                             # since CC's Read tool dumps base64 text that local models can't parse
-                            try:
-                                desc = await describe_image(str(src))
-                                file_notes.append(f"{src.name} — {desc}")
-                            except Exception as e:
-                                print(
-                                    f"[DESCRIBE] Failed to describe image {src.name}: {e}"
-                                )
-                                file_notes.append(
-                                    f"{src.name} — (image description unavailable)"
-                                )
+                            if ext in _IMAGE_EXTS:
+                                try:
+                                    desc = await describe_image(str(src))
+                                    file_notes.append(f"{src.name} — {desc}")
+                                except Exception as e:
+                                    print(
+                                        f"[DESCRIBE] Failed to describe image {src.name}: {e}"
+                                    )
+                                    file_notes.append(
+                                        f"{src.name} — (image description unavailable)"
+                                    )
+                            else:
+                                file_notes.append(f"{src.name} (in attached_files/)")
                         else:
                             if copied:
                                 file_notes.append(
-                                    f"{src.name} (placed in working directory)"
+                                    f"{src.name} (in attached_files/)"
                                 )
                             else:
                                 file_notes.append(str(src).replace("\\", "/"))
                     if file_notes:
-                        if use_ollama:
-                            files_str = "\n".join(f"  • {note}" for note in file_notes)
-                            prompt += f"\n\n[User attached {len(file_notes)} image(s):\n{files_str}\nThe image files are also in the working directory if you need to reference them by path.]"
-                        else:
-                            files_str = ", ".join(file_notes)
-                            prompt += f"\n\n[User attached {len(file_notes)} file(s): {files_str}. Use the Read tool to view them.]"
+                        files_str = "\n".join(f"  • {note}" for note in file_notes)
+                        prompt += f"\n\n[User attached {len(file_notes)} file(s). See attached_files/ for the files.]\n{files_str}"
         # Create draft message in DB immediately so it survives navigation/restarts.
         # If parent already has an empty assistant child (stale draft), reuse it.
         draft_msg = None
@@ -2136,7 +2137,7 @@ async def _handle_claude_generation(
                 print(f"[CC] Resume failed ({e}), falling back to full history")
                 await _ws_send(conv_id, {"type": "status", "text": "Session resume failed — rebuilding from history..."})
                 branch = await db.get_branch_to_root(parent_id) if parent_id else []
-                prompt = _build_claude_history_prompt(branch) or "(continue)"
+                prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
                 if is_gemini:
                     proc, event_stream = await gemini_client.run_gemini(
                         prompt,
@@ -2341,7 +2342,7 @@ async def _handle_claude_generation(
             print(f"[CC] Resume returned error, retrying with full history: {error_detail[:200]}")
             await _ws_send(conv_id, {"type": "status", "text": f"Session error — retrying with full history..."})
             branch = await db.get_branch_to_root(parent_id) if parent_id else []
-            fallback_prompt = _build_claude_history_prompt(branch) or "(continue)"
+            fallback_prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
             # Re-attach images
             if branch:
                 last_user_msg = None
@@ -2356,7 +2357,9 @@ async def _handle_claude_generation(
                     file_notes = []
                     for ip in img_paths:
                         src = Path(ip).resolve()
-                        dest = Path(project_dir) / src.name
+                        # Use attached_files subfolder for all attached files
+                        attached_files_dir = Path(project_dir) / "attached_files"
+                        dest = attached_files_dir / src.name
                         copied = False
                         try:
                             shutil.copy2(str(src), str(dest))
@@ -2366,34 +2369,35 @@ async def _handle_claude_generation(
                                 src = dest
                         except Exception as e:
                             print(
-                                f"[UPLOAD] Failed to copy image {src.name} to project_dir: {e}"
+                                f"[UPLOAD] Failed to copy file {src.name} to attached_files/: {e}"
                             )
                         if use_ollama:
                             # Local mode: describe image via Ollama's native multimodal API
-                            try:
-                                desc = await describe_image(str(src))
-                                file_notes.append(f"{src.name} — {desc}")
-                            except Exception as e:
-                                print(
-                                    f"[DESCRIBE] Failed to describe image {src.name}: {e}"
-                                )
-                                file_notes.append(
-                                    f"{src.name} — (image description unavailable)"
-                                )
+                            # since CC's Read tool dumps base64 text that local models can't parse
+                            if ext in _IMAGE_EXTS:
+                                try:
+                                    desc = await describe_image(str(src))
+                                    file_notes.append(f"{src.name} — {desc}")
+                                except Exception as e:
+                                    print(
+                                        f"[DESCRIBE] Failed to describe image {src.name}: {e}"
+                                    )
+                                    file_notes.append(
+                                        f"{src.name} — (image description unavailable)"
+                                    )
+                            else:
+                                file_notes.append(f"{src.name} (in attached_files/)")
                         else:
                             if copied:
                                 file_notes.append(
-                                    f"{src.name} (placed in working directory)"
+                                    f"{src.name} (in attached_files/)"
                                 )
                             else:
                                 file_notes.append(str(src).replace("\\", "/"))
                     if file_notes:
                         if use_ollama:
                             files_str = "\n".join(f"  • {note}" for note in file_notes)
-                            fallback_prompt += f"\n\n[User attached {len(file_notes)} image(s):\n{files_str}\nThe image files are also in the working directory if you need to reference them by path.]"
-                        else:
-                            files_str = ", ".join(file_notes)
-                            fallback_prompt += f"\n\n[User attached {len(file_notes)} file(s): {files_str}. Use the Read tool to view them.]"
+                            fallback_prompt += f"\n\n[User attached {len(file_notes)} file(s). See attached_files/ for the files.]\n{files_str}"
 
             proc, event_stream = await claude_client.run_claude(
                 fallback_prompt,
@@ -2717,13 +2721,25 @@ async def _handle_claude_generation(
                 await db.delete_pending_permission(rid)
 
 
-def _build_claude_history_prompt(branch: list[dict]) -> str:
-    """Build a text prompt from conversation history (fallback when --resume unavailable)."""
+def _build_claude_history_prompt(branch: list[dict], project_dir: Path = None) -> str:
+    """Build a text prompt from conversation history (fallback when --resume unavailable).
+
+    Also scans for attached files and includes references to them.
+    """
     history_parts = []
+    # Collect all attached files from the conversation
+    attached_files = []
+
     for msg in branch:
         if msg["role"] == "system":
             continue
         if msg["role"] == "user":
+            # Check for attached files in image_path
+            if msg.get("image_path"):
+                img_paths = _parse_image_paths(msg["image_path"])
+                for ip in img_paths:
+                    if project_dir and Path(ip).is_file():
+                        attached_files.append(ip)
             history_parts.append(f"Human: {msg['content']}")
         elif msg["role"] == "assistant":
             blocks = None
@@ -2761,6 +2777,11 @@ def _build_claude_history_prompt(branch: list[dict]) -> str:
                 history_parts.append(f"Assistant: {chr(10).join(parts)}")
             else:
                 history_parts.append(f"Assistant: {msg['content']}")
+
+    # Add file references if files were found
+    if attached_files:
+        files_str = "\n".join(f"  • {Path(ip).name} (in attached_files/)" for ip in attached_files)
+        return f"\n\n[Attached files:]\n{files_str}\n\n" + history_parts[-1]
 
     if not history_parts:
         return ""
