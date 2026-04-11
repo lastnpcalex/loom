@@ -296,6 +296,94 @@ async def tool_ollama_models():
         return JSONResponse({"status": "error", "output": str(e)})
 
 
+COMFYUI_URL = "http://127.0.0.1:8188"
+
+
+@app.post("/tools/comfyui-status")
+async def tool_comfyui_status():
+    """Check if ComfyUI is running and show system/device info."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{COMFYUI_URL}/system_stats")
+        if resp.status_code == 200:
+            data = resp.json()
+            lines = ["ComfyUI is RUNNING on port 8188", ""]
+            sys_info = data.get("system", {})
+            if sys_info:
+                lines.append(f"OS: {sys_info.get('os', '?')}")
+                lines.append(f"Python: {sys_info.get('python_version', '?')}")
+                lines.append(f"Embedded Python: {sys_info.get('embedded_python', '?')}")
+            devices = data.get("devices", [])
+            for i, dev in enumerate(devices):
+                lines.append(f"\nDevice {i}: {dev.get('name', '?')}")
+                lines.append(f"  Type: {dev.get('type', '?')}")
+                vram_total = dev.get('vram_total', 0)
+                vram_free = dev.get('vram_free', 0)
+                vram_used = vram_total - vram_free
+                if vram_total:
+                    lines.append(f"  VRAM: {vram_used / 1e9:.1f} / {vram_total / 1e9:.1f} GB used")
+                torch_vram = dev.get('torch_vram_total', 0)
+                torch_free = dev.get('torch_vram_free', 0)
+                if torch_vram:
+                    lines.append(f"  Torch VRAM: {(torch_vram - torch_free) / 1e9:.1f} / {torch_vram / 1e9:.1f} GB used")
+            return JSONResponse({"status": "ok", "output": "\n".join(lines)})
+        else:
+            return JSONResponse({"status": "error", "output": f"ComfyUI responded with status {resp.status_code}"})
+    except httpx.ConnectError:
+        return JSONResponse({"status": "ok", "output": "ComfyUI is NOT running (port 8188 not responding)"})
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": f"Error checking ComfyUI: {e}"})
+
+
+@app.post("/tools/comfyui-free")
+async def tool_comfyui_free():
+    """Free ComfyUI VRAM by unloading models and freeing memory."""
+    lines = []
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Get before stats
+            try:
+                before = await client.get(f"{COMFYUI_URL}/system_stats")
+                if before.status_code == 200:
+                    devs = before.json().get("devices", [])
+                    for dev in devs:
+                        vt = dev.get("vram_total", 0)
+                        vf = dev.get("vram_free", 0)
+                        if vt:
+                            lines.append(f"Before: {(vt - vf) / 1e9:.1f} / {vt / 1e9:.1f} GB VRAM used")
+            except Exception:
+                pass
+
+            # Call /free to unload models and free memory
+            resp = await client.post(
+                f"{COMFYUI_URL}/free",
+                json={"unload_models": True, "free_memory": True},
+            )
+            if resp.status_code == 200:
+                lines.append("Sent free request (unload_models + free_memory)")
+            else:
+                lines.append(f"Free request returned status {resp.status_code}")
+
+            # Get after stats
+            try:
+                after = await client.get(f"{COMFYUI_URL}/system_stats")
+                if after.status_code == 200:
+                    devs = after.json().get("devices", [])
+                    for dev in devs:
+                        vt = dev.get("vram_total", 0)
+                        vf = dev.get("vram_free", 0)
+                        if vt:
+                            lines.append(f"After:  {(vt - vf) / 1e9:.1f} / {vt / 1e9:.1f} GB VRAM used")
+            except Exception:
+                pass
+
+        return JSONResponse({"status": "ok", "output": "\n".join(lines)})
+    except httpx.ConnectError:
+        return JSONResponse({"status": "error", "output": "ComfyUI is not running (port 8188 not responding)"})
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": f"Error: {e}"})
+
+
 @app.post("/tools/disk-usage")
 async def tool_disk_usage():
     """Show disk usage for the Loom directory and DB files."""
@@ -483,6 +571,14 @@ async def dashboard():
     <button class="tool-btn" onclick="runTool('ollama-models')">
         <span class="icon">&#128451;</span> Model List
         <span class="label">Available models</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('comfyui-status')">
+        <span class="icon">&#127912;</span> ComfyUI Status
+        <span class="label">Is it running?</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('comfyui-free')">
+        <span class="icon">&#128165;</span> ComfyUI Free
+        <span class="label">Unload models &amp; free VRAM</span>
     </button>
     <button class="tool-btn" onclick="runTool('disk-usage')">
         <span class="icon">&#128190;</span> Disk Usage
