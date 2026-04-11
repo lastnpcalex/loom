@@ -1217,12 +1217,6 @@ function addPermissionNotification(data) {
         time: new Date(),
     });
     _renderNotifBell();
-    // Auto-open the dropdown for urgent permission requests
-    const dropdown = document.getElementById('notif-dropdown');
-    if (dropdown && dropdown.classList.contains('hidden')) {
-        dropdown.classList.remove('hidden');
-        _renderNotifDropdown();
-    }
 }
 
 function resolvePermissionNotification(requestId, allowed) {

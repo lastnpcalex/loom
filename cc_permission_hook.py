@@ -22,6 +22,10 @@ import ssl
 import urllib.request
 import urllib.error
 
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 
 # Tools that don't need user permission (read-only or low-risk)
 READ_ONLY = {

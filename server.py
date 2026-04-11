@@ -1,5 +1,14 @@
 """FastAPI server with REST endpoints and WebSocket streaming."""
 
+import sys
+
+# Windows defaults stdout/stderr to the system codepage (CP1252), which cannot
+# encode characters outside Latin-1 (e.g. Greek, Cyrillic).  Reconfigure to
+# UTF-8 so print() / logging never raises UnicodeEncodeError.
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import asyncio
 import json
 import os
