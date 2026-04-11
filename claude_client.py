@@ -275,6 +275,12 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     env = {**os.environ}
     env["LOOM_CONV_ID"] = str(conv_id)
     env["LOOM_PORT"] = str(server_port)
+    # Strip Ollama-injected env vars so CC talks to Anthropic, not Ollama.
+    # These leak in when the server (or its parent) was started from a shell
+    # that previously ran `ollama launch claude`.
+    if not use_ollama:
+        env.pop("CLAUDECODE", None)
+        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
     # If the prompt is too long for a command-line arg (Windows ~32K limit),
     # pipe it via stdin instead of -p
@@ -299,6 +305,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             cmd = ["claude"] + cc_args
 
     print(f"[CC] Starting subprocess in {cwd}")
+    print(f"[CC] CMD: {' '.join(cmd[:8])}{'...' if len(cmd) > 8 else ''}")
+    print(f"[CC] use_ollama={use_ollama} model={model} effort={effort}")
     print(f"[CC] Prompt length: {len(prompt)} chars (stdin={use_stdin})")
     print(f"[CC] Hook env: LOOM_CONV_ID={conv_id} LOOM_PORT={server_port}")
 
