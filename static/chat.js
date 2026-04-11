@@ -1397,6 +1397,13 @@ function _initNotifications() {
         dropdown.classList.toggle('hidden');
         if (!dropdown.classList.contains('hidden')) _renderNotifDropdown();
     });
+    document.getElementById('notif-refresh').addEventListener('click', (e) => {
+        e.stopPropagation();
+        const before = _notifications.length;
+        _notifications.splice(0, _notifications.length, ..._notifications.filter(n => !(n.type === 'permission' && n.resolved)));
+        if (_notifications.length !== before) _renderNotifBell();
+        else _renderNotifDropdown();
+    });
     document.getElementById('notif-clear').addEventListener('click', (e) => {
         e.stopPropagation();
         dropdown.classList.add('hidden');
