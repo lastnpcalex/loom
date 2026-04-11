@@ -2407,6 +2407,10 @@ body::after {
     50% { opacity: 0.4; transform: scale(0.8); }
 }
 
+@media (max-width: 768px) {
+    .looming-text { display: none; }
+}
+
 /* ── Streaming ── */
 #streaming-indicator {
     max-width: 800px;
