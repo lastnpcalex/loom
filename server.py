@@ -1893,9 +1893,13 @@ async def _handle_claude_generation(
                 },
             )
             return
-        # Prefer model from the generate message (client's current UI state)
-        # over the DB value, which may have been overwritten by another server.
-        cc_model = data.get("cc_model") or conv.get("cc_model") or "sonnet"
+        # For local mode, _handle_local_generation already set cc_model and
+        # _use_ollama on the conv dict — don't let the frontend override it.
+        # For claude mode, prefer the client's current UI state over stale DB.
+        if conv.get("_use_ollama"):
+            cc_model = conv.get("cc_model") or "sonnet"
+        else:
+            cc_model = data.get("cc_model") or conv.get("cc_model") or "sonnet"
         cc_effort = data.get("cc_effort") or conv.get("cc_effort") or "high"
         cc_permission_mode = (
             data.get("cc_permission_mode")

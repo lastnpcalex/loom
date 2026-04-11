@@ -275,10 +275,13 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     env = {**os.environ}
     env["LOOM_CONV_ID"] = str(conv_id)
     env["LOOM_PORT"] = str(server_port)
-    # Strip Ollama-injected env vars so CC talks to Anthropic, not Ollama.
-    # These leak in when the server (or its parent) was started from a shell
-    # that previously ran `ollama launch claude`.
-    if not use_ollama:
+    # Explicitly control CLAUDECODE so the launch method matches use_ollama.
+    # When True: ollama launch claude needs CLAUDECODE=1 in its subprocess.
+    # When False: plain claude must NOT see CLAUDECODE or it routes to Ollama.
+    if use_ollama:
+        env["CLAUDECODE"] = "1"
+        env["CLAUDE_CODE_ENTRYPOINT"] = "cli"
+    else:
         env.pop("CLAUDECODE", None)
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
