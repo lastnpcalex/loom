@@ -2006,61 +2006,63 @@ async def _handle_claude_generation(
                 print(f"[CC] No parent_id, no branch to retrieve")
                 prompt = "(continue)"
 
-            # Attach images if present on the latest user message
-            if branch:
-                last_user_msg = None
-                for msg in reversed(branch):
-                    if msg["role"] == "user":
-                        last_user_msg = msg
-                        break
-                if last_user_msg and last_user_msg.get("image_path"):
-                    img_paths = _parse_image_paths(last_user_msg["image_path"])
-                    import shutil
+        # Attach images if present on the latest user message
+        # (runs for both session-resume and fresh-session paths)
+        if branch:
+            last_user_msg = None
+            for msg in reversed(branch):
+                if msg["role"] == "user":
+                    last_user_msg = msg
+                    break
+            if last_user_msg and last_user_msg.get("image_path"):
+                img_paths = _parse_image_paths(last_user_msg["image_path"])
+                import shutil
 
-                    file_notes = []
-                    for ip in img_paths:
-                        src = Path(ip).resolve()
-                        # Use attached_files subfolder for all attached files
-                        attached_files_dir = Path(project_dir) / "attached_files"
-                        attached_files_dir.mkdir(exist_ok=True)
-                        dest = attached_files_dir / src.name
-                        copied = False
-                        try:
-                            shutil.copy2(str(src), str(dest))
-                            copied = True
-                            # For local mode, describe from project_dir where CC can access it
-                            if use_ollama and copied:
-                                src = dest
-                        except Exception as e:
-                            print(
-                                f"[UPLOAD] Failed to copy file {src.name} to attached_files/: {e}"
-                            )
-                        if use_ollama:
-                            # Local mode: describe image via Ollama's native multimodal API
-                            # since CC's Read tool dumps base64 text that local models can't parse
-                            if ext in _IMAGE_EXTS:
-                                try:
-                                    desc = await describe_image(str(src))
-                                    file_notes.append(f"{src.name} — {desc}")
-                                except Exception as e:
-                                    print(
-                                        f"[DESCRIBE] Failed to describe image {src.name}: {e}"
-                                    )
-                                    file_notes.append(
-                                        f"{src.name} — (image description unavailable)"
-                                    )
-                            else:
-                                file_notes.append(f"{src.name} (in attached_files/)")
-                        else:
-                            if copied:
-                                file_notes.append(
-                                    f"{src.name} (in attached_files/)"
+                file_notes = []
+                for ip in img_paths:
+                    src = Path(ip).resolve()
+                    file_ext = src.suffix.lower()
+                    # Use attached_files subfolder for all attached files
+                    attached_files_dir = Path(project_dir) / "attached_files"
+                    attached_files_dir.mkdir(exist_ok=True)
+                    dest = attached_files_dir / src.name
+                    copied = False
+                    try:
+                        shutil.copy2(str(src), str(dest))
+                        copied = True
+                        # For local mode, describe from project_dir where CC can access it
+                        if use_ollama and copied:
+                            src = dest
+                    except Exception as e:
+                        print(
+                            f"[UPLOAD] Failed to copy file {src.name} to attached_files/: {e}"
+                        )
+                    if use_ollama:
+                        # Local mode: describe image via Ollama's native multimodal API
+                        # since CC's Read tool dumps base64 text that local models can't parse
+                        if file_ext in _IMAGE_EXTS:
+                            try:
+                                desc = await describe_image(str(src))
+                                file_notes.append(f"{src.name} — {desc}")
+                            except Exception as e:
+                                print(
+                                    f"[DESCRIBE] Failed to describe image {src.name}: {e}"
                                 )
-                            else:
-                                file_notes.append(str(src).replace("\\", "/"))
-                    if file_notes:
-                        files_str = "\n".join(f"  • {note}" for note in file_notes)
-                        prompt += f"\n\n[User attached {len(file_notes)} file(s). See attached_files/ for the files.]\n{files_str}"
+                                file_notes.append(
+                                    f"{src.name} — (image description unavailable)"
+                                )
+                        else:
+                            file_notes.append(f"{src.name} (in attached_files/)")
+                    else:
+                        if copied:
+                            file_notes.append(
+                                f"{src.name} (in attached_files/)"
+                            )
+                        else:
+                            file_notes.append(str(src).replace("\\", "/"))
+                if file_notes:
+                    files_str = "\n".join(f"  • {note}" for note in file_notes)
+                    prompt += f"\n\n[User attached {len(file_notes)} file(s). See attached_files/ for the files.]\n{files_str}"
         # Create draft message in DB immediately so it survives navigation/restarts.
         # If parent already has an empty assistant child (stale draft), reuse it.
         draft_msg = None
@@ -2378,6 +2380,7 @@ async def _handle_claude_generation(
                     file_notes = []
                     for ip in img_paths:
                         src = Path(ip).resolve()
+                        file_ext = src.suffix.lower()
                         # Use attached_files subfolder for all attached files
                         attached_files_dir = Path(project_dir) / "attached_files"
                         attached_files_dir.mkdir(exist_ok=True)
@@ -2396,7 +2399,7 @@ async def _handle_claude_generation(
                         if use_ollama:
                             # Local mode: describe image via Ollama's native multimodal API
                             # since CC's Read tool dumps base64 text that local models can't parse
-                            if ext in _IMAGE_EXTS:
+                            if file_ext in _IMAGE_EXTS:
                                 try:
                                     desc = await describe_image(str(src))
                                     file_notes.append(f"{src.name} — {desc}")
@@ -2417,9 +2420,8 @@ async def _handle_claude_generation(
                             else:
                                 file_notes.append(str(src).replace("\\", "/"))
                     if file_notes:
-                        if use_ollama:
-                            files_str = "\n".join(f"  • {note}" for note in file_notes)
-                            fallback_prompt += f"\n\n[User attached {len(file_notes)} file(s). See attached_files/ for the files.]\n{files_str}"
+                        files_str = "\n".join(f"  • {note}" for note in file_notes)
+                        fallback_prompt += f"\n\n[User attached {len(file_notes)} file(s). See attached_files/ for the files.]\n{files_str}"
 
             proc, event_stream = await claude_client.run_claude(
                 fallback_prompt,
