@@ -15,6 +15,7 @@ loom_test.db
 
 # Uploaded files
 uploads/
+attached_files/
 
 # IDE
 .vscode/

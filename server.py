@@ -2009,6 +2009,7 @@ async def _handle_claude_generation(
                         src = Path(ip).resolve()
                         # Use attached_files subfolder for all attached files
                         attached_files_dir = Path(project_dir) / "attached_files"
+                        attached_files_dir.mkdir(exist_ok=True)
                         dest = attached_files_dir / src.name
                         copied = False
                         try:
@@ -2366,6 +2367,7 @@ async def _handle_claude_generation(
                         src = Path(ip).resolve()
                         # Use attached_files subfolder for all attached files
                         attached_files_dir = Path(project_dir) / "attached_files"
+                        attached_files_dir.mkdir(exist_ok=True)
                         dest = attached_files_dir / src.name
                         copied = False
                         try:

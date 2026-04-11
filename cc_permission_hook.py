@@ -28,13 +28,13 @@ READ_ONLY = {
     # Claude Code tools (CamelCase)
     "Read", "Glob", "Grep", "WebSearch", "WebFetch", "Task",
     "TaskGet", "TaskList", "TaskUpdate", "TaskCreate", "TaskStop",
-    "TaskOutput", "AskUserQuestion", "TodoWrite", "Skill",
+    "TaskOutput", "TodoWrite", "Skill",
     "EnterPlanMode", "EnterWorktree", "ExitWorktree",
     "Explore", "CronList", "ToolSearch", "Agent",
     # Gemini CLI tools (snake_case)
     "read_file", "read_many_files", "glob", "grep_search",
     "list_directory", "google_web_search", "web_fetch",
-    "ask_user", "write_todos", "enter_plan_mode",
+    "write_todos", "enter_plan_mode",
     "cli_help", "codebase_investigator", "get_internal_docs",
 }
 
