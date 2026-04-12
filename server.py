@@ -2176,13 +2176,21 @@ async def _handle_claude_generation(
                 print(f"[CC] No parent_id, no branch to retrieve")
                 prompt = "(continue)"
 
-        # Ensure canvas CLAUDE.md exists if canvas is enabled
+        # Ensure canvas CLAUDE.md and CANVAS_GUIDE.md exist if canvas is enabled
         if canvas_enabled and project_dir != ".":
-            canvas_claude_md = Path(project_dir) / "canvas" / "CLAUDE.md"
+            canvas_dir = Path(project_dir) / "canvas"
+            canvas_claude_md = canvas_dir / "CLAUDE.md"
             if not canvas_claude_md.exists():
-                canvas_claude_md.parent.mkdir(parents=True, exist_ok=True)
+                canvas_dir.mkdir(parents=True, exist_ok=True)
                 canvas_claude_md.write_text(
                     CANVAS_CLAUDE_MD,
+                    encoding="utf-8",
+                )
+            canvas_guide = canvas_dir / "CANVAS_GUIDE.md"
+            guide_source = Path(__file__).parent / "CANVAS_GUIDE.md"
+            if not canvas_guide.exists() and guide_source.is_file():
+                canvas_guide.write_text(
+                    guide_source.read_text(encoding="utf-8"),
                     encoding="utf-8",
                 )
 
