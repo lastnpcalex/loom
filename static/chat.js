@@ -2842,6 +2842,38 @@ function updateCanvasVisibility() {
 
 document.getElementById('btn-canvas-toggle')?.addEventListener('click', toggleCanvas);
 
+// ── Canvas postMessage Bridge ──
+// Allows canvas iframes to trigger Loom actions via window.parent.postMessage
+window.addEventListener('message', async (e) => {
+    // Only accept messages from our own canvas iframes
+    if (!e.data || e.data.source !== 'loom-canvas') return;
+    const convId = State.currentConvId;
+    if (!convId) return;
+
+    if (e.data.type === 'send-message') {
+        // Create user message and trigger generation
+        try {
+            const payload = { role: 'user', content: e.data.content || '' };
+            if (e.data.image_paths) payload.image_path = e.data.image_paths;
+            if (e.data.parent_id !== undefined) payload.parent_id = e.data.parent_id;
+            const resp = await fetch(`/api/conversations/${convId}/messages`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const msg = await resp.json();
+            if (msg.id) {
+                _triggerParallelGenerate(1, msg.id);
+                // Notify canvas of the message ID
+                e.source?.postMessage({ source: 'loom-host', type: 'message-sent', id: msg.id }, '*');
+            }
+        } catch (err) {
+            e.source?.postMessage({ source: 'loom-host', type: 'error', error: err.message }, '*');
+        }
+    } else if (e.data.type === 'get-conv-id') {
+        e.source?.postMessage({ source: 'loom-host', type: 'conv-id', convId }, '*');
+    }
+});
+
 // ── Code Block Preview ──
 
 function toggleCodePreview(wrapper, btn) {
