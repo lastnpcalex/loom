@@ -321,6 +321,8 @@ async def _run_migrations(db):
         "ALTER TABLE messages ADD COLUMN state_deltas TEXT",
         # Track which model generated each message (for provider switch detection)
         "ALTER TABLE messages ADD COLUMN cc_model_used TEXT",
+        # Canvas view: embedded website preview in tree view
+        "ALTER TABLE conversations ADD COLUMN canvas_enabled INTEGER DEFAULT 0",
     ]
     for sql in migrations:
         try:
@@ -637,6 +639,8 @@ async def update_conversation_fields(conv_id: int, **fields):
         "local_model",
         "cc_permission_mode",
         "ooda_enabled",
+        "canvas_enabled",
+        "project_dir",
     }
     updates = []
     params = []

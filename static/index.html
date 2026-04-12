@@ -150,7 +150,8 @@
                 </div>
                 <div id="tree-search-separator" class="hidden"></div>
                 <button id="tree-layout-toggle" title="Toggle layout">⇄</button>
-                <button id="tree-center-btn" title="Fit all nodes in view">⌖</button>
+                <button id="tree-center-btn" title="Fit all nodes in view">⛶</button>
+                <button id="btn-canvas-focus" title="Focus on Canvas" class="hidden">⌖</button>
                 <button id="btn-state-panel-tree" title="State Cards" class="hidden">▣</button>
                 <button id="btn-tree-last-branch" title="Return to last branch">↩</button>
                 <button id="tree-search-btn" title="Search tree">&#8981;</button>
@@ -166,6 +167,9 @@
                     </div>
                 </div>
                 <div id="tree-state-cards-list"></div>
+            </div>
+            <div id="canvas-fullview" class="hidden">
+                <iframe id="canvas-fullview-iframe" sandbox="allow-scripts allow-same-origin"></iframe>
             </div>
             <div id="tree-canvas">
                 <div id="tree-nodes"></div>
@@ -229,6 +233,7 @@
                     <option value="default">Act</option>
                     <option value="plan">Plan</option>
                 </select>
+                <button id="btn-canvas-toggle" class="hidden" title="Toggle Canvas view">Canvas</button>
             </div>
             <div id="input-row">
                 <label id="btn-attach" title="Attach file">

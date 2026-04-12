@@ -400,6 +400,10 @@ function handleWSMessage(data) {
             break;
         }
 
+        case 'canvas_updated':
+            refreshCanvasIframe();
+            break;
+
         case 'state_update':
             // OODA harness updated branch state — refresh with branch-aware data
             if (State.currentConvId) {
@@ -2603,12 +2607,18 @@ function showPermissionPrompt(data) {
         prompt.className = 'permission-prompt plan-prompt';
         let planInput = data.tool_input || {};
         if (typeof planInput === 'string') try { planInput = JSON.parse(planInput); } catch {}
-        const planText = escapeHtml(planInput.plan || planInput.planFilePath || data.input_summary || '');
+        const planRaw = planInput.plan || planInput.planFilePath || data.input_summary || '';
+        const planFileName = planInput.planFilePath ? planInput.planFilePath.split(/[/\\]/).pop() : '';
+        // Render plan as markdown if marked is available, otherwise fall back to escaped pre
+        const planHtml = (typeof marked !== 'undefined' && planRaw.length > 10)
+            ? DOMPurify.sanitize(marked.parse(planRaw))
+            : '<pre>' + escapeHtml(planRaw) + '</pre>';
         prompt.innerHTML = '<div class="permission-header">' +
             '<span class="permission-icon">&#x1F9F5;</span>' +
             '<span class="permission-title">Plan Ready for Review</span>' +
+            (planFileName ? '<span class="plan-filename">' + escapeHtml(planFileName) + '</span>' : '') +
             '</div>' +
-            (planText ? '<div class="permission-body"><div class="permission-input"><pre>' + planText + '</pre></div></div>' : '') +
+            (planRaw ? '<div class="permission-body"><div class="permission-input plan-content">' + planHtml + '</div></div>' : '') +
             '<div class="permission-actions">' +
             '<button class="btn-permission allow plan-approve" data-perm-action="allow" data-request-id="' + data.request_id + '">Approve Plan</button>' +
             '<button class="btn-permission deny plan-revise" data-perm-action="deny" data-request-id="' + data.request_id + '">Revise</button>' +
@@ -2756,6 +2766,81 @@ function hidePlanBar() {
     const existing = document.getElementById('plan-bar');
     if (existing) existing.remove();
 }
+
+// ── Canvas ──
+
+function refreshCanvasIframe() {
+    if (!State.currentConvId) return;
+    const src = `/api/canvas/${State.currentConvId}/index.html?t=${Date.now()}`;
+    // Refresh whichever canvas iframe is visible
+    const fullview = document.getElementById('canvas-fullview-iframe');
+    if (fullview && !document.getElementById('canvas-fullview')?.classList.contains('hidden')) {
+        fullview.src = src;
+    }
+    // Also refresh the tree node thumbnail
+    const thumb = document.querySelector('.canvas-node-iframe');
+    if (thumb) thumb.src = src;
+}
+
+function openCanvasFullview() {
+    const fullview = document.getElementById('canvas-fullview');
+    if (!fullview || !State.currentConvId) return;
+    fullview.classList.remove('hidden');
+    const iframe = document.getElementById('canvas-fullview-iframe');
+    iframe.src = `/api/canvas/${State.currentConvId}/index.html?t=${Date.now()}`;
+    // Show tree button so user can navigate back
+    const treeBtn = document.getElementById('btn-to-tree');
+    if (treeBtn) treeBtn.classList.remove('hidden');
+    // Hide canvas toggle — no purpose inside the canvas
+    const canvasBtn = document.getElementById('btn-canvas-toggle');
+    if (canvasBtn) canvasBtn.classList.add('hidden');
+}
+
+function closeCanvasFullview() {
+    const fullview = document.getElementById('canvas-fullview');
+    if (fullview) fullview.classList.add('hidden');
+    // Hide tree button again if we're in tree view
+    if (State.currentView === 'tree') {
+        const treeBtn = document.getElementById('btn-to-tree');
+        if (treeBtn) treeBtn.classList.add('hidden');
+    }
+    // Restore canvas toggle button
+    const canvasBtn = document.getElementById('btn-canvas-toggle');
+    if (canvasBtn && State.currentConv?.mode === 'claude') canvasBtn.classList.remove('hidden');
+}
+
+async function toggleCanvas() {
+    if (!State.currentConvId || !State.currentConv) return;
+    const isEnabled = State.currentConv.canvas_enabled;
+    const newState = !isEnabled;
+    try {
+        await API.post(`/api/conversations/${State.currentConvId}/canvas`, { enabled: newState });
+        State.currentConv.canvas_enabled = newState ? 1 : 0;
+        const btn = document.getElementById('btn-canvas-toggle');
+        if (btn) btn.classList.toggle('active', newState);
+        // Re-render tree without resetting camera position
+        if (typeof TREE !== 'undefined') TREE._skipCenter = true;
+        if (typeof renderTree === 'function') renderTree();
+    } catch (e) {
+        console.error('Canvas toggle failed:', e);
+    }
+}
+
+function updateCanvasVisibility() {
+    const btn = document.getElementById('btn-canvas-toggle');
+    if (!btn) return;
+    const hasConv = !!State.currentConv;
+    const showBtn = hasConv && State.currentView === 'tree';
+    btn.classList.toggle('hidden', !showBtn);
+    if (btn) btn.classList.toggle('active', !!(hasConv && State.currentConv?.canvas_enabled));
+    // Show/hide canvas focus button in tree toolbar
+    const focusBtn = document.getElementById('btn-canvas-focus');
+    if (focusBtn) focusBtn.classList.toggle('hidden', !(showBtn && State.currentConv?.canvas_enabled));
+    // Close fullview if canvas was disabled
+    if (!State.currentConv?.canvas_enabled) closeCanvasFullview();
+}
+
+document.getElementById('btn-canvas-toggle')?.addEventListener('click', toggleCanvas);
 
 // ── Code Block Preview ──
 

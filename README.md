@@ -104,6 +104,18 @@ Loom conversations can switch between Anthropic, Gemini, and local Ollama models
 
 > **Note:** `AskUserQuestion` is disabled in Loom's CC modes. CC's headless `-p` mode has no mechanism to send user responses back to an active `AskUserQuestion` tool call — stdin is closed after the initial prompt. This is an [open feature request](https://github.com/anthropics/claude-code/issues/16712) in Claude Code. When CC adds support for `--input-format stream-json` responses to pending tool calls, Loom can re-enable interactive questions. Until then, CC proceeds with its best judgment instead of asking.
 
+## Interactive Canvas
+
+Any conversation can enable an **Interactive Canvas** — a live website (HTML/CSS/JS) rendered within the Loom UI that the AI builds and maintains through chat. Toggle it with the Canvas button in tree view.
+
+The canvas appears as a **meta-root node** in the tree visualization — a glowing thumbnail positioned above all branch roots, connected by bezier curves. It looks like the trunk of the tree, with conversation branches growing from it. Click the canvas node to open the fullview, where the iframe fills the screen while the chat bar stays visible so you can keep directing the AI.
+
+- Works with all modes (Loom, Braid, Weave, Gemini)
+- Live refresh — when the AI writes to the `canvas/` directory, the iframe auto-updates via WebSocket
+- Progressive LOD — the canvas thumbnail blurs as you zoom out, with a pulsing cyan beacon at maximum zoom so you can always find it
+- Canvas focus button (⌖) in the tree toolbar pans directly to the canvas node
+- Zero-config — enabling canvas auto-creates the workspace directory and a `canvas/CLAUDE.md` with instructions for the AI
+
 ## Common features
 
 All four modes share the same conversation infrastructure:

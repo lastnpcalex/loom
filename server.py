@@ -277,6 +277,73 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 
+# ── Canvas ──
+
+
+@app.post("/api/conversations/{conv_id}/canvas")
+async def toggle_canvas(conv_id: int, data: dict = None):
+    """Enable or disable canvas for a conversation."""
+    data = data or {}
+    enabled = bool(data.get("enabled", True))
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    project_dir = conv.get("project_dir") or ""
+    if enabled and not project_dir:
+        # Auto-create a workspace for conversations without a project_dir
+        workspace = Path("canvas_workspaces") / str(conv_id)
+        workspace.mkdir(parents=True, exist_ok=True)
+        project_dir = str(workspace)
+        await db.update_conversation_fields(conv_id, project_dir=project_dir)
+
+    if enabled:
+        canvas_dir = Path(project_dir) / "canvas"
+        canvas_dir.mkdir(parents=True, exist_ok=True)
+        index_file = canvas_dir / "index.html"
+        if not index_file.exists():
+            index_file.write_text(
+                '<!DOCTYPE html>\n<html><head><meta charset="utf-8">'
+                "<title>Canvas</title></head>\n"
+                "<body><h1>Canvas ready</h1></body></html>\n",
+                encoding="utf-8",
+            )
+
+    await db.update_conversation_fields(conv_id, canvas_enabled=1 if enabled else 0)
+    return {"ok": True, "enabled": enabled, "project_dir": project_dir}
+
+
+@app.get("/api/canvas/{conv_id}")
+async def list_canvas_files(conv_id: int):
+    """List files in a conversation's canvas directory."""
+    conv = await db.get_conversation(conv_id)
+    if not conv or not conv.get("project_dir"):
+        return JSONResponse({"error": "No canvas"}, status_code=404)
+    canvas_dir = Path(conv["project_dir"]) / "canvas"
+    if not canvas_dir.is_dir():
+        return {"files": []}
+    files = [f.name for f in canvas_dir.iterdir() if f.is_file()]
+    return {"files": sorted(files)}
+
+
+@app.get("/api/canvas/{conv_id}/{file_path:path}")
+async def serve_canvas_file(conv_id: int, file_path: str = "index.html"):
+    """Serve a file from a conversation's canvas directory."""
+    conv = await db.get_conversation(conv_id)
+    if not conv or not conv.get("project_dir"):
+        return JSONResponse({"error": "No canvas"}, status_code=404)
+    canvas_dir = Path(conv["project_dir"]).resolve() / "canvas"
+    if not file_path:
+        file_path = "index.html"
+    target = (canvas_dir / file_path).resolve()
+    # Path traversal guard
+    if not str(target).startswith(str(canvas_dir)):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+    if not target.is_file():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return FileResponse(str(target))
+
+
 @app.get("/")
 async def index():
     return FileResponse("static/index.html")
@@ -1425,6 +1492,29 @@ async def handle_cc_permission(data: dict):
     elif isinstance(tool_input, str):
         input_summary = tool_input[:500]
 
+    # For ExitPlanMode, read the actual plan file content
+    if tool_name in ("ExitPlanMode", "exit_plan_mode"):
+        plan_content = ""
+        # Check project-local .claude/plans/ first, then user-level
+        conv = await db.get_conversation(conv_id) if conv_id else None
+        plan_dirs = []
+        if conv and conv.get("project_dir"):
+            plan_dirs.append(Path(conv["project_dir"]) / ".claude" / "plans")
+        plan_dirs.append(Path.home() / ".claude" / "plans")
+        for plan_dir in plan_dirs:
+            if plan_dir.is_dir():
+                plan_files = sorted(plan_dir.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
+                if plan_files:
+                    try:
+                        plan_content = plan_files[0].read_text(encoding="utf-8")
+                        print(f"[PERM] Read plan file: {plan_files[0]} ({len(plan_content)} chars)")
+                    except Exception as e:
+                        print(f"[PERM] Failed to read plan file: {e}")
+                    break
+        if plan_content:
+            input_summary = plan_content
+            tool_input = {"plan": plan_content, "planFilePath": str(plan_files[0])}
+
     # Sanitize strings — tool_input can contain surrogate characters that crash WS send
     def _sanitize(obj):
         if isinstance(obj, str):
@@ -1887,6 +1977,7 @@ async def _handle_claude_generation(
             parent_id = leaf["id"] if leaf else None
 
         project_dir = conv.get("project_dir") or "."
+        canvas_enabled = bool(conv.get("canvas_enabled"))
         if project_dir != "." and not os.path.isdir(project_dir):
             await _ws_send(
                 conv_id,
@@ -2008,6 +2099,21 @@ async def _handle_claude_generation(
             else:
                 print(f"[CC] No parent_id, no branch to retrieve")
                 prompt = "(continue)"
+
+        # Ensure canvas CLAUDE.md exists if canvas is enabled
+        if canvas_enabled and project_dir != ".":
+            canvas_claude_md = Path(project_dir) / "canvas" / "CLAUDE.md"
+            if not canvas_claude_md.exists():
+                canvas_claude_md.parent.mkdir(parents=True, exist_ok=True)
+                canvas_claude_md.write_text(
+                    "# Interactive Canvas\n\n"
+                    "This directory is a live canvas rendered in the user's browser.\n\n"
+                    "- Entry point: `index.html`\n"
+                    "- Use relative paths for CSS, JS, and images\n"
+                    "- The canvas auto-refreshes when you write files here\n"
+                    "- Build progressively — start simple, add interactivity over turns\n",
+                    encoding="utf-8",
+                )
 
         # Attach images if present on the latest user message
         # (runs for both session-resume and fresh-session paths)
@@ -2300,6 +2406,17 @@ async def _handle_claude_generation(
                     content=full_text,
                     content_blocks=json.dumps(content_blocks),
                 )
+                # Notify frontend if a canvas file was written
+                if canvas_enabled:
+                    matched_block = None
+                    for block in reversed(content_blocks):
+                        if block["type"] == "tool_use" and block.get("tool_id") == tool_id:
+                            matched_block = block
+                            break
+                    if matched_block and matched_block.get("name") in ("Write", "Edit", "MultiEdit"):
+                        tool_input_str = matched_block.get("input", "")
+                        if "canvas/" in tool_input_str or "canvas\\" in tool_input_str:
+                            await _ws_send(conv_id, {"type": "canvas_updated"})
 
             elif etype == "thinking_delta":
                 if current_block and current_block["type"] == "thinking":

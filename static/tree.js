@@ -99,10 +99,11 @@ function initCanvas() {
     });
 
     // Zoom with scroll wheel
+    let _zoomHideTimer = null;
     canvas.addEventListener('wheel', (e) => {
         e.preventDefault();
         const delta = e.deltaY > 0 ? 0.9 : 1.1;
-        const newZoom = Math.max(0.05, Math.min(3, TREE.zoom * delta));
+        const newZoom = Math.max(0.02, Math.min(5, TREE.zoom * delta));
 
         // Zoom toward mouse position
         const rect = canvas.getBoundingClientRect();
@@ -113,6 +114,14 @@ function initCanvas() {
         TREE.panY = my - (my - TREE.panY) * (newZoom / TREE.zoom);
         TREE.zoom = newZoom;
         applyTransform();
+
+        // Hide canvas iframe during zoom for performance, restore after idle
+        const cIframe = document.querySelector('.canvas-node-iframe');
+        if (cIframe) {
+            cIframe.style.visibility = 'hidden';
+            clearTimeout(_zoomHideTimer);
+            _zoomHideTimer = setTimeout(() => { cIframe.style.visibility = ''; }, 150);
+        }
     }, { passive: false });
 
     // Prevent context menu on canvas
@@ -156,7 +165,7 @@ function initCanvas() {
             const dist = Math.hypot(dx, dy);
             if (_lastPinchDist > 0) {
                 const scale = dist / _lastPinchDist;
-                const newZoom = Math.max(0.05, Math.min(3, TREE.zoom * scale));
+                const newZoom = Math.max(0.02, Math.min(5, TREE.zoom * scale));
                 const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
                 const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
                 const rect = canvas.getBoundingClientRect();
@@ -223,7 +232,7 @@ function centerLoom() {
     const availW = canvasRect.width - padding * 2;
     const availH = canvasRect.height - padding * 2;
 
-    const zoom = Math.min(1.5, Math.max(0.05, Math.min(availW / contentW, availH / contentH)));
+    const zoom = Math.min(1.5, Math.max(0.02, Math.min(availW / contentW, availH / contentH)));
     const panX = padding + (availW - contentW * zoom) / 2 - minX * zoom;
     const panY = padding + (availH - contentH * zoom) / 2 - minY * zoom;
 
@@ -263,6 +272,30 @@ function panToNode(msgId) {
         TREE.panX += dx * 0.15;
         TREE.panY += dy * 0.15;
         TREE.zoom += dz * 0.15;
+        applyTransform();
+        frame = requestAnimationFrame(animate);
+    }
+    animate();
+}
+
+function panToCanvasNode() {
+    const canvas = document.getElementById('tree-canvas');
+    const cp = TREE._canvasNodePos;
+    if (!canvas || !cp) return;
+    const canvasRect = canvas.getBoundingClientRect();
+    const targetZoom = Math.max(0.8, Math.min(TREE.zoom, 1.2));
+    const targetPanX = canvasRect.width / 2 - (cp.x + cp.width / 2) * targetZoom;
+    const targetPanY = canvasRect.height / 2 - (cp.y + cp.height / 2) * targetZoom;
+    let frame;
+    function animate() {
+        const dx = targetPanX - TREE.panX;
+        const dy = targetPanY - TREE.panY;
+        const dz = targetZoom - TREE.zoom;
+        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5 && Math.abs(dz) < 0.005) {
+            TREE.panX = targetPanX; TREE.panY = targetPanY; TREE.zoom = targetZoom;
+            applyTransform(); return;
+        }
+        TREE.panX += dx * 0.15; TREE.panY += dy * 0.15; TREE.zoom += dz * 0.15;
         applyTransform();
         frame = requestAnimationFrame(animate);
     }
@@ -372,6 +405,12 @@ function initTreeToolbar() {
     const centerBtn = document.getElementById('tree-center-btn');
     if (centerBtn) {
         centerBtn.addEventListener('click', centerLoom);
+    }
+    const canvasFocusBtn = document.getElementById('btn-canvas-focus');
+    if (canvasFocusBtn) {
+        canvasFocusBtn.addEventListener('click', () => {
+            if (TREE._canvasNodePos) panToCanvasNode();
+        });
     }
     initTreeSearch();
 }
@@ -650,6 +689,60 @@ async function renderTree() {
         };
     }
 
+    // Canvas meta-root node (if enabled)
+    let canvasNodePos = null;
+    TREE._canvasNodePos = null;
+    if (State.currentConv?.canvas_enabled && roots.length > 0) {
+        const CANVAS_W = 320;
+        const CANVAS_H = 200;
+        const GAP = TREE.vertical ? TREE.gapY : TREE.gapX;
+
+        // Find root positions to center the canvas node above/before them
+        // Offset scales with tree spread so the canvas looks like a trunk/root
+        const rootPositions = roots.map(rid => positions[rid]).filter(Boolean);
+        let cx, cy;
+        if (TREE.vertical) {
+            const minX = Math.min(...rootPositions.map(p => p.x));
+            const maxX = Math.max(...rootPositions.map(p => p.x + p.width));
+            const spread = maxX - minX;
+            const trunkGap = GAP + spread * 0.3;
+            cx = (minX + maxX) / 2 - CANVAS_W / 2;
+            const minY = Math.min(...rootPositions.map(p => p.y));
+            cy = minY - CANVAS_H - trunkGap;
+        } else {
+            const minY = Math.min(...rootPositions.map(p => p.y));
+            const maxY = Math.max(...rootPositions.map(p => p.y + p.height));
+            const spread = maxY - minY;
+            const trunkGap = GAP + spread * 0.3;
+            cy = (minY + maxY) / 2 - CANVAS_H / 2;
+            const minX = Math.min(...rootPositions.map(p => p.x));
+            cx = minX - CANVAS_W - trunkGap;
+        }
+
+        const canvasEl = document.createElement('div');
+        canvasEl.className = 'tree-node-card canvas-root';
+        canvasEl.innerHTML = `
+            <div class="canvas-node-header">Canvas</div>
+            <iframe class="canvas-node-iframe" sandbox="allow-scripts allow-same-origin"
+                scrolling="no" src="/api/canvas/${State.currentConvId}/index.html?t=${Date.now()}"></iframe>
+        `;
+        canvasEl.style.position = 'absolute';
+        canvasEl.style.left = cx + 'px';
+        canvasEl.style.top = cy + 'px';
+        canvasEl.style.width = CANVAS_W + 'px';
+        container.appendChild(canvasEl);
+
+        canvasNodePos = { x: cx, y: cy, width: CANVAS_W, height: CANVAS_H };
+        TREE._canvasNodePos = canvasNodePos;
+
+        // Click to open full canvas view
+        canvasEl.addEventListener('click', (e) => {
+            if (TREE.isPanning || TREE._touchMoved) return;
+            e.stopPropagation();
+            if (typeof openCanvasFullview === 'function') openCanvasFullview();
+        });
+    }
+
     container.insertBefore(svg, container.firstChild);
 
     // Initialize canvas if first render
@@ -670,6 +763,80 @@ async function renderTree() {
             }
         }
         drawConnectors(svg, layout.nodes, positions);
+        // Draw connectors from canvas node to edge roots + viewport-nearest roots
+        if (canvasNodePos && roots.length > 0) {
+            const connectedSet = new Set();
+            const validRoots = roots.filter(rid => positions[rid]);
+            if (validRoots.length > 0) {
+                // Always connect to edge roots (min/max position)
+                const axis = TREE.vertical ? 'x' : 'y';
+                let minRoot = validRoots[0], maxRoot = validRoots[0];
+                let minVal = Infinity, maxVal = -Infinity;
+                for (const rid of validRoots) {
+                    const v = positions[rid][axis];
+                    if (v < minVal) { minVal = v; minRoot = rid; }
+                    if (v > maxVal) { maxVal = v; maxRoot = rid; }
+                }
+                connectedSet.add(minRoot);
+                connectedSet.add(maxRoot);
+
+                // Also connect to up to 3 roots nearest to viewport center
+                const canvasEl = document.getElementById('tree-canvas');
+                if (canvasEl) {
+                    const rect = canvasEl.getBoundingClientRect();
+                    const vpCx = (rect.width / 2 - TREE.panX) / TREE.zoom;
+                    const vpCy = (rect.height / 2 - TREE.panY) / TREE.zoom;
+                    const byDist = validRoots
+                        .filter(rid => !connectedSet.has(rid))
+                        .map(rid => {
+                            const rp = positions[rid];
+                            const dx = (rp.x + rp.width / 2) - vpCx;
+                            const dy = (rp.y + (rp.height || 32) / 2) - vpCy;
+                            return { rid, dist: dx * dx + dy * dy };
+                        })
+                        .sort((a, b) => a.dist - b.dist);
+                    for (let i = 0; i < Math.min(3, byDist.length); i++) {
+                        connectedSet.add(byDist[i].rid);
+                    }
+                }
+
+                // Mark connected roots for CSS glow
+                for (const rid of connectedSet) {
+                    const el = container.querySelector(`.tree-node-card[data-msg-id="${rid}"]`);
+                    if (el) el.classList.add('canvas-connected');
+                }
+
+                // Draw the connectors
+                const color = TREE.connectorActiveColor;
+                for (const rid of connectedSet) {
+                    const rp = positions[rid];
+                    let d;
+                    if (TREE.vertical) {
+                        const x1 = canvasNodePos.x + canvasNodePos.width / 2;
+                        const y1 = canvasNodePos.y + canvasNodePos.height;
+                        const x2 = rp.x + rp.width / 2;
+                        const y2 = rp.y;
+                        const midY = y1 + (y2 - y1) / 2;
+                        d = `M${x1},${y1} C${x1},${midY} ${x2},${midY} ${x2},${y2}`;
+                    } else {
+                        const x1 = canvasNodePos.x + canvasNodePos.width;
+                        const y1 = canvasNodePos.y + canvasNodePos.height / 2;
+                        const x2 = rp.x;
+                        const y2 = rp.y + (rp.height || 32) / 2;
+                        const midX = x1 + (x2 - x1) / 2;
+                        d = `M${x1},${y1} C${midX},${y1} ${midX},${y2} ${x2},${y2}`;
+                    }
+                    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                    path.setAttribute('d', d);
+                    path.setAttribute('fill', 'none');
+                    path.setAttribute('stroke', color);
+                    path.setAttribute('stroke-width', '2');
+                    path.setAttribute('stroke-linecap', 'round');
+                    path.classList.add('canvas-connector');
+                    svg.appendChild(path);
+                }
+            }
+        }
         // Reapply search highlights if a search is active
         if (TREE.searchMatches.length > 0) {
             applyTreeSearchHighlight();
@@ -677,6 +844,9 @@ async function renderTree() {
             if (TREE.searchIndex >= 0) {
                 panToNode(TREE.searchMatches[TREE.searchIndex]);
             }
+        } else if (TREE._skipCenter) {
+            TREE._skipCenter = false;
+            applyTransform();
         } else {
             centerLoom();
         }

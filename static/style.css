@@ -633,9 +633,10 @@ body::after {
 }
 #tree-toolbar button {
     background: var(--surface);
-    border: 1px solid var(--border);
+    border: 1px solid rgba(191, 0, 255, 0.35);
     border-radius: var(--radius);
-    color: var(--text-secondary);
+    color: rgba(200, 130, 255, 0.9);
+    font-family: 'Segoe UI Symbol', 'Noto Sans Symbols2', var(--font-main);
     font-size: 18px;
     width: 36px;
     height: 36px;
@@ -644,11 +645,14 @@ body::after {
     display: flex;
     align-items: center;
     justify-content: center;
+    text-shadow: 0 0 8px rgba(191, 0, 255, 0.45);
+    box-shadow: 0 0 8px rgba(191, 0, 255, 0.15);
 }
 #tree-toolbar button:hover {
-    color: var(--cyan);
-    border-color: var(--cyan);
-    box-shadow: 0 0 8px rgba(0, 255, 255, 0.2);
+    color: var(--purple);
+    border-color: var(--purple);
+    box-shadow: 0 0 8px rgba(191, 0, 255, 0.4);
+    text-shadow: 0 0 8px rgba(191, 0, 255, 0.5);
 }
 
 /* Bookmarks panel */
@@ -1256,6 +1260,90 @@ body::after {
 
 #view-tree {
     position: relative;
+}
+
+/* ── Canvas Tree Node ── */
+.tree-node-card.canvas-root {
+    background: rgba(15, 5, 30, 0.95);
+    border: 2px solid rgba(0, 255, 255, 0.5);
+    border-radius: 8px;
+    overflow: hidden;
+    cursor: pointer;
+    transition: box-shadow 0.2s, border-color 0.2s;
+    box-shadow: 0 0 10px rgba(0, 255, 255, 0.35), 0 0 20px rgba(0, 255, 255, 0.15);
+    position: relative;
+    will-change: transform;
+    transform: translateZ(0);
+    contain: layout style paint;
+}
+/* Block scroll/wheel events from reaching the iframe */
+.tree-node-card.canvas-root::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+}
+.tree-node-card.canvas-root:hover {
+    border-color: rgba(0, 255, 255, 0.8);
+    box-shadow: 0 0 14px rgba(0, 255, 255, 0.4), 0 0 28px rgba(191, 0, 255, 0.3);
+}
+.canvas-node-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    font-size: 11px;
+    color: rgba(191, 0, 255, 0.7);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.canvas-node-iframe {
+    width: 100%;
+    height: 160px;
+    border: none;
+    border-top: 1px solid rgba(191, 0, 255, 0.15);
+    pointer-events: none;
+    background: #fff;
+    will-change: transform;
+    transform: translateZ(0);
+    content-visibility: auto;
+}
+
+/* ── Canvas Full View ── */
+#canvas-fullview {
+    position: absolute;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    background: rgba(5, 5, 15, 0.95);
+}
+#canvas-fullview-iframe {
+    flex: 1;
+    width: 100%;
+    border: none;
+    background: #fff;
+}
+
+#btn-canvas-toggle {
+    background: rgba(191, 0, 255, 0.1);
+    border: 1px solid rgba(191, 0, 255, 0.3);
+    color: rgba(191, 0, 255, 0.8);
+    border-radius: 4px;
+    padding: 2px 10px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+}
+#btn-canvas-toggle:hover {
+    background: rgba(191, 0, 255, 0.25);
+}
+#btn-canvas-toggle.active {
+    background: rgba(191, 0, 255, 0.3);
+    color: rgb(220, 180, 255);
+}
+#btn-canvas-focus {
 }
 
 #tree-canvas {
@@ -2529,6 +2617,9 @@ body::after {
     display: flex;
     gap: 8px;
     margin-bottom: 8px;
+    max-width: 800px;
+    margin-left: auto;
+    margin-right: auto;
 }
 #cc-inline-controls select {
     background: var(--surface);
@@ -3421,6 +3512,43 @@ pre.tool-output {
 }
 .plan-prompt .permission-icon { font-size: 18px; }
 .plan-prompt .permission-title { color: rgb(180, 130, 255); }
+.plan-prompt .plan-filename {
+    margin-left: auto;
+    font-size: 11px;
+    color: rgba(180, 130, 255, 0.5);
+    font-family: monospace;
+}
+.plan-prompt .plan-content {
+    max-height: 400px;
+    overflow-y: auto;
+    font-size: 13px;
+    line-height: 1.5;
+}
+.plan-prompt .plan-content h1,
+.plan-prompt .plan-content h2,
+.plan-prompt .plan-content h3 {
+    color: rgb(200, 170, 255);
+    margin-top: 0.8em;
+}
+.plan-prompt .plan-content h1 { font-size: 16px; }
+.plan-prompt .plan-content h2 { font-size: 14px; }
+.plan-prompt .plan-content h3 { font-size: 13px; }
+.plan-prompt .plan-content code {
+    background: rgba(0,0,0,0.3);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 12px;
+}
+.plan-prompt .plan-content pre {
+    background: rgba(0,0,0,0.3);
+    padding: 8px;
+    border-radius: 4px;
+    overflow-x: auto;
+}
+.plan-prompt .plan-content pre code {
+    background: none;
+    padding: 0;
+}
 .plan-prompt .permission-input pre {
     max-height: 300px;
     overflow-y: auto;
@@ -3849,6 +3977,53 @@ pre.tool-output {
 .lod-micro .tree-node-card {
     min-height: 12px !important;
     padding: 2px !important;
+}
+
+/* Canvas node LOD — keep size, blur content, grow glow */
+.lod-mid .canvas-node-iframe {
+    filter: blur(2px);
+    opacity: 0.6;
+}
+.lod-mid .canvas-root {
+    box-shadow: 0 0 20px rgba(0, 255, 255, 0.4),
+                0 0 40px rgba(0, 255, 255, 0.2),
+                0 0 60px rgba(0, 200, 255, 0.1) !important;
+}
+.lod-mini .canvas-node-iframe {
+    filter: blur(6px);
+    opacity: 0.3;
+}
+.lod-mini .canvas-root {
+    box-shadow: 0 0 30px rgba(0, 255, 255, 0.45),
+                0 0 60px rgba(0, 255, 255, 0.25),
+                0 0 100px rgba(0, 200, 255, 0.12) !important;
+}
+.lod-micro .canvas-node-iframe {
+    filter: blur(10px);
+    opacity: 0.15;
+}
+.lod-micro .canvas-root {
+    box-shadow: 0 0 40px rgba(0, 255, 255, 0.5),
+                0 0 80px rgba(0, 255, 255, 0.3),
+                0 0 140px rgba(0, 200, 255, 0.18),
+                0 0 200px rgba(0, 255, 255, 0.08) !important;
+    animation: canvas-beacon 2s ease-in-out infinite !important;
+}
+.lod-micro .canvas-connector {
+    stroke: rgba(0, 255, 255, 0.9) !important;
+    stroke-width: 3 !important;
+    filter: drop-shadow(0 0 8px rgba(0, 255, 255, 0.8))
+           drop-shadow(0 0 16px rgba(0, 255, 255, 0.5))
+           drop-shadow(0 0 30px rgba(0, 255, 255, 0.3)) !important;
+}
+.lod-micro .canvas-connected {
+    box-shadow: 0 0 16px 6px rgba(0, 255, 255, 0.5),
+                0 0 32px 10px rgba(0, 255, 255, 0.25) !important;
+    border-color: rgba(0, 255, 255, 0.7) !important;
+}
+@keyframes canvas-beacon {
+    0%, 100% { box-shadow: 0 0 40px rgba(0, 255, 255, 0.5), 0 0 80px rgba(0, 255, 255, 0.3), 0 0 140px rgba(0, 200, 255, 0.18), 0 0 200px rgba(0, 255, 255, 0.08); }
+    50% { box-shadow: 0 0 50px rgba(0, 255, 255, 0.65), 0 0 100px rgba(0, 255, 255, 0.4), 0 0 180px rgba(0, 200, 255, 0.22), 0 0 250px rgba(0, 255, 255, 0.12); }
 }
 
 /* ── Star Button ── */

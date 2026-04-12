@@ -293,3 +293,53 @@ async def describe_image(image_path: str, model: str = None) -> str:
             return msg.get("content") or msg.get("thinking") or "An image was shared."
     except Exception:
         return "An image was shared."
+
+
+async def describe_image_with_data(image_path: str, model: str = None) -> tuple[str, dict]:
+    """Use a multimodal Ollama model to describe an image AND return the image data for direct passing.
+
+    Returns:
+        Tuple of (description_text, image_payload) where image_payload is a dict with base64 image data
+        that can be used in Ollama's chat API.
+    """
+    global _mock_mode
+
+    if _mock_mode:
+        return ("An image was shared.", {})
+
+    try:
+        with open(image_path, "rb") as f:
+            img_data = base64.b64encode(f.read()).decode("utf-8")
+    except (IOError, OSError):
+        return ("An image was shared but could not be read.", {})
+
+    # Describe the image
+    try:
+        describe_payload = {
+            "model": model or config.ollama_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Describe this image in thorough detail. Include: subjects and their appearance (clothing, expression, posture, physical features), setting and environment, lighting and mood, composition and framing, any text or symbols visible, and notable artistic or photographic qualities. Describe what you observe objectively and completely without editorializing or omitting details. No preamble.",
+                    "images": [img_data],
+                }
+            ],
+            "stream": False,
+            "think": False,
+            "options": {
+                "temperature": 0.3,
+                "num_predict": 800,
+            },
+        }
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+            resp = await client.post(f"{config.ollama_host}/api/chat", json=describe_payload)
+            resp.raise_for_status()
+            data = resp.json()
+            msg = data.get("message", {})
+            description = msg.get("content") or msg.get("thinking") or "An image was shared."
+    except Exception:
+        description = "An image was shared."
+
+    # Return both description and the image payload for direct passing
+    return (description, {"images": [img_data]})

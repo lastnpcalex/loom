@@ -107,6 +107,9 @@ function switchView(view) {
         title.textContent = State.currentConv?.title || '—';
         breadcrumb.classList.add('hidden');
         treeBtn.classList.add('hidden');
+        // Close canvas fullview when returning to tree
+        if (typeof closeCanvasFullview === 'function') closeCanvasFullview();
+        if (typeof updateCanvasVisibility === 'function') updateCanvasVisibility();
 
         globalBmBtn?.classList.remove('hidden');
         inputArea?.classList.remove('hidden');
@@ -123,6 +126,7 @@ function switchView(view) {
         breadcrumb.classList.remove('hidden');
         treeBtn.classList.remove('hidden');
         updateBreadcrumbs();
+        if (typeof updateCanvasVisibility === 'function') updateCanvasVisibility();
 
         globalBmBtn?.classList.remove('hidden');
         inputArea?.classList.remove('hidden');
@@ -929,6 +933,9 @@ function updateInlineCCControls(conv) {
             fileInput.accept = 'image/*,.md,.txt,.pdf,.json,.csv,.py,.js,.ts,.html,.css,.yaml,.yml,.xml,.sh,.bat,.ps1,.docx,.xlsx';
         }
     }
+
+    // Canvas preview visibility
+    if (typeof updateCanvasVisibility === 'function') updateCanvasVisibility();
 }
 
 let _ollamaModelsCache = null;
