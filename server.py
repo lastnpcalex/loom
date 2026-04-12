@@ -1403,8 +1403,11 @@ async def handle_cc_permission(data: dict):
         f"[PERM] Hook request: conv={conv_id} tool={tool_name} request_id={request_id}"
     )
 
+    # These tools always need user interaction, even under "Allow All"
+    _interactive_tools = {"ExitPlanMode", "exit_plan_mode"}
+
     # Auto-approve if user previously clicked "Allow All" for this session
-    if conv_id in _auto_approve_sessions:
+    if conv_id in _auto_approve_sessions and tool_name not in _interactive_tools:
         print(f"[PERM] Auto-approved (Allow All active)")
         return {"allow": True}
 

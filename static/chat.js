@@ -1365,6 +1365,11 @@ function _renderPermissionNotifItem(n) {
             _renderNotifBell();
             // Also update the inline prompt if it exists
             resolvePermissionPrompt(n.requestId, allow);
+            // If plan was approved, flip dropdown back to Act
+            if (isPlanNotif && allow) {
+                const permSel = document.getElementById('cc-permission-mode-inline');
+                if (permSel) permSel.value = 'default';
+            }
             // Auto-remove after delay
             setTimeout(() => {
                 const idx = _notifications.indexOf(n);
@@ -2651,6 +2656,12 @@ function showPermissionPrompt(data) {
 
             // Also clear the notification bell
             resolvePermissionNotification(requestId, allow);
+
+            // If this was a plan approval, flip dropdown back to Act
+            if (prompt.classList.contains('plan-prompt') && allow) {
+                const permSel = document.getElementById('cc-permission-mode-inline');
+                if (permSel) permSel.value = 'default';
+            }
         });
     });
 
@@ -2665,6 +2676,12 @@ function resolvePermissionPrompt(requestId, allowed) {
         prompt.querySelectorAll('.btn-permission').forEach(b => b.disabled = true);
         prompt.querySelector('.permission-title').textContent = allowed ? 'Allowed' : 'Denied';
         prompt.classList.add(allowed ? 'resolved-allow' : 'resolved-deny');
+
+        // If this was a plan approval, flip dropdown back to Act
+        if (prompt.classList.contains('plan-prompt') && allowed) {
+            const permSel = document.getElementById('cc-permission-mode-inline');
+            if (permSel) permSel.value = 'default';
+        }
     }
 }
 
