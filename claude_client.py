@@ -185,15 +185,6 @@ def _configure_permission_hook(cwd: str) -> bool:
     # Use PreToolUse (not PermissionRequest — that doesn't fire in -p mode)
     # Matcher ".*" catches all tools; nested hooks array is required
     new_config = {
-        "permissions": {
-            "allow": [
-                "Read(.claude/**)",
-                "Write(.claude/commands/**)",
-                "Write(.claude/settings.json)",
-                "Edit(.claude/commands/**)",
-                "Edit(.claude/settings.json)",
-            ]
-        },
         "hooks": {
             "PreToolUse": [
                 {
@@ -217,23 +208,21 @@ def _configure_permission_hook(cwd: str) -> bool:
         except (json.JSONDecodeError, IOError):
             existing = {}
 
-    # Only write if hooks or permissions differ (idempotent check)
+    # Only write if the hooks section differs (idempotent check)
     existing_hooks = existing.get("hooks", {})
-    existing_perms = existing.get("permissions", {})
 
-    # Compare: skip write if PreToolUse command AND permissions are unchanged
-    perms_match = existing_perms.get("allow") == new_config["permissions"]["allow"]
-    if "PreToolUse" in existing_hooks and perms_match:
+    # Compare: skip write if PreToolUse exists and command is unchanged
+    # The command is nested at PreToolUse[0].hooks[0].command
+    if "PreToolUse" in existing_hooks:
         existing_item = existing_hooks["PreToolUse"][0]
         existing_cmd = existing_item.get("command", "") or existing_item.get("hooks", [{}])[0].get("command", "")
         if existing_cmd == hook_command:
             print(f"[CC] Skipping write: command unchanged")
             return False  # Already configured, skip write
 
-    # Merge into existing settings (preserve other config)
-    existing.update(new_config)
+    # Write settings
     claude_dir.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    settings_path.write_text(json.dumps(new_config, indent=2), encoding="utf-8")
     print(f"[CC] Hook configured/updated in {settings_path}")
 
     return True
