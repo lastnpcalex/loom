@@ -325,8 +325,8 @@ function handleWSMessage(data) {
         case 'permission_request':
             // Always add to notification bell (works from any conversation)
             addPermissionNotification(data);
-            // Also render inline if we're viewing the right conversation and streaming
-            if ((!data.conv_id || data.conv_id === State.currentConvId) && streamingDiv) {
+            // Also render inline if we're viewing the right conversation
+            if (!data.conv_id || data.conv_id === State.currentConvId) {
                 showPermissionPrompt(data);
             }
             // Push notification if tab is hidden
