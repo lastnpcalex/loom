@@ -6,6 +6,8 @@
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
+A self-hosted web interface for branching AI conversations across Claude Code, Gemini CLI, and local Ollama models — and for handing off between them mid-conversation. Every conversation is a tree — branch, fork, regenerate, and full-text search across every path without losing anything.
+
 ## What is a loom?
 
 An LLM loom treats every conversation as a **tree, not a thread**. Each message is a node. At any point you can branch — regenerate, edit, fork — and explore alternate paths without losing the originals. The metaphor comes from weaving: every response is a thread, and the loom holds them all in tension so you can compare, backtrack, and choose.
@@ -114,7 +116,42 @@ The canvas appears as a **meta-root node** in the tree visualization — a glowi
 - Live refresh — when the AI writes to the `canvas/` directory, the iframe auto-updates via WebSocket
 - Progressive LOD — the canvas thumbnail blurs as you zoom out, with a pulsing cyan beacon at maximum zoom so you can always find it
 - Canvas focus button (⌖) in the tree toolbar pans directly to the canvas node
-- Zero-config — enabling canvas auto-creates the workspace directory and a `canvas/CLAUDE.md` with instructions for the AI
+- Zero-config — enabling canvas auto-creates the workspace directory, a `canvas/CLAUDE.md` with instructions for the AI, and a `.gitignore` so generated canvas output stays out of version control
+
+### Canvas SDK
+
+Canvas pages can talk back to Loom through a postMessage bridge. Include the SDK script and the canvas becomes interactive — it can send messages, upload files, and react to conversation events without the user touching the chat bar.
+
+```html
+<script src="/static/canvas-sdk.js"></script>
+<script>
+  // Send a message and trigger AI generation
+  Loom.send("Update the chart with the latest data");
+
+  // Upload a file, then send a message referencing it
+  Loom.uploadAndSend(file, "Analyze this CSV");
+
+  // Load a prompt template from canvas/triggers/
+  const prompt = await Loom.loadTrigger('analyze', { filename: 'data.csv' });
+  Loom.send(prompt);
+
+  // Wire up drag-and-drop
+  Loom.dropZone(element, { trigger: 'process' });
+
+  // Listen for events
+  Loom.on('canvas_updated', () => location.reload());
+</script>
+```
+
+| Method | What it does |
+|--------|-------------|
+| `Loom.send(content, opts)` | Send a message to the conversation and trigger generation. Options: `imagePaths`, `parentId` |
+| `Loom.getConvId()` | Get the current conversation ID |
+| `Loom.upload(file)` | Upload a file to the conversation |
+| `Loom.uploadAndSend(file, content)` | Upload a file and send a message referencing it |
+| `Loom.loadTrigger(name, vars)` | Load a prompt template from `canvas/triggers/{name}.md` with `{{variable}}` interpolation |
+| `Loom.dropZone(element, opts)` | Wire drag-and-drop on an element — uploads files and sends a trigger prompt |
+| `Loom.on(event, handler)` | Listen for Loom events (`canvas_updated`, `message-sent`, etc.) |
 
 ## Common features
 

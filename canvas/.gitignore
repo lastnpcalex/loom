@@ -1,0 +1,3 @@
+# Canvas output is generated per-conversation — don't commit it
+*
+!.gitignore

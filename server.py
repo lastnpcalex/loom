@@ -376,6 +376,15 @@ async def toggle_canvas(conv_id: int, data: dict = None):
     if enabled:
         canvas_dir = Path(project_dir) / "canvas"
         canvas_dir.mkdir(parents=True, exist_ok=True)
+        # Auto-create .gitignore so canvas output doesn't leak into git
+        gitignore = canvas_dir / ".gitignore"
+        if not gitignore.exists():
+            gitignore.write_text(
+                "# Canvas output is generated per-conversation — don't commit it\n"
+                "*\n"
+                "!.gitignore\n",
+                encoding="utf-8",
+            )
         index_file = canvas_dir / "index.html"
         if not index_file.exists():
             index_file.write_text(
@@ -1534,7 +1543,7 @@ async def handle_cc_permission(data: dict):
     """Receive permission request from CC hook script, forward to UI, wait for response.
 
     The hook script (cc_permission_hook.py) POSTs here when CC needs tool approval.
-    This endpoint long-polls until the user responds in the browser UI (up to 5 min).
+    This endpoint long-polls until the user responds in the browser UI (no timeout).
     """
     conv_id = int(data.get("loom_conv_id", 0))
     request_id = str(uuid.uuid4())
@@ -2176,12 +2185,20 @@ async def _handle_claude_generation(
                 print(f"[CC] No parent_id, no branch to retrieve")
                 prompt = "(continue)"
 
-        # Ensure canvas CLAUDE.md and CANVAS_GUIDE.md exist if canvas is enabled
+        # Ensure canvas CLAUDE.md, CANVAS_GUIDE.md, and .gitignore exist if canvas is enabled
         if canvas_enabled and project_dir != ".":
             canvas_dir = Path(project_dir) / "canvas"
+            canvas_dir.mkdir(parents=True, exist_ok=True)
+            gitignore = canvas_dir / ".gitignore"
+            if not gitignore.exists():
+                gitignore.write_text(
+                    "# Canvas output is generated per-conversation — don't commit it\n"
+                    "*\n"
+                    "!.gitignore\n",
+                    encoding="utf-8",
+                )
             canvas_claude_md = canvas_dir / "CLAUDE.md"
             if not canvas_claude_md.exists():
-                canvas_dir.mkdir(parents=True, exist_ok=True)
                 canvas_claude_md.write_text(
                     CANVAS_CLAUDE_MD,
                     encoding="utf-8",

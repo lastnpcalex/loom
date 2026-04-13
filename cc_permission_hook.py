@@ -135,7 +135,7 @@ def main():
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=600, context=ctx) as resp:
+            with urllib.request.urlopen(req, timeout=None, context=ctx) as resp:
                 response = json.loads(resp.read().decode("utf-8"))
                 if response.get("allow"):
                     allow(f"Approved by user in Loom UI via {proto}", event_name=event_name)
