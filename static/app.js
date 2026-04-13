@@ -414,9 +414,46 @@ function renderConversationList() {
             <span class="conv-folder-arrow">${collapsed ? '▸' : '▾'}</span>
             <span class="conv-folder-name">${escapeHtml(folderName)}</span>
             <span class="conv-folder-count">(${folders[folderName].length})</span>
+            <span class="conv-folder-actions">
+                <button class="conv-folder-action-btn conv-folder-rename" title="Rename folder">✎</button>
+                <button class="conv-folder-action-btn conv-folder-dissolve" title="Dissolve folder (unfolder all)">✕</button>
+            </span>
         `;
-        header.addEventListener('click', () => {
+        // Collapse/expand on header click (but not on action buttons)
+        header.addEventListener('click', (e) => {
+            if (e.target.closest('.conv-folder-actions')) return;
             State.convFolderCollapsed[folderName] = !State.convFolderCollapsed[folderName];
+            renderConversationList();
+        });
+        // Rename folder
+        header.querySelector('.conv-folder-rename').addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const newName = prompt('Rename folder:', folderName);
+            if (newName && newName.trim() && newName.trim() !== folderName) {
+                const trimmed = newName.trim();
+                for (const c of folders[folderName]) {
+                    try {
+                        await API.put(`/api/conversations/${c.id}`, { folder: trimmed });
+                        c.folder = trimmed;
+                    } catch { showToast('Failed to rename folder', 'error'); return; }
+                }
+                // Transfer collapse state
+                State.convFolderCollapsed[trimmed] = State.convFolderCollapsed[folderName];
+                delete State.convFolderCollapsed[folderName];
+                renderConversationList();
+            }
+        });
+        // Dissolve folder (move all conversations to unfiled)
+        header.querySelector('.conv-folder-dissolve').addEventListener('click', async (e) => {
+            e.stopPropagation();
+            if (!confirm(`Dissolve "${folderName}"? All conversations will be unfiled.`)) return;
+            for (const c of folders[folderName]) {
+                try {
+                    await API.put(`/api/conversations/${c.id}`, { folder: '' });
+                    c.folder = '';
+                } catch { showToast('Failed to dissolve folder', 'error'); return; }
+            }
+            delete State.convFolderCollapsed[folderName];
             renderConversationList();
         });
         group.appendChild(header);
@@ -466,6 +503,7 @@ function buildConvItem(conv) {
             <span class="conv-meta">${escapeHtml(charName)}</span>
         </div>
         <div class="conv-actions">
+            <button class="char-action-btn conv-folder-btn" title="Move to folder">🗀</button>
             <button class="char-action-btn conv-edit-btn" title="Rename">✎</button>
             <button class="char-action-btn conv-export-btn" title="Export">↓</button>
             <button class="char-action-btn char-delete-btn conv-delete-btn" title="Delete">✕</button>
@@ -492,6 +530,11 @@ function buildConvItem(conv) {
     div.querySelector('.conv-title-text').addEventListener('click', () => loadConversation(conv.id));
     div.querySelector('.conv-meta').addEventListener('click', () => loadConversation(conv.id));
 
+    // Folder move
+    div.querySelector('.conv-folder-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        showFolderDropdown(e.currentTarget, conv);
+    });
 
     // Rename
     div.querySelector('.conv-edit-btn').addEventListener('click', (e) => {
@@ -577,8 +620,17 @@ function showFolderDropdown(anchorBtn, conv) {
     html += `<div class="conv-move-option conv-move-new">+ New folder...</div>`;
     dropdown.innerHTML = html;
 
-    // Position relative to anchor
-    anchorBtn.appendChild(dropdown);
+    // Position relative to anchor, but append to body to avoid overflow clipping
+    const rect = anchorBtn.getBoundingClientRect();
+    dropdown.style.position = 'fixed';
+    dropdown.style.top = (rect.bottom + 4) + 'px';
+    dropdown.style.left = rect.left + 'px';
+    // Flip left if it would overflow the viewport
+    document.body.appendChild(dropdown);
+    const dRect = dropdown.getBoundingClientRect();
+    if (dRect.right > window.innerWidth - 8) {
+        dropdown.style.left = (rect.right - dRect.width) + 'px';
+    }
 
     // Handle clicks
     dropdown.querySelectorAll('.conv-move-option:not(.conv-move-new)').forEach(opt => {

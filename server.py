@@ -800,6 +800,8 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["cc_permission_mode"] = data["cc_permission_mode"]
     if "ooda_enabled" in data:
         fields["ooda_enabled"] = int(data["ooda_enabled"])
+    if "folder" in data:
+        fields["folder"] = data["folder"]
     if fields:
         await db.update_conversation_fields(conv_id, **fields)
     return await db.get_conversation(conv_id)

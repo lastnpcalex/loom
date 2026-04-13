@@ -4094,15 +4094,13 @@ pre.tool-output {
 
 /* ── Folder Move Dropdown ── */
 .conv-move-dropdown {
-    position: absolute;
-    top: 100%;
-    right: 0;
+    position: fixed;
     min-width: 160px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     padding: 4px 0;
-    z-index: 100;
+    z-index: 9999;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
 }
 
@@ -4134,6 +4132,34 @@ pre.tool-output {
 
 .conv-folder-btn svg {
     vertical-align: middle;
+}
+
+.conv-folder-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 2px;
+    opacity: 0;
+    transition: opacity var(--transition);
+}
+
+.conv-folder-header:hover .conv-folder-actions {
+    opacity: 1;
+}
+
+.conv-folder-action-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 11px;
+    padding: 2px 4px;
+    border-radius: var(--radius-sm);
+    transition: all var(--transition);
+}
+
+.conv-folder-action-btn:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.08);
 }
 
 /* ── Mode Badge ── */
