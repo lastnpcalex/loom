@@ -9,9 +9,10 @@ build/
 venv/
 env/
 
-# Local database
-loom.db
-loom_test.db
+# Local database (including SQLite WAL/SHM runtime files)
+*.db
+*.db-wal
+*.db-shm
 
 # Uploaded files
 uploads/
