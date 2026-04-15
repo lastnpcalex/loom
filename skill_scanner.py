@@ -93,6 +93,10 @@ BUILTIN_COMMANDS = [
      "prompt_template": None},
     {"name": "privacy",         "command": "/privacy",         "description": "View or change privacy and data sharing settings", "mode": "meta",
      "prompt_template": None},
+    {"name": "compact",          "command": "/compact",          "description": "Compact CC context window (optional: /compact focus on X)", "mode": "meta",
+     "prompt_template": None},
+    {"name": "compact-test",    "command": "/compact-test",    "description": "Show compactification banner (UI test)", "mode": "meta",
+     "prompt_template": None},
 
     # ── Plugin & extension management ──
     {"name": "mcp",             "command": "/mcp",             "description": "Manage MCP (Model Context Protocol) server connections", "mode": "headless",

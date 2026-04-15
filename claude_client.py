@@ -26,11 +26,31 @@ def _process_event(raw: dict) -> list[dict]:
     etype = raw.get("type", "")
 
     if etype == "system":
-        events.append({
-            "type": "session_info",
-            "session_id": raw.get("session_id", ""),
-            "model": raw.get("model", ""),
-        })
+        subtype = raw.get("subtype", "")
+        if subtype == "compact_boundary":
+            # CC compactified its context window
+            # compact_metadata: { trigger: "manual"|"auto", pre_tokens: int }
+            meta = raw.get("compact_metadata", {})
+            events.append({
+                "type": "compact_boundary",
+                "trigger": meta.get("trigger", "auto"),
+                "pre_tokens": meta.get("pre_tokens"),
+                "session_id": raw.get("session_id", ""),
+            })
+        elif subtype == "api_retry":
+            events.append({
+                "type": "api_retry",
+                "attempt": raw.get("attempt"),
+                "max_retries": raw.get("max_retries"),
+                "retry_delay_ms": raw.get("retry_delay_ms"),
+                "error": raw.get("error", ""),
+            })
+        else:
+            events.append({
+                "type": "session_info",
+                "session_id": raw.get("session_id", ""),
+                "model": raw.get("model", ""),
+            })
 
     elif etype == "assistant":
         message = raw.get("message", {})

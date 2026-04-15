@@ -83,11 +83,16 @@ async def get_context_for_generation(conv_id: int, character: dict = None) -> di
 
     summary_tokens = estimate_tokens(summary_text) if summary_text else 0
 
+    summarized_count = len(branch) - len(verbatim_msgs)
+
     return {
         "summary": summary_text,
         "verbatim_messages": verbatim_msgs,
         "total_tokens": system_overhead + summary_tokens + verbatim_tokens,
         "was_compactified": True,
+        "total_messages": len(branch),
+        "verbatim_count": len(verbatim_msgs),
+        "summarized_count": summarized_count,
     }
 
 

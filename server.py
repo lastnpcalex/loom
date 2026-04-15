@@ -1961,6 +1961,14 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                     await db.delete_pending_permission(request_id)
                 continue
 
+            if action == "compact":
+                # Manual compaction: launch CC with /compact as the prompt
+                # using --resume to compact the existing session
+                asyncio.create_task(
+                    _handle_compact(websocket, conv_id, data)
+                )
+                continue
+
             print(f"[WS] Received action={action} for conv={conv_id}")
             if action in ("generate", "regenerate"):
                 global _gen_seq
@@ -2032,6 +2040,117 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
             await websocket.send_json({"type": "error", "error": str(e)})
 
 
+async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
+    """Trigger manual CC compaction via /compact on an existing session.
+
+    Finds the most recent CC session ID for the conversation, then launches
+    a CC subprocess with `-p "/compact" --resume <session_id>` and streams
+    compact_boundary events back to the UI.
+    """
+    try:
+        conv = await db.get_conversation(conv_id)
+        if not conv:
+            await _ws_send(conv_id, {"type": "error", "error": "Conversation not found"})
+            return
+
+        mode = conv.get("mode", "weave") if conv else "weave"
+        if mode != "claude":
+            await _ws_send(conv_id, {"type": "error", "error": "/compact is only available in Claude mode"})
+            return
+
+        # Find the most recent CC session ID
+        session_id = conv.get("claude_session_id")
+        if not session_id:
+            # Fall back to scanning the branch for a session ID
+            leaf = await db.get_active_leaf(conv_id)
+            if leaf:
+                branch = await db.get_branch_to_root(leaf["id"])
+                for msg in reversed(branch):
+                    if msg["role"] == "assistant" and msg.get("cc_session_id"):
+                        session_id = msg["cc_session_id"]
+                        break
+
+        if not session_id:
+            await _ws_send(conv_id, {"type": "error", "error": "No CC session to compact — send at least one message first"})
+            return
+
+        project_dir = conv.get("project_dir") or "."
+        cc_model = data.get("cc_model") or conv.get("cc_model") or "sonnet"
+        cc_effort = conv.get("cc_effort") or "high"
+
+        # Determine provider (same logic as _handle_claude_generation)
+        _ANTHROPIC_MODELS = {"sonnet", "opus", "haiku"}
+        _base_model = cc_model.split("[")[0] if "[" in cc_model else cc_model
+        is_anthropic = _base_model in _ANTHROPIC_MODELS
+        use_ollama = conv.get("_use_ollama", False) or not (is_anthropic or cc_model.startswith("gemini"))
+        if is_anthropic or cc_model.startswith("gemini"):
+            use_ollama = False
+
+        await _ws_send(conv_id, {"type": "status", "text": "Compacting context..."})
+
+        # Launch CC with /compact as the prompt, resuming the existing session
+        # No --fork-session: we want to compact the session in place
+        compact_prompt = data.get("focus") or ""
+        prompt = f"/compact {compact_prompt}".strip() if compact_prompt else "/compact"
+
+        server_port = int(os.environ.get("LOOM_PORT", 3000))
+        proc, event_stream = await claude_client.run_claude(
+            prompt=prompt,
+            cwd=project_dir,
+            conv_id=conv_id,
+            server_port=server_port,
+            model=cc_model,
+            effort=cc_effort,
+            resume_session_id=session_id,
+            fork_session=False,  # compact in place, don't fork
+            use_ollama=use_ollama,
+        )
+
+        got_compact = False
+        async for evt in event_stream:
+            etype = evt.get("type", "")
+
+            if etype == "compact_boundary":
+                got_compact = True
+                await _ws_send(conv_id, {
+                    "type": "compact_boundary",
+                    "trigger": "manual",
+                    "pre_tokens": evt.get("pre_tokens"),
+                })
+
+            elif etype == "result":
+                new_session_id = evt.get("session_id", "")
+                if new_session_id:
+                    await db.update_conversation_fields(
+                        conv_id, claude_session_id=new_session_id
+                    )
+                cost = evt.get("cost_usd", 0)
+                if cost:
+                    old_cost = conv.get("total_cost_usd") or 0
+                    await db.update_conversation_fields(
+                        conv_id, total_cost_usd=old_cost + cost
+                    )
+
+            elif etype == "api_retry":
+                attempt = evt.get("attempt", 1)
+                max_retries = evt.get("max_retries", 5)
+                error = evt.get("error", "unknown")
+                await _ws_send(conv_id, {
+                    "type": "status",
+                    "text": f"API retry {attempt}/{max_retries} ({error})...",
+                })
+
+        if got_compact:
+            await _ws_send(conv_id, {"type": "status", "text": "Context compacted successfully"})
+        else:
+            await _ws_send(conv_id, {"type": "status", "text": "Compaction completed (no boundary event received)"})
+
+    except Exception as e:
+        print(f"[Compact] Error: {e}")
+        import traceback; traceback.print_exc()
+        await _ws_send(conv_id, {"type": "error", "error": f"Compaction failed: {e}"})
+
+
 async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
     """Handle a generation request over WebSocket — routes by conversation mode."""
     conv = await db.get_conversation(conv_id)
@@ -2092,8 +2211,10 @@ async def _handle_claude_generation(
             await db.update_conversation_fields(conv_id, cc_model=cc_model)
 
         # Identify provider based on model name
+        # Strip [1m] suffix for provider detection (e.g. "sonnet[1m]" → "sonnet")
         _ANTHROPIC_MODELS = {"sonnet", "opus", "haiku"}
-        is_anthropic = cc_model in _ANTHROPIC_MODELS
+        _base_model = cc_model.split("[")[0] if "[" in cc_model else cc_model
+        is_anthropic = _base_model in _ANTHROPIC_MODELS
         is_gemini = cc_model.startswith("gemini")
         # Only use Ollama when explicitly flagged (local mode) or when the model
         # is not a known Anthropic/Gemini model.  The _use_ollama flag is set by
@@ -2130,7 +2251,8 @@ async def _handle_claude_generation(
                     continue
                 # Check if the session was created by a different provider
                 prev_model = msg.get("cc_model_used", "")
-                prev_is_anthropic = prev_model in _ANTHROPIC_MODELS
+                _prev_base = prev_model.split("[")[0] if "[" in prev_model else prev_model
+                prev_is_anthropic = _prev_base in _ANTHROPIC_MODELS
                 prev_is_gemini = prev_model.startswith("gemini")
                 prev_is_ollama = bool(prev_model) and not (
                     prev_is_anthropic or prev_is_gemini
@@ -2535,6 +2657,30 @@ async def _handle_claude_generation(
                         "type": "usage",
                         "input_tokens": total_input_tokens,
                         "output_tokens": total_output_tokens,
+                    },
+                )
+
+            elif etype == "compact_boundary":
+                # CC compactified its context — notify the UI
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "compact_boundary",
+                        "trigger": evt.get("trigger", "auto"),
+                        "pre_tokens": evt.get("pre_tokens"),
+                    },
+                )
+
+            elif etype == "api_retry":
+                attempt = evt.get("attempt", 1)
+                max_retries = evt.get("max_retries", 5)
+                delay_ms = evt.get("retry_delay_ms", 0)
+                error = evt.get("error", "unknown")
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "status",
+                        "text": f"API retry {attempt}/{max_retries} ({error}) — retrying in {delay_ms // 1000}s...",
                     },
                 )
 
@@ -3141,16 +3287,29 @@ async def _handle_ooda_generation(
 
         actual_tokens = sum(len(m["content"]) // 3 for m in messages)
         active_nudge = get_style_nudge(nudge_index)
-        await _ws_send(
-            conv_id,
-            {
-                "type": "context_info",
-                "total_tokens": actual_tokens,
-                "was_compactified": context["was_compactified"],
-                "style_nudge": active_nudge["name"],
-                "parent_id": parent_id,
-            },
-        )
+        context_payload = {
+            "type": "context_info",
+            "total_tokens": actual_tokens,
+            "was_compactified": context["was_compactified"],
+            "style_nudge": active_nudge["name"],
+            "parent_id": parent_id,
+        }
+        if context["was_compactified"]:
+            context_payload["total_messages"] = context.get("total_messages")
+            context_payload["verbatim_count"] = context.get("verbatim_count")
+            context_payload["summarized_count"] = context.get("summarized_count")
+            context_payload["summary_text"] = context.get("summary")
+            # Auto-branch: insert a system marker at the compaction point
+            summ_count = context.get("summarized_count", "?")
+            verb_count = context.get("verbatim_count", "?")
+            marker = await db.add_message(
+                conv_id, "system",
+                f"[Context compactified — {summ_count} messages summarized, {verb_count} sent verbatim]",
+                parent_id=parent_id,
+            )
+            parent_id = marker["id"]
+            context_payload["compaction_marker_id"] = marker["id"]
+        await _ws_send(conv_id, context_payload)
 
         # Create draft message in DB so it appears as ghost node on tree
         draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
@@ -3469,16 +3628,29 @@ async def _handle_weave_generation(
         # Send context info — use actual assembled prompt token count
         actual_tokens = sum(len(m["content"]) // 3 for m in messages)
         active_nudge = get_style_nudge(nudge_index)
-        await _ws_send(
-            conv_id,
-            {
-                "type": "context_info",
-                "total_tokens": actual_tokens,
-                "was_compactified": context["was_compactified"],
-                "style_nudge": active_nudge["name"],
-                "parent_id": parent_id,
-            },
-        )
+        context_payload = {
+            "type": "context_info",
+            "total_tokens": actual_tokens,
+            "was_compactified": context["was_compactified"],
+            "style_nudge": active_nudge["name"],
+            "parent_id": parent_id,
+        }
+        if context["was_compactified"]:
+            context_payload["total_messages"] = context.get("total_messages")
+            context_payload["verbatim_count"] = context.get("verbatim_count")
+            context_payload["summarized_count"] = context.get("summarized_count")
+            context_payload["summary_text"] = context.get("summary")
+            # Auto-branch: insert a system marker at the compaction point
+            summ_count = context.get("summarized_count", "?")
+            verb_count = context.get("verbatim_count", "?")
+            marker = await db.add_message(
+                conv_id, "system",
+                f"[Context compactified — {summ_count} messages summarized, {verb_count} sent verbatim]",
+                parent_id=parent_id,
+            )
+            parent_id = marker["id"]
+            context_payload["compaction_marker_id"] = marker["id"]
+        await _ws_send(conv_id, context_payload)
 
         # Create draft message in DB so it appears as ghost node on tree
         draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)

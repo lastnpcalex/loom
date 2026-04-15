@@ -112,6 +112,10 @@ document.addEventListener('visibilitychange', () => {
 
 async function loadMessages(convId) {
     try {
+        // Clear compactification banner on conversation load
+        const compBanner = document.getElementById('compactify-banner');
+        if (compBanner) compBanner.classList.add('hidden');
+
         const prevCount = State.messages.length;
         const treeData = await API.get(`/api/conversations/${convId}/tree`);
         State.treeData = treeData;  // keep branch indicators in sync
@@ -213,7 +217,22 @@ function handleWSMessage(data) {
         case 'context_info':
             if (!_isOurBranch(data)) break;
             updateContextInfo(data);
-            showGenStatus(`Context: ${data.total_tokens.toLocaleString()} tokens — Waiting for model...`);
+            if (data.was_compactified) {
+                const summ = data.summarized_count || '?';
+                const verb = data.verbatim_count || '?';
+                showGenStatus(`Context: ${data.total_tokens.toLocaleString()} tokens (${summ} summarized, ${verb} verbatim) — Waiting for model...`);
+            } else {
+                showGenStatus(`Context: ${data.total_tokens.toLocaleString()} tokens — Waiting for model...`);
+            }
+            break;
+
+        case 'compact_boundary':
+            // Claude Code compactified its context window — show banner now,
+            // usage event will update it with post-compaction token count
+            State._compactedThisGen = true;
+            State._compactData = data;
+            updateContextInfo({ was_compactified: true, ...data });
+            showGenStatus('Context compactified by Claude Code — continuing...');
             break;
 
         case 'status':
@@ -303,6 +322,14 @@ function handleWSMessage(data) {
             if (tokEl) {
                 tokEl.textContent = '↑' + _fmtTok(data.input_tokens) + ' ↓' + _fmtTok(data.output_tokens) + ' · ';
                 tokEl.dataset.hasUsage = '1';  // stop timer from overwriting with chunk count
+            }
+            // Update compaction banner with actual post-compaction context size
+            if (State._compactedThisGen && data.input_tokens) {
+                updateContextInfo({
+                    was_compactified: true,
+                    ...State._compactData,
+                    post_tokens: data.input_tokens,
+                });
             }
             break;
         }
@@ -448,6 +475,8 @@ function handleWSMessage(data) {
             State.isStreaming = false;
             State._streamIsOurBranch = undefined;
             State._followingGenId = null;
+            State._compactedThisGen = false;
+            State._compactData = null;
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
             // Clear ghost node before tree refresh so it doesn't persist
@@ -588,7 +617,44 @@ function handleWSMessage(data) {
 }
 
 function updateContextInfo(data) {
-    // Context token info now shown via gen status bar, not header
+    let banner = document.getElementById('compactify-banner');
+    if (data.was_compactified) {
+        if (!banner) {
+            banner = document.createElement('div');
+            banner.id = 'compactify-banner';
+            const messagesEl = document.getElementById('messages');
+            messagesEl.parentNode.insertBefore(banner, messagesEl);
+        }
+        // Build summary line and expanded details per source
+        let summaryLine, details = [];
+        if (data.pre_tokens != null) {
+            // Claude Code compaction
+            const trigger = data.trigger === 'manual' ? 'manual' : 'auto';
+            summaryLine = `Context compactified (${trigger})`;
+            details.push(`Before: ${data.pre_tokens.toLocaleString()} tokens`);
+            if (data.post_tokens) {
+                details.push(`After: ${data.post_tokens.toLocaleString()} tokens`);
+            }
+        } else if (data.summarized_count != null) {
+            // Local (Ollama) compaction
+            summaryLine = `Context compactified — ${data.summarized_count} of ${data.total_messages || '?'} messages summarized`;
+            details.push(`${data.verbatim_count || '?'} messages sent verbatim`);
+            if (data.total_tokens) details.push(`Post-compaction context: ${data.total_tokens.toLocaleString()} tokens`);
+            if (data.summary_text) {
+                details.push(`--- Rolling summary ---\n${data.summary_text}`);
+            }
+        } else {
+            summaryLine = 'Context compactified';
+        }
+
+        const detailsHtml = details.length
+            ? `<div class="compactify-details">${details.map(d => `<pre>${escapeHtml(d)}</pre>`).join('')}</div>`
+            : '';
+        banner.innerHTML = `<details class="compactify-collapse"><summary><span class="compactify-icon">⧈</span> ${escapeHtml(summaryLine)}</summary>${detailsHtml}</details>`;
+        banner.classList.remove('hidden');
+    } else if (banner) {
+        banner.classList.add('hidden');
+    }
 }
 
 /**
@@ -801,6 +867,59 @@ function _handleMetaCommand(name, args) {
         case 'privacy':
             showToast('Privacy settings — configure in Claude Code directly', 3000);
             break;
+        case 'compact': {
+            // Manual CC compaction — send /compact to the CC session
+            if (!State.currentConvId) {
+                showToast('No conversation selected');
+                break;
+            }
+            if (State.isGenerating) {
+                showToast('Cannot compact while generation is in progress');
+                break;
+            }
+            const ws = State.ws;
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                showToast('Not connected — try again');
+                break;
+            }
+            const ccModel = document.getElementById('cc-model')?.value;
+            ws.send(JSON.stringify({
+                action: 'compact',
+                cc_model: ccModel || undefined,
+                focus: args || undefined,
+            }));
+            showToast('Compacting context...', 5000);
+            break;
+        }
+        case 'compact-test': {
+            // Fake compactification for UI testing
+            // /compact-test cc  → Claude Code compaction
+            // /compact-test     → local (Ollama) compaction
+            const isCC = args.toLowerCase().startsWith('cc');
+            if (isCC) {
+                updateContextInfo({
+                    was_compactified: true,
+                    trigger: 'auto',
+                    pre_tokens: 185000,
+                    post_tokens: 42000,
+                });
+                showGenStatus('Context compactified by Claude Code — continuing...');
+                showToast('Showing CC compaction banner (test)', 3000);
+            } else {
+                updateContextInfo({
+                    was_compactified: true,
+                    total_tokens: 28500,
+                    total_messages: 42,
+                    verbatim_count: 6,
+                    summarized_count: 36,
+                    style_nudge: 'visceral',
+                    summary_text: '[Turns 1-8]: Player entered the abandoned cathedral. Character described the shattered stained glass and the sound of dripping water. Player investigated the altar and found a hidden compartment.\n[Turns 9-18]: Confrontation with the Keeper. Extended dialogue about the nature of the curse. Player chose to bargain rather than fight.\n[Turns 19-36]: Journey through the underground passage. Character described the bioluminescent fungi and the distant rumbling. Player lost their torch and had to navigate by touch.',
+                });
+                showGenStatus('Context: 28,500 tokens (36 summarized, 6 verbatim) — Waiting for model...');
+                showToast('Showing local compaction banner (test)', 3000);
+            }
+            break;
+        }
         default:
             showToast(`/${name} is handled locally but not yet implemented`, 3000);
     }
@@ -960,8 +1079,8 @@ async function sendMessage() {
     const hasImages = State.pendingImages.length > 0;
     if (!content && !(hasImages && !isClaudeMode)) return;
 
-    // Handle slash commands for CC mode
-    if (isClaudeMode && content.startsWith('/')) {
+    // Handle slash commands — meta commands work in all modes
+    if (content.startsWith('/')) {
         const skills = await _loadSkills();
         const translated = _translateSlashCommand(content, skills);
         if (translated && translated.meta) {
@@ -969,8 +1088,8 @@ async function sendMessage() {
             input.value = '';
             return;
         }
-        // Pass slash commands directly to CC — it handles skills natively
-        if (translated) {
+        // In CC mode, pass non-meta slash commands directly to CC
+        if (isClaudeMode && translated) {
             showToast(`Running skill: ${translated.skillName}`);
         }
     }
