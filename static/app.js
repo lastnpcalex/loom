@@ -388,7 +388,38 @@ function renderConversationList() {
     }
     empty.style.display = 'none';
 
-    // Group by folder
+    // Separate starred conversations (shown above everything)
+    const starred = convs.filter(c => c.starred);
+
+    if (starred.length) {
+        const starSection = document.createElement('div');
+        starSection.className = 'conv-folder-group';
+        const starHeader = document.createElement('div');
+        starHeader.className = 'conv-folder-header conv-starred-header';
+        const starCollapsed = !!State.convFolderCollapsed['__starred__'];
+        starHeader.innerHTML = `
+            <span class="conv-folder-arrow">${starCollapsed ? '▸' : '▾'}</span>
+            <span class="conv-folder-icon">★</span>
+            <span class="conv-folder-name">Starred</span>
+            <span class="conv-folder-count">(${starred.length})</span>
+        `;
+        starHeader.addEventListener('click', () => {
+            State.convFolderCollapsed['__starred__'] = !State.convFolderCollapsed['__starred__'];
+            renderConversationList();
+        });
+        starSection.appendChild(starHeader);
+        if (!starCollapsed) {
+            const itemsWrap = document.createElement('div');
+            itemsWrap.className = 'conv-folder-items';
+            for (const conv of starred) {
+                itemsWrap.appendChild(buildConvItem(conv));
+            }
+            starSection.appendChild(itemsWrap);
+        }
+        list.appendChild(starSection);
+    }
+
+    // Group ALL conversations by folder (starred appear in both sections)
     const folders = {};  // folder name -> [conv, ...]
     const unfiled = [];
     for (const conv of convs) {
@@ -401,7 +432,7 @@ function renderConversationList() {
         }
     }
 
-    // Render folder groups first
+    // Render folder groups
     const folderNames = Object.keys(folders).sort();
     for (const folderName of folderNames) {
         const group = document.createElement('div');
@@ -412,6 +443,7 @@ function renderConversationList() {
         header.className = 'conv-folder-header';
         header.innerHTML = `
             <span class="conv-folder-arrow">${collapsed ? '▸' : '▾'}</span>
+            <svg class="conv-folder-icon" width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 3V10.5C1 11 1.4 11 1.5 11H12.5C12.6 11 13 11 13 10.5V3H1Z"/><path d="M1 3V1.5C1 1 1.4 1 1.5 1H5L6.5 3H1Z"/></svg>
             <span class="conv-folder-name">${escapeHtml(folderName)}</span>
             <span class="conv-folder-count">(${folders[folderName].length})</span>
             <span class="conv-folder-actions">
@@ -425,23 +457,47 @@ function renderConversationList() {
             State.convFolderCollapsed[folderName] = !State.convFolderCollapsed[folderName];
             renderConversationList();
         });
-        // Rename folder
+        // Rename folder — inline edit, no popup
         header.querySelector('.conv-folder-rename').addEventListener('click', async (e) => {
             e.stopPropagation();
-            const newName = prompt('Rename folder:', folderName);
-            if (newName && newName.trim() && newName.trim() !== folderName) {
-                const trimmed = newName.trim();
-                for (const c of folders[folderName]) {
-                    try {
-                        await API.put(`/api/conversations/${c.id}`, { folder: trimmed });
-                        c.folder = trimmed;
-                    } catch { showToast('Failed to rename folder', 'error'); return; }
+            const nameSpan = header.querySelector('.conv-folder-name');
+            const countSpan = header.querySelector('.conv-folder-count');
+            const actionsSpan = header.querySelector('.conv-folder-actions');
+            // Hide name/count/actions, show inline input
+            nameSpan.style.display = 'none';
+            countSpan.style.display = 'none';
+            actionsSpan.style.display = 'none';
+            const inp = document.createElement('input');
+            inp.type = 'text';
+            inp.className = 'conv-folder-inline-edit';
+            inp.value = folderName;
+            nameSpan.insertAdjacentElement('afterend', inp);
+            inp.focus();
+            inp.select();
+
+            const commit = async () => {
+                const newName = inp.value.trim();
+                inp.remove();
+                nameSpan.style.display = '';
+                countSpan.style.display = '';
+                actionsSpan.style.display = '';
+                if (newName && newName !== folderName) {
+                    for (const c of folders[folderName]) {
+                        try {
+                            await API.put(`/api/conversations/${c.id}`, { folder: newName });
+                            c.folder = newName;
+                        } catch { showToast('Failed to rename folder', 'error'); return; }
+                    }
+                    State.convFolderCollapsed[newName] = State.convFolderCollapsed[folderName];
+                    delete State.convFolderCollapsed[folderName];
+                    renderConversationList();
                 }
-                // Transfer collapse state
-                State.convFolderCollapsed[trimmed] = State.convFolderCollapsed[folderName];
-                delete State.convFolderCollapsed[folderName];
-                renderConversationList();
-            }
+            };
+            inp.addEventListener('keydown', (ev) => {
+                if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+                if (ev.key === 'Escape') { inp.value = folderName; commit(); }
+            });
+            inp.addEventListener('blur', commit);
         });
         // Dissolve folder (move all conversations to unfiled)
         header.querySelector('.conv-folder-dissolve').addEventListener('click', async (e) => {
@@ -459,9 +515,12 @@ function renderConversationList() {
         group.appendChild(header);
 
         if (!collapsed) {
+            const itemsWrap = document.createElement('div');
+            itemsWrap.className = 'conv-folder-items';
             for (const conv of folders[folderName]) {
-                group.appendChild(buildConvItem(conv));
+                itemsWrap.appendChild(buildConvItem(conv));
             }
+            group.appendChild(itemsWrap);
         }
         list.appendChild(group);
     }
@@ -648,15 +707,32 @@ function showFolderDropdown(anchorBtn, conv) {
 
     dropdown.querySelector('.conv-move-new').addEventListener('click', (e) => {
         e.stopPropagation();
-        const name = prompt('Folder name:');
-        if (name && name.trim()) {
-            const folder = name.trim();
-            API.put(`/api/conversations/${conv.id}`, { folder }).then(() => {
-                conv.folder = folder;
-                renderConversationList();
-            }).catch(() => showToast('Failed to move', 'error'));
-        }
-        dropdown.remove();
+        const newOpt = dropdown.querySelector('.conv-move-new');
+        // Replace "+ New folder..." text with inline input
+        newOpt.innerHTML = '';
+        const inp = document.createElement('input');
+        inp.type = 'text';
+        inp.className = 'conv-folder-inline-edit';
+        inp.placeholder = 'Folder name';
+        newOpt.appendChild(inp);
+        inp.focus();
+
+        const commit = () => {
+            const name = inp.value.trim();
+            if (name) {
+                API.put(`/api/conversations/${conv.id}`, { folder: name }).then(() => {
+                    conv.folder = name;
+                    renderConversationList();
+                }).catch(() => showToast('Failed to move', 'error'));
+            }
+            dropdown.remove();
+        };
+        inp.addEventListener('keydown', (ev) => {
+            ev.stopPropagation();
+            if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+            if (ev.key === 'Escape') { dropdown.remove(); }
+        });
+        inp.addEventListener('blur', commit);
     });
 
     // Close on outside click
@@ -1877,6 +1953,10 @@ function setupEventListeners() {
     document.getElementById('btn-send').addEventListener('click', sendMessage);
     document.getElementById('user-input').addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
+            // On touch devices, Enter inserts a newline (use send button instead).
+            // On desktop, Enter sends the message.
+            const isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+            if (isMobile) return; // let default newline behavior happen
             e.preventDefault();
             sendMessage();
         }

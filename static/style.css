@@ -4115,10 +4115,17 @@ pre.tool-output {
 /* ── Folder Groups ── */
 .conv-folder-group {
     margin-bottom: 4px;
+    flex-basis: 100%;
     width: 100%;
     display: flex;
     flex-direction: column;
     gap: 6px;
+}
+
+.conv-folder-items {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
 }
 
 .conv-folder-header {
@@ -4144,6 +4151,23 @@ pre.tool-output {
     font-size: 10px;
     width: 12px;
     flex-shrink: 0;
+}
+
+.conv-folder-icon {
+    flex-shrink: 0;
+    color: var(--text-muted);
+    opacity: 0.7;
+    font-size: 13px;
+    line-height: 1;
+}
+
+.conv-folder-header:hover .conv-folder-icon {
+    color: var(--cyan);
+    opacity: 1;
+}
+
+.conv-starred-header .conv-folder-icon {
+    display: none;
 }
 
 .conv-folder-name {
@@ -4224,6 +4248,19 @@ pre.tool-output {
 .conv-folder-action-btn:hover {
     color: var(--text-primary);
     background: rgba(255, 255, 255, 0.08);
+}
+
+.conv-folder-inline-edit {
+    background: var(--bg-primary);
+    border: 1px solid var(--cyan);
+    color: var(--text-primary);
+    font-size: 12px;
+    font-family: var(--font-main);
+    padding: 2px 6px;
+    border-radius: var(--radius-sm);
+    outline: none;
+    width: 120px;
+    max-width: 100%;
 }
 
 /* ── Mode Badge ── */
@@ -4371,15 +4408,11 @@ pre.tool-output {
         max-height: 50vh;
     }
     .conv-item {
-        width: 100%;
-        flex-direction: row;
-        align-items: center;
+        width: calc(50% - 5px);
+        min-width: 140px;
         overflow: hidden;
     }
-    .conv-card-top { flex-direction: row; gap: 6px; flex-shrink: 0; }
-    .conv-card-body { flex-direction: row; gap: 8px; flex: 1; min-width: 0; overflow: hidden; justify-content: space-between; }
-    .conv-item .conv-title-text { max-width: 50vw; }
-    .conv-item .conv-meta { margin-left: auto; text-align: right; }
+    .conv-item .conv-title-text { max-width: 40vw; }
     #char-state-panel {
         right: 8px;
         left: 8px;
