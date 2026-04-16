@@ -61,9 +61,13 @@ const State = {
     stateCards: [],
     config: {},
     convFilter: 'all',
-    convFolderCollapsed: {},
+    convFolderCollapsed: JSON.parse(localStorage.getItem('loom-folder-collapsed') || '{}'),
     branchCount: 1,  // number of response branches to generate (Weave/OODA only)
 };
+
+function saveFolderCollapsed() {
+    localStorage.setItem('loom-folder-collapsed', JSON.stringify(State.convFolderCollapsed));
+}
 
 // ── View Switching ──
 function switchView(view) {
@@ -405,6 +409,7 @@ function renderConversationList() {
         `;
         starHeader.addEventListener('click', () => {
             State.convFolderCollapsed['__starred__'] = !State.convFolderCollapsed['__starred__'];
+            saveFolderCollapsed();
             renderConversationList();
         });
         starSection.appendChild(starHeader);
@@ -455,6 +460,7 @@ function renderConversationList() {
         header.addEventListener('click', (e) => {
             if (e.target.closest('.conv-folder-actions')) return;
             State.convFolderCollapsed[folderName] = !State.convFolderCollapsed[folderName];
+            saveFolderCollapsed();
             renderConversationList();
         });
         // Rename folder — inline edit, no popup
@@ -490,6 +496,7 @@ function renderConversationList() {
                     }
                     State.convFolderCollapsed[newName] = State.convFolderCollapsed[folderName];
                     delete State.convFolderCollapsed[folderName];
+                    saveFolderCollapsed();
                     renderConversationList();
                 }
             };
@@ -510,6 +517,7 @@ function renderConversationList() {
                 } catch { showToast('Failed to dissolve folder', 'error'); return; }
             }
             delete State.convFolderCollapsed[folderName];
+            saveFolderCollapsed();
             renderConversationList();
         });
         group.appendChild(header);
