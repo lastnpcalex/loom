@@ -2103,6 +2103,13 @@ async function attachImage(file) {
         showToast(`Max ${MAX_PENDING_IMAGES} attachments allowed`, 'error');
         return;
     }
+    // Show uploading placeholder
+    const container = document.getElementById('image-preview');
+    container.classList.remove('hidden');
+    const placeholder = document.createElement('div');
+    placeholder.className = 'preview-thumb upload-placeholder';
+    placeholder.innerHTML = '<div class="upload-spinner"></div><span class="upload-label">Uploading…</span>';
+    container.appendChild(placeholder);
     try {
         const result = await API.upload(file);
         State.pendingImages.push({
@@ -2110,10 +2117,11 @@ async function attachImage(file) {
             is_image: result.is_image !== false,
             original_name: result.original_name || file.name,
         });
-        renderImagePreviews();
     } catch (err) {
         showToast('File upload failed', 'error');
     }
+    placeholder.remove();
+    renderImagePreviews();
 }
 
 // Paste handler is registered in setupEventListeners via handleImagePaste

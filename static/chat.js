@@ -2648,14 +2648,20 @@ function editMessage(msgId) {
 
     // File attach handler
     const editFileInput = btnRow.querySelector('.edit-file-input');
+    const editAttachLabel = btnRow.querySelector('.edit-attach');
     editFileInput.addEventListener('change', async (e) => {
         const file = e.target.files[0];
         if (!file) return;
+        editAttachLabel.classList.add('uploading');
+        editAttachLabel.setAttribute('data-orig', editAttachLabel.textContent);
+        editAttachLabel.textContent = '⏳';
         try {
             const result = await API.upload(file);
             editFiles.push({ path: result.path, original: false });
             renderEditFiles();
         } catch { showToast('File upload failed', 'error'); }
+        editAttachLabel.textContent = editAttachLabel.getAttribute('data-orig') || '📎';
+        editAttachLabel.classList.remove('uploading');
         e.target.value = '';
     });
 
