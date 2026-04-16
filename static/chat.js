@@ -104,7 +104,8 @@ document.addEventListener('visibilitychange', () => {
             connectWebSocket(State.currentConvId);
         } else if (State.ws && State.ws.readyState === WebSocket.OPEN && !State.isStreaming) {
             // WS is open but we may have missed events while backgrounded — resync
-            // Skip during streaming — loadMessages destroys the streaming div
+            // Skip during streaming or active edit — loadMessages destroys the UI
+            if (document.querySelector('.edit-message-input')) return;
             loadMessages(State.currentConvId);
         }
     }
