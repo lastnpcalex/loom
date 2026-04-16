@@ -812,6 +812,10 @@ function _translateSlashCommand(content, skills) {
  */
 function _handleMetaCommand(name, args) {
     switch (name) {
+        case 'help':
+            // Alias for /skills — show all available commands
+            _handleMetaCommand('skills', args);
+            break;
         case 'skills':
             _loadSkills().then(skills => {
                 const lines = skills.map(s =>
@@ -866,6 +870,36 @@ function _handleMetaCommand(name, args) {
             break;
         case 'privacy':
             showToast('Privacy settings — configure in Claude Code directly', 3000);
+            break;
+        case 'hooks':
+            API.get('/api/cc-hooks').then(data => {
+                const container = document.getElementById('messages-container');
+                if (!container) { showToast('Could not display hooks'); return; }
+                const el = document.createElement('div');
+                el.className = 'system-message';
+                const hookEntries = data.hooks || {};
+                if (Object.keys(hookEntries).length === 0) {
+                    el.innerHTML = `<pre style="font-size:0.85em;color:var(--text-dim);white-space:pre-wrap">No CC hooks configured.\n\nSearched:\n${(data.paths || []).map(p => '  ' + p).join('\n')}</pre>`;
+                } else {
+                    let lines = 'CC Hooks:\n\n';
+                    for (const [file, hooks] of Object.entries(hookEntries)) {
+                        lines += `── ${file} ──\n`;
+                        for (const [event, rules] of Object.entries(hooks)) {
+                            lines += `  ${event}:\n`;
+                            const ruleList = Array.isArray(rules) ? rules : [rules];
+                            for (const rule of ruleList) {
+                                const cmd = rule.command || rule.cmd || JSON.stringify(rule);
+                                const matcher = rule.matcher ? ` (${rule.matcher})` : '';
+                                lines += `    → ${cmd}${matcher}\n`;
+                            }
+                        }
+                        lines += '\n';
+                    }
+                    el.innerHTML = `<pre style="font-size:0.85em;color:var(--text-dim);white-space:pre-wrap">${escapeHtml(lines)}</pre>`;
+                }
+                container.appendChild(el);
+                el.scrollIntoView({ behavior: 'smooth' });
+            }).catch(() => showToast('Failed to read hooks config'));
             break;
         case 'compact': {
             // Manual CC compaction — send /compact to the CC session
@@ -1088,9 +1122,10 @@ async function sendMessage() {
             input.value = '';
             return;
         }
-        // In CC mode, pass non-meta slash commands directly to CC
-        if (isClaudeMode && translated) {
-            showToast(`Running skill: ${translated.skillName}`);
+        // Headless commands: substitute the NL prompt template for the raw /slash text
+        if (translated) {
+            content = translated.prompt;
+            showToast(`Running: /${translated.skillName}`);
         }
     }
 

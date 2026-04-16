@@ -1688,6 +1688,30 @@ async def list_skills(conv_id: int = None):
     return skills
 
 
+@app.get("/api/cc-hooks")
+async def get_cc_hooks():
+    """Read CC hooks from settings files and return them."""
+    import json as _json
+    hooks = {}
+    # Check all settings locations CC uses
+    paths = [
+        Path.home() / ".claude" / "settings.json",
+        Path.home() / ".claude" / "settings.local.json",
+        Path(".claude") / "settings.json",
+        Path(".claude") / "settings.local.json",
+    ]
+    for p in paths:
+        try:
+            if p.is_file():
+                data = _json.loads(p.read_text(encoding="utf-8"))
+                file_hooks = data.get("hooks", {})
+                if file_hooks:
+                    hooks[str(p)] = file_hooks
+        except Exception:
+            pass
+    return {"hooks": hooks, "paths": [str(p) for p in paths]}
+
+
 @app.get("/api/modules")
 async def list_modules(module_type: str = None):
     """List registered modules from the database."""

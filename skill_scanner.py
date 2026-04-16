@@ -41,8 +41,8 @@ BUILTIN_COMMANDS = [
      "prompt_template": "Initialize this project for Claude Code. Create or update CLAUDE.md with project conventions, structure, build/test commands, and any relevant context. {args}"},
     {"name": "update-config",   "command": "/update-config",   "description": "Configure Claude Code settings, hooks, and behaviors", "mode": "headless",
      "prompt_template": "Update the Claude Code configuration. {args}. Modify settings.json hooks or automated behaviors as needed."},
-    {"name": "hooks",           "command": "/hooks",           "description": "View or manage CC hooks configuration", "mode": "headless",
-     "prompt_template": "Show the current Claude Code hooks configuration. List all configured hooks, their triggers, and what they do. {args}"},
+    {"name": "hooks",           "command": "/hooks",           "description": "View or manage CC hooks configuration", "mode": "meta",
+     "prompt_template": None},
 
     # ── Agents & skills ──
     {"name": "agents",          "command": "/agents",          "description": "Create, list, or manage custom sub-agent definitions", "mode": "headless",
@@ -105,7 +105,8 @@ BUILTIN_COMMANDS = [
      "prompt_template": "Install the skill or plugin from GitHub: {args}"},
 
     # ── CLI-only (excluded from Loom UI) ──
-    {"name": "help",            "command": "/help",            "description": "Show help and available commands", "mode": "cli-only"},
+    {"name": "help",            "command": "/help",            "description": "Show help and available commands", "mode": "meta",
+     "prompt_template": None},
     {"name": "terminal-help",   "command": "/terminal-help",   "description": "Help with terminal and shell usage", "mode": "cli-only"},
     {"name": "keybindings-help","command": "/keybindings-help", "description": "Customize keyboard shortcuts", "mode": "cli-only"},
     {"name": "vim",             "command": "/vim",             "description": "Toggle vim keybindings in CC terminal", "mode": "cli-only"},
