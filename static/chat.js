@@ -622,8 +622,9 @@ function updateContextInfo(data) {
         if (!banner) {
             banner = document.createElement('div');
             banner.id = 'compactify-banner';
-            const messagesEl = document.getElementById('messages');
-            messagesEl.parentNode.insertBefore(banner, messagesEl);
+            // Place above input area so it's visible without scrolling
+            const inputArea = document.getElementById('input-area');
+            inputArea.parentNode.insertBefore(banner, inputArea);
         }
         // Build summary line and expanded details per source
         let summaryLine, details = [];

@@ -2130,16 +2130,28 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
             use_ollama=use_ollama,
         )
 
+        # Get the current leaf for parenting the compaction marker
+        leaf = await db.get_active_leaf(conv_id)
+        compact_parent_id = leaf["id"] if leaf else None
+
         got_compact = False
         async for evt in event_stream:
             etype = evt.get("type", "")
 
             if etype == "compact_boundary":
                 got_compact = True
+                pre_tokens = evt.get("pre_tokens")
+                token_info = f" — {pre_tokens:,} tokens before" if pre_tokens else ""
+                marker = await db.add_message(
+                    conv_id, "system",
+                    f"[CC context compactified (manual){token_info}]",
+                    parent_id=compact_parent_id,
+                )
                 await _ws_send(conv_id, {
                     "type": "compact_boundary",
                     "trigger": "manual",
-                    "pre_tokens": evt.get("pre_tokens"),
+                    "pre_tokens": pre_tokens,
+                    "marker_id": marker["id"],
                 })
 
             elif etype == "result":
@@ -2685,13 +2697,22 @@ async def _handle_claude_generation(
                 )
 
             elif etype == "compact_boundary":
-                # CC compactified its context — notify the UI
+                # CC compactified its context — persist as system message + notify UI
+                trigger = evt.get("trigger", "auto")
+                pre_tokens = evt.get("pre_tokens")
+                token_info = f" — {pre_tokens:,} tokens before" if pre_tokens else ""
+                marker = await db.add_message(
+                    conv_id, "system",
+                    f"[CC context compactified ({trigger}){token_info}]",
+                    parent_id=parent_id,
+                )
                 await _ws_send(
                     conv_id,
                     {
                         "type": "compact_boundary",
-                        "trigger": evt.get("trigger", "auto"),
-                        "pre_tokens": evt.get("pre_tokens"),
+                        "trigger": trigger,
+                        "pre_tokens": pre_tokens,
+                        "marker_id": marker["id"],
                     },
                 )
 

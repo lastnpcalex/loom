@@ -1027,7 +1027,8 @@ function updateInlineCCControls(conv) {
         modelSel.value = ccModel;
         effortSel.value = conv.cc_effort || 'high';
         if (permSel) permSel.value = conv.cc_permission_mode || 'default';
-        const isAnthropicModel = ['sonnet', 'opus', 'haiku'].includes(ccModel);
+        const _baseModel = ccModel.includes('[') ? ccModel.split('[')[0] : ccModel;
+        const isAnthropicModel = ['sonnet', 'opus', 'haiku'].includes(_baseModel);
         modelSel.style.display = conv.mode === 'local' ? 'none' : '';
         effortSel.style.display = (conv.mode === 'local' || !isAnthropicModel) ? 'none' : '';
         statePanelChat?.classList.add('hidden');
@@ -1127,7 +1128,8 @@ function initInlineCCControls() {
     const _GEMINI_MODELS = new Set(['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview', 'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite']);
 
     function _syncEffortVisibility(model) {
-        effortSel.style.display = _ANTHROPIC_MODELS.has(model) ? '' : 'none';
+        const base = model.includes('[') ? model.split('[')[0] : model;
+        effortSel.style.display = _ANTHROPIC_MODELS.has(base) ? '' : 'none';
     }
 
     modelSel.addEventListener('change', () => {
@@ -1840,13 +1842,14 @@ function setupEventListeners() {
     const _MODAL_ANTHROPIC = new Set(['sonnet', 'opus', 'haiku']);
     document.getElementById('cc-model').addEventListener('change', () => {
         const model = document.getElementById('cc-model').value;
+        const baseModel = model.includes('[') ? model.split('[')[0] : model;
         const effortGroup = document.getElementById('cc-effort-group');
-        if (!_MODAL_ANTHROPIC.has(model)) {
+        if (!_MODAL_ANTHROPIC.has(baseModel)) {
             effortGroup.classList.add('hidden');
         } else {
             effortGroup.classList.remove('hidden');
             const maxOpt = document.querySelector('#cc-effort option[value="max"]');
-            if (model !== 'opus') {
+            if (baseModel !== 'opus') {
                 maxOpt.disabled = true;
                 if (document.getElementById('cc-effort').value === 'max') {
                     document.getElementById('cc-effort').value = 'high';
