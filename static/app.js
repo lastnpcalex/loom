@@ -1962,14 +1962,16 @@ function setupEventListeners() {
 
     // Send message
     document.getElementById('btn-send').addEventListener('click', sendMessage);
+    const isMobile = window.matchMedia('(pointer: coarse)').matches
+        && window.matchMedia('(max-width: 768px)').matches;
     document.getElementById('user-input').addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            // On touch devices, Enter inserts a newline (use send button instead).
-            // On desktop, Enter sends the message.
-            const isMobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-            if (isMobile) return; // let default newline behavior happen
-            e.preventDefault();
-            sendMessage();
+        if (e.key === 'Enter') {
+            if (isMobile) return; // mobile: Enter = newline, use send button
+            if (e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+            // plain Enter = newline (default textarea behavior)
         }
     });
 
