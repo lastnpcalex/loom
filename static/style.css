@@ -2733,6 +2733,69 @@ body::after {
     font-size: 11px;
 }
 
+#describe-context-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+    padding: 4px 8px;
+    max-width: 800px;
+    margin-left: auto;
+    margin-right: auto;
+}
+#describe-context-bar label {
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    cursor: help;
+}
+#describe-context {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-size: 12px;
+    padding: 4px 8px;
+    outline: none;
+}
+#describe-context:focus {
+    border-color: var(--cyan);
+}
+#describe-context::placeholder {
+    color: var(--text-muted);
+    font-style: italic;
+}
+.edit-describe-context {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0;
+}
+.edit-describe-context label {
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    cursor: help;
+}
+.edit-describe-input {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-size: 12px;
+    padding: 4px 8px;
+    outline: none;
+}
+.edit-describe-input:focus {
+    border-color: var(--cyan);
+}
+.edit-describe-input::placeholder {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
 #image-preview {
     display: flex;
     align-items: center;

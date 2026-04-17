@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT NOT NULL,
     image_path TEXT,
     image_alt TEXT,
+    describe_context TEXT,
     token_estimate INTEGER NOT NULL DEFAULT 0,
     is_active INTEGER NOT NULL DEFAULT 1,
     summary TEXT,
@@ -323,6 +324,8 @@ async def _run_migrations(db):
         "ALTER TABLE messages ADD COLUMN cc_model_used TEXT",
         # Canvas view: embedded website preview in tree view
         "ALTER TABLE conversations ADD COLUMN canvas_enabled INTEGER DEFAULT 0",
+        # Vision model describe focus (sent only to vision model, never chat)
+        "ALTER TABLE messages ADD COLUMN describe_context TEXT",
     ]
     for sql in migrations:
         try:
@@ -671,6 +674,7 @@ async def add_message(
     turn_input_tokens: int = None,
     turn_output_tokens: int = None,
     cc_session_id: str = None,
+    describe_context: str = None,
 ) -> dict:
     db = await get_db()
     token_est = len(content) // 3
@@ -679,8 +683,8 @@ async def add_message(
         """INSERT INTO messages
            (conversation_id, parent_id, role, content, image_path, token_estimate,
             is_active, content_blocks, turn_cost_usd, turn_input_tokens, turn_output_tokens,
-            cc_session_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            cc_session_id, describe_context, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             conversation_id,
             parent_id,
@@ -694,6 +698,7 @@ async def add_message(
             turn_input_tokens,
             turn_output_tokens,
             cc_session_id,
+            describe_context,
             now,
         ),
     )

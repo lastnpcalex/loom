@@ -1193,8 +1193,10 @@ async def api_add_message(conv_id: int, data: dict):
         leaf = await db.get_active_leaf(conv_id)
         parent_id = leaf["id"] if leaf else None
 
+    describe_context = data.get("describe_context", "").strip() or None
     msg = await db.add_message(
-        conv_id, role, content, parent_id=parent_id, image_path=image_path
+        conv_id, role, content, parent_id=parent_id, image_path=image_path,
+        describe_context=describe_context
     )
     await db.set_active_branch(conv_id, msg["id"])
     return msg
@@ -2442,13 +2444,13 @@ async def _handle_claude_generation(
                     encoding="utf-8",
                 )
 
-        # Parse /describe context from user message for image description
+        # Retrieve describe context from DB (vision model only, never sent to chat model)
         _describe_context = None
-        if prompt.startswith("/describe"):
-            _describe_rest = prompt[len("/describe"):].strip()
-            _describe_context = _describe_rest if _describe_rest else None
-            # Replace the prompt so the model gets the context as normal text
-            prompt = _describe_rest if _describe_rest else "(see attached image)"
+        if branch:
+            for msg in reversed(branch):
+                if msg["role"] == "user":
+                    _describe_context = msg.get("describe_context")
+                    break
 
         # Attach images if present on the latest user message
         # (runs for both session-resume and fresh-session paths)

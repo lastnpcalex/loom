@@ -2180,6 +2180,8 @@ const MAX_PENDING_IMAGES = 5;
 function clearPendingImages() {
     State.pendingImages = [];
     document.getElementById('file-input').value = '';
+    const descInput = document.getElementById('describe-context');
+    if (descInput) descInput.value = '';
     renderImagePreviews();
 }
 
@@ -2190,12 +2192,17 @@ function removePendingImage(index) {
 
 function renderImagePreviews() {
     const container = document.getElementById('image-preview');
+    const describeBar = document.getElementById('describe-context-bar');
+    const hasImages = State.pendingImages.some(img => img.is_image);
     if (State.pendingImages.length === 0) {
         container.classList.add('hidden');
         container.innerHTML = '';
+        if (describeBar) describeBar.classList.add('hidden');
         return;
     }
     container.classList.remove('hidden');
+    // Show describe context bar only when images are attached
+    if (describeBar) describeBar.classList.toggle('hidden', !hasImages);
     container.innerHTML = State.pendingImages.map((img, i) => `
         <div class="preview-thumb">
             ${img.is_image

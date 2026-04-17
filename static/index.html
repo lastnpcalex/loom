@@ -193,6 +193,10 @@
         <!-- Shared input area (visible on both chat and tree views) -->
         <div id="input-area" class="hidden">
             <div id="image-preview" class="hidden"></div>
+            <div id="describe-context-bar" class="hidden">
+                <label for="describe-context" title="Extra focus for vision model image description — not sent to chat model">Describe focus</label>
+                <input type="text" id="describe-context" placeholder="e.g. focus on body language and composition" autocomplete="off" spellcheck="false">
+            </div>
             <div id="weave-inline-controls" class="hidden">
                 <select id="weave-model-inline" title="Ollama model">
                     <option value="">Default</option>

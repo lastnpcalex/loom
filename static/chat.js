@@ -1123,12 +1123,15 @@ async function sendMessage() {
 
     // Add user message via REST — send image paths as JSON array
     const imagePaths = hasImages ? State.pendingImages.map(img => img.path) : null;
+    const describeInput = document.getElementById('describe-context');
+    const describeContext = describeInput ? describeInput.value.trim() : '';
     const isFromTree = State.currentView === 'tree';
     const msgData = {
         role: 'user',
         content: content,
         image_path: imagePaths,
     };
+    if (describeContext) msgData.describe_context = describeContext;
     // From tree view: create a new root branch
     if (isFromTree) {
         msgData.parent_id = null;
@@ -2623,6 +2626,28 @@ function editMessage(msgId) {
     }
     renderEditFiles();
 
+    // Describe focus input for image descriptions (only shown when images attached)
+    const describeRow = document.createElement('div');
+    describeRow.className = 'edit-describe-context hidden';
+    describeRow.innerHTML = `
+        <label title="Extra focus for vision model image description — not sent to chat model">Describe focus</label>
+        <input type="text" class="edit-describe-input" placeholder="e.g. focus on body language and composition" autocomplete="off" spellcheck="false" value="${escapeHtml(msg.describe_context || '')}">
+    `;
+    filePreview.after(describeRow);
+
+    // Show/hide describe row based on whether images are attached
+    function updateDescribeVisibility() {
+        const hasImg = editFiles.some(f => {
+            const ext = f.path.split('.').pop().toLowerCase();
+            return ['jpg','jpeg','png','gif','webp','bmp','svg'].includes(ext);
+        });
+        describeRow.classList.toggle('hidden', !hasImg);
+    }
+    updateDescribeVisibility();
+    // Patch renderEditFiles to also update describe visibility
+    const _origRenderEditFiles = renderEditFiles;
+    renderEditFiles = function() { _origRenderEditFiles(); updateDescribeVisibility(); };
+
     const isWeave = State.currentConv && State.currentConv.mode === 'weave';
     const btnRow = document.createElement('div');
     btnRow.className = 'edit-message-actions';
@@ -2637,7 +2662,7 @@ function editMessage(msgId) {
         <button class="btn-small edit-cancel">Cancel</button>
     `;
     if (isWeave) _setupBranchPillClick(btnRow.querySelector('.branch-count-pill'));
-    filePreview.after(btnRow);
+    describeRow.after(btnRow);
 
     // File attach handler
     const editFileInput = btnRow.querySelector('.edit-file-input');
@@ -2664,6 +2689,7 @@ function editMessage(msgId) {
         newContent.innerHTML = formatContent(msg.content);
         textarea.replaceWith(newContent);
         filePreview.remove();
+        describeRow.remove();
         btnRow.remove();
     });
 
@@ -2675,12 +2701,16 @@ function editMessage(msgId) {
             const parentId = msg.parent_id || null;
             const allPaths = editFiles.map(f => f.path);
 
-            const newMsg = await API.post(`/api/conversations/${State.currentConvId}/messages`, {
+            const editDescInput = describeRow.querySelector('.edit-describe-input');
+            const editDescCtx = editDescInput ? editDescInput.value.trim() : '';
+            const editMsgData = {
                 role: 'user',
                 content: newText,
                 parent_id: parentId,
                 image_path: allPaths.length > 0 ? allPaths : null,
-            });
+            };
+            if (editDescCtx) editMsgData.describe_context = editDescCtx;
+            const newMsg = await API.post(`/api/conversations/${State.currentConvId}/messages`, editMsgData);
 
             // Switch to and scroll to the new branch, then kick off generation
             await switchToBranch(newMsg.id, newMsg.id);
