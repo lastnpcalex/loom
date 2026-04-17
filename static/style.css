@@ -2689,6 +2689,7 @@ body::after {
 
 #cc-inline-controls {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     margin-bottom: 8px;
     max-width: 800px;
@@ -2704,6 +2705,11 @@ body::after {
     padding: 4px 8px;
     cursor: pointer;
     transition: var(--transition);
+    flex: 0 1 auto;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 #cc-inline-controls select:hover {
     border-color: var(--cyan);
@@ -4330,6 +4336,7 @@ pre.tool-output {
     #cc-inline-controls select {
         font-size: 11px;
         padding: 3px 6px;
+        max-width: 140px;
     }
     #input-row {
         gap: 6px;
