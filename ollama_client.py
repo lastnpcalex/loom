@@ -260,8 +260,8 @@ async def sync_chat(messages: list[dict],
         return "Summary: The conversation continues with escalating tension and mutual wariness."
 
 
-async def describe_image(image_path: str, model: str = None) -> str:
-    """Use a multimodal Ollama model to describe an image in 1-2 sentences."""
+async def describe_image(image_path: str, model: str = None, context: str = None) -> str:
+    """Use a multimodal Ollama model to describe an image in detail."""
     global _mock_mode
 
     if _mock_mode:
@@ -274,12 +274,15 @@ async def describe_image(image_path: str, model: str = None) -> str:
         return "An image was shared but could not be read."
 
     try:
+        _describe_prompt = "Describe this image in thorough detail. Include: subjects and their appearance (clothing, expression, physical features), their physical pose and body language (how they are positioned, what their limbs are doing, spatial arrangement relative to each other and the environment), setting and environment, lighting and mood, composition and framing, any text or symbols visible, and notable artistic or photographic qualities. Describe what you observe objectively and completely without editorializing or omitting details. No preamble."
+        if context:
+            _describe_prompt += f"\n\nAdditional focus: {context}"
         payload = {
             "model": model or config.ollama_model,
             "messages": [
                 {
                     "role": "user",
-                    "content": "Describe this image in thorough detail. Include: subjects and their appearance (clothing, expression, posture, physical features), setting and environment, lighting and mood, composition and framing, any text or symbols visible, and notable artistic or photographic qualities. Describe what you observe objectively and completely without editorializing or omitting details. No preamble.",
+                    "content": _describe_prompt,
                     "images": [img_data],
                 }
             ],
@@ -303,7 +306,7 @@ async def describe_image(image_path: str, model: str = None) -> str:
         return "An image was shared."
 
 
-async def describe_image_with_data(image_path: str, model: str = None) -> tuple[str, dict]:
+async def describe_image_with_data(image_path: str, model: str = None, context: str = None) -> tuple[str, dict]:
     """Use a multimodal Ollama model to describe an image AND return the image data for direct passing.
 
     Returns:
@@ -323,12 +326,15 @@ async def describe_image_with_data(image_path: str, model: str = None) -> tuple[
 
     # Describe the image
     try:
+        _describe_prompt = "Describe this image in thorough detail. Include: subjects and their appearance (clothing, expression, physical features), their physical pose and body language (how they are positioned, what their limbs are doing, spatial arrangement relative to each other and the environment), setting and environment, lighting and mood, composition and framing, any text or symbols visible, and notable artistic or photographic qualities. Describe what you observe objectively and completely without editorializing or omitting details. No preamble."
+        if context:
+            _describe_prompt += f"\n\nAdditional focus: {context}"
         describe_payload = {
             "model": model or config.ollama_model,
             "messages": [
                 {
                     "role": "user",
-                    "content": "Describe this image in thorough detail. Include: subjects and their appearance (clothing, expression, posture, physical features), setting and environment, lighting and mood, composition and framing, any text or symbols visible, and notable artistic or photographic qualities. Describe what you observe objectively and completely without editorializing or omitting details. No preamble.",
+                    "content": _describe_prompt,
                     "images": [img_data],
                 }
             ],

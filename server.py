@@ -2442,6 +2442,14 @@ async def _handle_claude_generation(
                     encoding="utf-8",
                 )
 
+        # Parse /describe context from user message for image description
+        _describe_context = None
+        if prompt.startswith("/describe"):
+            _describe_rest = prompt[len("/describe"):].strip()
+            _describe_context = _describe_rest if _describe_rest else None
+            # Replace the prompt so the model gets the context as normal text
+            prompt = _describe_rest if _describe_rest else "(see attached image)"
+
         # Attach images if present on the latest user message
         # (runs for both session-resume and fresh-session paths)
         if branch:
@@ -2479,14 +2487,14 @@ async def _handle_claude_generation(
                         if file_ext in _IMAGE_EXTS:
                             try:
                                 await _ws_send(conv_id, {"type": "status", "text": f"Describing image {src.name}..."})
-                                desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None), timeout=30)
-                                file_notes.append(f"{src.name} — {desc}")
+                                desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None, context=_describe_context), timeout=30)
+                                file_notes.append(f"[Image: {desc}]")
                             except asyncio.TimeoutError:
                                 print(f"[DESCRIBE] Timed out describing {src.name} (30s)")
-                                file_notes.append(f"{src.name} (in attached_files/ — description timed out)")
+                                file_notes.append("[Image shared but description timed out]")
                             except Exception as e:
                                 print(f"[DESCRIBE] Failed to describe image {src.name}: {e}")
-                                file_notes.append(f"{src.name} (in attached_files/ — description unavailable)")
+                                file_notes.append("[Image shared but description unavailable]")
                         else:
                             file_notes.append(f"{src.name} (in attached_files/)")
                     else:
@@ -2498,7 +2506,9 @@ async def _handle_claude_generation(
                             file_notes.append(str(src).replace("\\", "/"))
                 if file_notes:
                     files_str = "\n".join(f"  • {note}" for note in file_notes)
-                    prompt += f"\n\n[User attached {len(file_notes)} file(s). See attached_files/ for the files.]\n{files_str}"
+                    _has_img = any(note.startswith("[Image") for note in file_notes)
+                    _hdr = "[Attached files — image descriptions already provided, do NOT read image files.]" if _has_img else f"[User attached {len(file_notes)} file(s). See attached_files/ for the files.]"
+                    prompt += f"\n\n{_hdr}\n{files_str}"
         # Create draft message in DB immediately so it survives navigation/restarts.
         # If parent already has an empty assistant child (stale draft), reuse it.
         draft_msg = None
@@ -2896,14 +2906,14 @@ async def _handle_claude_generation(
                             if file_ext in _IMAGE_EXTS:
                                 try:
                                     await _ws_send(conv_id, {"type": "status", "text": f"Describing image {src.name}..."})
-                                    desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None), timeout=30)
-                                    file_notes.append(f"{src.name} — {desc}")
+                                    desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None, context=_describe_context), timeout=30)
+                                    file_notes.append(f"[Image: {desc}]")
                                 except asyncio.TimeoutError:
                                     print(f"[DESCRIBE] Timed out describing {src.name} (30s)")
-                                    file_notes.append(f"{src.name} (in attached_files/ — description timed out)")
+                                    file_notes.append("[Image shared but description timed out]")
                                 except Exception as e:
                                     print(f"[DESCRIBE] Failed to describe image {src.name}: {e}")
-                                    file_notes.append(f"{src.name} (in attached_files/ — description unavailable)")
+                                    file_notes.append("[Image shared but description unavailable]")
                             else:
                                 file_notes.append(f"{src.name} (in attached_files/)")
                         else:
@@ -2915,7 +2925,9 @@ async def _handle_claude_generation(
                                 file_notes.append(str(src).replace("\\", "/"))
                     if file_notes:
                         files_str = "\n".join(f"  • {note}" for note in file_notes)
-                        fallback_prompt += f"\n\n[User attached {len(file_notes)} file(s). See attached_files/ for the files.]\n{files_str}"
+                        _has_img = any(note.startswith("[Image") for note in file_notes)
+                        _hdr = "[Attached files — image descriptions already provided, do NOT read image files.]" if _has_img else f"[User attached {len(file_notes)} file(s). See attached_files/ for the files.]"
+                        fallback_prompt += f"\n\n{_hdr}\n{files_str}"
 
             proc, event_stream = await claude_client.run_claude(
                 fallback_prompt,
