@@ -65,6 +65,9 @@ start_loom.bat
 .env
 .env.*
 
+# User config (persisted settings from UI)
+config.json
+
 # Screenshots
 Screenshot*.png
 

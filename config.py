@@ -68,6 +68,38 @@ class Config:
                 if key == "ollama_host" and val and not val.startswith(("http://", "https://")):
                     val = f"http://{val}"
                 setattr(self, key, val)
+        self.save()
+
+    def save(self):
+        """Persist user-editable settings to config.json."""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.to_dict(), f, indent=2)
+        except Exception as e:
+            print(f"[CONFIG] Failed to save config.json: {e}")
+
+    def load(self):
+        """Load saved settings from config.json if it exists."""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            # Apply without re-saving
+            for key in ("ollama_host", "ollama_model", "vision_model",
+                         "max_context_tokens", "verbatim_window", "temperature",
+                         "top_p", "max_tokens", "repeat_penalty"):
+                if key in saved:
+                    val = type(getattr(self, key))(saved[key])
+                    if key == "ollama_host" and val and not val.startswith(("http://", "https://")):
+                        val = f"http://{val}"
+                    setattr(self, key, val)
+            print(f"[CONFIG] Loaded settings from config.json")
+        except FileNotFoundError:
+            pass  # No saved config yet, use defaults
+        except Exception as e:
+            print(f"[CONFIG] Failed to load config.json: {e}")
 
 
 config = Config()
+config.load()
