@@ -227,11 +227,19 @@ function handleWSMessage(data) {
             break;
 
         case 'compact_boundary':
-            // Claude Code compactified its context — now forks into a new branch.
-            // No banner needed; the branch fork in the tree is the visual cue.
+            // Claude Code compactified its context — forked into a new branch.
+            // Reload messages immediately to show the system marker and switch branch.
             State._compactedThisGen = true;
             State._compactData = data;
             showGenStatus('Context compactified — branching...');
+            if (data.marker_id) {
+                // Switch to the new branch (compact marker) so user sees the fork
+                switchToBranch(data.marker_id, data.marker_id).then(() => {
+                    showGenStatus('Context compactified — continuing generation...');
+                });
+            } else {
+                loadMessages(State.currentConvId);
+            }
             break;
 
         case 'compact_done':
@@ -924,32 +932,18 @@ function _handleMetaCommand(name, args) {
             break;
         }
         case 'compact-test': {
-            // Fake compactification for UI testing
-            // /compact-test cc  → Claude Code compaction
-            // /compact-test     → local (Ollama) compaction
-            const isCC = args.toLowerCase().startsWith('cc');
-            if (isCC) {
-                updateContextInfo({
-                    was_compactified: true,
-                    trigger: 'auto',
-                    pre_tokens: 185000,
-                    post_tokens: 42000,
-                });
-                showGenStatus('Context compactified by Claude Code — continuing...');
-                showToast('Showing CC compaction banner (test)', 3000);
-            } else {
-                updateContextInfo({
-                    was_compactified: true,
-                    total_tokens: 28500,
-                    total_messages: 42,
-                    verbatim_count: 6,
-                    summarized_count: 36,
-                    style_nudge: 'visceral',
-                    summary_text: '[Turns 1-8]: Player entered the abandoned cathedral. Character described the shattered stained glass and the sound of dripping water. Player investigated the altar and found a hidden compartment.\n[Turns 9-18]: Confrontation with the Keeper. Extended dialogue about the nature of the curse. Player chose to bargain rather than fight.\n[Turns 19-36]: Journey through the underground passage. Character described the bioluminescent fungi and the distant rumbling. Player lost their torch and had to navigate by touch.',
-                });
-                showGenStatus('Context: 28,500 tokens (36 summarized, 6 verbatim) — Waiting for model...');
-                showToast('Showing local compaction banner (test)', 3000);
-            }
+            // Simulate full compact branching flow — creates a real system message
+            if (!State.currentConvId) { showToast('No conversation selected'); break; }
+            const ctLeaf = State.messages[State.messages.length - 1];
+            if (!ctLeaf) { showToast('No messages to compact from'); break; }
+            API.post(`/api/conversations/${State.currentConvId}/messages`, {
+                role: 'system',
+                content: '[CC context compactified (test) — 185,000 tokens before]',
+                parent_id: ctLeaf.id,
+            }).then(marker => {
+                showToast('Compact test — switching to new branch', 3000);
+                switchToBranch(marker.id, marker.id);
+            }).catch(() => showToast('Failed to create test compact marker', 'error'));
             break;
         }
         default:

@@ -13,12 +13,20 @@ from config import config
 _mock_mode = False
 
 
+def _ollama_host():
+    """Return the Ollama host URL with protocol prefix."""
+    host = config.ollama_host
+    if host and not host.startswith(("http://", "https://")):
+        host = f"http://{host}"
+    return host
+
+
 async def health_check() -> dict:
     """Check if Ollama is reachable and the model is available."""
     global _mock_mode
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{config.ollama_host}/api/tags")
+            resp = await client.get(f"{_ollama_host()}/api/tags")
             resp.raise_for_status()
             data = resp.json()
             models = [m["name"] for m in data.get("models", [])]
@@ -170,7 +178,7 @@ async def stream_chat(messages: list[dict],
         }
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
-            async with client.stream("POST", f"{config.ollama_host}/api/chat",
+            async with client.stream("POST", f"{_ollama_host()}/api/chat",
                                      json=payload) as response:
                 if response.status_code != 200:
                     body = await response.aread()
@@ -213,7 +221,7 @@ async def stream_chat(messages: list[dict],
                     except json.JSONDecodeError:
                         continue
     except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as e:
-        raise RuntimeError(f"Cannot reach Ollama at {config.ollama_host}: {e}")
+        raise RuntimeError(f"Cannot reach Ollama at {_ollama_host()}: {e}")
 
 
 async def sync_chat(messages: list[dict],
@@ -241,7 +249,7 @@ async def sync_chat(messages: list[dict],
             payload["think"] = think
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
-            resp = await client.post(f"{config.ollama_host}/api/chat", json=payload)
+            resp = await client.post(f"{_ollama_host()}/api/chat", json=payload)
             resp.raise_for_status()
             data = resp.json()
             msg = data.get("message", {})
@@ -284,7 +292,7 @@ async def describe_image(image_path: str, model: str = None) -> str:
         }
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
-            resp = await client.post(f"{config.ollama_host}/api/chat", json=payload)
+            resp = await client.post(f"{_ollama_host()}/api/chat", json=payload)
             resp.raise_for_status()
             data = resp.json()
             msg = data.get("message", {})
@@ -333,7 +341,7 @@ async def describe_image_with_data(image_path: str, model: str = None) -> tuple[
         }
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
-            resp = await client.post(f"{config.ollama_host}/api/chat", json=describe_payload)
+            resp = await client.post(f"{_ollama_host()}/api/chat", json=describe_payload)
             resp.raise_for_status()
             data = resp.json()
             msg = data.get("message", {})
