@@ -2128,8 +2128,16 @@ function setupEventListeners() {
 
 function autoResizeTextarea() {
     const ta = document.getElementById('user-input');
-    ta.style.height = 'auto';
-    ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
+    // Measure in an off-screen clone to avoid flex reflow flicker in tree view
+    const clone = ta.cloneNode(true);
+    clone.style.position = 'absolute';
+    clone.style.visibility = 'hidden';
+    clone.style.height = 'auto';
+    clone.style.width = ta.offsetWidth + 'px';
+    ta.parentNode.appendChild(clone);
+    const newH = Math.min(clone.scrollHeight, 200) + 'px';
+    clone.remove();
+    ta.style.height = newH;
 }
 
 // ── Character Grid ──

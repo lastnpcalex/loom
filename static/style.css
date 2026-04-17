@@ -1348,6 +1348,7 @@ body::after {
 
 #tree-canvas {
     flex: 1;
+    min-height: 0;
     overflow: hidden;
     position: relative;
     background:
@@ -1372,7 +1373,7 @@ body::after {
     padding: 8px 12px;
     cursor: pointer;
     transition: all var(--transition);
-    border: 1px solid var(--border);
+    border: 1px solid rgba(191, 0, 255, 0.55);
     background: rgba(5, 5, 15, 0.92);
     backdrop-filter: var(--glass);
     -webkit-backdrop-filter: var(--glass);
@@ -1380,6 +1381,7 @@ body::after {
     line-height: 1.4;
     user-select: none;
     min-height: 32px;
+    box-shadow: 0 0 8px rgba(191, 0, 255, 0.15);
 }
 
 .tree-node-card:hover {
@@ -1720,12 +1722,12 @@ body::after {
 
 .tree-node-card.user {
     background: rgba(0, 20, 30, 0.92);
-    border-color: var(--user-border);
+    border-color: rgba(0, 255, 255, 0.5);
 }
 
 .tree-node-card.assistant {
     background: rgba(15, 5, 25, 0.92);
-    border-color: var(--assistant-border);
+    border-color: rgba(191, 0, 255, 0.5);
 }
 
 .tree-node-card.active {

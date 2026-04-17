@@ -14,7 +14,7 @@ const TREE = {
     gapX: 40,
     gapY: 80,
     vertical: false,  // false = horizontal chains, true = vertical chains
-    connectorColor: '#30363d',
+    connectorColor: '#6e7681',
     connectorActiveColor: '#58a6ff',
     // Canvas state
     panX: 0,
@@ -992,7 +992,7 @@ function drawConnectors(svg, nodes, positions) {
             const isActive = node.isActive && nodes.find(n => n.data.id === node.parentId)?.isActive;
 
             const color = isActive ? TREE.connectorActiveColor : TREE.connectorColor;
-            const width = isActive ? 2.5 : 1.5;
+            const width = isActive ? 2.5 : 2;
 
             let d;
             if (vertical) {
