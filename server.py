@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.websockets import WebSocketState
 
+import httpx
 import database as db
 from config import config
 from character_loader import (
@@ -798,6 +799,8 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["cc_effort"] = data["cc_effort"]
     if "cc_permission_mode" in data:
         fields["cc_permission_mode"] = data["cc_permission_mode"]
+    if "local_model" in data:
+        fields["local_model"] = data["local_model"]
     if "ooda_enabled" in data:
         fields["ooda_enabled"] = int(data["ooda_enabled"])
     if "folder" in data:
@@ -1446,6 +1449,63 @@ async def api_get_config():
 async def api_update_config(data: dict):
     config.update_from_dict(data)
     return config.to_dict()
+
+
+# ── CC Model List ──
+# Single source of truth for Anthropic + Gemini models available in Loom/Braid.
+# Update this list when new models ship — all dropdowns pull from here.
+
+CC_MODELS = [
+    {"group": "Anthropic", "models": [
+        {"value": "sonnet", "label": "Sonnet"},
+        {"value": "sonnet[1m]", "label": "Sonnet (1M)"},
+        {"value": "opus", "label": "Opus"},
+        {"value": "opus[1m]", "label": "Opus (1M)"},
+        {"value": "haiku", "label": "Haiku"},
+    ]},
+    {"group": "Gemini", "models": [
+        {"value": "gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro Preview"},
+        {"value": "gemini-3-flash-preview", "label": "Gemini 3 Flash Preview"},
+        {"value": "gemini-3.1-flash-lite-preview", "label": "Gemini 3.1 Flash Lite Preview"},
+        {"value": "gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
+        {"value": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
+        {"value": "gemini-2.5-flash-lite", "label": "Gemini 2.5 Flash Lite"},
+    ]},
+]
+
+
+@app.get("/api/cc-models")
+async def api_cc_models():
+    return CC_MODELS
+
+
+@app.get("/api/ollama/vision-models")
+async def api_ollama_vision_models():
+    """Return Ollama models that support vision (have a projector/clip family or vision capability)."""
+    _VISION_FAMILIES = {"clip", "mllama", "mmproj"}
+    host = config.ollama_host
+    if host and not host.startswith(("http://", "https://")):
+        host = f"http://{host}"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{host}/api/tags")
+            resp.raise_for_status()
+            data = resp.json()
+            vision = []
+            for m in data.get("models", []):
+                details = m.get("details", {})
+                families = set(details.get("families") or [])
+                # Check families for known vision projector types
+                if families & _VISION_FAMILIES:
+                    vision.append(m["name"])
+                    continue
+                # Newer Ollama versions may include capabilities
+                caps = m.get("capabilities") or []
+                if "vision" in caps:
+                    vision.append(m["name"])
+            return {"models": vision}
+    except Exception as e:
+        return {"models": [], "error": str(e)}
 
 
 # ── Directory Browser (for Claude mode project picker) ──
@@ -2130,7 +2190,8 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
             use_ollama=use_ollama,
         )
 
-        # Get the current leaf for parenting the compaction marker
+        # Get the current leaf — compact marker becomes its child,
+        # forking the conversation at this point
         leaf = await db.get_active_leaf(conv_id)
         compact_parent_id = leaf["id"] if leaf else None
 
@@ -2142,11 +2203,15 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
                 got_compact = True
                 pre_tokens = evt.get("pre_tokens")
                 token_info = f" — {pre_tokens:,} tokens before" if pre_tokens else ""
+                content = f"[CC context compactified (manual){token_info}]"
                 marker = await db.add_message(
                     conv_id, "system",
-                    f"[CC context compactified (manual){token_info}]",
+                    content,
                     parent_id=compact_parent_id,
+                    is_active=True,
                 )
+                # Switch active branch to the compact marker
+                await db.set_active_branch(conv_id, marker["id"])
                 await _ws_send(conv_id, {
                     "type": "compact_boundary",
                     "trigger": "manual",
@@ -2180,10 +2245,16 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
             await _ws_send(conv_id, {"type": "status", "text": "Context compacted successfully"})
         else:
             await _ws_send(conv_id, {"type": "status", "text": "Compaction completed (no boundary event received)"})
+        # Clear the status bar and trigger a message reload to show the new branch
+        await asyncio.sleep(1.5)
+        await _ws_send(conv_id, {"type": "compact_done"})
 
     except Exception as e:
         print(f"[Compact] Error: {e}")
         import traceback; traceback.print_exc()
+        await _ws_send(conv_id, {"type": "status", "text": f"Compaction failed: {e}"})
+        await asyncio.sleep(2)
+        await _ws_send(conv_id, {"type": "compact_done"})
         await _ws_send(conv_id, {"type": "error", "error": f"Compaction failed: {e}"})
 
 
@@ -2286,7 +2357,7 @@ async def _handle_claude_generation(
                     print(f"[CC] Skipping empty/error session on msg {msg['id']}")
                     continue
                 # Check if the session was created by a different provider
-                prev_model = msg.get("cc_model_used", "")
+                prev_model = msg.get("cc_model_used") or ""
                 _prev_base = prev_model.split("[")[0] if "[" in prev_model else prev_model
                 prev_is_anthropic = _prev_base in _ANTHROPIC_MODELS
                 prev_is_gemini = prev_model.startswith("gemini")
@@ -2404,18 +2475,18 @@ async def _handle_claude_generation(
                         )
                     if use_ollama:
                         # Local mode: describe image via Ollama's native multimodal API
-                        # since CC's Read tool dumps base64 text that local models can't parse
+                        # since CC's view_image tool returns file paths that local models can't parse
                         if file_ext in _IMAGE_EXTS:
                             try:
-                                desc = await describe_image(str(src))
+                                await _ws_send(conv_id, {"type": "status", "text": f"Describing image {src.name}..."})
+                                desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None), timeout=30)
                                 file_notes.append(f"{src.name} — {desc}")
+                            except asyncio.TimeoutError:
+                                print(f"[DESCRIBE] Timed out describing {src.name} (30s)")
+                                file_notes.append(f"{src.name} (in attached_files/ — description timed out)")
                             except Exception as e:
-                                print(
-                                    f"[DESCRIBE] Failed to describe image {src.name}: {e}"
-                                )
-                                file_notes.append(
-                                    f"{src.name} — (image description unavailable)"
-                                )
+                                print(f"[DESCRIBE] Failed to describe image {src.name}: {e}")
+                                file_notes.append(f"{src.name} (in attached_files/ — description unavailable)")
                         else:
                             file_notes.append(f"{src.name} (in attached_files/)")
                     else:
@@ -2697,15 +2768,29 @@ async def _handle_claude_generation(
                 )
 
             elif etype == "compact_boundary":
-                # CC compactified its context — persist as system message + notify UI
+                # CC compactified its context — fork into a new branch.
+                # The compact summary becomes the first message of the new branch,
+                # and the draft (assistant response) is reparented under it.
                 trigger = evt.get("trigger", "auto")
                 pre_tokens = evt.get("pre_tokens")
                 token_info = f" — {pre_tokens:,} tokens before" if pre_tokens else ""
+                content = f"[CC context compactified ({trigger}){token_info}]"
                 marker = await db.add_message(
                     conv_id, "system",
-                    f"[CC context compactified ({trigger}){token_info}]",
+                    content,
                     parent_id=parent_id,
+                    is_active=True,
                 )
+                # Reparent the draft under the compact marker so the branch is:
+                # ... → parent → [compact marker] → draft(assistant) → ...
+                if draft_msg_id:
+                    _db = await db.get_db()
+                    await _db.execute(
+                        "UPDATE messages SET parent_id = ? WHERE id = ?",
+                        (marker["id"], draft_msg_id),
+                    )
+                    await _db.commit()
+                await db.set_active_branch(conv_id, marker["id"])
                 await _ws_send(
                     conv_id,
                     {
@@ -2807,18 +2892,18 @@ async def _handle_claude_generation(
                             )
                         if use_ollama:
                             # Local mode: describe image via Ollama's native multimodal API
-                            # since CC's Read tool dumps base64 text that local models can't parse
+                            # since CC's view_image tool returns file paths that local models can't parse
                             if file_ext in _IMAGE_EXTS:
                                 try:
-                                    desc = await describe_image(str(src))
+                                    await _ws_send(conv_id, {"type": "status", "text": f"Describing image {src.name}..."})
+                                    desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None), timeout=30)
                                     file_notes.append(f"{src.name} — {desc}")
+                                except asyncio.TimeoutError:
+                                    print(f"[DESCRIBE] Timed out describing {src.name} (30s)")
+                                    file_notes.append(f"{src.name} (in attached_files/ — description timed out)")
                                 except Exception as e:
-                                    print(
-                                        f"[DESCRIBE] Failed to describe image {src.name}: {e}"
-                                    )
-                                    file_notes.append(
-                                        f"{src.name} — (image description unavailable)"
-                                    )
+                                    print(f"[DESCRIBE] Failed to describe image {src.name}: {e}")
+                                    file_notes.append(f"{src.name} (in attached_files/ — description unavailable)")
                             else:
                                 file_notes.append(f"{src.name} (in attached_files/)")
                         else:

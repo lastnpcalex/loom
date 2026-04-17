@@ -113,9 +113,8 @@ document.addEventListener('visibilitychange', () => {
 
 async function loadMessages(convId) {
     try {
-        // Clear compactification banner on conversation load
-        const compBanner = document.getElementById('compactify-banner');
-        if (compBanner) compBanner.classList.add('hidden');
+        // NOTE: compactify banner is NOT cleared here — it's cleared in
+        // loadConversation() when switching conversations, not on message reload
 
         const prevCount = State.messages.length;
         const treeData = await API.get(`/api/conversations/${convId}/tree`);
@@ -228,12 +227,17 @@ function handleWSMessage(data) {
             break;
 
         case 'compact_boundary':
-            // Claude Code compactified its context window — show banner now,
-            // usage event will update it with post-compaction token count
+            // Claude Code compactified its context — now forks into a new branch.
+            // No banner needed; the branch fork in the tree is the visual cue.
             State._compactedThisGen = true;
             State._compactData = data;
-            updateContextInfo({ was_compactified: true, ...data });
-            showGenStatus('Context compactified by Claude Code — continuing...');
+            showGenStatus('Context compactified — branching...');
+            break;
+
+        case 'compact_done':
+            // Compaction finished — clear status and reload to show the new branch
+            hideGenStatus();
+            loadMessages(State.currentConvId);
             break;
 
         case 'status':
@@ -324,14 +328,7 @@ function handleWSMessage(data) {
                 tokEl.textContent = '↑' + _fmtTok(data.input_tokens) + ' ↓' + _fmtTok(data.output_tokens) + ' · ';
                 tokEl.dataset.hasUsage = '1';  // stop timer from overwriting with chunk count
             }
-            // Update compaction banner with actual post-compaction context size
-            if (State._compactedThisGen && data.input_tokens) {
-                updateContextInfo({
-                    was_compactified: true,
-                    ...State._compactData,
-                    post_tokens: data.input_tokens,
-                });
-            }
+            // Compaction banner removed — branch fork is the visual cue now
             break;
         }
 
@@ -652,7 +649,10 @@ function updateContextInfo(data) {
         const detailsHtml = details.length
             ? `<div class="compactify-details">${details.map(d => `<pre>${escapeHtml(d)}</pre>`).join('')}</div>`
             : '';
-        banner.innerHTML = `<details class="compactify-collapse"><summary><span class="compactify-icon">⧈</span> ${escapeHtml(summaryLine)}</summary>${detailsHtml}</details>`;
+        // Preserve open/closed state of existing <details> element
+        const existingDetails = banner.querySelector('details.compactify-collapse');
+        const wasOpen = existingDetails ? existingDetails.open : false;
+        banner.innerHTML = `<details class="compactify-collapse"${wasOpen ? ' open' : ''}><summary><span class="compactify-icon">⧈</span> ${escapeHtml(summaryLine)}</summary>${detailsHtml}</details>`;
         banner.classList.remove('hidden');
     } else if (banner) {
         banner.classList.add('hidden');
@@ -904,27 +904,23 @@ function _handleMetaCommand(name, args) {
             }).catch(() => showToast('Failed to read hooks config'));
             break;
         case 'compact': {
-            // Manual CC compaction — send /compact to the CC session
-            if (!State.currentConvId) {
-                showToast('No conversation selected');
-                break;
-            }
-            if (State.isGenerating) {
-                showToast('Cannot compact while generation is in progress');
-                break;
-            }
-            const ws = State.ws;
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                showToast('Not connected — try again');
-                break;
-            }
-            const ccModel = document.getElementById('cc-model')?.value;
-            ws.send(JSON.stringify({
-                action: 'compact',
-                cc_model: ccModel || undefined,
-                focus: args || undefined,
-            }));
-            showToast('Compacting context...', 5000);
+            // CC compacts automatically — manual /compact just informs the user
+            showToast('Context compacts automatically when needed. Use /clear to start a fresh branch.', 5000);
+            break;
+        }
+        case 'clear': {
+            // Start a fresh branch from the current point
+            if (!State.currentConvId) { showToast('No conversation selected'); break; }
+            const leaf = State.messages[State.messages.length - 1];
+            if (!leaf) { showToast('No messages to branch from'); break; }
+            API.post(`/api/conversations/${State.currentConvId}/messages`, {
+                role: 'system',
+                content: '[Fresh branch started by user]',
+                parent_id: leaf.id,
+            }).then(marker => {
+                switchToBranch(marker.id, marker.id);
+                showToast('Fresh branch started');
+            }).catch(() => showToast('Failed to create branch', 'error'));
             break;
         }
         case 'compact-test': {
@@ -1631,8 +1627,7 @@ function renderMessages() {
         return;
     }
 
-    // Filter out system messages for rendering
-    const renderMsgs = State.messages.filter(m => m.role !== 'system');
+    const renderMsgs = State.messages;
 
     // Only render the last N messages initially
     const startIdx = Math.max(0, renderMsgs.length - VIRTUAL_SCROLL.initialCount);
@@ -1830,7 +1825,8 @@ function createMessageElement(msg, cost) {
     const msgModel = msg.cc_model_used || State.currentConv?.cc_model || '';
     const isGemini = isClaudeMode && msgModel.startsWith('gemini');
     const isLocalMode = State.currentConv && State.currentConv.mode === 'local';
-    const roleLabel = msg.role === 'user' ? 'You'
+    const roleLabel = msg.role === 'system' ? 'System'
+        : msg.role === 'user' ? 'You'
         : isGemini ? 'Gemini'
         : isClaudeMode ? 'Claude'
         : isLocalMode ? (State.currentConv.local_model || 'Local')
@@ -1842,7 +1838,10 @@ function createMessageElement(msg, cost) {
     const isBm = State.bookmarks?.some(b => b.message_id === msg.id);
     const bmBtn = `<button onclick="toggleChatBookmark(${msg.id})" title="${isBm ? 'Remove bookmark' : 'Bookmark'}" class="chat-bookmark-btn${isBm ? ' active' : ''}">${isBm ? '⏣' : '⬡'}</button>`;
     let actionsHtml = '';
-    if (msg.role === 'assistant') {
+    if (msg.role === 'system') {
+        // No actions for system messages (compact markers, etc.)
+        actionsHtml = '';
+    } else if (msg.role === 'assistant') {
         actionsHtml = '<button onclick="regenerateMessage(' + msg.id + ')" title="Regenerate">&#x21BB;</button>' +
             '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
             '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>' + bmBtn;
@@ -2162,7 +2161,7 @@ async function switchToBranch(leafId, scrollToMsgId) {
 
         // Scroll to the clicked message, or bottom if not specified
         const targetId = scrollToMsgId || leafId;
-        const renderMsgs = State.messages.filter(m => m.role !== 'system');
+        const renderMsgs = State.messages;
         const targetIdx = renderMsgs.findIndex(m => m.id === targetId);
 
         if (targetIdx >= 0 && targetIdx < VIRTUAL_SCROLL.renderedStart) {

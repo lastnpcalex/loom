@@ -330,6 +330,7 @@ async function init() {
     renderHomeLore();
     setupEventListeners();
     initInlineCCControls();
+    populateCCModelDropdowns('sonnet');
     // Paste handler registered in setupEventListeners
     // Restore last page: view first, then conversation if applicable
     // sessionStorage is per-tab and survives refresh; localStorage is the cross-tab default
@@ -756,6 +757,9 @@ function showFolderDropdown(anchorBtn, conv) {
 // ── Load Conversation → Tree View ──
 async function loadConversation(convId) {
     showLoading();
+    // Clear compactify banner when switching conversations
+    const compBanner = document.getElementById('compactify-banner');
+    if (compBanner) compBanner.classList.add('hidden');
     State.currentConvId = convId;
     localStorage.setItem('loom-last-conv', convId);
     sessionStorage.setItem('loom-tab-conv', convId);
@@ -945,17 +949,17 @@ function openNewConvModal() {
     document.querySelectorAll('#first-turn-toggle .toggle-btn').forEach(b => b.classList.remove('active'));
     document.querySelector('#first-turn-toggle .toggle-btn[data-value="character"]').classList.add('active');
     document.getElementById('custom-scene').value = '';
-    // Reset mode toggle to Weave
+    // Reset mode toggle to Loom
     document.querySelectorAll('#mode-toggle .toggle-btn').forEach(b => b.classList.remove('active'));
-    document.querySelector('#mode-toggle .toggle-btn[data-value="weave"]').classList.add('active');
-    document.getElementById('project-dir-group').classList.add('hidden');
+    document.querySelector('#mode-toggle .toggle-btn[data-value="claude"]').classList.add('active');
+    document.getElementById('project-dir-group').classList.remove('hidden');
     document.getElementById('project-dir').value = '';
-    document.getElementById('cc-model-group').classList.add('hidden');
-    document.getElementById('cc-effort-group').classList.add('hidden');
+    document.getElementById('cc-model-group').classList.remove('hidden');
+    document.getElementById('cc-effort-group').classList.remove('hidden');
     document.getElementById('cc-model').value = 'sonnet';
     document.getElementById('cc-effort').value = 'high';
     document.getElementById('local-model-group').classList.add('hidden');
-    showWeaveFields(true);
+    showWeaveFields(false);
     openModal('modal-new-conv');
 }
 
@@ -1133,7 +1137,6 @@ function initInlineCCControls() {
     }
 
     const _ANTHROPIC_MODELS = new Set(['sonnet', 'opus', 'haiku']);
-    const _GEMINI_MODELS = new Set(['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview', 'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite']);
 
     function _syncEffortVisibility(model) {
         const base = model.includes('[') ? model.split('[')[0] : model;
@@ -1148,25 +1151,7 @@ function initInlineCCControls() {
     });
     effortSel.addEventListener('change', () => saveCC('cc_effort', effortSel.value));
 
-    // Populate Ollama models (qwen3.5 family) into the dropdown
-    (async () => {
-        try {
-            const data = await API.get('/api/ollama/models');
-            const models = (data.models || []).map(m => m.name || m);
-            const qwenModels = models.filter(m => /qwen.*3\.5/i.test(m) || /qwen3\.5/i.test(m));
-            if (qwenModels.length > 0) {
-                const grp = document.createElement('optgroup');
-                grp.label = 'Ollama';
-                for (const name of qwenModels) {
-                    const opt = document.createElement('option');
-                    opt.value = name;
-                    opt.textContent = name;
-                    grp.appendChild(opt);
-                }
-                modelSel.appendChild(grp);
-            }
-        } catch { /* Ollama not available — no local models shown */ }
-    })();
+    // Ollama models are now appended by populateCCModelDropdowns()
 
     const permSel = document.getElementById('cc-permission-mode-inline');
     if (permSel) permSel.addEventListener('change', () => saveCC('cc_permission_mode', permSel.value));
@@ -1688,6 +1673,52 @@ async function fetchOllamaModels() {
     }
 }
 
+// ── Populate CC Model Dropdowns from Server ──
+let _ccModelsCache = null;
+async function populateCCModelDropdowns(selectedValue) {
+    if (!_ccModelsCache) {
+        try { _ccModelsCache = await API.get('/api/cc-models'); } catch { return; }
+    }
+    // Also fetch Ollama models for the "All Agents" dropdowns
+    if (!_ollamaModelsCache) {
+        try {
+            const data = await API.get('/api/ollama/models');
+            _ollamaModelsCache = (data.models || []).map(m => m.name || m);
+        } catch { _ollamaModelsCache = []; }
+    }
+    const selects = ['cc-model-inline', 'cc-model', 'cfg-cc-model'];
+    for (const id of selects) {
+        const sel = document.getElementById(id);
+        if (!sel) continue;
+        const prev = selectedValue || sel.value;
+        sel.innerHTML = '';
+        for (const group of _ccModelsCache) {
+            const og = document.createElement('optgroup');
+            og.label = group.group;
+            for (const m of group.models) {
+                const opt = document.createElement('option');
+                opt.value = m.value;
+                opt.textContent = m.label;
+                og.appendChild(opt);
+            }
+            sel.appendChild(og);
+        }
+        // Append local Ollama models
+        if (_ollamaModelsCache.length > 0) {
+            const og = document.createElement('optgroup');
+            og.label = 'Ollama';
+            for (const name of _ollamaModelsCache) {
+                const opt = document.createElement('option');
+                opt.value = name;
+                opt.textContent = name;
+                og.appendChild(opt);
+            }
+            sel.appendChild(og);
+        }
+        if (prev) sel.value = prev;
+    }
+}
+
 // ── Setup Event Listeners ──
 function setupEventListeners() {
     // Home button
@@ -1771,6 +1802,11 @@ function setupEventListeners() {
             btn.classList.add('active');
             State.convFilter = btn.dataset.filter;
             renderConversationList();
+            // Show Weave-only sections (characters, personas, lore) only for All/Weave
+            const showWeave = btn.dataset.filter === 'all' || btn.dataset.filter === 'weave';
+            document.querySelectorAll('.weave-only-section').forEach(el => {
+                el.style.display = showWeave ? '' : 'none';
+            });
         });
     });
 
@@ -1857,37 +1893,22 @@ function setupEventListeners() {
         } else {
             effortGroup.classList.remove('hidden');
             const maxOpt = document.querySelector('#cc-effort option[value="max"]');
+            const xhighOpt = document.querySelector('#cc-effort option[value="xhigh"]');
             if (baseModel !== 'opus') {
-                maxOpt.disabled = true;
-                if (document.getElementById('cc-effort').value === 'max') {
+                if (maxOpt) maxOpt.disabled = true;
+                if (xhighOpt) xhighOpt.disabled = true;
+                const curEffort = document.getElementById('cc-effort').value;
+                if (curEffort === 'max' || curEffort === 'xhigh') {
                     document.getElementById('cc-effort').value = 'high';
                 }
             } else {
-                maxOpt.disabled = false;
+                if (maxOpt) maxOpt.disabled = false;
+                if (xhighOpt) xhighOpt.disabled = false;
             }
         }
     });
 
-    // Populate Ollama models (qwen3.5 family) into the new-conversation modal dropdown
-    (async () => {
-        try {
-            const data = await API.get('/api/ollama/models');
-            const models = (data.models || []).map(m => m.name || m);
-            const qwenModels = models.filter(m => /qwen.*3\.5/i.test(m) || /qwen3\.5/i.test(m));
-            if (qwenModels.length > 0) {
-                const sel = document.getElementById('cc-model');
-                const grp = document.createElement('optgroup');
-                grp.label = 'Ollama';
-                for (const name of qwenModels) {
-                    const opt = document.createElement('option');
-                    opt.value = name;
-                    opt.textContent = name;
-                    grp.appendChild(opt);
-                }
-                sel.appendChild(grp);
-            }
-        } catch { /* Ollama unavailable */ }
-    })();
+    // Ollama models are now appended by populateCCModelDropdowns()
 
     // Browse directory button
     document.getElementById('btn-browse-dir').addEventListener('click', () => {
@@ -1920,25 +1941,89 @@ function setupEventListeners() {
         });
     }
 
-    // Settings
+    // Settings — tabbed panel
+    function _switchSettingsTab(tab) {
+        document.querySelectorAll('#settings-tabs .toggle-btn').forEach(b => b.classList.remove('active'));
+        document.querySelector(`#settings-tabs [data-settings-tab="${tab}"]`).classList.add('active');
+        ['settings-global', 'settings-loom', 'settings-braid', 'settings-weave'].forEach(id => {
+            document.getElementById(id).classList.toggle('hidden', id !== `settings-${tab}`);
+        });
+    }
+    document.querySelectorAll('#settings-tabs .toggle-btn').forEach(btn => {
+        btn.addEventListener('click', () => _switchSettingsTab(btn.dataset.settingsTab));
+    });
+
+    async function _populateOllamaSelect(selectId, selectedModel) {
+        const sel = document.getElementById(selectId);
+        try {
+            const data = await API.get('/api/ollama/models');
+            const models = (data.models || []).map(m => m.name || m);
+            if (models.length > 0) {
+                sel.innerHTML = models.map(m =>
+                    `<option value="${m}"${m === selectedModel ? ' selected' : ''}>${m}</option>`
+                ).join('');
+            } else {
+                sel.innerHTML = `<option value="${selectedModel || ''}">${selectedModel || '(no models found)'}</option>`;
+            }
+        } catch { sel.innerHTML = `<option value="${selectedModel || ''}">${selectedModel || '(Ollama unavailable)'}</option>`; }
+    }
+
     document.getElementById('btn-settings').addEventListener('click', async () => {
         const cfg = await API.get('/api/config');
         State.config = cfg;
+        // Global
         document.getElementById('cfg-host').value = cfg.ollama_host || '';
         document.getElementById('cfg-model').value = cfg.ollama_model || '';
+        // Vision model dropdown
+        const visionSel = document.getElementById('cfg-vision-model');
+        try {
+            const vData = await API.get('/api/ollama/vision-models');
+            const vModels = (vData.models || []).map(m => m.name || m);
+            visionSel.innerHTML = '<option value="">(use default model)</option>' +
+                vModels.map(m => `<option value="${m}"${m === (cfg.vision_model || '') ? ' selected' : ''}>${m}</option>`).join('');
+        } catch {
+            visionSel.innerHTML = '<option value="">(use default model)</option>';
+            if (cfg.vision_model) visionSel.innerHTML += `<option value="${cfg.vision_model}" selected>${cfg.vision_model}</option>`;
+        }
+        // Loom
+        await populateCCModelDropdowns();
+        const conv = State.currentConv;
+        document.getElementById('cfg-cc-model').value = (conv && conv.cc_model) || 'sonnet';
+        document.getElementById('cfg-cc-effort').value = (conv && conv.cc_effort) || 'high';
+        document.getElementById('cfg-cc-permission').value = (conv && conv.cc_permission_mode) || 'default';
+        // Braid
+        _populateOllamaSelect('cfg-braid-model', (conv && conv.local_model) || cfg.ollama_model);
+        // Weave
+        _populateOllamaSelect('cfg-weave-model', (conv && conv.local_model) || cfg.ollama_model);
         document.getElementById('cfg-temp').value = cfg.temperature || 0.85;
         document.getElementById('cfg-top-p').value = cfg.top_p || 0.92;
         document.getElementById('cfg-max-tokens').value = cfg.max_tokens || 1024;
         document.getElementById('cfg-repeat-penalty').value = cfg.repeat_penalty || 1.12;
         document.getElementById('cfg-context').value = cfg.max_context_tokens || 28000;
         document.getElementById('cfg-verbatim').value = cfg.verbatim_window || 8;
+        // Open to the relevant tab based on current context
+        const mode = conv ? conv.mode : null;
+        const startTab = mode === 'claude' ? 'loom' : mode === 'local' ? 'braid' : mode === 'weave' ? 'weave' : 'global';
+        _switchSettingsTab(startTab);
         openModal('modal-settings');
     });
 
+    // Settings model change — toggle effort visibility
+    document.getElementById('cfg-cc-model').addEventListener('change', () => {
+        const _base = (document.getElementById('cfg-cc-model').value || '').split('[')[0];
+        const isAnthropicCfg = ['sonnet', 'opus', 'haiku'].includes(_base);
+        document.getElementById('cfg-cc-effort-group').classList.toggle('hidden', !isAnthropicCfg);
+    });
+
     document.getElementById('btn-save-settings').addEventListener('click', async () => {
-        const cfg = {
+        // Save all tabs at once
+        const conv = State.currentConv;
+        // Global
+        const globalCfg = {
+            ...State.config,
             ollama_host: document.getElementById('cfg-host').value,
             ollama_model: document.getElementById('cfg-model').value,
+            vision_model: document.getElementById('cfg-vision-model').value,
             temperature: parseFloat(document.getElementById('cfg-temp').value),
             top_p: parseFloat(document.getElementById('cfg-top-p').value),
             max_tokens: parseInt(document.getElementById('cfg-max-tokens').value),
@@ -1946,8 +2031,30 @@ function setupEventListeners() {
             max_context_tokens: parseInt(document.getElementById('cfg-context').value),
             verbatim_window: parseInt(document.getElementById('cfg-verbatim').value),
         };
-        await API.put('/api/config', cfg);
-        State.config = cfg;
+        await API.put('/api/config', globalCfg);
+        State.config = globalCfg;
+        // Loom/Braid per-conversation settings (if in a conversation)
+        if (conv && State.currentConvId) {
+            const updates = {};
+            if (conv.mode === 'claude') {
+                updates.cc_model = document.getElementById('cfg-cc-model').value;
+                updates.cc_effort = document.getElementById('cfg-cc-effort').value;
+                updates.cc_permission_mode = document.getElementById('cfg-cc-permission').value;
+            } else if (conv.mode === 'local') {
+                updates.local_model = document.getElementById('cfg-braid-model').value;
+            } else if (conv.mode === 'weave') {
+                updates.local_model = document.getElementById('cfg-weave-model').value;
+            }
+            if (Object.keys(updates).length) {
+                await API.put(`/api/conversations/${State.currentConvId}`, updates);
+                Object.assign(conv, updates);
+                // Sync inline controls
+                if (updates.cc_model) { const s = document.getElementById('cc-model-inline'); if (s) s.value = updates.cc_model; }
+                if (updates.cc_effort) { const s = document.getElementById('cc-effort-inline'); if (s) s.value = updates.cc_effort; }
+                if (updates.cc_permission_mode) { const s = document.getElementById('cc-permission-mode-inline'); if (s) s.value = updates.cc_permission_mode; }
+                if (updates.local_model) { const s = document.getElementById('weave-model-inline'); if (s) s.value = updates.local_model; }
+            }
+        }
         closeModal('modal-settings');
         showToast('Settings saved');
     });

@@ -10,6 +10,7 @@ class Config:
     # Ollama connection
     ollama_host: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
     ollama_model: str = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
+    vision_model: str = os.getenv("VISION_MODEL", "")  # small/fast model for image description; empty = use ollama_model
 
     # Context budget
     max_context_tokens: int = 32768
@@ -48,6 +49,7 @@ class Config:
         return {
             "ollama_host": self.ollama_host,
             "ollama_model": self.ollama_model,
+            "vision_model": self.vision_model,
             "max_context_tokens": self.max_context_tokens,
             "verbatim_window": self.verbatim_window,
             "temperature": self.temperature,
@@ -57,9 +59,9 @@ class Config:
         }
 
     def update_from_dict(self, d: dict):
-        for key in ("ollama_host", "ollama_model", "max_context_tokens",
-                     "verbatim_window", "temperature", "top_p",
-                     "max_tokens", "repeat_penalty"):
+        for key in ("ollama_host", "ollama_model", "vision_model",
+                     "max_context_tokens", "verbatim_window", "temperature",
+                     "top_p", "max_tokens", "repeat_penalty"):
             if key in d:
                 val = type(getattr(self, key))(d[key])
                 # Ensure ollama_host always has a protocol

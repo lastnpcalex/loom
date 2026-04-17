@@ -28,8 +28,9 @@ def _process_event(raw: dict) -> list[dict]:
     if etype == "system":
         subtype = raw.get("subtype", "")
         if subtype == "compact_boundary":
-            # CC compactified its context window
-            # compact_metadata: { trigger: "manual"|"auto", pre_tokens: int }
+            # CC compactified its context window.
+            # The detailed summary is baked into CC's next assistant response,
+            # not available as a separate field in this event.
             meta = raw.get("compact_metadata", {})
             events.append({
                 "type": "compact_boundary",

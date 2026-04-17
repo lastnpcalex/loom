@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=101">
+    <link rel="stylesheet" href="/static/style.css?v=103">
 </head>
 <body>
     <div id="blackhole-container"></div>
@@ -91,9 +91,9 @@
                     </div>
                     <div id="conv-filter-bar">
                         <button class="conv-filter-btn active" data-filter="all">All</button>
-                        <button class="conv-filter-btn" data-filter="weave" title="Structured roleplay with local models">Weave</button>
-                        <button class="conv-filter-btn" data-filter="local" title="Claude Code powered by a local Ollama model">Braid {Local}</button>
-                        <button class="conv-filter-btn" data-filter="claude" title="Claude Code in the browser via Anthropic API">Loom {Claude}</button>
+                        <button class="conv-filter-btn" data-filter="claude" title="Claude Code in the browser via Anthropic API">Loom {All Agents}</button>
+                        <button class="conv-filter-btn" data-filter="local" title="Claude Code powered by a local Ollama model">Braid {Local Agents}</button>
+                        <button class="conv-filter-btn" data-filter="weave" title="Structured roleplay with local models">Weave {Chat}</button>
                     </div>
                     <div id="conv-list"></div>
                     <div id="home-empty" style="display:none;">
@@ -101,8 +101,8 @@
                     </div>
                 </div>
 
-                <!-- Characters Section -->
-                <div class="home-section">
+                <!-- Characters Section (Weave only) -->
+                <div class="home-section weave-only-section">
                     <div class="home-section-header">
                         <span class="home-section-label">Characters</span>
                         <div class="home-section-actions">
@@ -113,8 +113,8 @@
                     <div id="home-char-grid"></div>
                 </div>
 
-                <!-- User Personas Section -->
-                <div class="home-section">
+                <!-- User Personas Section (Weave only) -->
+                <div class="home-section weave-only-section">
                     <div class="home-section-header">
                         <span class="home-section-label">User Personas</span>
                         <div class="home-section-actions">
@@ -125,8 +125,8 @@
                     <div id="home-persona-grid"></div>
                 </div>
 
-                <!-- Lore / History Section -->
-                <div class="home-section">
+                <!-- Lore / History Section (Weave only) -->
+                <div class="home-section weave-only-section">
                     <div class="home-section-header">
                         <span class="home-section-label">Lore / History</span>
                         <div class="home-section-actions">
@@ -208,27 +208,12 @@
                 </div>
             </div>
             <div id="cc-inline-controls" class="hidden">
-                <select id="cc-model-inline" title="Model">
-                    <optgroup label="Gemini">
-                        <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro Preview</option>
-                        <option value="gemini-3-flash-preview">Gemini 3 Flash Preview</option>
-                        <option value="gemini-3.1-flash-lite-preview">Gemini 3.1 Flash Lite Preview</option>
-                        <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
-                        <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
-                        <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash Lite</option>
-                    </optgroup>
-                    <optgroup label="Anthropic">
-                        <option value="sonnet">Sonnet</option>
-                        <option value="sonnet[1m]">Sonnet (1M)</option>
-                        <option value="opus">Opus</option>
-                        <option value="opus[1m]">Opus (1M)</option>
-                        <option value="haiku">Haiku</option>
-                    </optgroup>
-                </select>
+                <select id="cc-model-inline" title="Model"></select>
                 <select id="cc-effort-inline" title="Thinking effort">
                     <option value="low">Low</option>
                     <option value="medium">Medium</option>
                     <option value="high">High</option>
+                    <option value="xhigh">Extra High</option>
                     <option value="max">Max</option>
                 </select>
                 <select id="cc-permission-mode-inline" title="Permission mode">
@@ -256,9 +241,9 @@
             <div class="form-group">
                 <label>Mode</label>
                 <div id="mode-toggle" class="toggle-group">
-                    <button class="toggle-btn active" data-value="weave">Weave</button>
+                    <button class="toggle-btn active" data-value="claude">Loom</button>
                     <button class="toggle-btn" data-value="local">Braid</button>
-                    <button class="toggle-btn" data-value="claude">Loom</button>
+                    <button class="toggle-btn" data-value="weave">Weave</button>
                 </div>
             </div>
             <div class="form-group hidden" id="local-model-group">
@@ -277,21 +262,7 @@
             </div>
             <div class="form-group hidden" id="cc-model-group">
                 <label for="cc-model">Model</label>
-                <select id="cc-model" class="form-select">
-                    <optgroup label="Gemini">
-                        <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro Preview</option>
-                        <option value="gemini-3-flash-preview">Gemini 3 Flash Preview</option>
-                        <option value="gemini-3.1-flash-lite-preview">Gemini 3.1 Flash Lite Preview</option>
-                        <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
-                        <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
-                        <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash Lite</option>
-                    </optgroup>
-                    <optgroup label="Anthropic">
-                        <option value="sonnet" selected>Sonnet</option>
-                        <option value="opus">Opus</option>
-                        <option value="haiku">Haiku</option>
-                    </optgroup>
-                </select>
+                <select id="cc-model" class="form-select"></select>
             </div>
             <div class="form-group hidden" id="cc-effort-group">
                 <label for="cc-effort">Thinking Effort</label>
@@ -299,6 +270,7 @@
                     <option value="low">Low</option>
                     <option value="medium">Medium</option>
                     <option value="high" selected>High</option>
+                    <option value="xhigh">Extra High (Opus)</option>
                     <option value="max">Max (Opus only)</option>
                 </select>
             </div>
@@ -343,37 +315,88 @@
         <div class="modal-backdrop"></div>
         <div class="modal-content">
             <h2>Settings</h2>
-            <div class="form-group">
-                <label for="cfg-host">Ollama Host</label>
-                <input type="text" id="cfg-host" placeholder="http://localhost:11434">
+            <div id="settings-tabs" class="toggle-group settings-toggle">
+                <button class="toggle-btn active" data-settings-tab="global">Global</button>
+                <button class="toggle-btn" data-settings-tab="loom">Loom</button>
+                <button class="toggle-btn" data-settings-tab="braid">Braid</button>
+                <button class="toggle-btn" data-settings-tab="weave">Weave</button>
             </div>
-            <div class="form-group">
-                <label for="cfg-model">Model</label>
-                <input type="text" id="cfg-model" placeholder="qwen3.5:9b">
+            <!-- Global -->
+            <div id="settings-global" class="settings-section">
+                <div class="form-group">
+                    <label for="cfg-host">Ollama Host</label>
+                    <input type="text" id="cfg-host" placeholder="http://localhost:11434">
+                </div>
+                <div class="form-group">
+                    <label for="cfg-model">Default Ollama Model</label>
+                    <input type="text" id="cfg-model" placeholder="qwen3.5:9b">
+                </div>
+                <div class="form-group">
+                    <label for="cfg-vision-model">Vision Model <span class="hint">(for image description — leave empty for default)</span></label>
+                    <select id="cfg-vision-model" class="form-select"></select>
+                </div>
             </div>
-            <div class="form-group">
-                <label for="cfg-temp">Temperature</label>
-                <input type="number" id="cfg-temp" step="0.05" min="0" max="2">
+            <!-- Loom -->
+            <div id="settings-loom" class="settings-section hidden">
+                <div class="form-group">
+                    <label for="cfg-cc-model">Default Model</label>
+                    <select id="cfg-cc-model" class="form-select"></select>
+                </div>
+                <div class="form-group" id="cfg-cc-effort-group">
+                    <label for="cfg-cc-effort">Default Thinking Effort</label>
+                    <select id="cfg-cc-effort" class="form-select">
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high" selected>High</option>
+                        <option value="xhigh">Extra High (Opus)</option>
+                        <option value="max">Max (Opus only)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="cfg-cc-permission">Default Permission Mode</label>
+                    <select id="cfg-cc-permission" class="form-select">
+                        <option value="default">Act</option>
+                        <option value="plan">Plan</option>
+                    </select>
+                </div>
             </div>
-            <div class="form-group">
-                <label for="cfg-top-p">Top P</label>
-                <input type="number" id="cfg-top-p" step="0.01" min="0" max="1">
+            <!-- Braid -->
+            <div id="settings-braid" class="settings-section hidden">
+                <div class="form-group">
+                    <label for="cfg-braid-model">Default Local Model</label>
+                    <select id="cfg-braid-model" class="form-select"></select>
+                </div>
             </div>
-            <div class="form-group">
-                <label for="cfg-max-tokens">Max Tokens</label>
-                <input type="number" id="cfg-max-tokens" step="64" min="64" max="8192">
-            </div>
-            <div class="form-group">
-                <label for="cfg-repeat-penalty">Repeat Penalty</label>
-                <input type="number" id="cfg-repeat-penalty" step="0.01" min="1" max="2">
-            </div>
-            <div class="form-group">
-                <label for="cfg-context">Max Context Tokens</label>
-                <input type="number" id="cfg-context" step="4096" min="4096" max="262144">
-            </div>
-            <div class="form-group">
-                <label for="cfg-verbatim">Verbatim Window (turns)</label>
-                <input type="number" id="cfg-verbatim" step="1" min="2" max="50">
+            <!-- Weave -->
+            <div id="settings-weave" class="settings-section hidden">
+                <div class="form-group">
+                    <label for="cfg-weave-model">Ollama Model</label>
+                    <select id="cfg-weave-model" class="form-select"></select>
+                </div>
+                <div class="form-group">
+                    <label for="cfg-temp">Temperature</label>
+                    <input type="number" id="cfg-temp" step="0.05" min="0" max="2">
+                </div>
+                <div class="form-group">
+                    <label for="cfg-top-p">Top P</label>
+                    <input type="number" id="cfg-top-p" step="0.01" min="0" max="1">
+                </div>
+                <div class="form-group">
+                    <label for="cfg-max-tokens">Max Tokens</label>
+                    <input type="number" id="cfg-max-tokens" step="64" min="64" max="8192">
+                </div>
+                <div class="form-group">
+                    <label for="cfg-repeat-penalty">Repeat Penalty</label>
+                    <input type="number" id="cfg-repeat-penalty" step="0.01" min="1" max="2">
+                </div>
+                <div class="form-group">
+                    <label for="cfg-context">Max Context Tokens</label>
+                    <input type="number" id="cfg-context" step="4096" min="4096" max="262144">
+                </div>
+                <div class="form-group">
+                    <label for="cfg-verbatim">Verbatim Window (turns)</label>
+                    <input type="number" id="cfg-verbatim" step="1" min="2" max="50">
+                </div>
             </div>
             <div class="modal-actions">
                 <button class="btn-secondary" data-close-modal>Cancel</button>
@@ -514,8 +537,8 @@ assistant: *Another example response*"></textarea>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=13"></script>
-    <script src="/static/app.js?v=69"></script>
-    <script src="/static/chat.js?v=117"></script>
+    <script src="/static/app.js?v=72"></script>
+    <script src="/static/chat.js?v=122"></script>
     <script src="/static/tree.js?v=37"></script>
 </body>
 </html>

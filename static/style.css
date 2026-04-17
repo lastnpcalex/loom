@@ -1939,6 +1939,16 @@ body::after {
 
 .message.user .message-role { color: var(--cyan); text-shadow: 0 0 8px rgba(0, 255, 255, 0.4); }
 .message.assistant .message-role { color: var(--purple); text-shadow: 0 0 8px rgba(191, 0, 255, 0.4); }
+.message.system {
+    background: var(--bg-tertiary);
+    border: 1px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 8px 12px;
+    margin: 8px 0;
+    font-size: 0.85em;
+}
+.message.system .message-content { color: var(--text-muted); }
+.message.system .message-role { color: var(--yellow, #e2b714); text-shadow: 0 0 8px rgba(226, 183, 20, 0.4); }
 
 .local-model-label {
     font-family: var(--font-display);
@@ -3157,6 +3167,10 @@ body::after {
 }
 
 .lore-check input[type="checkbox"] { accent-color: var(--cyan); }
+
+.settings-toggle { margin-bottom: 16px; }
+.settings-section { min-height: 80px; }
+.hint { font-size: 0.8em; color: var(--text-muted); font-weight: normal; }
 
 .modal-actions {
     display: flex;
