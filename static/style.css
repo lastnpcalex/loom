@@ -391,8 +391,39 @@ body::after {
     align-items: center;
     justify-content: space-between;
     margin-bottom: 12px;
-    padding-bottom: 8px;
+    padding: 6px 10px 8px;
     border-bottom: 1px solid rgba(191, 0, 255, 0.2);
+    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+    transition: all var(--transition);
+    user-select: none;
+}
+
+.home-section-header:hover {
+    background: rgba(191, 0, 255, 0.06);
+    box-shadow: 0 0 10px rgba(191, 0, 255, 0.2),
+                0 0 20px rgba(191, 0, 255, 0.08);
+}
+
+.home-section-arrow {
+    display: inline-block;
+    width: 14px;
+    font-size: 11px;
+    margin-right: 8px;
+    color: var(--purple);
+    vertical-align: middle;
+}
+
+.home-section-header:hover .home-section-arrow {
+    color: var(--cyan);
+    filter: drop-shadow(0 0 4px rgba(0, 255, 255, 0.5));
+}
+
+.home-section.is-collapsed > :not(.home-section-header) {
+    display: none;
+}
+.home-section.is-collapsed .home-section-header {
+    margin-bottom: 0;
+    border-bottom-color: transparent;
 }
 
 .home-section-label {

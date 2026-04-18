@@ -61,6 +61,7 @@ const State = {
     stateCards: [],
     config: {},
     convFilter: 'all',
+    homeSectionCollapsed: JSON.parse(localStorage.getItem('loom-home-section-collapsed') || '{}'),
     convFolderCollapsed: (() => {
         const raw = JSON.parse(localStorage.getItem('loom-folder-collapsed') || '{}');
         // Migration: one-time drop of stale __starred__ entry so new default (open) takes effect
@@ -90,6 +91,51 @@ function isFolderCollapsed(key) {
 function toggleFolderCollapsed(key) {
     State.convFolderCollapsed[key] = !isFolderCollapsed(key);
     saveFolderCollapsed();
+}
+
+// Home sections (Characters / Personas / Lore) — collapse default depends on
+// the active conversation filter: open on Weave, collapsed otherwise.
+function saveHomeSectionCollapsed() {
+    localStorage.setItem('loom-home-section-collapsed', JSON.stringify(State.homeSectionCollapsed));
+}
+function isHomeSectionCollapsed(key) {
+    const v = State.homeSectionCollapsed[key];
+    if (v === undefined) return State.convFilter !== 'weave';
+    return !!v;
+}
+function toggleHomeSection(key) {
+    State.homeSectionCollapsed[key] = !isHomeSectionCollapsed(key);
+    saveHomeSectionCollapsed();
+    applyHomeSectionCollapsed();
+}
+function applyHomeSectionCollapsed() {
+    document.querySelectorAll('.home-section[data-section-key]').forEach(sec => {
+        const key = sec.dataset.sectionKey;
+        const collapsed = isHomeSectionCollapsed(key);
+        sec.classList.toggle('is-collapsed', collapsed);
+        const arrow = sec.querySelector('.home-section-arrow');
+        if (arrow) arrow.textContent = collapsed ? '▸' : '▾';
+    });
+}
+function initHomeSectionCollapse() {
+    const sections = document.querySelectorAll('.home-section.weave-only-section');
+    const keys = ['characters', 'personas', 'lore'];
+    sections.forEach((sec, i) => {
+        if (sec.dataset.sectionKey) return;  // already wired
+        sec.dataset.sectionKey = keys[i] || `section-${i}`;
+        const header = sec.querySelector('.home-section-header');
+        if (!header) return;
+        const arrow = document.createElement('span');
+        arrow.className = 'home-section-arrow';
+        arrow.textContent = '▾';
+        header.insertBefore(arrow, header.firstChild);
+        header.style.cursor = 'pointer';
+        header.addEventListener('click', (e) => {
+            if (e.target.closest('.home-section-actions')) return;
+            toggleHomeSection(sec.dataset.sectionKey);
+        });
+    });
+    applyHomeSectionCollapsed();
 }
 
 function formatTimeAgo(ts) {
@@ -1921,8 +1967,13 @@ function setupEventListeners() {
             document.querySelectorAll('.weave-only-section').forEach(el => {
                 el.style.display = showWeave ? '' : 'none';
             });
+            // Re-apply collapse defaults now that the filter (and thus the default) may have changed
+            applyHomeSectionCollapsed();
         });
     });
+
+    // Collapsible Characters / Personas / Lore sections
+    initHomeSectionCollapse();
 
     // Home search
     initHomeSearch();
