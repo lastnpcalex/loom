@@ -12,6 +12,10 @@ from config import config
 # Track whether we're in mock mode
 _mock_mode = False
 
+# Serializes Ollama API calls so describe_image doesn't collide with
+# CC's own Ollama calls (Braid mode shares one Ollama instance).
+_ollama_lock = asyncio.Lock()
+
 
 def _ollama_host():
     """Return the Ollama host URL with protocol prefix."""
@@ -294,15 +298,42 @@ async def describe_image(image_path: str, model: str = None, context: str = None
             },
         }
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
-            resp = await client.post(f"{_ollama_host()}/api/chat", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            msg = data.get("message", {})
-            # Workaround: Qwen 3.5 vision routes output to thinking field
-            # instead of content (ollama/ollama#14716)
-            return msg.get("content") or msg.get("thinking") or "An image was shared."
-    except Exception:
+        # Try the configured model first, then fall back to defaults if it crashes.
+        # Some models 500 on certain content with long prompts — fallback gives us
+        # a fighting chance instead of returning useless "An image was shared".
+        _candidates = []
+        _primary = model or config.vision_model or config.ollama_model
+        _candidates.append(_primary)
+        for _fb in (config.ollama_model, "llama3.2-vision:latest"):
+            if _fb and _fb not in _candidates:
+                _candidates.append(_fb)
+
+        async with _ollama_lock:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+                last_err = None
+                for _used_model in _candidates:
+                    payload["model"] = _used_model
+                    print(f"[DESCRIBE] Trying model={_used_model!r}")
+                    try:
+                        resp = await client.post(f"{_ollama_host()}/api/chat", json=payload)
+                        resp.raise_for_status()
+                        data = resp.json()
+                        msg = data.get("message", {})
+                        result = msg.get("content") or msg.get("thinking") or ""
+                        if result:
+                            print(f"[DESCRIBE] Got {len(result)} chars from {_used_model!r}")
+                            return result
+                        print(f"[DESCRIBE] Empty response from {_used_model!r}, trying fallback")
+                    except Exception as e:
+                        last_err = e
+                        print(f"[DESCRIBE] {_used_model!r} failed: {type(e).__name__}: {str(e)[:200]}")
+                        continue
+                if last_err:
+                    print(f"[DESCRIBE] All models failed, last error: {last_err}")
+                return "An image was shared."
+    except Exception as e:
+        print(f"[DESCRIBE] Outer exception: {type(e).__name__}: {e}")
+        import traceback; traceback.print_exc()
         return "An image was shared."
 
 

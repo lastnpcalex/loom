@@ -2489,7 +2489,7 @@ async def _handle_claude_generation(
                         if file_ext in _IMAGE_EXTS:
                             try:
                                 await _ws_send(conv_id, {"type": "status", "text": f"Describing image {src.name}..."})
-                                desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None, context=_describe_context), timeout=30)
+                                desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None, context=_describe_context), timeout=120)
                                 file_notes.append(f"[Image: {desc}]")
                             except asyncio.TimeoutError:
                                 print(f"[DESCRIBE] Timed out describing {src.name} (30s)")
@@ -2908,7 +2908,7 @@ async def _handle_claude_generation(
                             if file_ext in _IMAGE_EXTS:
                                 try:
                                     await _ws_send(conv_id, {"type": "status", "text": f"Describing image {src.name}..."})
-                                    desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None, context=_describe_context), timeout=30)
+                                    desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None, context=_describe_context), timeout=120)
                                     file_notes.append(f"[Image: {desc}]")
                                 except asyncio.TimeoutError:
                                     print(f"[DESCRIBE] Timed out describing {src.name} (30s)")
