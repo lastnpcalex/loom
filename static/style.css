@@ -4789,3 +4789,68 @@ pre.tool-output {
         max-height: 50vh;
     }
 }
+
+/* ── Compact Marker (system message after /compact or handoff) ── */
+.compact-marker {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-family: var(--font-mono);
+}
+.compact-marker-header {
+    color: rgba(191, 0, 255, 0.85);
+    font-size: 12px;
+    letter-spacing: 0.3px;
+    text-shadow: 0 0 6px rgba(191, 0, 255, 0.25);
+}
+.compact-marker-previously {
+    border-left: 2px solid rgba(191, 0, 255, 0.3);
+    padding-left: 10px;
+    margin-top: 2px;
+}
+.compact-marker-toggle {
+    background: none;
+    border: none;
+    color: rgba(0, 255, 255, 0.75);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    cursor: pointer;
+    padding: 2px 0;
+    text-align: left;
+    user-select: none;
+    transition: color var(--transition);
+}
+.compact-marker-toggle:hover {
+    color: var(--cyan);
+    text-shadow: 0 0 4px rgba(0, 255, 255, 0.4);
+}
+.compact-marker-arrow {
+    display: inline-block;
+    width: 10px;
+    transition: transform var(--transition);
+}
+.compact-marker-previously.expanded .compact-marker-arrow {
+    transform: rotate(90deg);
+}
+.compact-marker-summary {
+    display: none;
+    margin-top: 6px;
+    padding: 8px 10px;
+    background: rgba(191, 0, 255, 0.05);
+    border: 1px solid rgba(191, 0, 255, 0.2);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-family: var(--font-main);
+    font-size: 13px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+}
+.compact-marker-summary p { margin: 0 0 8px 0; }
+.compact-marker-summary p:last-child { margin-bottom: 0; }
+.compact-marker-previously.expanded .compact-marker-summary {
+    display: block;
+}
+.compact-summary-pending {
+    color: var(--text-muted);
+    opacity: 0.7;
+}

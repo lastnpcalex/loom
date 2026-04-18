@@ -13,6 +13,60 @@ log = logging.getLogger(__name__)
 _HOOK_SCRIPT = str(Path(__file__).parent / "cc_permission_hook.py")
 
 
+async def read_compact_summary(session_id: str, timeout_sec: float = 8.0) -> str | None:
+    """Return the narrative summary CC wrote after a compact, or None.
+
+    CC persists the compact summary as a `type:"summary"` record in the session
+    transcript at ~/.claude/projects/<cwd-hash>/<session_id>.jsonl. That file is
+    written asynchronously, so we retry with a short backoff before giving up.
+    """
+    if not session_id:
+        return None
+    projects = Path.home() / ".claude" / "projects"
+    deadline = asyncio.get_event_loop().time() + timeout_sec
+    delay = 0.25
+    while True:
+        # Glob across project dirs since the cwd-hash encoding isn't stable to
+        # guess — cheaper than computing it and robust to future changes.
+        candidates = list(projects.glob(f"*/{session_id}.jsonl"))
+        for path in candidates:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if rec.get("type") != "summary":
+                            continue
+                        # Shape varies across CC versions; try the common paths.
+                        msg = rec.get("message") or {}
+                        content = msg.get("content") if isinstance(msg, dict) else None
+                        if isinstance(content, str) and content.strip():
+                            return content.strip()
+                        if isinstance(content, list):
+                            parts = []
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    t = block.get("text", "")
+                                    if t:
+                                        parts.append(t)
+                            if parts:
+                                return "\n\n".join(parts).strip()
+                        summary_text = rec.get("summary")
+                        if isinstance(summary_text, str) and summary_text.strip():
+                            return summary_text.strip()
+            except OSError:
+                continue
+        if asyncio.get_event_loop().time() >= deadline:
+            return None
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.5, 1.0)
+
+
 def _process_event(raw: dict) -> list[dict]:
     """Process a raw CC stream-json event and return simplified event dicts.
 
