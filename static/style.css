@@ -557,15 +557,15 @@ body::after {
 .conv-item {
     display: flex;
     flex-direction: column;
-    width: 200px;
-    padding: 12px;
+    width: 220px;
+    padding: 10px 12px;
     border-radius: var(--radius);
     cursor: pointer;
     transition: all var(--transition);
     font-size: 14px;
-    color: var(--text-secondary);
-    border: 1px solid var(--border);
-    background: rgba(5, 5, 15, 0.6);
+    color: var(--text-primary);
+    border: 1px solid rgba(0, 255, 255, 0.18);
+    background: rgba(10, 15, 30, 0.78);
     backdrop-filter: var(--glass);
     -webkit-backdrop-filter: var(--glass);
     gap: 6px;
@@ -595,15 +595,53 @@ body::after {
     white-space: nowrap;
     flex: 1;
     min-width: 0;
-    color: var(--text-primary);
+    color: #ffffff;
     font-weight: 500;
 }
 
 .conv-item .conv-meta {
     font-size: 12px;
-    color: var(--text-muted);
+    color: rgba(255, 255, 255, 0.72);
     white-space: nowrap;
     flex-shrink: 0;
+}
+
+.conv-item .conv-path {
+    font-size: 10px;
+    color: rgba(255, 255, 255, 0.4);
+    font-family: var(--font-mono);
+    max-width: 100%;
+    position: relative;
+    cursor: help;
+}
+.conv-item .conv-path-short {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.conv-item .conv-path-full {
+    display: none;
+    position: absolute;
+    left: 0;
+    top: 100%;
+    margin-top: 2px;
+    padding: 4px 8px;
+    background: rgba(5, 5, 15, 0.98);
+    border: 1px solid rgba(0, 255, 255, 0.35);
+    border-radius: var(--radius-sm);
+    color: rgba(255, 255, 255, 0.9);
+    white-space: nowrap;
+    z-index: 10000;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
+    pointer-events: none;
+}
+.conv-item .conv-path:hover .conv-path-full {
+    display: block;
+}
+.conv-item:has(.conv-path:hover) {
+    z-index: 100;
 }
 
 .conv-item .conv-actions {
@@ -4156,6 +4194,24 @@ pre.tool-output {
     min-height: 12px !important;
     padding: 2px !important;
 }
+.lod-micro .tree-node-card.user {
+    background: rgba(0, 255, 255, 0.75) !important;
+    border-color: rgba(0, 255, 255, 0.9) !important;
+    box-shadow: 0 0 6px rgba(0, 255, 255, 0.6) !important;
+}
+.lod-micro .tree-node-card.assistant {
+    background: rgba(191, 0, 255, 0.75) !important;
+    border-color: rgba(191, 0, 255, 0.9) !important;
+    box-shadow: 0 0 6px rgba(191, 0, 255, 0.6) !important;
+}
+.lod-micro .tree-node-card.system {
+    background: rgba(255, 255, 255, 0.55) !important;
+    box-shadow: 0 0 6px rgba(255, 255, 255, 0.35) !important;
+}
+.lod-micro .tree-node-card.active {
+    outline: 2px solid var(--cyan);
+    outline-offset: 1px;
+}
 
 /* Canvas node LOD — keep size, blur content, grow glow */
 .lod-mid .canvas-node-iframe {
@@ -4168,8 +4224,8 @@ pre.tool-output {
                 0 0 60px rgba(0, 200, 255, 0.1) !important;
 }
 .lod-mini .canvas-node-iframe {
-    filter: blur(6px);
-    opacity: 0.3;
+    filter: blur(4px) brightness(1.25);
+    opacity: 0.55;
 }
 .lod-mini .canvas-root {
     box-shadow: 0 0 30px rgba(0, 255, 255, 0.45),
@@ -4177,8 +4233,8 @@ pre.tool-output {
                 0 0 100px rgba(0, 200, 255, 0.12) !important;
 }
 .lod-micro .canvas-node-iframe {
-    filter: blur(10px);
-    opacity: 0.15;
+    filter: blur(6px) brightness(1.5);
+    opacity: 0.45;
 }
 .lod-micro .canvas-root {
     box-shadow: 0 0 40px rgba(0, 255, 255, 0.5),
@@ -4229,17 +4285,141 @@ pre.tool-output {
 /* ── Folder Groups ── */
 .conv-folder-group {
     margin-bottom: 4px;
-    flex-basis: 100%;
-    width: 100%;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 4px;
+}
+.conv-folder-group.is-expanded {
+    flex-basis: 100%;
+    width: 100%;
+}
+
+/* File-explorer tree container: folders + loose unfiled leaves */
+.conv-tree {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 100%;
+}
+
+/* Stack of collapsed folder cards (wraps like the conv-item grid) */
+.conv-folder-stack {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding-top: 4px;
+}
+
+/* Expanded folder: full-width row (header + item grid below) */
+.conv-folder-group.is-expanded {
+    width: 100%;
+}
+
+/* Collapsed folder: looks like a conv-item card, sits in the wrap grid */
+.conv-folder-group.is-collapsed {
+    width: 220px;
+    flex-shrink: 0;
+}
+
+.conv-folder-group.is-collapsed .conv-folder-header {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 10px 12px;
+    background: rgba(10, 15, 30, 0.78);
+    border: 1px solid rgba(191, 0, 255, 0.25);
+    backdrop-filter: var(--glass);
+    -webkit-backdrop-filter: var(--glass);
+    border-radius: var(--radius);
+}
+
+.conv-folder-group.is-collapsed .conv-folder-header:hover {
+    background: rgba(25, 10, 40, 0.85);
+    border-color: rgba(191, 0, 255, 0.55);
+    box-shadow: 0 0 14px rgba(191, 0, 255, 0.35),
+                0 0 28px rgba(191, 0, 255, 0.18);
+}
+
+/* Card-style folder headers always show action buttons faintly (keep room) */
+.conv-folder-group.is-collapsed .conv-folder-actions {
+    margin-left: auto;
+}
+
+/* Starred section sits above the tree with a thin divider */
+.conv-starred-section {
+    padding-bottom: 6px;
+    margin-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+}
+
+.conv-nsfw-section {
+    padding-bottom: 6px;
+    margin-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+}
+.conv-nsfw-header .conv-folder-icon { display: inline; }
+.conv-nsfw-header {
+    color: var(--purple);
+}
+.conv-nsfw-header .conv-folder-name {
+    color: var(--purple);
+    text-shadow: 0 0 6px rgba(191, 0, 255, 0.35);
+}
+.conv-nsfw-header:hover {
+    color: var(--cyan);
+    background: rgba(0, 255, 255, 0.06);
+    border-color: rgba(0, 255, 255, 0.35);
+    box-shadow: 0 0 10px rgba(0, 255, 255, 0.25),
+                0 0 20px rgba(0, 255, 255, 0.12);
+}
+.conv-nsfw-header:hover .conv-folder-name {
+    color: var(--cyan);
+    text-shadow: 0 0 6px rgba(0, 255, 255, 0.4);
+}
+.conv-nsfw-header:hover .conv-folder-arrow,
+.conv-nsfw-header:hover .conv-folder-icon {
+    color: var(--cyan);
+    filter: drop-shadow(0 0 4px rgba(0, 255, 255, 0.6));
+}
+
+.conv-card-flags {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.conv-nsfw-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 13px;
+    padding: 0 2px;
+    opacity: 0.35;
+    filter: grayscale(1);
+    transition: opacity var(--transition), filter var(--transition);
+    line-height: 1;
+}
+.conv-nsfw-btn:hover {
+    opacity: 0.7;
+    filter: grayscale(0.4);
+}
+.conv-nsfw-btn.active {
+    opacity: 1;
+    filter: grayscale(0) drop-shadow(0 0 4px rgba(255, 60, 60, 0.55));
 }
 
 .conv-folder-items {
     display: flex;
     flex-wrap: wrap;
     gap: 10px;
+    padding-left: 14px;
+    margin-left: 6px;
+    border-left: 1px solid rgba(191, 0, 255, 0.2);
+}
+
+.conv-tree-unfiled {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding-top: 4px;
 }
 
 .conv-folder-header {
@@ -4247,24 +4427,42 @@ pre.tool-output {
     align-items: center;
     gap: 6px;
     cursor: pointer;
-    padding: 4px 8px;
-    color: var(--text-muted);
-    font-size: 12px;
-    font-weight: 500;
+    padding: 6px 10px;
+    color: rgba(0, 255, 255, 0.85);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
     border-radius: var(--radius-sm);
+    border: 1px solid transparent;
     transition: all var(--transition);
     user-select: none;
 }
 
+.conv-folder-header .conv-folder-name {
+    text-shadow: 0 0 6px rgba(0, 255, 255, 0.25);
+}
+
+.conv-folder-header .conv-folder-count {
+    color: rgba(255, 255, 255, 0.55);
+}
+
 .conv-folder-header:hover {
-    color: var(--text-secondary);
-    background: rgba(255, 255, 255, 0.03);
+    color: var(--text-primary);
+    background: rgba(191, 0, 255, 0.06);
+    border-color: rgba(191, 0, 255, 0.35);
+    box-shadow: 0 0 10px rgba(191, 0, 255, 0.25),
+                0 0 20px rgba(191, 0, 255, 0.12);
 }
 
 .conv-folder-arrow {
     font-size: 10px;
     width: 12px;
     flex-shrink: 0;
+    color: var(--text-muted);
+}
+
+.conv-folder-header:hover .conv-folder-arrow {
+    color: var(--purple);
 }
 
 .conv-folder-icon {
@@ -4276,8 +4474,9 @@ pre.tool-output {
 }
 
 .conv-folder-header:hover .conv-folder-icon {
-    color: var(--cyan);
+    color: var(--purple);
     opacity: 1;
+    filter: drop-shadow(0 0 4px rgba(191, 0, 255, 0.6));
 }
 
 .conv-starred-header .conv-folder-icon {
@@ -4382,8 +4581,9 @@ pre.tool-output {
     font-size: 10px;
     padding: 1px 5px;
     border-radius: 3px;
-    background: rgba(255,255,255,0.08);
-    color: var(--text-muted);
+    background: rgba(0, 255, 255, 0.12);
+    color: rgba(0, 255, 255, 0.85);
+    border: 1px solid rgba(0, 255, 255, 0.25);
     font-family: var(--font-mono);
     flex-shrink: 0;
 }
@@ -4528,6 +4728,26 @@ pre.tool-output {
         overflow: hidden;
     }
     .conv-item .conv-title-text { max-width: 40vw; }
+
+    /* Mobile: shrink collapsed folder cards so multiple fit per row */
+    .conv-folder-group.is-collapsed {
+        width: calc(50% - 5px);
+        min-width: 0;
+    }
+    .conv-folder-group.is-collapsed .conv-folder-header {
+        padding: 8px 10px;
+        gap: 4px;
+    }
+    .conv-folder-group.is-collapsed .conv-folder-name {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .conv-folder-group.is-collapsed .conv-folder-actions {
+        display: none;
+    }
     #char-state-panel {
         right: 8px;
         left: 8px;

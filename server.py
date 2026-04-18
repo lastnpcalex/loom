@@ -793,6 +793,8 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["custom_scene"] = data["custom_scene"]
     if "starred" in data:
         fields["starred"] = int(data["starred"])
+    if "nsfw" in data:
+        fields["nsfw"] = int(data["nsfw"])
     if "cc_model" in data:
         fields["cc_model"] = data["cc_model"]
     if "cc_effort" in data:
