@@ -62,6 +62,7 @@ from prompt_engine import (
 from context_manager import get_context_for_generation
 import claude_client
 import gemini_client
+import model_context
 from skill_scanner import get_all_skills, BUILTIN_COMMANDS
 
 from contextlib import asynccontextmanager
@@ -2128,6 +2129,184 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
             await websocket.send_json({"type": "error", "error": str(e)})
 
 
+async def _patch_marker_with_summary(conv_id: int, marker_id: int, new_session: str):
+    """Background task: once CC has flushed the post-compact transcript,
+    read the summary out of the JSONL and UPDATE the marker row content.
+    Emits `compact_summary_ready` so the UI can swap in the narrative text."""
+    try:
+        summary = await claude_client.read_compact_summary(new_session)
+        if not summary:
+            return
+        _dbh = await db.get_db()
+        # Prepend the existing header so we keep the token count line.
+        row = await _dbh.execute_fetchall(
+            "SELECT content FROM messages WHERE id = ?", (marker_id,)
+        )
+        header = ""
+        if row:
+            header = (dict(row[0]).get("content") or "").split("\n", 1)[0]
+        new_content = (header + "\n\n---\nPreviously:\n" + summary).strip()
+        await _dbh.execute(
+            "UPDATE messages SET content = ? WHERE id = ?",
+            (new_content, marker_id),
+        )
+        await _dbh.commit()
+        await _ws_send(
+            conv_id,
+            {
+                "type": "compact_summary_ready",
+                "marker_id": marker_id,
+                "summary": summary,
+            },
+        )
+    except Exception as e:
+        print(f"[Handoff] Failed to patch marker {marker_id} with summary: {e}")
+
+
+async def _run_compact_handoff(
+    conv_id: int,
+    conv: dict,
+    parent_leaf_id: int,
+    target_model: str,
+    cc_effort: str,
+    project_dir: str,
+) -> tuple[int | None, str | None, int | None]:
+    """Execute a compact-and-handoff before switching to a non-1M target.
+
+    Runs CC `/compact` on the most recent 1M-capable session, forks a new
+    branch rooted at a compact marker under `parent_leaf_id`, and returns
+    `(marker_id, new_session_id, new_parent_id)`. `new_parent_id` is the
+    msg id the caller should use as `parent_id` for the pending generation —
+    either the marker itself, or (when `parent_leaf_id` was a user message we
+    re-parented under the marker) the unchanged user message id.
+    Returns (None, None, None) on failure.
+    """
+    # Find the most recent assistant session we can actually /compact.
+    # Needs to be Anthropic (gemini has no --fork-session, local doesn't have
+    # /compact) and ideally 1M-context since we're over 175k.
+    session_id = None
+    branch = await db.get_branch_to_root(parent_leaf_id)
+    for msg in reversed(branch):
+        if msg["role"] != "assistant":
+            continue
+        if not msg.get("cc_session_id"):
+            continue
+        prev_model = msg.get("cc_model_used") or ""
+        # Only Anthropic sessions can run /compact.
+        _base = prev_model.split("[")[0] if "[" in prev_model else prev_model
+        if _base not in {"sonnet", "opus", "haiku"}:
+            continue
+        session_id = msg["cc_session_id"]
+        compact_model = prev_model or "sonnet[1m]"
+        break
+
+    if not session_id:
+        await _ws_send(
+            conv_id,
+            {"type": "status", "text": "Handoff skipped — no compactable session in this branch"},
+        )
+        return None, None, None
+
+    await _ws_send(
+        conv_id,
+        {"type": "status", "text": f"Compacting for handoff to {target_model}..."},
+    )
+
+    server_port = int(os.environ.get("LOOM_PORT", 3000))
+    try:
+        proc, event_stream = await claude_client.run_claude(
+            prompt="/compact",
+            cwd=project_dir,
+            conv_id=conv_id,
+            server_port=server_port,
+            model=compact_model,
+            effort=cc_effort,
+            resume_session_id=session_id,
+            fork_session=False,
+            use_ollama=False,
+        )
+    except Exception as e:
+        await _ws_send(conv_id, {"type": "status", "text": f"Handoff launch failed: {e}"})
+        return None, None, None
+
+    # If the caller's parent is a user message (the turn we're about to
+    # generate for), we re-parent it UNDER the marker so the replay-history
+    # path keeps that user message visible after truncating at the marker.
+    parent_row = None
+    _dbh = await db.get_db()
+    _prows = await _dbh.execute_fetchall(
+        "SELECT id, role, parent_id FROM messages WHERE id = ?", (parent_leaf_id,)
+    )
+    if _prows:
+        parent_row = dict(_prows[0])
+    reparent_user = bool(parent_row and parent_row.get("role") == "user")
+    marker_parent = parent_row.get("parent_id") if reparent_user else parent_leaf_id
+
+    marker_id = None
+    new_session = None
+    pre_tokens = None
+    async for evt in event_stream:
+        etype = evt.get("type", "")
+        if etype == "compact_boundary":
+            pre_tokens = evt.get("pre_tokens")
+            token_info = f" — {pre_tokens:,} tokens before" if pre_tokens else ""
+            content = f"[CC context compactified (handoff → {target_model}){token_info}]"
+            new_session = evt.get("session_id", "") or ""
+            if new_session:
+                await db.update_conversation_fields(
+                    conv_id, claude_session_id=new_session
+                )
+            marker = await db.add_message(
+                conv_id, "system",
+                content,
+                parent_id=marker_parent,
+                is_active=True,
+                cc_session_id=new_session or None,
+            )
+            marker_id = marker["id"]
+            if reparent_user:
+                # Slot the marker between the user message and its old parent.
+                await _dbh.execute(
+                    "UPDATE messages SET parent_id = ? WHERE id = ?",
+                    (marker_id, parent_leaf_id),
+                )
+                await _dbh.commit()
+                await db.set_active_branch(conv_id, parent_leaf_id)
+            else:
+                await db.set_active_branch(conv_id, marker_id)
+            await _ws_send(
+                conv_id,
+                {
+                    "type": "compact_boundary",
+                    "trigger": "handoff",
+                    "pre_tokens": pre_tokens,
+                    "marker_id": marker_id,
+                    "target_model": target_model,
+                },
+            )
+        elif etype == "result":
+            rs = evt.get("session_id", "")
+            if rs and not new_session:
+                new_session = rs
+                await db.update_conversation_fields(
+                    conv_id, claude_session_id=rs
+                )
+
+    if marker_id and new_session:
+        asyncio.create_task(_patch_marker_with_summary(conv_id, marker_id, new_session))
+        await _ws_send(
+            conv_id,
+            {"type": "status", "text": f"Handoff complete — continuing on {target_model}"},
+        )
+    elif not marker_id:
+        await _ws_send(
+            conv_id,
+            {"type": "status", "text": "Handoff did not produce a compact marker — continuing anyway"},
+        )
+    new_parent_id = parent_leaf_id if reparent_user else marker_id
+    return marker_id, new_session, new_parent_id
+
+
 async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
     """Trigger manual CC compaction via /compact on an existing session.
 
@@ -2342,6 +2521,34 @@ async def _handle_claude_generation(
             use_ollama = False
         print(f"[CC] Model routing: cc_model={cc_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} use_ollama={use_ollama} conv._use_ollama={conv.get('_use_ollama')} conv.mode={conv.get('mode')}")
 
+        # --- Compact-handoff gate ---
+        # Fast check: if the target model is a 1M Anthropic, skip. Otherwise
+        # sum the branch's token estimate and compare against a per-provider
+        # threshold. If we trip, run /compact on the latest 1M session and fork
+        # a new branch under a compact marker — leaving the old branch intact.
+        handoff_forced_session = None
+        if (
+            action == "generate"
+            and parent_id
+            and not model_context.is_1m_anthropic(cc_model)
+        ):
+            branch_tokens = await db.sum_branch_tokens(parent_id)
+            if model_context.needs_handoff(cc_model, branch_tokens):
+                threshold = model_context.handoff_threshold(cc_model)
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "status",
+                        "text": f"Branch is {branch_tokens:,} tokens (> {threshold:,} for {cc_model}) — preparing handoff...",
+                    },
+                )
+                marker_id, new_session, new_parent = await _run_compact_handoff(
+                    conv_id, conv, parent_id, cc_model, cc_effort, project_dir
+                )
+                if marker_id:
+                    parent_id = new_parent or marker_id
+                    handoff_forced_session = new_session
+
         # --- Session resume logic ---
         # Every turn uses --resume + --fork-session. Each assistant message
         # gets its own immutable session snapshot. This means branches, edits,
@@ -2351,12 +2558,26 @@ async def _handle_claude_generation(
         resume_session_id = None
         fork_session = True  # always fork — every turn creates a new snapshot
         use_resume = False
+        branch = []
+        crossed_provider = False
 
         if parent_id:
             branch = await db.get_branch_to_root(parent_id)
+
+        if handoff_forced_session and is_anthropic:
+            # Same-provider (Anthropic) handoff — resume the fresh compacted
+            # session rather than walking back to a pre-compact session that
+            # the target window can't hold.
+            resume_session_id = handoff_forced_session
+            use_resume = True
+            print(f"[CC] Handoff resume: id={resume_session_id} model={cc_model}")
+        elif handoff_forced_session:
+            # Cross-provider handoff (Gemini / local) — fall through to history
+            # replay, which will truncate at the compact marker.
+            print(f"[CC] Handoff replay for {cc_model}")
+        elif parent_id and branch:
             # Find nearest ancestor assistant with a session ID AND real content
             # Skip empty drafts, error messages, and broken sessions
-            crossed_provider = False
             for msg in reversed(branch):
                 if msg["role"] != "assistant":
                     continue
@@ -3275,10 +3496,30 @@ def _build_claude_history_prompt(branch: list[dict], project_dir: Path = None) -
     """Build a text prompt from conversation history (fallback when --resume unavailable).
 
     Also scans for attached files and includes references to them.
+
+    If the branch contains one or more `[CC context compactified ...]` system
+    markers, the history is truncated at the LAST such marker and the marker's
+    body (which should contain the narrative summary) is injected as a
+    preamble. This keeps replay prompts compact after a handoff.
     """
     history_parts = []
     # Collect all attached files from the conversation
     attached_files = []
+
+    # Respect compact markers: treat the latest one as a "start here" point.
+    compact_preamble = ""
+    last_compact_idx = None
+    for i, msg in enumerate(branch):
+        if msg.get("role") != "system":
+            continue
+        content = (msg.get("content") or "").lstrip()
+        if content.startswith("[CC context compactified"):
+            last_compact_idx = i
+    if last_compact_idx is not None:
+        compact_preamble = (branch[last_compact_idx].get("content") or "").strip()
+        branch = branch[last_compact_idx + 1 :]
+    if compact_preamble:
+        history_parts.append(compact_preamble)
 
     for msg in branch:
         if msg["role"] == "system":

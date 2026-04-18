@@ -248,6 +248,27 @@ function handleWSMessage(data) {
             loadMessages(State.currentConvId);
             break;
 
+        case 'compact_summary_ready':
+            // Background task patched the marker row with the narrative summary.
+            // Update the marker element in place (if it's visible) so the user
+            // can expand "Previously" without a reload.
+            if (data.marker_id) {
+                const markerEl = document.querySelector(`.compact-marker[data-msg-id="${data.marker_id}"]`);
+                if (markerEl) {
+                    const summaryBox = markerEl.querySelector('.compact-marker-summary');
+                    if (summaryBox && data.summary) {
+                        summaryBox.innerHTML = formatContent(data.summary);
+                    }
+                }
+                // Sync State.messages so re-renders keep the summary
+                const m = State.messages?.find(x => x.id === data.marker_id);
+                if (m && data.summary) {
+                    const header = (m.content || '').split('\n', 1)[0];
+                    m.content = header + '\n\n---\nPreviously:\n' + data.summary;
+                }
+            }
+            break;
+
         case 'status':
             if (!_isOurBranch(data)) break;
             showGenStatus(data.text || 'Looming...');
@@ -1863,6 +1884,8 @@ function createMessageElement(msg, cost) {
     if (isDraft) {
         contentHtml = '<span class="generating-placeholder"><span class="thinking-dots"></span> Generating...</span>'
             + ' <button onclick="cancelGeneration()" title="Cancel generation" class="cancel-draft-btn">&#x2298;</button>';
+    } else if (msg.role === 'system' && typeof msg.content === 'string' && msg.content.trimStart().startsWith('[CC context compactified')) {
+        contentHtml = renderCompactMarker(msg.content, msg.id);
     } else if (blocks && blocks.length > 0) {
         contentHtml = renderContentBlocks(blocks);
     } else {
@@ -2237,6 +2260,40 @@ if (typeof marked !== 'undefined') {
             '<pre><code' + langClass + '>' + codeHtml + '</code></pre></div>\n';
     };
     marked.setOptions({ breaks: true, gfm: true, renderer });
+}
+
+function renderCompactMarker(content, msgId) {
+    // Marker body looks like:
+    //   [CC context compactified (handoff → <target>) — N tokens before]
+    //   \n\n---\nPreviously:\n<summary>
+    // Header is the first line. Everything after the "Previously:" label (or
+    // an empty fallback until the summary is patched in) goes in a default-
+    // collapsed block.
+    const text = (content || '').trim();
+    const firstNl = text.indexOf('\n');
+    const header = firstNl === -1 ? text : text.slice(0, firstNl);
+    let summary = '';
+    const marker = text.indexOf('Previously:');
+    if (marker !== -1) {
+        summary = text.slice(marker + 'Previously:'.length).trim();
+    } else if (firstNl !== -1) {
+        const rest = text.slice(firstNl + 1).replace(/^[-\s]+/, '').trim();
+        if (rest) summary = rest;
+    }
+    const summaryHtml = summary ? formatContent(summary) : '<em class="compact-summary-pending">Summary pending…</em>';
+    return (
+        '<div class="compact-marker" data-msg-id="' + msgId + '">' +
+            '<div class="compact-marker-header">' +
+                '<span class="compact-marker-text">' + escapeHtml(header) + '</span>' +
+            '</div>' +
+            '<div class="compact-marker-previously">' +
+                '<button class="compact-marker-toggle" onclick="this.parentElement.classList.toggle(\'expanded\')">' +
+                    '<span class="compact-marker-arrow">▸</span> Previously' +
+                '</button>' +
+                '<div class="compact-marker-summary">' + summaryHtml + '</div>' +
+            '</div>' +
+        '</div>'
+    );
 }
 
 function formatContent(text) {

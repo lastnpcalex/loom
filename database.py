@@ -812,6 +812,34 @@ async def get_siblings(msg_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def sum_branch_tokens(leaf_id: int) -> int:
+    """Single-roundtrip token-estimate sum from a leaf up to the root.
+
+    Used by the compact-handoff gate on every generation; must be fast.
+    Relies on SQLite's recursive CTE so we don't round-trip one row at a time.
+    """
+    if leaf_id is None:
+        return 0
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        """
+        WITH RECURSIVE branch(id, parent_id, token_estimate) AS (
+            SELECT id, parent_id, token_estimate
+            FROM messages WHERE id = ?
+            UNION ALL
+            SELECT m.id, m.parent_id, m.token_estimate
+            FROM messages m
+            JOIN branch b ON m.id = b.parent_id
+        )
+        SELECT COALESCE(SUM(token_estimate), 0) AS total FROM branch
+        """,
+        (leaf_id,),
+    )
+    if not rows:
+        return 0
+    return int(rows[0]["total"] or 0)
+
+
 async def get_branch_to_root(msg_id: int) -> list[dict]:
     """Walk from a message up to the root, return list root->leaf order."""
     chain = []
