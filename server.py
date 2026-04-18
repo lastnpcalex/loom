@@ -2208,11 +2208,17 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
                 pre_tokens = evt.get("pre_tokens")
                 token_info = f" — {pre_tokens:,} tokens before" if pre_tokens else ""
                 content = f"[CC context compactified (manual){token_info}]"
+                compact_session = evt.get("session_id", "") or ""
+                if compact_session:
+                    await db.update_conversation_fields(
+                        conv_id, claude_session_id=compact_session
+                    )
                 marker = await db.add_message(
                     conv_id, "system",
                     content,
                     parent_id=compact_parent_id,
                     is_active=True,
+                    cc_session_id=compact_session or None,
                 )
                 # Switch active branch to the compact marker
                 await db.set_active_branch(conv_id, marker["id"])
@@ -2789,11 +2795,21 @@ async def _handle_claude_generation(
                 pre_tokens = evt.get("pre_tokens")
                 token_info = f" — {pre_tokens:,} tokens before" if pre_tokens else ""
                 content = f"[CC context compactified ({trigger}){token_info}]"
+                # CC forks to a new session at the compact boundary. Capture it
+                # now so the post-compact assistant reply doesn't end up orphaned
+                # if the result event's session_id is missing or a retry resets state.
+                compact_session = evt.get("session_id", "") or ""
+                if compact_session:
+                    new_session_id = compact_session
+                    await db.update_conversation_fields(
+                        conv_id, claude_session_id=compact_session
+                    )
                 marker = await db.add_message(
                     conv_id, "system",
                     content,
                     parent_id=parent_id,
                     is_active=True,
+                    cc_session_id=compact_session or None,
                 )
                 # Reparent the draft under the compact marker so the branch is:
                 # ... → parent → [compact marker] → draft(assistant) → ...
