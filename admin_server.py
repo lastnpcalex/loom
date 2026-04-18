@@ -587,6 +587,12 @@ async def dashboard():
 </div>
 <div id="tool-output"></div>
 
+<h2>Admin Server</h2>
+<div style="margin-bottom: 12px;">
+    <button onclick="adminAction('restart')" class="btn btn-cyan">Restart Admin</button>
+    <button onclick="adminAction('shutdown')" class="btn btn-warn">Shutdown Admin</button>
+    <span style="color:#666; font-size:12px; margin-left:10px;">(connection drops; page auto-reloads after restart)</span>
+</div>
 <p class="refresh-note">Auto-refreshes every 10s &mdash; admin running on :{ADMIN_PORT}</p>
 <div id="toast"></div>
 <script>
@@ -602,6 +608,30 @@ async def dashboard():
         const d = await r.json();
         showToast(d.status || d.error || 'done');
         setTimeout(() => location.reload(), 2000);
+    }}
+
+    async function adminAction(action) {{
+        showToast('admin ' + action + '...');
+        const url = action === 'shutdown' ? '/shutdown' : '/admin/restart';
+        try {{
+            const r = await fetch(url, {{method: 'POST'}});
+            const d = await r.json();
+            showToast(d.status || 'done');
+        }} catch (e) {{ /* connection drops — expected */ }}
+        if (action === 'restart') {{
+            // Poll until admin comes back, then reload
+            showToast('admin restarting — waiting for :' + {ADMIN_PORT} + '...');
+            const start = Date.now();
+            const poll = async () => {{
+                try {{
+                    const p = await fetch('/api/status', {{cache: 'no-store'}});
+                    if (p.ok) {{ location.reload(); return; }}
+                }} catch (e) {{}}
+                if (Date.now() - start < 20000) setTimeout(poll, 1000);
+                else showToast('admin did not come back — check logs');
+            }};
+            setTimeout(poll, 2500);
+        }}
     }}
 
     let refreshTimer = setTimeout(() => location.reload(), 10000);
@@ -835,6 +865,40 @@ async def admin_shutdown():
         return JSONResponse({"status": "admin shutting down"})
     os.kill(os.getpid(), signal.SIGINT)
     return JSONResponse({"status": "admin shutting down (signal)"})
+
+
+@app.post("/admin/restart")
+async def admin_restart():
+    """Respawn the admin server. Client must reconnect after ~2s."""
+    admin_dir = Path(__file__).parent
+    child_log = admin_dir / "admin_server.log"
+    # Detached child must have stdout/stderr redirected — inheriting the
+    # parent's (about-to-close) console handles makes uvicorn's logger crash.
+    spawn_code = (
+        "import time, subprocess, sys;"
+        "time.sleep(2);"
+        f"log = open(r'{child_log}', 'a');"
+        "flags = getattr(subprocess, 'DETACHED_PROCESS', 0) | getattr(subprocess, 'CREATE_NO_WINDOW', 0);"
+        f"subprocess.Popen([sys.executable, r'{__file__}'], cwd=r'{admin_dir}', "
+        "creationflags=flags, stdout=log, stderr=log)"
+    )
+    subprocess.Popen(
+        [sys.executable, "-c", spawn_code],
+        env=os.environ.copy(),
+        cwd=str(admin_dir),
+        creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
+                    | getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+    async def _exit_soon():
+        await asyncio.sleep(0.5)
+        if _server_ref:
+            _server_ref[0].should_exit = True
+        else:
+            os.kill(os.getpid(), signal.SIGINT)
+
+    asyncio.create_task(_exit_soon())
+    return JSONResponse({"status": f"admin restarting on :{ADMIN_PORT}"})
 
 
 if __name__ == "__main__":

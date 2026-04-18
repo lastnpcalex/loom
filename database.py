@@ -308,6 +308,7 @@ async def _run_migrations(db):
         # Phase 3: starred & folders
         "ALTER TABLE conversations ADD COLUMN starred INTEGER DEFAULT 0",
         "ALTER TABLE conversations ADD COLUMN folder TEXT DEFAULT ''",
+        "ALTER TABLE conversations ADD COLUMN nsfw INTEGER DEFAULT 0",
         # Phase 4: session resume — store CC session_id per message node
         "ALTER TABLE messages ADD COLUMN cc_session_id TEXT",
         # Local mode: store selected Ollama model per conversation
@@ -639,6 +640,7 @@ async def update_conversation_fields(conv_id: int, **fields):
         "cc_effort",
         "starred",
         "folder",
+        "nsfw",
         "local_model",
         "cc_permission_mode",
         "ooda_enabled",

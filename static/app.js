@@ -61,13 +61,49 @@ const State = {
     stateCards: [],
     config: {},
     convFilter: 'all',
-    convFolderCollapsed: JSON.parse(localStorage.getItem('loom-folder-collapsed') || '{}'),
+    convFolderCollapsed: (() => {
+        const raw = JSON.parse(localStorage.getItem('loom-folder-collapsed') || '{}');
+        // Migration: one-time drop of stale __starred__ entry so new default (open) takes effect
+        if (localStorage.getItem('loom-folder-collapsed-v') !== '2') {
+            delete raw.__starred__;
+            localStorage.setItem('loom-folder-collapsed', JSON.stringify(raw));
+            localStorage.setItem('loom-folder-collapsed-v', '2');
+        }
+        return raw;
+    })(),
     branchCount: 1,  // number of response branches to generate (Weave/OODA only)
 };
 
 function saveFolderCollapsed() {
     localStorage.setItem('loom-folder-collapsed', JSON.stringify(State.convFolderCollapsed));
 }
+
+// Defaults: starred section open, regular folders collapsed.
+// localStorage only stores explicit user toggles; unset entries use the default.
+function isFolderCollapsedDefault(key) {
+    return key !== '__starred__';
+}
+function isFolderCollapsed(key) {
+    const v = State.convFolderCollapsed[key];
+    return v === undefined ? isFolderCollapsedDefault(key) : !!v;
+}
+function toggleFolderCollapsed(key) {
+    State.convFolderCollapsed[key] = !isFolderCollapsed(key);
+    saveFolderCollapsed();
+}
+
+function formatTimeAgo(ts) {
+    if (!ts) return '';
+    const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+    if (s < 60) return `${s}s ago`;
+    if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+    if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+    if (s < 86400 * 30) return `${Math.floor(s / 86400)}d ago`;
+    return new Date(ts * 1000).toLocaleDateString();
+}
+
+const FOLDER_ICON_CLOSED_SVG = '<svg class="conv-folder-icon" width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 3V10.5C1 11 1.4 11 1.5 11H12.5C12.6 11 13 11 13 10.5V3H1Z"/><path d="M1 3V1.5C1 1 1.4 1 1.5 1H5L6.5 3H1Z"/></svg>';
+const FOLDER_ICON_OPEN_SVG = '<svg class="conv-folder-icon" width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M1 3V1.5C1 1 1.4 1 1.5 1H5L6.5 3H1Z"/><path d="M1 3H13V4.5H1Z"/><path d="M1.4 4.5L2.5 10.7C2.55 10.9 2.7 11 2.85 11H11.5C11.65 11 11.8 10.9 11.85 10.7L13 4.5"/></svg>';
 
 // ── View Switching ──
 function switchView(view) {
@@ -393,15 +429,20 @@ function renderConversationList() {
     }
     empty.style.display = 'none';
 
-    // Separate starred conversations (shown above everything)
-    const starred = convs.filter(c => c.starred);
+    // Sort by last edited (desc) within each bucket
+    const byRecent = (a, b) => (b.updated_at || 0) - (a.updated_at || 0);
+
+    // Separate starred conversations (shown above everything) — NSFW items
+    // are pulled out of starred into their own section below.
+    const starred = convs.filter(c => c.starred && !c.nsfw).slice().sort(byRecent);
+    const nsfw = convs.filter(c => c.nsfw).slice().sort(byRecent);
 
     if (starred.length) {
         const starSection = document.createElement('div');
-        starSection.className = 'conv-folder-group';
+        starSection.className = 'conv-folder-group conv-starred-section';
         const starHeader = document.createElement('div');
         starHeader.className = 'conv-folder-header conv-starred-header';
-        const starCollapsed = !!State.convFolderCollapsed['__starred__'];
+        const starCollapsed = isFolderCollapsed('__starred__');
         starHeader.innerHTML = `
             <span class="conv-folder-arrow">${starCollapsed ? '▸' : '▾'}</span>
             <span class="conv-folder-icon">★</span>
@@ -409,8 +450,7 @@ function renderConversationList() {
             <span class="conv-folder-count">(${starred.length})</span>
         `;
         starHeader.addEventListener('click', () => {
-            State.convFolderCollapsed['__starred__'] = !State.convFolderCollapsed['__starred__'];
-            saveFolderCollapsed();
+            toggleFolderCollapsed('__starred__');
             renderConversationList();
         });
         starSection.appendChild(starHeader);
@@ -425,6 +465,40 @@ function renderConversationList() {
         list.appendChild(starSection);
     }
 
+    // Not-for-Work section (acts like starred, default collapsed, above folders)
+    if (nsfw.length) {
+        const nsfwSection = document.createElement('div');
+        nsfwSection.className = 'conv-folder-group conv-nsfw-section';
+        const nsfwHeader = document.createElement('div');
+        nsfwHeader.className = 'conv-folder-header conv-nsfw-header';
+        const nsfwCollapsed = isFolderCollapsed('__nsfw__');
+        nsfwHeader.innerHTML = `
+            <span class="conv-folder-arrow">${nsfwCollapsed ? '▸' : '▾'}</span>
+            <span class="conv-folder-icon">\uD83D\uDD1E</span>
+            <span class="conv-folder-name">Not for Work</span>
+            <span class="conv-folder-count">(${nsfw.length})</span>
+        `;
+        nsfwHeader.addEventListener('click', () => {
+            toggleFolderCollapsed('__nsfw__');
+            renderConversationList();
+        });
+        nsfwSection.appendChild(nsfwHeader);
+        if (!nsfwCollapsed) {
+            const itemsWrap = document.createElement('div');
+            itemsWrap.className = 'conv-folder-items';
+            for (const conv of nsfw) {
+                itemsWrap.appendChild(buildConvItem(conv));
+            }
+            nsfwSection.appendChild(itemsWrap);
+        }
+        list.appendChild(nsfwSection);
+    }
+
+    // File-explorer tree wrapper (folders + unfiled leaves)
+    const tree = document.createElement('div');
+    tree.className = 'conv-tree';
+    list.appendChild(tree);
+
     // Group ALL conversations by folder (starred appear in both sections)
     const folders = {};  // folder name -> [conv, ...]
     const unfiled = [];
@@ -438,18 +512,23 @@ function renderConversationList() {
         }
     }
 
-    // Render folder groups
-    const folderNames = Object.keys(folders).sort();
-    for (const folderName of folderNames) {
-        const group = document.createElement('div');
-        group.className = 'conv-folder-group';
+    // Render folder groups — alphabetical. Expanded folders render first as
+    // full-width rows; collapsed folders stack as cards below them.
+    const folderNames = Object.keys(folders).sort((a, b) => a.localeCompare(b));
+    const collapsedStack = document.createElement('div');
+    collapsedStack.className = 'conv-folder-stack';
 
-        const collapsed = !!State.convFolderCollapsed[folderName];
+    for (const folderName of folderNames) {
+        folders[folderName].sort(byRecent);
+        const group = document.createElement('div');
+        const collapsed = isFolderCollapsed(folderName);
+        group.className = 'conv-folder-group ' + (collapsed ? 'is-collapsed' : 'is-expanded');
+
         const header = document.createElement('div');
         header.className = 'conv-folder-header';
         header.innerHTML = `
             <span class="conv-folder-arrow">${collapsed ? '▸' : '▾'}</span>
-            <svg class="conv-folder-icon" width="14" height="12" viewBox="0 0 14 12" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 3V10.5C1 11 1.4 11 1.5 11H12.5C12.6 11 13 11 13 10.5V3H1Z"/><path d="M1 3V1.5C1 1 1.4 1 1.5 1H5L6.5 3H1Z"/></svg>
+            ${collapsed ? FOLDER_ICON_CLOSED_SVG : FOLDER_ICON_OPEN_SVG}
             <span class="conv-folder-name">${escapeHtml(folderName)}</span>
             <span class="conv-folder-count">(${folders[folderName].length})</span>
             <span class="conv-folder-actions">
@@ -460,8 +539,7 @@ function renderConversationList() {
         // Collapse/expand on header click (but not on action buttons)
         header.addEventListener('click', (e) => {
             if (e.target.closest('.conv-folder-actions')) return;
-            State.convFolderCollapsed[folderName] = !State.convFolderCollapsed[folderName];
-            saveFolderCollapsed();
+            toggleFolderCollapsed(folderName);
             renderConversationList();
         });
         // Rename folder — inline edit, no popup
@@ -530,13 +608,24 @@ function renderConversationList() {
                 itemsWrap.appendChild(buildConvItem(conv));
             }
             group.appendChild(itemsWrap);
+            tree.appendChild(group);
+        } else {
+            collapsedStack.appendChild(group);
         }
-        list.appendChild(group);
+    }
+    if (collapsedStack.childElementCount > 0) {
+        tree.appendChild(collapsedStack);
     }
 
-    // Render unfiled conversations
-    for (const conv of unfiled) {
-        list.appendChild(buildConvItem(conv));
+    // Render unfiled conversations as loose leaves under folders, sorted by recency
+    unfiled.sort(byRecent);
+    if (unfiled.length) {
+        const unfiledWrap = document.createElement('div');
+        unfiledWrap.className = 'conv-tree-unfiled';
+        for (const conv of unfiled) {
+            unfiledWrap.appendChild(buildConvItem(conv));
+        }
+        tree.appendChild(unfiledWrap);
     }
 }
 
@@ -560,23 +649,48 @@ function buildConvItem(conv) {
     const starred = conv.starred ? 1 : 0;
     const starChar = starred ? '★' : '☆';
     const starClass = starred ? 'conv-star-btn active' : 'conv-star-btn';
+    const nsfwOn = conv.nsfw ? 1 : 0;
+    const nsfwClass = nsfwOn ? 'conv-nsfw-btn active' : 'conv-nsfw-btn';
+
+    const pathFull = conv.project_dir || '';
+    const pathShort = pathFull ? pathFull.split(/[\\/]/).slice(-2).join('/') : '';
+    const lastLine = conv.updated_at ? `Last: ${formatTimeAgo(conv.updated_at)}` : '';
+    const folderTip = [pathFull ? `Path: ${pathFull}` : 'Path: (no working dir)', lastLine, '', 'Click to move to folder'].filter(Boolean).join('\n');
+    const pathHtml = pathShort
+        ? `<span class="conv-path" title="${escapeHtml(pathFull)}" data-full="${escapeHtml(pathFull)}"><span class="conv-path-short">…/${escapeHtml(pathShort)}</span><span class="conv-path-full">${escapeHtml(pathFull)}</span></span>`
+        : '';
 
     div.innerHTML = `
         <div class="conv-card-top">
             ${modeBadge}
-            <button class="${starClass}" title="Star">${starChar}</button>
+            <div class="conv-card-flags">
+                <button class="${starClass}" title="Star">${starChar}</button>
+                <button class="${nsfwClass}" title="Mark 18+ / Not for Work">\uD83D\uDD1E</button>
+            </div>
         </div>
         <div class="conv-card-body">
             <span class="conv-title-text">${escapeHtml(conv.title)}</span>
             <span class="conv-meta">${escapeHtml(charName)}</span>
+            ${pathHtml}
         </div>
         <div class="conv-actions">
-            <button class="char-action-btn conv-folder-btn" title="Move to folder">🗀</button>
+            <button class="char-action-btn conv-folder-btn" title="${escapeHtml(folderTip)}">${FOLDER_ICON_CLOSED_SVG}</button>
             <button class="char-action-btn conv-edit-btn" title="Rename">✎</button>
             <button class="char-action-btn conv-export-btn" title="Export">↓</button>
             <button class="char-action-btn char-delete-btn conv-delete-btn" title="Delete">✕</button>
         </div>
     `;
+
+    // NSFW toggle
+    div.querySelector('.conv-nsfw-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const newNsfw = conv.nsfw ? 0 : 1;
+        try {
+            await API.put(`/api/conversations/${conv.id}`, { nsfw: newNsfw });
+            conv.nsfw = newNsfw;
+            renderConversationList();
+        } catch { showToast('Failed to update NSFW flag', 'error'); }
+    });
 
     // Star toggle
     div.querySelector('.conv-star-btn').addEventListener('click', async (e) => {
