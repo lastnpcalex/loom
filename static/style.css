@@ -419,7 +419,7 @@ body::after {
 }
 
 .home-section.is-collapsed > :not(.home-section-header) {
-    display: none;
+    display: none !important;
 }
 .home-section.is-collapsed .home-section-header {
     margin-bottom: 0;
