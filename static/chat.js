@@ -65,6 +65,8 @@ function connectWebSocket(convId, _attempt) {
         // Server immediately sends generation_active (with snapshot) or generation_idle.
         // We let those handlers trigger loadMessages — no more racy setTimeout.
         ws._needsSync = true;
+        // If the user hit Send while the old socket was stale, replay now.
+        _flushPendingGenerate();
     };
 
     ws.onmessage = (event) => {
@@ -1873,19 +1875,54 @@ function showChildBranchHint(msgId, container) {
     container.appendChild(hint);
 }
 
+// Pending generate stashed while we reconnect a dead/stale WS on mobile.
+// Flushed by connectWebSocket's onopen handler.
+let _pendingGenerate = null;
+
 function _triggerParallelGenerate(count, parentId) {
-    if (!State.ws || State.ws.readyState !== WebSocket.OPEN) return;
-    // Only Weave mode supports parallel branching
     const isWeave = State.currentConv && State.currentConv.mode === 'weave';
     const n = isWeave ? Math.max(1, Math.min(5, count)) : 1;
+
+    // Mobile safari / NAT can leave the socket reporting OPEN while it's
+    // actually TCP-dead. send() goes into the void and no stream_start ever
+    // comes back — the user sees their own message disappear into the grey.
+    // Detect staleness (no inbound traffic in 10s) or closed socket, force
+    // a reconnect, and replay the generate on the new socket's onopen.
+    const ws = State.ws;
+    const stale = !ws
+        || ws.readyState === WebSocket.CLOSED
+        || ws.readyState === WebSocket.CLOSING
+        || (ws.readyState === WebSocket.OPEN && Date.now() - (ws._lastActivity || 0) > 10000)
+        || ws.readyState === WebSocket.CONNECTING;
+    if (stale) {
+        console.log('[WS] generate: socket stale or not open — reconnecting and stashing');
+        _pendingGenerate = { count: n, parentId };
+        showGenStatus('Reconnecting...');
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+            try { ws.close(); } catch {}
+        } else if (!ws || ws.readyState === WebSocket.CLOSED) {
+            connectWebSocket(State.currentConvId);
+        }
+        return;
+    }
+
     for (let i = 0; i < n; i++) {
         const msg = { action: 'generate' };
         if (parentId) msg.parent_id = parentId;
-        // Include current model settings so the server doesn't rely on stale DB
         _attachCCSettings(msg);
-        State.ws.send(JSON.stringify(msg));
+        ws.send(JSON.stringify(msg));
     }
     showGenStatus(n > 1 ? `Generating ${n} branches...` : 'Sending...');
+}
+
+// Fired by connectWebSocket onopen — replays a stashed generate so the user
+// doesn't have to resend after a silent mobile reconnect.
+function _flushPendingGenerate() {
+    if (!_pendingGenerate) return;
+    const { count, parentId } = _pendingGenerate;
+    _pendingGenerate = null;
+    // Defer one tick so server has processed our ws_chat setup (generation_idle etc.)
+    setTimeout(() => _triggerParallelGenerate(count, parentId), 150);
 }
 
 /** Attach cc_model/effort/permission to a WS message from current UI state */
