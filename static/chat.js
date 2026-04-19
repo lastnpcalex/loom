@@ -40,14 +40,27 @@ function connectWebSocket(convId, _attempt) {
         console.log('WebSocket connected');
         ws._reconnectAttempt = 0;
         _wsReconnectDelay = 2000; // reset backoff on success
+        ws._lastActivity = Date.now();
         // Web Worker keepalive — runs at full speed even in background tabs
-        // (setInterval gets throttled to ~60s by Chrome in background)
-        const workerBlob = new Blob([`setInterval(() => postMessage('ping'), 15000)`], {type: 'text/javascript'});
+        // (setInterval gets throttled to ~60s by Chrome in background). The
+        // worker fires every 15s; we use it to both ping the server AND check
+        // whether we've gone silent for too long (half-open TCP on mobile
+        // Safari / NAT timeouts typically present this way — readyState stays
+        // OPEN forever but no traffic flows).
+        const workerBlob = new Blob([`setInterval(() => postMessage('tick'), 15000)`], {type: 'text/javascript'});
         ws._pingWorker = new Worker(URL.createObjectURL(workerBlob));
         ws._pingWorker.onmessage = () => {
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ action: 'ping' }));
+            if (ws.readyState !== WebSocket.OPEN) return;
+            // Staleness check BEFORE sending — if the socket's already silent
+            // for 35s, force-close so onclose can trigger a reconnect. Don't
+            // send a ping into the void; it'd reset nothing.
+            const since = Date.now() - (ws._lastActivity || 0);
+            if (since > 35000) {
+                console.warn(`[WS] No activity for ${Math.round(since/1000)}s — forcing reconnect`);
+                try { ws.close(); } catch {}
+                return;
             }
+            ws.send(JSON.stringify({ action: 'ping' }));
         };
         // Server immediately sends generation_active (with snapshot) or generation_idle.
         // We let those handlers trigger loadMessages — no more racy setTimeout.
@@ -55,6 +68,7 @@ function connectWebSocket(convId, _attempt) {
     };
 
     ws.onmessage = (event) => {
+        ws._lastActivity = Date.now();
         const data = JSON.parse(event.data);
         handleWSMessage(data);
     };
@@ -96,19 +110,39 @@ function connectWebSocket(convId, _attempt) {
 let _streamTokenCount = 0;
 let _streamStartTime = 0;
 
-// Force reconnect when tab becomes visible again
-document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && State.currentConvId) {
-        if (!State.ws || State.ws.readyState === WebSocket.CLOSED) {
-            console.log('Tab visible — reconnecting WebSocket');
-            connectWebSocket(State.currentConvId);
-        } else if (State.ws && State.ws.readyState === WebSocket.OPEN && !State.isStreaming) {
-            // WS is open but we may have missed events while backgrounded — resync
-            // Skip during streaming or active edit — loadMessages destroys the UI
-            if (document.querySelector('.edit-message-input')) return;
-            loadMessages(State.currentConvId);
-        }
+// Probe the WS when the tab returns to foreground. readyState alone is not
+// enough on mobile — the socket often reports OPEN while actually being
+// TCP-dead. If we've had no inbound message recently, force-close so the
+// normal reconnect path can replace it.
+function _probeWSOnResume(source) {
+    if (!State.currentConvId) return;
+    const ws = State.ws;
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        console.log(`[WS] ${source} — no live socket, reconnecting`);
+        connectWebSocket(State.currentConvId);
+        return;
     }
+    const since = Date.now() - (ws._lastActivity || 0);
+    if (since > 15000) {
+        console.log(`[WS] ${source} — ${Math.round(since/1000)}s since last activity, forcing reconnect`);
+        try { ws.close(); } catch {}
+        // onclose will trigger reconnect. Don't loadMessages here — the new
+        // socket's generation_active / generation_idle will handle sync.
+        return;
+    }
+    // Socket looks fresh. A light resync covers anything we missed while blurred.
+    if (!State.isStreaming && !document.querySelector('.edit-message-input')) {
+        loadMessages(State.currentConvId);
+    }
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') _probeWSOnResume('visibilitychange');
+});
+// iOS Safari back/forward cache restores the page without firing
+// visibilitychange. pageshow with persisted=true is the reliable signal.
+window.addEventListener('pageshow', (e) => {
+    if (e.persisted) _probeWSOnResume('pageshow(bfcache)');
 });
 
 async function loadMessages(convId) {
