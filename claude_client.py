@@ -13,12 +13,30 @@ log = logging.getLogger(__name__)
 _HOOK_SCRIPT = str(Path(__file__).parent / "cc_permission_hook.py")
 
 
+def _extract_message_text(content) -> str:
+    """Pull readable text out of a CC transcript record's message.content."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                t = block.get("text", "")
+                if t:
+                    parts.append(t)
+        return "\n\n".join(parts)
+    return ""
+
+
 async def read_compact_summary(session_id: str, timeout_sec: float = 8.0) -> str | None:
     """Return the narrative summary CC wrote after a compact, or None.
 
-    CC persists the compact summary as a `type:"summary"` record in the session
-    transcript at ~/.claude/projects/<cwd-hash>/<session_id>.jsonl. That file is
-    written asynchronously, so we retry with a short backoff before giving up.
+    Modern CC (2.x) opens a post-compact session transcript with a `type:"user"`
+    record flagged `isCompactSummary: true` whose message content is the
+    narrative summary ("This session is being continued from a previous
+    conversation…"). Older CC versions wrote a separate `type:"summary"`
+    record. We handle both. The transcript is written asynchronously so we
+    retry with a short backoff before giving up.
     """
     if not session_id:
         return None
@@ -40,25 +58,21 @@ async def read_compact_summary(session_id: str, timeout_sec: float = 8.0) -> str
                             rec = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        if rec.get("type") != "summary":
-                            continue
-                        # Shape varies across CC versions; try the common paths.
-                        msg = rec.get("message") or {}
-                        content = msg.get("content") if isinstance(msg, dict) else None
-                        if isinstance(content, str) and content.strip():
-                            return content.strip()
-                        if isinstance(content, list):
-                            parts = []
-                            for block in content:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    t = block.get("text", "")
-                                    if t:
-                                        parts.append(t)
-                            if parts:
-                                return "\n\n".join(parts).strip()
-                        summary_text = rec.get("summary")
-                        if isinstance(summary_text, str) and summary_text.strip():
-                            return summary_text.strip()
+                        if rec.get("isCompactSummary"):
+                            msg = rec.get("message") or {}
+                            content = msg.get("content") if isinstance(msg, dict) else None
+                            text = _extract_message_text(content).strip()
+                            if text:
+                                return text
+                        if rec.get("type") == "summary":
+                            msg = rec.get("message") or {}
+                            content = msg.get("content") if isinstance(msg, dict) else None
+                            text = _extract_message_text(content).strip()
+                            if text:
+                                return text
+                            alt = rec.get("summary")
+                            if isinstance(alt, str) and alt.strip():
+                                return alt.strip()
             except OSError:
                 continue
         if asyncio.get_event_loop().time() >= deadline:
