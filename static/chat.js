@@ -262,15 +262,52 @@ function handleWSMessage(data) {
 
         case 'compact_boundary':
             // Claude Code compactified its context — forked into a new branch.
-            // Reload messages immediately to show the system marker and switch branch.
+            // When streaming, we CAN'T call switchToBranch — it rebuilds the
+            // DOM and detaches the streamingDiv, so the incoming stream chunks
+            // pile into an orphan div. Instead, splice the marker into State
+            // and insert it DIRECTLY BEFORE the streaming div so the visual
+            // order matches the tree (parent → [compact marker] → draft).
             State._compactedThisGen = true;
             State._compactData = data;
-            showGenStatus('Context compactified — branching...');
+            showGenStatus('Context compactified — continuing generation...');
             if (data.marker_id) {
-                // Switch to the new branch (compact marker) so user sees the fork
-                switchToBranch(data.marker_id, data.marker_id).then(() => {
-                    showGenStatus('Context compactified — continuing generation...');
-                });
+                const trigger = data.trigger || 'auto';
+                const preTokens = data.pre_tokens;
+                const tokenInfo = preTokens ? ` — ${preTokens.toLocaleString()} tokens before` : '';
+                const markerContent = `[CC context compactified (${trigger})${tokenInfo}]`;
+                // Find the draft (streaming) message — it should be the active leaf.
+                const draftMsg = State.messages.find(m => m.role === 'assistant' && !m.content?.trim());
+                const markerMsg = {
+                    id: data.marker_id,
+                    role: 'system',
+                    content: markerContent,
+                    parent_id: draftMsg ? draftMsg.parent_id : null,
+                };
+                // Re-parent the draft under the marker in local state so ordering is stable.
+                if (draftMsg) draftMsg.parent_id = data.marker_id;
+
+                // Insert into State.messages right before the draft (or at end)
+                if (draftMsg) {
+                    const draftIdx = State.messages.indexOf(draftMsg);
+                    if (draftIdx >= 0) {
+                        State.messages.splice(draftIdx, 0, markerMsg);
+                    } else {
+                        State.messages.push(markerMsg);
+                    }
+                } else {
+                    State.messages.push(markerMsg);
+                }
+
+                // DOM insert: put the marker right before streamingDiv if it
+                // exists and is attached, else just append to messages container.
+                const container = document.getElementById('messages');
+                const markerEl = createMessageElement(markerMsg);
+                if (streamingDiv && streamingDiv.parentNode === container) {
+                    container.insertBefore(markerEl, streamingDiv);
+                } else if (container) {
+                    container.appendChild(markerEl);
+                }
+                refreshTree();
             } else {
                 loadMessages(State.currentConvId);
             }
@@ -1901,7 +1938,12 @@ function createMessageElement(msg, cost) {
         : getCharacterName();
     // Local model tag to show alongside Claude label
     const localModelTag = isLocalMode ? `<span class="local-model-tag">({${escapeHtml(State.currentConv.local_model || 'local')} model})</span>` : '';
-    const branchLabel = State.branchNames?.[msg.id] || '';
+    const branchLabelFull = State.branchNames?.[msg.id] || '';
+    // Middle-truncate long branch labels so they don't push action buttons off
+    // the row (matches tree nodes + breadcrumb).
+    const branchLabel = branchLabelFull.length > 14
+        ? branchLabelFull.slice(0, Math.ceil(14 / 2) - 1) + '…' + branchLabelFull.slice(-Math.floor(14 / 2))
+        : branchLabelFull;
 
     const isBm = State.bookmarks?.some(b => b.message_id === msg.id);
     const bmBtn = `<button onclick="toggleChatBookmark(${msg.id})" title="${isBm ? 'Remove bookmark' : 'Bookmark'}" class="chat-bookmark-btn${isBm ? ' active' : ''}">${isBm ? '⏣' : '⬡'}</button>`;
@@ -2019,7 +2061,7 @@ function createMessageElement(msg, cost) {
     div.innerHTML = '<div class="message-header">' +
         '<div class="message-header-left">' +
             '<span class="message-role">' + escapeHtml(roleLabel) + '</span>' +
-            (localModelTag ? `<span class="local-model-label">${localModelTag}</span>` : '') + (branchLabel ? '<span class="message-branch-label" title="Click to copy branch path">' + escapeHtml(branchLabel) + '</span>' : '') +
+            (localModelTag ? `<span class="local-model-label">${localModelTag}</span>` : '') + (branchLabel ? '<span class="message-branch-label" title="' + escapeHtml(branchLabelFull) + ' — click to copy branch path">' + escapeHtml(branchLabel) + '</span>' : '') +
         '</div>' +
         '<div class="message-actions">' + branchPlaceholder + actionsHtml + '</div>' +
         '</div>' +
@@ -2760,34 +2802,84 @@ function editMessage(msgId) {
     btnRow.className = 'edit-message-actions';
     const pillHtml = isWeave ? `<div class="branch-count-pill pill-compact" title="Branches to generate (click to cycle)"><span class="branch-count-icon">⑂</span><span class="branch-count-value">${State.branchCount}</span></div>` : '';
     btnRow.innerHTML = `
-        <label class="btn-small edit-attach" title="Attach file">
-            <input type="file" class="edit-file-input" accept="image/*,.md,.txt,.pdf,.json,.csv,.py,.js,.ts,.html,.css" hidden>
+        <label class="btn-small edit-attach" title="Attach file(s) — you can also paste or drop files onto the textarea">
+            <input type="file" class="edit-file-input" accept="image/*,.md,.txt,.pdf,.json,.csv,.py,.js,.ts,.html,.css" multiple hidden>
             📎
         </label>
-        <button class="btn-small edit-save">Send as new branch</button>
+        <button class="btn-small edit-save" title="Send as new branch (Shift+Enter)">Send as new branch</button>
         ${pillHtml}
         <button class="btn-small edit-cancel">Cancel</button>
     `;
     if (isWeave) _setupBranchPillClick(btnRow.querySelector('.branch-count-pill'));
     describeRow.after(btnRow);
 
-    // File attach handler
-    const editFileInput = btnRow.querySelector('.edit-file-input');
-    const editAttachLabel = btnRow.querySelector('.edit-attach');
-    editFileInput.addEventListener('change', async (e) => {
-        const file = e.target.files[0];
+    // Shared uploader: takes a File, uploads it, appends to editFiles, refreshes chips.
+    async function _uploadEditFile(file) {
         if (!file) return;
-        editAttachLabel.classList.add('uploading');
-        editAttachLabel.setAttribute('data-orig', editAttachLabel.textContent);
-        editAttachLabel.textContent = '⏳';
         try {
             const result = await API.upload(file);
             editFiles.push({ path: result.path, original: false });
             renderEditFiles();
         } catch { showToast('File upload failed', 'error'); }
-        editAttachLabel.textContent = editAttachLabel.getAttribute('data-orig') || '📎';
+    }
+    async function _uploadEditFiles(fileList) {
+        const files = Array.from(fileList || []);
+        if (!files.length) return;
+        const editAttachLabel = btnRow.querySelector('.edit-attach');
+        const orig = editAttachLabel.textContent;
+        editAttachLabel.classList.add('uploading');
+        editAttachLabel.textContent = '⏳';
+        for (const f of files) await _uploadEditFile(f);
+        editAttachLabel.textContent = orig || '📎';
         editAttachLabel.classList.remove('uploading');
+    }
+
+    // File picker (now accepts multiple)
+    const editFileInput = btnRow.querySelector('.edit-file-input');
+    editFileInput.addEventListener('change', async (e) => {
+        await _uploadEditFiles(e.target.files);
         e.target.value = '';
+    });
+
+    // Paste clipboard images / files directly into the textarea
+    textarea.addEventListener('paste', async (e) => {
+        const items = e.clipboardData && e.clipboardData.items;
+        if (!items) return;
+        const files = [];
+        for (const item of items) {
+            // Image from clipboard or a regular File
+            if (item.kind === 'file') {
+                const f = item.getAsFile();
+                if (f) files.push(f);
+            }
+        }
+        if (files.length > 0) {
+            e.preventDefault();
+            await _uploadEditFiles(files);
+        }
+    });
+
+    // Drop files onto the textarea
+    textarea.addEventListener('dragover', (e) => {
+        if (e.dataTransfer && e.dataTransfer.types && e.dataTransfer.types.indexOf('Files') !== -1) {
+            e.preventDefault();
+            textarea.classList.add('drag-over');
+        }
+    });
+    textarea.addEventListener('dragleave', () => textarea.classList.remove('drag-over'));
+    textarea.addEventListener('drop', async (e) => {
+        if (!(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length)) return;
+        e.preventDefault();
+        textarea.classList.remove('drag-over');
+        await _uploadEditFiles(e.dataTransfer.files);
+    });
+
+    // Shift+Enter = send (matches main #user-input). Plain Enter = newline.
+    textarea.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && e.shiftKey) {
+            e.preventDefault();
+            btnRow.querySelector('.edit-save').click();
+        }
     });
 
     btnRow.querySelector('.edit-cancel').addEventListener('click', () => {
