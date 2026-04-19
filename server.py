@@ -2407,6 +2407,10 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
                     "pre_tokens": pre_tokens,
                     "marker_id": marker["id"],
                 })
+                if compact_session:
+                    asyncio.create_task(
+                        _patch_marker_with_summary(conv_id, marker["id"], compact_session)
+                    )
 
             elif etype == "result":
                 new_session_id = evt.get("session_id", "")
@@ -3051,6 +3055,10 @@ async def _handle_claude_generation(
                         "marker_id": marker["id"],
                     },
                 )
+                if compact_session:
+                    asyncio.create_task(
+                        _patch_marker_with_summary(conv_id, marker["id"], compact_session)
+                    )
 
             elif etype == "api_retry":
                 attempt = evt.get("attempt", 1)
