@@ -2129,6 +2129,26 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
             await websocket.send_json({"type": "error", "error": str(e)})
 
 
+def _model_family(model_id: str) -> str | None:
+    """Return 'opus' / 'sonnet' / 'haiku' / None for a Claude model id or alias."""
+    if not model_id:
+        return None
+    m = model_id.lower()
+    for fam in ("opus", "sonnet", "haiku"):
+        if fam in m:
+            return fam
+    return None
+
+
+def _detect_model_fallback(requested: str, actual: str) -> str | None:
+    """If CC silently downgraded to a different family, return a warning line."""
+    rf = _model_family(requested)
+    af = _model_family(actual)
+    if rf and af and rf != af:
+        return f"Claude Code fell back from {rf} to {af} (usage cap on {rf})"
+    return None
+
+
 async def _patch_marker_with_summary(conv_id: int, marker_id: int, new_session: str):
     """Background task: once CC has flushed the post-compact transcript,
     read the summary out of the JSONL and UPDATE the marker row content.
@@ -2874,6 +2894,7 @@ async def _handle_claude_generation(
         current_block = None
         result_info = {}
         new_session_id = ""
+        actual_model = ""  # what CC actually ran (may differ from cc_model if CC fell back)
         total_input_tokens = 0
         total_output_tokens = 0
         got_error = False
@@ -2883,6 +2904,7 @@ async def _handle_claude_generation(
 
             if etype == "session_info":
                 new_session_id = evt.get("session_id", "") or new_session_id
+                actual_model = evt.get("model", "") or actual_model
 
             elif etype == "text_delta":
                 full_text += evt["text"]
@@ -3379,6 +3401,26 @@ async def _handle_claude_generation(
         new_session_id = result_info.get("session_id", "") or new_session_id
         duration_ms = result_info.get("duration_ms", 0)
 
+        # Record what CC actually ran (from session_info), not just what we asked
+        # for. If CC silently downgraded (usage cap, availability), surface it.
+        resolved_model = actual_model or cc_model
+        if use_ollama:
+            model_used_field = f"{cc_model}@ollama"
+        else:
+            model_used_field = resolved_model
+
+        fallback_note = _detect_model_fallback(cc_model, actual_model)
+        if fallback_note:
+            await _ws_send(
+                conv_id,
+                {
+                    "type": "warning",
+                    "text": f"{fallback_note} — this branch is now on {actual_model}. Further turns may auto-compact sooner.",
+                    "requested_model": cc_model,
+                    "actual_model": actual_model,
+                },
+            )
+
         # Finalize the draft message with full content
         await db.update_message_content(
             draft_msg_id,
@@ -3388,7 +3430,7 @@ async def _handle_claude_generation(
             turn_input_tokens=input_tokens,
             turn_output_tokens=output_tokens,
             cc_session_id=new_session_id or None,
-            cc_model_used=cc_model if not use_ollama else f"{cc_model}@ollama",
+            cc_model_used=model_used_field,
         )
         msg = await db.get_message(draft_msg_id)
 

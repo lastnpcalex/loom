@@ -561,6 +561,12 @@ function handleWSMessage(data) {
             _flushQueuedGeneration();
             break;
 
+        case 'warning':
+            // Server-side non-fatal warning (e.g. CC silently downgraded model).
+            // Show as a sticky toast so the user actually reads it.
+            if (data.text) showToast(data.text, 8000);
+            break;
+
         case 'error':
             if (!_isOurBranch(data)) {
                 hideGenStatus();
