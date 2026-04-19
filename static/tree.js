@@ -853,12 +853,22 @@ async function renderTree() {
     });
 }
 
+// Middle-truncate a long branch label so it fits inside a tree node without
+// overrunning adjacent nodes. Mirrors _truncateLabel in app.js (breadcrumb).
+function _truncTreeLabel(s, max = 14) {
+    if (!s || s.length <= max) return s;
+    const head = s.slice(0, Math.ceil(max / 2) - 1);
+    const tail = s.slice(-Math.floor(max / 2));
+    return head + '…' + tail;
+}
+
 function createNode(node, branchNames) {
     const data = node.data;
     const isActive = node.isActive;
     const isRoot = !data.parent_id;
     const isForkPoint = node.childCount > 1;
-    const label = branchNames[data.id] || '';
+    const fullLabel = branchNames[data.id] || '';
+    const label = _truncTreeLabel(fullLabel);
 
     // Ghost: either injected ghost node OR real draft message (empty assistant content)
     // Error node = content starts with [Error:
@@ -905,7 +915,7 @@ function createNode(node, branchNames) {
         <div class="tree-node-header">
             <span class="tree-node-role">${escapeHtml(roleLabel)}</span>
             ${hasImage ? '<span class="tree-node-img-badge" title="Has image">img</span>' : ''}
-            <span class="tree-node-label">${escapeHtml(label)}</span>
+            <span class="tree-node-label" title="${escapeHtml(fullLabel)}">${escapeHtml(label)}</span>
             ${isForkPoint ? `<span class="tree-node-fork">${node.childCount} branches</span>` : ''}
             <button class="tree-node-bookmark-btn${isBookmarked ? ' active' : ''}" title="${isBookmarked ? 'Remove bookmark' : 'Bookmark this node'}">${isBookmarked ? '⏣' : '⬡'}</button>
             <button class="tree-node-delete-btn" title="Delete branch">&#x2715;</button>

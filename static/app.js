@@ -342,25 +342,32 @@ function updateBreadcrumbs() {
         html += '<span class="breadcrumb-sep">›</span>' + _crumbBtn(last);
     }
 
-    trail.innerHTML = html;
-
-    // Full branch path (for double-click copy and title-bar copy)
+    // Full branch path (copied when the button at the end is clicked)
     const fullPath = crumbs.map(c => c.label).filter(Boolean).join(' > ');
+
+    // Dedicated copy button at the end of the trail. Double-click on crumbs
+    // doesn't work because single-click navigates — by the time the dblclick
+    // fires the trail has been replaced by the new branch's crumbs.
+    html += `<button class="breadcrumb-copy" title="Copy full branch path to clipboard">⧉</button>`;
+
+    trail.innerHTML = html;
     trail.dataset.fullPath = fullPath;
 
-    // Click handlers for breadcrumb buttons
+    // Click handlers for breadcrumb buttons (single-click only — navigate)
     trail.querySelectorAll('.breadcrumb-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
             const msgId = parseInt(btn.dataset.msgId);
             await switchToBranch(msgId);
         });
-        btn.addEventListener('dblclick', async (e) => {
+    });
+
+    // Copy-path button
+    const copyBtn = trail.querySelector('.breadcrumb-copy');
+    if (copyBtn) {
+        copyBtn.addEventListener('click', async (e) => {
             e.stopPropagation();
-            e.preventDefault();
-            // Double-click anywhere on the breadcrumb trail copies the
-            // FULL path (root > ... > current), matching "copy full path
-            // from the header". Single-click still navigates to that crumb.
-            const full = trail.dataset.fullPath || (btn.dataset.fullLabel || btn.textContent);
+            const full = trail.dataset.fullPath || '';
+            if (!full) { showToast('No path to copy'); return; }
             try {
                 await navigator.clipboard.writeText(full);
                 showToast('Branch path copied');
@@ -368,7 +375,7 @@ function updateBreadcrumbs() {
                 showToast('Copy failed', 'error');
             }
         });
-    });
+    }
 
     // Ellipsis expands hidden crumbs
     const ellipsis = trail.querySelector('.breadcrumb-ellipsis');

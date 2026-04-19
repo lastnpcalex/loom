@@ -229,6 +229,29 @@ body::after {
     font-size: 11px;
     margin: 0 1px;
 }
+.breadcrumb-copy {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1;
+    padding: 2px 7px;
+    margin-left: 6px;
+    cursor: pointer;
+    transition: var(--transition);
+    font-family: 'Space Grotesk', sans-serif;
+    user-select: none;
+}
+.breadcrumb-copy:hover {
+    color: var(--cyan);
+    border-color: var(--cyan);
+    box-shadow: 0 0 6px rgba(0, 255, 255, 0.35);
+}
+.edit-message-input.drag-over {
+    outline: 2px dashed var(--cyan);
+    outline-offset: 2px;
+}
 /* Bookmark button on tree nodes — ⬡ hexagon / ⏣ benzene */
 .tree-node-bookmark-btn {
     background: none;
