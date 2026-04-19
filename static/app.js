@@ -301,14 +301,25 @@ function updateBreadcrumbs() {
         crumbs.push({ label: currentLabel, msgId: lastMsg.id, title: 'Current position' });
     }
 
+    // Middle-truncate a long branch label so it doesn't overrun the crumb node.
+    // Keeps the first segment and the last two — the discriminating parts.
+    function _truncateLabel(s, max = 14) {
+        if (!s || s.length <= max) return s;
+        const head = s.slice(0, Math.ceil(max / 2) - 1);
+        const tail = s.slice(-Math.floor(max / 2));
+        return head + '…' + tail;
+    }
+    function _crumbBtn(c) {
+        const safeTitle = escapeHtml((c.title || '') + (c.label ? ' — double-click to copy full path' : ''));
+        return `<button class="breadcrumb-btn" data-msg-id="${c.msgId}" data-full-label="${escapeHtml(c.label || '')}" title="${safeTitle}">${escapeHtml(_truncateLabel(c.label || ''))}</button>`;
+    }
+
     // Render — collapse middle crumbs if more than 3
     const MAX_VISIBLE = 3;
     let html = '';
 
     if (crumbs.length <= MAX_VISIBLE) {
-        html = crumbs.map(c =>
-            `<button class="breadcrumb-btn" data-msg-id="${c.msgId}" title="${c.title}">${escapeHtml(c.label)}</button>`
-        ).join('<span class="breadcrumb-sep">›</span>');
+        html = crumbs.map(_crumbBtn).join('<span class="breadcrumb-sep">›</span>');
     } else {
         // Show: root ... second-to-last > current
         const first = crumbs[0];
@@ -316,7 +327,7 @@ function updateBreadcrumbs() {
         const last = crumbs[crumbs.length - 1];
         const hidden = crumbs.slice(1, crumbs.length - 2);
 
-        html = `<button class="breadcrumb-btn" data-msg-id="${first.msgId}" title="${first.title}">${escapeHtml(first.label)}</button>`;
+        html = _crumbBtn(first);
         // Ellipsis replaces the separator — clicking it reveals hidden crumbs
         html += '<span class="breadcrumb-ellipsis-wrap">';
         html += '<span class="breadcrumb-sep">›</span>';
@@ -324,22 +335,38 @@ function updateBreadcrumbs() {
         html += '</span>';
         html += '<span class="breadcrumb-hidden" style="display:none;">';
         for (const c of hidden) {
-            html += `<span class="breadcrumb-sep">›</span><button class="breadcrumb-btn" data-msg-id="${c.msgId}" title="${c.title}">${escapeHtml(c.label)}</button>`;
+            html += '<span class="breadcrumb-sep">›</span>' + _crumbBtn(c);
         }
         html += '</span>';
-        html += '<span class="breadcrumb-sep">›</span>';
-        html += `<button class="breadcrumb-btn" data-msg-id="${secondLast.msgId}" title="${secondLast.title}">${escapeHtml(secondLast.label)}</button>`;
-        html += '<span class="breadcrumb-sep">›</span>';
-        html += `<button class="breadcrumb-btn" data-msg-id="${last.msgId}" title="${last.title}">${escapeHtml(last.label)}</button>`;
+        html += '<span class="breadcrumb-sep">›</span>' + _crumbBtn(secondLast);
+        html += '<span class="breadcrumb-sep">›</span>' + _crumbBtn(last);
     }
 
     trail.innerHTML = html;
+
+    // Full branch path (for double-click copy and title-bar copy)
+    const fullPath = crumbs.map(c => c.label).filter(Boolean).join(' > ');
+    trail.dataset.fullPath = fullPath;
 
     // Click handlers for breadcrumb buttons
     trail.querySelectorAll('.breadcrumb-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
             const msgId = parseInt(btn.dataset.msgId);
             await switchToBranch(msgId);
+        });
+        btn.addEventListener('dblclick', async (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            // Double-click anywhere on the breadcrumb trail copies the
+            // FULL path (root > ... > current), matching "copy full path
+            // from the header". Single-click still navigates to that crumb.
+            const full = trail.dataset.fullPath || (btn.dataset.fullLabel || btn.textContent);
+            try {
+                await navigator.clipboard.writeText(full);
+                showToast('Branch path copied');
+            } catch {
+                showToast('Copy failed', 'error');
+            }
         });
     });
 

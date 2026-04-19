@@ -199,6 +199,11 @@ body::after {
     cursor: pointer;
     transition: var(--transition);
     font-family: 'Space Grotesk', sans-serif;
+    max-width: 180px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    user-select: none;
 }
 .breadcrumb-btn:hover {
     color: var(--cyan);

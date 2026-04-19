@@ -3060,6 +3060,10 @@ async def _handle_claude_generation(
                 )
                 # Reparent the draft under the compact marker so the branch is:
                 # ... → parent → [compact marker] → draft(assistant) → ...
+                # The DRAFT must remain the active leaf — otherwise the
+                # streaming assistant response ends up on a sibling branch and
+                # the user has to click "Switch to this branch" to see their
+                # own reply.
                 if draft_msg_id:
                     _db = await db.get_db()
                     await _db.execute(
@@ -3067,7 +3071,9 @@ async def _handle_claude_generation(
                         (marker["id"], draft_msg_id),
                     )
                     await _db.commit()
-                await db.set_active_branch(conv_id, marker["id"])
+                    await db.set_active_branch(conv_id, draft_msg_id)
+                else:
+                    await db.set_active_branch(conv_id, marker["id"])
                 await _ws_send(
                     conv_id,
                     {
