@@ -2008,6 +2008,16 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
             data = json.loads(raw)
             action = data.get("action")
 
+            if action == "ping":
+                # Reply so the client's heartbeat worker sees inbound activity
+                # and doesn't force-reconnect (which would trigger loadMessages
+                # and wipe any in-progress textarea edit).
+                try:
+                    await websocket.send_json({"type": "pong"})
+                except Exception:
+                    pass
+                continue
+
             if action == "cancel":
                 # Cancel all active generations for this conversation
                 cancelled_keys = [k for k in _active_generations if k[0] == conv_id]
@@ -2608,13 +2618,31 @@ async def _handle_claude_generation(
                 if not msg.get("cc_session_id"):
                     continue
                 content = msg.get("content") or ""
-                if not content.strip() or content.startswith("[Error:"):
-                    print(f"[CC] Skipping empty/error session on msg {msg['id']}")
+                blocks_raw = msg.get("content_blocks") or ""
+                has_blocks = False
+                if blocks_raw:
+                    try:
+                        _b = json.loads(blocks_raw) if isinstance(blocks_raw, str) else blocks_raw
+                        has_blocks = bool(_b)
+                    except (json.JSONDecodeError, TypeError):
+                        has_blocks = False
+                if content.startswith("[Error:"):
+                    print(f"[CC] Skipping error session on msg {msg['id']}")
                     continue
-                # Check if the session was created by a different provider
+                if not content.strip() and not has_blocks:
+                    print(f"[CC] Skipping empty session on msg {msg['id']}")
+                    continue
+                # Check if the session was created by a different provider.
+                # cc_model_used can hold either a shortcode alias ("opus[1m]")
+                # or the full Anthropic model id ("claude-opus-4-7[1m]") — accept both.
                 prev_model = msg.get("cc_model_used") or ""
                 _prev_base = prev_model.split("[")[0] if "[" in prev_model else prev_model
-                prev_is_anthropic = _prev_base in _ANTHROPIC_MODELS
+                _prev_base_lower = _prev_base.lower()
+                prev_is_anthropic = (
+                    _prev_base in _ANTHROPIC_MODELS
+                    or _prev_base_lower.startswith("claude-")
+                    or any(fam in _prev_base_lower for fam in ("opus", "sonnet", "haiku"))
+                )
                 prev_is_gemini = prev_model.startswith("gemini")
                 prev_is_ollama = bool(prev_model) and not (
                     prev_is_anthropic or prev_is_gemini
@@ -3625,20 +3653,19 @@ def _build_claude_history_prompt(branch: list[dict], project_dir: Path = None) -
             else:
                 history_parts.append(f"Assistant: {msg['content']}")
 
-    # Add file references if files were found
-    if attached_files:
-        files_str = "\n".join(f"  • {Path(ip).name} (in attached_files/)" for ip in attached_files)
-        return f"\n\n[Attached files:]\n{files_str}\n\n" + history_parts[-1]
-
     if not history_parts:
-        return ""
-
-    if len(history_parts) > 1:
+        base = ""
+    elif len(history_parts) > 1:
         history = "\n\n".join(history_parts[:-1])
         latest = history_parts[-1].removeprefix("Human: ")
-        return f"<conversation_history>\n{history}\n</conversation_history>\n\n{latest}"
+        base = f"<conversation_history>\n{history}\n</conversation_history>\n\n{latest}"
     else:
-        return history_parts[0].removeprefix("Human: ")
+        base = history_parts[0].removeprefix("Human: ")
+
+    if attached_files:
+        files_str = "\n".join(f"  • {Path(ip).name} (in attached_files/)" for ip in attached_files)
+        return f"[Attached files:]\n{files_str}\n\n{base}" if base else f"[Attached files:]\n{files_str}"
+    return base
 
 
 async def _handle_local_generation(

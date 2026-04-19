@@ -676,9 +676,19 @@ function handleWSMessage(data) {
                 document.getElementById('btn-send').disabled = false;
                 removeStreamingMessage();
                 hideGenStatus();
-                loadMessages(State.currentConvId);
+                // Don't clobber an in-progress edit or typed draft on reconnect.
+                const editing = !!document.querySelector('.edit-message-input');
+                const ta = document.getElementById('message-input');
+                const typing = !!(ta && ta.value && ta.value.trim().length > 0);
+                if (!editing && !typing) {
+                    loadMessages(State.currentConvId);
+                }
             }
             if (State.ws) State.ws._needsSync = false;
+            break;
+
+        case 'pong':
+            // Heartbeat ack — no UI action needed; onmessage already updated _lastActivity.
             break;
     }
 }
