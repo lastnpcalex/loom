@@ -112,6 +112,36 @@ function connectWebSocket(convId, _attempt) {
 let _streamTokenCount = 0;
 let _streamStartTime = 0;
 
+// DOM-authoritative streaming check. State.isStreaming is a flag we set and
+// try to clear cleanly, but it leaks any time stream_end fires on a dropped
+// WS, or when a permission prompt auto-creates a streamingDiv between turns
+// and we lose track of whose turn it belonged to. Symptom: user sends a new
+// message, it "disappears" (queued behind a stream that already ended), or
+// stream chunks land in a detached div. The only ground truth is whether
+// streamingDiv is (a) set and (b) still attached to #messages.
+function _isActuallyStreaming() {
+    if (!State.isStreaming) return false;
+    if (!streamingDiv) return false;
+    return !!streamingDiv.isConnected;
+}
+
+// Force-clear streaming state. Called before starting a new turn, to recover
+// from any leaked flags / stale streamingDiv references.
+function _resetStreamState() {
+    if (typeof _streamFlushTimer !== 'undefined' && _streamFlushTimer) {
+        clearTimeout(_streamFlushTimer);
+        _streamFlushTimer = null;
+    }
+    if (typeof _streamBuffer !== 'undefined') _streamBuffer = '';
+    State.isStreaming = false;
+    State._streamIsOurBranch = undefined;
+    State._followingGenId = null;
+    State._parallelCount = 0;
+    if (streamingDiv && !streamingDiv.isConnected) {
+        streamingDiv = null;  // detached; drop the stale ref
+    }
+}
+
 // Probe the WS when the tab returns to foreground. readyState alone is not
 // enough on mobile — the socket often reports OPEN while actually being
 // TCP-dead. If we've had no inbound message recently, force-close so the
@@ -380,6 +410,14 @@ function handleWSMessage(data) {
             const parentId = data.parent_id;
             const myMsgIds = new Set(State.messages.map(m => m.id));
             const isOnOurBranch = parentId == null || myMsgIds.has(parentId);
+            // If the isStreaming flag leaked from a previous turn (no live
+            // streamingDiv attached) clear it now so we actually create a
+            // fresh div for this stream. Without this, stream chunks fall
+            // into the void and the user has to refresh to see anything.
+            if (State.isStreaming && !_isActuallyStreaming()) {
+                console.log('[WS] stream_start: clearing leaked isStreaming flag');
+                _resetStreamState();
+            }
             // Only follow the FIRST stream on our branch — parallel siblings stream silently
             const shouldFollow = isOnOurBranch && !State.isStreaming;
             console.log('[WS] stream_start parent_id=', parentId, 'gen_id=', data.gen_id, 'follow=', shouldFollow);
@@ -1304,7 +1342,16 @@ async function sendMessage() {
             return;
         }
 
-        if (State.isStreaming) {
+        // Ground-truth streaming check — State.isStreaming alone leaks after
+        // disconnect/reconnect or between turns when perm prompts create
+        // stray streamingDivs. If the flag is set but no streamingDiv is
+        // attached to the DOM, reset and treat as idle.
+        const reallyStreaming = _isActuallyStreaming();
+        if (!reallyStreaming && State.isStreaming) {
+            console.log('[SEND] stale isStreaming flag — resetting before new turn');
+            _resetStreamState();
+        }
+        if (reallyStreaming) {
             // Queue it — will fire when current stream ends
             _queuedGeneration = msg;
             State.messages.push(msg);
@@ -2632,6 +2679,13 @@ let _streamBuffer = '';
 let _streamFlushTimer = null;
 
 function appendStreamChunk(content) {
+    // If the streamingDiv got detached (e.g. by a mid-stream renderMessages
+    // that happens when loadMessages or reconstruct races with chunks),
+    // drop the stale ref so nothing appends into the void. The next flush
+    // will no-op, and the reconstruction path will rebuild.
+    if (streamingDiv && !streamingDiv.isConnected) {
+        streamingDiv = null;
+    }
     if (!streamingDiv) return;
     _streamBuffer += content;
     // Throttle DOM updates to max every 50ms
@@ -3104,6 +3158,10 @@ function _drainPendingPermPrompts() {
 }
 
 function showPermissionPrompt(data) {
+    // Detect and drop stale streamingDiv ref before attaching a prompt to it.
+    if (streamingDiv && !streamingDiv.isConnected) {
+        streamingDiv = null;
+    }
     if (!streamingDiv) appendStreamingMessage();
     const contentEl = streamingDiv.querySelector('.message-content');
 
