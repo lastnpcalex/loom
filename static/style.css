@@ -1339,6 +1339,12 @@ body::after {
     color: var(--cyan);
     filter: drop-shadow(0 0 6px rgba(0, 255, 255, 0.4));
 }
+/* Reserve space when hidden so sibling header buttons don't shift on view switch. */
+#btn-bookmarks-global.hidden {
+    display: inline-block !important;
+    visibility: hidden;
+    pointer-events: none;
+}
 
 /* Chat message bookmark button */
 .chat-bookmark-btn {
@@ -1722,13 +1728,18 @@ body::after {
     background: rgba(160, 140, 255, 0.05);
 }
 
-/* Permission notifications in bell */
+/* Permission notifications in bell.
+   Animate opacity (GPU-composited) instead of text-shadow/color, which force
+   CPU repaint every frame ("Compositing failed: Unsupported CSS property: text-shadow"). */
 #notif-bell.notif-urgent {
+    color: rgb(255, 210, 90);
+    text-shadow: 0 0 12px rgba(255, 180, 0, 0.7);
     animation: notif-pulse 1.5s ease-in-out infinite;
+    will-change: opacity;
 }
 @keyframes notif-pulse {
-    0%, 100% { text-shadow: 0 0 8px rgba(255, 180, 0, 0.5); color: rgb(255, 200, 80); }
-    50% { text-shadow: 0 0 16px rgba(255, 180, 0, 0.8); color: rgb(255, 220, 120); }
+    0%, 100% { opacity: 0.75; }
+    50%      { opacity: 1; }
 }
 #notif-bell.notif-urgent .notif-badge {
     background: rgb(255, 180, 0);

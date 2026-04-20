@@ -121,8 +121,8 @@ function initHomeSectionCollapse() {
     const sections = document.querySelectorAll('.home-section.weave-only-section');
     const keys = ['characters', 'personas', 'lore'];
     sections.forEach((sec, i) => {
-        if (sec.dataset.sectionKey) return;  // already wired
-        sec.dataset.sectionKey = keys[i] || `section-${i}`;
+        if (sec.querySelector('.home-section-arrow')) return;  // already wired
+        if (!sec.dataset.sectionKey) sec.dataset.sectionKey = keys[i] || `section-${i}`;
         const header = sec.querySelector('.home-section-header');
         if (!header) return;
         const arrow = document.createElement('span');
