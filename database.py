@@ -886,16 +886,46 @@ async def set_active_branch(conv_id: int, leaf_id: int):
 
 
 async def get_active_branch(conv_id: int) -> list[dict]:
-    """Get the currently active branch messages in order."""
+    """Get the currently active branch messages in root→leaf order.
+
+    Ordered by the parent chain (topological), NOT by created_at. A system
+    compact marker inserted mid-stream has a later created_at than the draft
+    assistant message it becomes the parent of, so ORDER BY created_at would
+    render the marker AFTER the reply even though the tree (parent_id) says
+    it's the reply's parent.
+    """
     db = await get_db()
     rows = await db.execute_fetchall(
         """SELECT * FROM messages
-           WHERE conversation_id = ? AND is_active = 1
-           ORDER BY created_at""",
+           WHERE conversation_id = ? AND is_active = 1""",
         (conv_id,),
     )
-
-    return [dict(r) for r in rows]
+    by_id = {r["id"]: dict(r) for r in rows}
+    if not by_id:
+        return []
+    # Root: parent_id NULL, or parent not in the active set.
+    child_ids = set(by_id.keys())
+    roots = [
+        m for m in by_id.values()
+        if not m["parent_id"] or m["parent_id"] not in child_ids
+    ]
+    if not roots:
+        # Defensive fallback — a cycle-free active set should always have
+        # a root. If not, at least return something stable.
+        return sorted(by_id.values(), key=lambda m: m.get("created_at") or 0)
+    root = min(roots, key=lambda m: m.get("created_at") or 0)
+    children_of = {}
+    for m in by_id.values():
+        children_of.setdefault(m["parent_id"], []).append(m)
+    chain = []
+    current = root
+    visited = set()
+    while current and current["id"] not in visited:
+        visited.add(current["id"])
+        chain.append(current)
+        kids = children_of.get(current["id"], [])
+        current = min(kids, key=lambda m: m.get("created_at") or 0) if kids else None
+    return chain
 
 
 async def get_active_leaf(conv_id: int) -> Optional[dict]:
