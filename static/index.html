@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=103">
+    <link rel="stylesheet" href="/static/style.css?v=105">
 </head>
 <body>
     <div id="blackhole-container"></div>
@@ -102,7 +102,7 @@
                 </div>
 
                 <!-- Characters Section (Weave only) -->
-                <div class="home-section weave-only-section">
+                <div class="home-section weave-only-section is-collapsed" data-section-key="characters">
                     <div class="home-section-header">
                         <span class="home-section-label">Characters</span>
                         <div class="home-section-actions">
@@ -114,7 +114,7 @@
                 </div>
 
                 <!-- User Personas Section (Weave only) -->
-                <div class="home-section weave-only-section">
+                <div class="home-section weave-only-section is-collapsed" data-section-key="personas">
                     <div class="home-section-header">
                         <span class="home-section-label">User Personas</span>
                         <div class="home-section-actions">
@@ -126,7 +126,7 @@
                 </div>
 
                 <!-- Lore / History Section (Weave only) -->
-                <div class="home-section weave-only-section">
+                <div class="home-section weave-only-section is-collapsed" data-section-key="lore">
                     <div class="home-section-header">
                         <span class="home-section-label">Lore / History</span>
                         <div class="home-section-actions">
@@ -136,6 +136,22 @@
                     </div>
                     <div id="home-lore-grid"></div>
                 </div>
+                <script>
+                // Sync collapse state from localStorage before first paint to avoid CLS.
+                // Sections start collapsed in HTML (default for non-weave filter); uncollapse
+                // here if the user saved an expanded state for any of them.
+                (function() {
+                    try {
+                        var saved = JSON.parse(localStorage.getItem('loom-home-section-collapsed') || '{}');
+                        ['characters','personas','lore'].forEach(function(key) {
+                            if (saved[key] === false) {
+                                var sec = document.querySelector('.home-section[data-section-key="' + key + '"]');
+                                if (sec) sec.classList.remove('is-collapsed');
+                            }
+                        });
+                    } catch (e) {}
+                })();
+                </script>
             </div>
         </div>
 
