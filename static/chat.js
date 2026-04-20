@@ -1812,12 +1812,15 @@ function loadOlderMessages(renderMsgs, container, scrollParent) {
         const newStart = Math.max(0, currentStart - VIRTUAL_SCROLL.batchSize);
         const batch = renderMsgs.slice(newStart, currentStart);
 
-        // Snapshot scroll position before DOM mutation
-        const scrollHeightBefore = scrollParent.scrollHeight;
-        const scrollTopBefore = scrollParent.scrollTop;
-
-        // Find the sentinel and insert batch after it (in correct order)
+        // Anchor to an existing DOM element rather than scrollHeight deltas.
+        // scrollHeight can keep growing after layout (images, fonts, code
+        // blocks) so the delta math was under-adjusting and the view would
+        // jump. Remember the first-rendered old message's screen position,
+        // then scroll it back to the same spot after insert.
         const sentinel = document.getElementById('scroll-sentinel');
+        const anchorEl = sentinel ? sentinel.nextElementSibling : container.firstElementChild;
+        const anchorTopBefore = anchorEl ? anchorEl.getBoundingClientRect().top : null;
+
         const fragment = document.createDocumentFragment();
         for (let i = 0; i < batch.length; i++) {
             fragment.appendChild(createMessageElement(batch[i]));
@@ -1838,12 +1841,19 @@ function loadOlderMessages(renderMsgs, container, scrollParent) {
             sentinel.textContent = `↑ ${newStart} older messages`;
         }
 
-        // Restore scroll position after layout (rAF ensures reflow is done)
-        requestAnimationFrame(() => {
-            const added = scrollParent.scrollHeight - scrollHeightBefore;
-            scrollParent.scrollTop = scrollTopBefore + added;
+        // Restore scroll position: after paint, anchor element has shifted
+        // down by (batch height). Offset scrollTop so its getBoundingClientRect
+        // is back where it was. Double rAF covers fonts/images that resize
+        // between layout and paint.
+        const restoreAnchor = () => {
+            if (anchorEl && anchorTopBefore != null) {
+                const anchorTopAfter = anchorEl.getBoundingClientRect().top;
+                const shift = anchorTopAfter - anchorTopBefore;
+                if (shift) scrollParent.scrollTop += shift;
+            }
             VIRTUAL_SCROLL.isLoadingOlder = false;
-        });
+        };
+        requestAnimationFrame(() => requestAnimationFrame(restoreAnchor));
     } catch (e) {
         VIRTUAL_SCROLL.isLoadingOlder = false;
         throw e;
@@ -2594,6 +2604,15 @@ function appendStreamChunk(content) {
     }
 }
 
+// Throttle scroll during streaming so rapid chunk flushes don't thrash layout.
+let _lastStreamScrollAt = 0;
+function _scrollDuringStream() {
+    const now = Date.now();
+    if (now - _lastStreamScrollAt < 250) return;
+    _lastStreamScrollAt = now;
+    scrollToBottom();
+}
+
 function _flushStreamBuffer() {
     _streamFlushTimer = null;
     if (!streamingDiv || !_streamBuffer) return;
@@ -2605,24 +2624,46 @@ function _flushStreamBuffer() {
     if (!textSpan || (lastChild && !lastChild.classList.contains('streaming-text'))) {
         textSpan = document.createElement('span');
         textSpan.className = 'streaming-text';
+        // Cursor lives as a sibling of the text, so we can append text nodes
+        // directly without touching cursor markup on every flush.
         contentEl.appendChild(textSpan);
+        // Ensure a single cursor span exists on the contentEl as last child
+        if (!contentEl.querySelector('.typing-cursor')) {
+            const cur = document.createElement('span');
+            cur.className = 'typing-cursor';
+            contentEl.appendChild(cur);
+        }
     }
-    const existing = textSpan.dataset.rawContent || '';
-    const updated = existing + _streamBuffer;
+    // Append-only: just tack on a text node with the new delta. O(1) per flush
+    // regardless of total message size. We accept raw markdown chars visible
+    // during the stream (no `**bold**` formatting until finalize) in exchange
+    // for flushes that don't re-parse the entire message every 50ms.
+    const delta = _streamBuffer;
     _streamBuffer = '';
-    textSpan.dataset.rawContent = updated;
-    textSpan.innerHTML = formatContent(updated) + '<span class="typing-cursor"></span>';
-    scrollToBottom();
+    const prev = textSpan.dataset.rawContent || '';
+    textSpan.dataset.rawContent = prev + delta;
+    textSpan.appendChild(document.createTextNode(delta));
+    // Keep cursor at the end
+    const cursor = contentEl.querySelector('.typing-cursor');
+    if (cursor && cursor !== contentEl.lastChild) contentEl.appendChild(cursor);
+    _scrollDuringStream();
 }
 
 function finalizeStreamingMessage(msg, cost) {
     if (!streamingDiv) return;
     _stopGenTimer();
 
-    // Flush any remaining buffered text
-    if (_streamBuffer) _flushStreamBuffer();
+    // Cancel any pending incremental flush — we're about to do a full markdown
+    // render in one pass, so a trailing setTimeout would just waste work.
+    if (_streamFlushTimer) {
+        clearTimeout(_streamFlushTimer);
+        _streamFlushTimer = null;
+    }
+    _streamBuffer = '';
 
-    // Replace the streaming div with a proper message element
+    // Replace the streaming div (which holds append-only raw text) with a
+    // fully rendered message element. This is the ONE markdown parse pass per
+    // turn — O(N) instead of O(N²) from per-chunk reparsing.
     State.messages.push(msg);
     const newEl = createMessageElement(msg, cost);
     streamingDiv.replaceWith(newEl);
