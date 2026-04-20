@@ -153,6 +153,7 @@ async function loadMessages(convId) {
         // loadConversation() when switching conversations, not on message reload
 
         const prevCount = State.messages.length;
+        const prevIdSig = State.messages.map(m => m.id).join(',');
         const treeData = await API.get(`/api/conversations/${convId}/tree`);
         State.treeData = treeData;  // keep branch indicators in sync
         hideRetryBar();
@@ -178,6 +179,17 @@ async function loadMessages(convId) {
             State.messages = await API.get(`/api/conversations/${convId}/branch/${leafId}`);
         } else {
             State.messages = [];
+        }
+        // Cheap change detection: if the message id list is identical to what
+        // we already rendered, skip the container.innerHTML='' + full rebuild.
+        // Heartbeat-driven WS reconnects used to call loadMessages on every
+        // generation_idle and wipe the DOM even when nothing actually changed
+        // — that's what the user was seeing as flicker.
+        const newIdSig = State.messages.map(m => m.id).join(',');
+        if (newIdSig === prevIdSig && prevIdSig !== '' && !State.isStreaming) {
+            // Same chain. Refresh tree decorations only and bail.
+            if (typeof refreshTree === 'function') refreshTree();
+            return;
         }
         renderMessages();
         // If still streaming, re-create the streaming div (renderMessages destroyed it)
@@ -468,9 +480,16 @@ function handleWSMessage(data) {
         case 'permission_request':
             // Always add to notification bell (works from any conversation)
             addPermissionNotification(data);
-            // Also render inline if we're viewing the right conversation
+            // Also render inline if we're viewing the right conversation.
+            // If a snapshot reconstruction is in flight, queue the prompt —
+            // rendering it now would attach it to a streamingDiv that's about
+            // to be destroyed by _reconstructFromSnapshot's remove+re-append.
             if (!data.conv_id || data.conv_id === State.currentConvId) {
-                showPermissionPrompt(data);
+                if (State._reconstructing) {
+                    (State._pendingPermPrompts = State._pendingPermPrompts || []).push(data);
+                } else {
+                    showPermissionPrompt(data);
+                }
             }
             // Push notification if tab is hidden
             if (document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
@@ -708,7 +727,8 @@ function handleWSMessage(data) {
                         if (stillOurs) {
                             _reconstructFromSnapshot(snap);
                         }
-                    }).catch(() => { State._reconstructing = false; });
+                        _drainPendingPermPrompts();
+                    }).catch(() => { State._reconstructing = false; _drainPendingPermPrompts(); });
                 }
             } else {
                 // No snapshot — just load messages
@@ -3070,6 +3090,18 @@ async function refreshTree() {
 }
 
 // ── Permission Prompts ──
+
+// Queued permission prompts that arrived while _reconstructFromSnapshot
+// was in flight. Rendering them immediately would attach them to a
+// streamingDiv that's about to be destroyed and replaced.
+function _drainPendingPermPrompts() {
+    const queue = State._pendingPermPrompts;
+    if (!queue || !queue.length) return;
+    State._pendingPermPrompts = [];
+    for (const data of queue) {
+        showPermissionPrompt(data);
+    }
+}
 
 function showPermissionPrompt(data) {
     if (!streamingDiv) appendStreamingMessage();
