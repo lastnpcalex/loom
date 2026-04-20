@@ -158,7 +158,23 @@ async function loadMessages(convId) {
         hideRetryBar();
         const activeNodes = treeData.filter(n => n.is_active);
         if (activeNodes.length > 0) {
-            const leafId = activeNodes[activeNodes.length - 1].id;
+            // The leaf is the active node whose id is no other active node's
+            // parent_id. Picking by max(id) breaks when a system message
+            // (e.g. mid-stream auto-compact marker) is inserted with a higher
+            // id than its assistant child — the marker would be misidentified
+            // as the leaf, and /branch/<marker> walks UP to root, dropping
+            // the actual reply from State.messages.
+            const activeIds = new Set(activeNodes.map(n => n.id));
+            const activeParents = new Set(
+                activeNodes.map(n => n.parent_id).filter(p => p != null && activeIds.has(p))
+            );
+            const leaves = activeNodes.filter(n => !activeParents.has(n.id));
+            // In a clean tree there's exactly one leaf. If somehow multiple,
+            // prefer the deepest by created_at as a tiebreaker.
+            const leaf = leaves.length === 1
+                ? leaves[0]
+                : leaves.sort((a, b) => (b.created_at || 0) - (a.created_at || 0))[0];
+            const leafId = leaf ? leaf.id : activeNodes[activeNodes.length - 1].id;
             State.messages = await API.get(`/api/conversations/${convId}/branch/${leafId}`);
         } else {
             State.messages = [];
