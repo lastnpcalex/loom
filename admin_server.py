@@ -545,10 +545,20 @@ async def dashboard():
 </head>
 <body>
 <h1>Loom Admin</h1>
-<table>
+<table id="instances-table">
     <tr><th>Instance</th><th>Port</th><th>Database</th><th>PID</th><th>Actions</th></tr>
-    {rows}
+    <tbody id="instances-body">{rows}</tbody>
 </table>
+
+<h2>Active Generations <span id="gens-count" style="color:#888; font-size:12px; font-weight:normal;"></span></h2>
+<div id="generations-panel">
+    <div id="generations-empty" style="color:#666; font-size:12px; padding:8px 0;">None tracked.</div>
+    <table id="generations-table" style="display:none;">
+        <tr><th>Conv</th><th>Draft</th><th>PID</th><th>Status</th><th>Mode</th><th>Started</th><th></th></tr>
+        <tbody id="generations-body"></tbody>
+    </table>
+</div>
+
 {terminal_html}
 <h2>Tools</h2>
 <div class="tools-grid">
@@ -593,7 +603,7 @@ async def dashboard():
     <button onclick="adminAction('shutdown')" class="btn btn-warn">Shutdown Admin</button>
     <span style="color:#666; font-size:12px; margin-left:10px;">(connection drops; page auto-reloads after restart)</span>
 </div>
-<p class="refresh-note">Auto-refreshes every 10s &mdash; admin running on :{ADMIN_PORT}</p>
+<p class="refresh-note">Live updates via AJAX (no page reload) &mdash; admin running on :{ADMIN_PORT}</p>
 <div id="toast"></div>
 <script>
     function showToast(msg) {{
@@ -607,7 +617,7 @@ async def dashboard():
         const r = await fetch('/action/' + name + '/' + action, {{method: 'POST'}});
         const d = await r.json();
         showToast(d.status || d.error || 'done');
-        setTimeout(() => location.reload(), 2000);
+        setTimeout(refreshAll, 1500);
     }}
 
     async function adminAction(action) {{
@@ -634,7 +644,93 @@ async def dashboard():
         }}
     }}
 
-    let refreshTimer = setTimeout(() => location.reload(), 10000);
+    // ── AJAX status polling (no full-page reloads) ──
+    let refreshTimer = null;
+    function scheduleRefresh(delay = 10000) {{
+        clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(refreshAll, delay);
+    }}
+
+    async function refreshAll() {{
+        try {{
+            await Promise.all([refreshInstances(), refreshGenerations()]);
+        }} catch (e) {{ /* keep ticking */ }}
+        scheduleRefresh();
+    }}
+
+    async function refreshInstances() {{
+        const r = await fetch('/api/status', {{cache: 'no-store'}});
+        if (!r.ok) return;
+        const d = await r.json();
+        const body = document.getElementById('instances-body');
+        if (!body) return;
+        const rows = (d.instances || []).map(s => {{
+            const color = s.status === 'online' ? '#0f6' : '#f44';
+            const dot = '<span style="color:' + color + '; font-size:20px;">&#9679;</span>';
+            const managedTag = s.managed ? ' <span class="tag">managed</span>' : '';
+            const pidInfo = s.pid ? 'PID ' + s.pid : '\u2014';
+            let actions = '';
+            if (s.status === 'online') {{
+                actions += '<button onclick="doAction(\\'' + s.name + '\\', \\'shutdown\\')" class="btn btn-warn">Shutdown</button> ';
+                actions += '<button onclick="doAction(\\'' + s.name + '\\', \\'restart\\')" class="btn btn-cyan">Restart</button>';
+            }} else {{
+                actions += '<button onclick="doAction(\\'' + s.name + '\\', \\'start\\')" class="btn btn-green">Start</button>';
+            }}
+            return '<tr><td>' + dot + ' ' + s.label + managedTag + '</td>' +
+                '<td>:' + s.port + '</td><td>' + s.db + '</td><td>' + pidInfo + '</td>' +
+                '<td>' + actions + '</td></tr>';
+        }}).join('');
+        body.innerHTML = rows;
+    }}
+
+    async function refreshGenerations() {{
+        let gens = [];
+        try {{
+            const r = await fetch('/api/generations-proxy', {{cache: 'no-store'}});
+            if (r.ok) gens = await r.json();
+        }} catch (e) {{ /* ignore */ }}
+        const empty = document.getElementById('generations-empty');
+        const table = document.getElementById('generations-table');
+        const body = document.getElementById('generations-body');
+        const count = document.getElementById('gens-count');
+        if (!gens.length) {{
+            empty.style.display = 'block';
+            table.style.display = 'none';
+            count.textContent = '';
+            return;
+        }}
+        empty.style.display = 'none';
+        table.style.display = 'table';
+        count.textContent = '(' + gens.length + ')';
+        body.innerHTML = gens.map(g => {{
+            const status = g.in_memory ? 'running' : (g.pid_alive ? 'orphan' : 'dead');
+            const statusColor = status === 'running' ? '#0f6' : (status === 'orphan' ? '#f90' : '#666');
+            const age = g.started_at ? Math.round(Date.now()/1000 - g.started_at) + 's' : '—';
+            return '<tr>' +
+                '<td>' + g.conv_id + '</td>' +
+                '<td>#' + g.draft_msg_id + '</td>' +
+                '<td>' + (g.pid || '—') + '</td>' +
+                '<td><span style="color:' + statusColor + '">' + status + '</span></td>' +
+                '<td>' + (g.mode || '—') + '</td>' +
+                '<td>' + age + '</td>' +
+                '<td><button class="btn btn-warn" onclick="killGen(' + g.draft_msg_id + ')">Kill</button></td>' +
+                '</tr>';
+        }}).join('');
+    }}
+
+    async function killGen(draftId) {{
+        if (!confirm('Kill generation #' + draftId + '?')) return;
+        showToast('killing #' + draftId);
+        try {{
+            const r = await fetch('/api/generations-proxy/' + draftId + '/kill', {{method: 'POST'}});
+            if (r.ok) {{ const d = await r.json(); showToast(d.status || 'killed'); }}
+            else showToast('kill failed');
+        }} catch (e) {{ showToast('kill failed: ' + e); }}
+        setTimeout(refreshAll, 500);
+    }}
+
+    // Kick off first refresh shortly after load (server already SSRed initial state).
+    scheduleRefresh(2000);
 
     async function runTool(name) {{
         clearTimeout(refreshTimer);
@@ -657,7 +753,7 @@ async def dashboard():
             out.textContent = 'Request failed: ' + e;
             out.className = 'visible error';
         }}
-        refreshTimer = setTimeout(() => location.reload(), 30000);
+        scheduleRefresh(30000);
     }}
 
     async function pollLoginStatus() {{
@@ -672,11 +768,11 @@ async def dashboard():
             }} else if (d.status === 'ok') {{
                 poll.style.color = '#0f6';
                 poll.textContent = d.output;
-                refreshTimer = setTimeout(() => location.reload(), 5000);
+                scheduleRefresh(5000);
             }} else {{
                 poll.style.color = '#f66';
                 poll.textContent = d.output;
-                refreshTimer = setTimeout(() => location.reload(), 10000);
+                scheduleRefresh(10000);
             }}
         }} catch (e) {{
             poll.textContent = 'Poll failed: ' + e;
@@ -721,6 +817,34 @@ async def api_status():
         *[check_instance(name, info) for name, info in INSTANCES.items()]
     )
     return JSONResponse({"instances": statuses, "admin_port": ADMIN_PORT})
+
+
+@app.get("/api/generations-proxy")
+async def api_generations_proxy():
+    """Proxy /api/generations from whichever Loom instance is online.
+    Dashboard can't call main:3000 directly due to mixed-content (HTTPS from
+    HTTP admin) and cert-prompt issues."""
+    for name, info in INSTANCES.items():
+        try:
+            r = await _get_instance(info["port"], "/api/generations")
+            if r.status_code == 200:
+                return JSONResponse(r.json())
+        except Exception:
+            continue
+    return JSONResponse([])
+
+
+@app.post("/api/generations-proxy/{draft_msg_id}/kill")
+async def api_generations_kill_proxy(draft_msg_id: int):
+    """Proxy a kill request to the Loom instance that owns this draft."""
+    for name, info in INSTANCES.items():
+        try:
+            r = await _post_instance(info["port"], f"/api/generations/{draft_msg_id}/kill")
+            if r.status_code == 200:
+                return JSONResponse(r.json())
+        except Exception:
+            continue
+    return JSONResponse({"error": "no instance reachable"}, status_code=502)
 
 
 async def _post_instance(port: int, path: str) -> httpx.Response:

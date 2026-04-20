@@ -123,6 +123,23 @@ CREATE TABLE IF NOT EXISTS pending_permissions (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_conv ON pending_permissions(conv_id);
 CREATE INDEX IF NOT EXISTS idx_pending_started ON pending_permissions(started_at);
+
+-- Generations in flight. Row inserted when a CC/Gemini/local subprocess
+-- launches, deleted when it finalizes normally. Any row we find on server
+-- startup is an orphan (the server that spawned it died before finalize) —
+-- we reap them in _reap_orphan_generations(). Keys off msg_id which is
+-- unique per draft, so server restarts don't collide.
+CREATE TABLE IF NOT EXISTS active_generations (
+    draft_msg_id INTEGER PRIMARY KEY,
+    conv_id INTEGER NOT NULL,
+    pid INTEGER,
+    session_id TEXT,
+    project_dir TEXT,
+    mode TEXT,
+    started_at REAL NOT NULL,
+    FOREIGN KEY (conv_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_active_gen_conv ON active_generations(conv_id);
 """
 
 
@@ -1590,3 +1607,58 @@ async def count_conversation_tokens(conv_id: int) -> int:
     )
 
     return rows[0]["total"] if rows else 0
+
+
+# ── Active generation tracking (orphan reap) ──
+
+
+async def register_active_generation(
+    draft_msg_id: int,
+    conv_id: int,
+    pid: int,
+    session_id: str = None,
+    project_dir: str = None,
+    mode: str = None,
+):
+    """Record that a generation subprocess is running. Called right after
+    subprocess launch in _handle_*_generation. The row survives server
+    restart so we can reap orphans."""
+    db = await get_db()
+    await db.execute(
+        """INSERT OR REPLACE INTO active_generations
+           (draft_msg_id, conv_id, pid, session_id, project_dir, mode, started_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (draft_msg_id, conv_id, pid, session_id, project_dir, mode, time.time()),
+    )
+    await db.commit()
+
+
+async def update_active_generation_session(draft_msg_id: int, session_id: str):
+    """Patch the session_id onto a tracked generation once CC emits it.
+    Makes JSONL-based rescue possible in a future phase."""
+    if not session_id:
+        return
+    db = await get_db()
+    await db.execute(
+        "UPDATE active_generations SET session_id = ? WHERE draft_msg_id = ?",
+        (session_id, draft_msg_id),
+    )
+    await db.commit()
+
+
+async def unregister_active_generation(draft_msg_id: int):
+    """Drop the tracking row when the generation finalizes normally."""
+    db = await get_db()
+    await db.execute(
+        "DELETE FROM active_generations WHERE draft_msg_id = ?", (draft_msg_id,)
+    )
+    await db.commit()
+
+
+async def list_active_generations() -> list[dict]:
+    """All currently tracked generations (alive + orphaned until reaped)."""
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM active_generations ORDER BY started_at DESC"
+    )
+    return [dict(r) for r in rows]

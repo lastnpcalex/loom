@@ -149,12 +149,98 @@ async def lifespan(app):
     await db.init_db()
     # Clean up stale draft messages (empty assistant msgs older than 30 min)
     await _cleanup_stale_drafts()
+    # Reap orphan CC/ollama subprocesses from prior server instances.
+    await _reap_orphan_generations()
     # Re-broadcast pending permission requests from DB (server restart)
     await _reload_pending_permissions()
     # Ensure Ollama is running (launches it if not)
     asyncio.create_task(_ensure_ollama())
     yield
     await db.close_db()
+
+
+def _pid_alive(pid: int) -> bool:
+    """Cross-platform PID liveness check. Returns False on unknown error."""
+    if not pid or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return False
+            try:
+                exit_code = ctypes.c_ulong()
+                ok = kernel32.GetExitCodeProcess(h, ctypes.byref(exit_code))
+                return bool(ok) and exit_code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(h)
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+
+def _kill_pid(pid: int) -> bool:
+    """Force-kill a process. Returns True if the kill was dispatched."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        if sys.platform == "win32":
+            import subprocess
+            # /T kills the child tree too — CC spawns sub-procs (e.g. bash for tools)
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=5,
+            )
+        else:
+            import signal as _signal
+            os.kill(pid, _signal.SIGKILL)
+        return True
+    except Exception as e:
+        print(f"[REAP] Failed to kill pid={pid}: {e}")
+        return False
+
+
+async def _reap_orphan_generations():
+    """On server startup, any row in active_generations came from a prior
+    server instance that didn't finalize before shutdown. Kill the subprocess
+    if it's still alive, mark the draft errored, and delete the tracking row."""
+    rows = await db.list_active_generations()
+    if not rows:
+        print("[REAP] No orphan generations to check")
+        return
+    print(f"[REAP] Found {len(rows)} tracked generation(s) from prior run")
+    for row in rows:
+        pid = row.get("pid")
+        draft_msg_id = row.get("draft_msg_id")
+        conv_id = row.get("conv_id")
+        alive = _pid_alive(pid) if pid else False
+        if alive:
+            killed = _kill_pid(pid)
+            print(f"[REAP] conv={conv_id} draft={draft_msg_id} pid={pid} alive — killed={killed}")
+        else:
+            print(f"[REAP] conv={conv_id} draft={draft_msg_id} pid={pid} already dead")
+        # Mark draft as errored if it's still an empty draft (don't clobber
+        # finalized content).
+        try:
+            m = await db.get_message(draft_msg_id)
+            if m and (m.get("role") == "assistant") and not (m.get("content") or "").strip():
+                await db.update_message_content(
+                    draft_msg_id,
+                    content="[Error: generation orphaned by server restart]",
+                )
+        except Exception as e:
+            print(f"[REAP] Could not update draft {draft_msg_id}: {e}")
+        await db.unregister_active_generation(draft_msg_id)
+    print(f"[REAP] Reaped {len(rows)} orphan generation(s)")
 
 
 async def _cleanup_stale_drafts():
@@ -292,6 +378,47 @@ async def shutdown():
 
     os.kill(os.getpid(), signal.SIGINT)
     return JSONResponse({"status": "shutting down (signal)"})
+
+
+@app.get("/api/generations")
+async def api_list_generations():
+    """List currently tracked generations (for admin dashboard)."""
+    rows = await db.list_active_generations()
+    # Annotate each with liveness + in-memory status
+    for r in rows:
+        r["pid_alive"] = _pid_alive(r.get("pid")) if r.get("pid") else False
+        r["in_memory"] = any(
+            k[0] == r.get("conv_id") and not t.done()
+            for k, t in _active_generations.items()
+        )
+    return rows
+
+
+@app.post("/api/generations/{draft_msg_id}/kill")
+async def api_kill_generation(draft_msg_id: int):
+    """Terminate a tracked generation and mark its draft errored."""
+    rows = await db.list_active_generations()
+    row = next((r for r in rows if r.get("draft_msg_id") == draft_msg_id), None)
+    if not row:
+        return JSONResponse({"error": "not tracked"}, status_code=404)
+    pid = row.get("pid")
+    killed = _kill_pid(pid) if pid else False
+    # Cancel the in-memory task too
+    for k, t in list(_active_generations.items()):
+        if k[0] == row.get("conv_id") and not t.done():
+            t.cancel()
+    # Mark draft as errored if still empty
+    try:
+        m = await db.get_message(draft_msg_id)
+        if m and m.get("role") == "assistant" and not (m.get("content") or "").strip():
+            await db.update_message_content(
+                draft_msg_id,
+                content="[Error: generation killed by admin]",
+            )
+    except Exception:
+        pass
+    await db.unregister_active_generation(draft_msg_id)
+    return {"status": "killed", "pid": pid, "pid_killed": killed}
 
 
 # Ensure upload directory exists
@@ -2917,6 +3044,19 @@ async def _handle_claude_generation(
 
         _active_claude_procs[conv_id] = proc
 
+        # Persist the generation so server-restart can reap or (phase 2) rescue.
+        # session_id is filled in later when CC emits session_info.
+        try:
+            await db.register_active_generation(
+                draft_msg_id=draft_msg_id,
+                conv_id=conv_id,
+                pid=proc.pid,
+                project_dir=project_dir,
+                mode="local" if use_ollama else ("gemini" if is_gemini else "claude"),
+            )
+        except Exception as e:
+            print(f"[GEN] Failed to register active generation: {e}")
+
         full_text = ""
         content_blocks = []
         current_block = None
@@ -2933,6 +3073,11 @@ async def _handle_claude_generation(
             if etype == "session_info":
                 new_session_id = evt.get("session_id", "") or new_session_id
                 actual_model = evt.get("model", "") or actual_model
+                # Patch session_id onto the tracking row for future rescue support
+                try:
+                    await db.update_active_generation_session(draft_msg_id, new_session_id)
+                except Exception:
+                    pass
 
             elif etype == "text_delta":
                 full_text += evt["text"]
@@ -3569,6 +3714,13 @@ async def _handle_claude_generation(
             _active_generations.pop(_gen_key, None)
             _generation_snapshots.pop(_gen_key, None)
         _auto_approve_sessions.discard(conv_id)
+        # Drop the orphan-tracking row — the generation finished (success,
+        # cancel, or error), so there's nothing to reap on next startup.
+        try:
+            if 'draft_msg_id' in locals() and draft_msg_id:
+                await db.unregister_active_generation(draft_msg_id)
+        except Exception:
+            pass
         # Clean up any pending hook permissions for this conversation (memory + DB)
         for rid in list(_pending_hook_permissions):
             if _pending_hook_permissions[rid].get("conv_id") == conv_id:
