@@ -933,16 +933,19 @@ function _reconstructFromSnapshot(snap) {
     _streamBuffer = '';
     _streamFlushTimer = null;
 
-    // Re-render any pending permission prompts that were lost when we rebuilt the streaming div
+    // Re-render pending permission prompts that were lost when we rebuilt the
+    // streaming div — but ONLY for the current conversation. Without this
+    // filter, a page reload that replays every globally-pending perm inlines
+    // prompts from other loom conversations into this branch's stream.
     for (const n of _notifications) {
-        if (n.type === 'permission' && !n.resolved) {
-            showPermissionPrompt({
-                request_id: n.requestId,
-                conv_id: n.convId,
-                tool_name: n.toolName,
-                input_summary: n.inputSummary,
-            });
-        }
+        if (n.type !== 'permission' || n.resolved) continue;
+        if (n.convId && n.convId !== State.currentConvId) continue;
+        showPermissionPrompt({
+            request_id: n.requestId,
+            conv_id: n.convId,
+            tool_name: n.toolName,
+            input_summary: n.inputSummary,
+        });
     }
 
     showGenStatus('Reconnected — streaming in progress', true);

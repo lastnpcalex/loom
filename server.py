@@ -2023,6 +2023,28 @@ async def delete_user_skill(skill_name: str, conv_id: int = None):
 # ── WebSocket Chat ──
 
 
+def _scrub_surrogates(obj):
+    """Strip unpaired UTF-16 surrogates from strings in a JSON-serializable obj.
+
+    CC tool inputs (especially Bash command strings chunked mid-codepoint) can
+    contain lone surrogates like '\\udc90'. json.dumps + websocket.send_json
+    encodes to UTF-8 which rejects them, raising UnicodeEncodeError and
+    tearing down the WS handler. This recurses through dicts/lists and
+    replaces bad chars with U+FFFD.
+    """
+    if isinstance(obj, str):
+        try:
+            obj.encode("utf-8")
+            return obj
+        except UnicodeEncodeError:
+            return obj.encode("utf-8", "replace").decode("utf-8")
+    if isinstance(obj, dict):
+        return {k: _scrub_surrogates(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub_surrogates(v) for v in obj]
+    return obj
+
+
 async def _ws_send(conv_id: int, data: dict):
     """Best-effort broadcast to ALL active WebSockets for a conversation.
     Silently skips dead clients — generation continues regardless.
@@ -2036,9 +2058,19 @@ async def _ws_send(conv_id: int, data: dict):
     if not clients:
         return
     dead = []
+    scrubbed = None
     for ws in list(clients):
         try:
             await ws.send_json(data)
+        except UnicodeEncodeError:
+            # Unpaired surrogate in data — socket is fine, payload is bad.
+            # Scrub once and retry; don't mark ws dead.
+            if scrubbed is None:
+                scrubbed = _scrub_surrogates(data)
+            try:
+                await ws.send_json(scrubbed)
+            except Exception:
+                dead.append(ws)
         except Exception:
             dead.append(ws)
     for ws in dead:
@@ -2101,33 +2133,40 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
         )
         # Resend ALL pending permission requests (broadcast globally now)
         for rid, pending in list(_pending_hook_permissions.items()):
-            if not pending.get("response"):
-                print(f"[WS] Resending pending permission request {rid} on reconnect")
-                await websocket.send_json(
-                    {
-                        "type": "permission_request",
-                        "request_id": rid,
-                        "conv_id": pending.get("conv_id"),
-                        "tool_name": pending.get("tool_name", ""),
-                        "tool_input": pending.get("tool_input", ""),
-                        "input_summary": pending.get("input_summary", ""),
-                    }
-                )
+            if pending.get("response"):
+                continue
+            print(f"[WS] Resending pending permission request {rid} on reconnect")
+            try:
+                await websocket.send_json(_scrub_surrogates({
+                    "type": "permission_request",
+                    "request_id": rid,
+                    "conv_id": pending.get("conv_id"),
+                    "tool_name": pending.get("tool_name", ""),
+                    "tool_input": pending.get("tool_input", ""),
+                    "input_summary": pending.get("input_summary", ""),
+                }))
+            except Exception as e:
+                # One malformed pending perm must not kill the whole reconnect —
+                # UnicodeEncodeError on an unpaired surrogate in tool_input was
+                # tearing down ws_chat before the receive loop started.
+                print(f"[WS] Failed to resend pending permission {rid}: {e!r} — skipping")
     else:
         await websocket.send_json({"type": "generation_idle"})
         # Even when idle, resend any pending permissions from other conversations
         for rid, pending in list(_pending_hook_permissions.items()):
-            if not pending.get("response"):
-                await websocket.send_json(
-                    {
-                        "type": "permission_request",
-                        "request_id": rid,
-                        "conv_id": pending.get("conv_id"),
-                        "tool_name": pending.get("tool_name", ""),
-                        "tool_input": pending.get("tool_input", ""),
-                        "input_summary": pending.get("input_summary", ""),
-                    }
-                )
+            if pending.get("response"):
+                continue
+            try:
+                await websocket.send_json(_scrub_surrogates({
+                    "type": "permission_request",
+                    "request_id": rid,
+                    "conv_id": pending.get("conv_id"),
+                    "tool_name": pending.get("tool_name", ""),
+                    "tool_input": pending.get("tool_input", ""),
+                    "input_summary": pending.get("input_summary", ""),
+                }))
+            except Exception as e:
+                print(f"[WS] Failed to resend pending permission {rid}: {e!r} — skipping")
 
     try:
         while True:
