@@ -16,6 +16,40 @@ _mock_mode = False
 # CC's own Ollama calls (Braid mode shares one Ollama instance).
 _ollama_lock = asyncio.Lock()
 
+# Keep models resident in VRAM between turns so llama.cpp's prefix cache
+# hits on the shared prompt prefix. Ollama accepts durations ("30m") or
+# -1 for indefinite; 0 unloads immediately.
+KEEP_ALIVE_CHAT = "30m"
+KEEP_ALIVE_VISION = "5m"
+
+# Tracks the model Ollama is currently holding resident so we can unload
+# it before loading a different one (avoids VRAM thrash when /describe
+# fires a vision model mid-chat).
+_last_loaded_model: Optional[str] = None
+
+
+async def _unload_model(model: str) -> None:
+    """Tell Ollama to drop the given model from memory (keep_alive=0)."""
+    if not model:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"{_ollama_host()}/api/generate",
+                json={"model": model, "keep_alive": 0},
+            )
+    except Exception as e:
+        print(f"[OLLAMA] unload {model!r} failed: {e}")
+
+
+async def _prepare_model(model: str) -> None:
+    """If a different model is currently resident, unload it first."""
+    global _last_loaded_model
+    if _last_loaded_model and _last_loaded_model != model:
+        print(f"[OLLAMA] switching {_last_loaded_model!r} -> {model!r}, unloading previous")
+        await _unload_model(_last_loaded_model)
+    _last_loaded_model = model
+
 
 def _ollama_host():
     """Return the Ollama host URL with protocol prefix."""
@@ -161,7 +195,10 @@ async def stream_chat(messages: list[dict],
             yield token
         return
 
-    print(f"[OLLAMA] Sending {len(messages)} messages to {model or config.ollama_model}")
+    target_model = model or config.ollama_model
+    print(f"[OLLAMA] Sending {len(messages)} messages to {target_model}")
+
+    await _prepare_model(target_model)
 
     try:
         effective_max = max_tokens or config.max_tokens
@@ -170,9 +207,10 @@ async def stream_chat(messages: list[dict],
         num_predict = effective_max + 8192
 
         payload = {
-            "model": model or config.ollama_model,
+            "model": target_model,
             "messages": _build_ollama_messages(messages),
             "stream": True,
+            "keep_alive": KEEP_ALIVE_CHAT,
             "options": {
                 "temperature": temperature or config.temperature,
                 "top_p": top_p or config.top_p,
@@ -239,11 +277,15 @@ async def sync_chat(messages: list[dict],
     if _mock_mode:
         return "Summary: The conversation continues with escalating tension and mutual wariness."
 
+    target_model = model or config.ollama_model
+    await _prepare_model(target_model)
+
     try:
         payload = {
-            "model": model or config.ollama_model,
+            "model": target_model,
             "messages": _build_ollama_messages(messages),
             "stream": False,
+            "keep_alive": KEEP_ALIVE_CHAT,
             "options": {
                 "temperature": temperature or config.temperature,
                 "num_predict": max_tokens or config.max_tokens,
@@ -292,6 +334,7 @@ async def describe_image(image_path: str, model: str = None, context: str = None
             ],
             "stream": False,
             "think": False,  # Disable thinking to avoid vision output routing bug
+            "keep_alive": KEEP_ALIVE_VISION,
             "options": {
                 "temperature": 0.3,
                 "num_predict": 800,
@@ -313,6 +356,7 @@ async def describe_image(image_path: str, model: str = None, context: str = None
                 last_err = None
                 for _used_model in _candidates:
                     payload["model"] = _used_model
+                    await _prepare_model(_used_model)
                     print(f"[DESCRIBE] Trying model={_used_model!r}")
                     try:
                         resp = await client.post(f"{_ollama_host()}/api/chat", json=payload)
@@ -360,8 +404,10 @@ async def describe_image_with_data(image_path: str, model: str = None, context: 
         _describe_prompt = "Describe this image in thorough detail. Include: subjects and their appearance (clothing, expression, physical features), their physical pose and body language (how they are positioned, what their limbs are doing, spatial arrangement relative to each other and the environment), setting and environment, lighting and mood, composition and framing, any text or symbols visible, and notable artistic or photographic qualities. Describe what you observe objectively and completely without editorializing or omitting details. No preamble."
         if context:
             _describe_prompt += f"\n\nAdditional focus: {context}"
+        target_model = model or config.ollama_model
+        await _prepare_model(target_model)
         describe_payload = {
-            "model": model or config.ollama_model,
+            "model": target_model,
             "messages": [
                 {
                     "role": "user",
@@ -371,6 +417,7 @@ async def describe_image_with_data(image_path: str, model: str = None, context: 
             ],
             "stream": False,
             "think": False,
+            "keep_alive": KEEP_ALIVE_VISION,
             "options": {
                 "temperature": 0.3,
                 "num_predict": 800,
