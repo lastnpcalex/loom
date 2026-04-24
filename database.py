@@ -582,11 +582,15 @@ async def get_or_create_backstage(parent_conv_id: int) -> dict:
     if not parent:
         raise ValueError(f"parent conversation {parent_conv_id} not found")
     title = f"Backstage: {parent.get('title', 'Untitled')}"
+    # Sandbox: each backstage gets a neutral empty workspace so the agent
+    # doesn't see (and try to refactor) the Loom repo it's hosted in.
+    workspace = _os.path.join(_os.getcwd(), "backstage_workspaces", f"parent_{parent_conv_id}")
+    _os.makedirs(workspace, exist_ok=True)
     return await create_conversation(
         title=title,
         character_id=parent.get("character_id"),
         mode="claude",
-        project_dir=_os.getcwd(),
+        project_dir=workspace,
         backstage_parent_id=parent_conv_id,
     )
 

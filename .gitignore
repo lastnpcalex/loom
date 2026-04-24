@@ -83,3 +83,4 @@ run_server.py
 cc_permission_hook-*.py
 test_ooda_live.py
 CLAUDE.md
+backstage_workspaces/

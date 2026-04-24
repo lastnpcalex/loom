@@ -337,11 +337,22 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     _configure_permission_hook(cwd) if not resume_session_id else None
 
     # Build the Claude Code arguments (common to both launch methods)
-    disallowed = "AskUserQuestion,WebSearch,WebFetch" if use_ollama else "AskUserQuestion"
+    disallowed_list = ["AskUserQuestion"]
+    if use_ollama:
+        disallowed_list += ["WebSearch", "WebFetch"]
+    # Backstage: lock the agent down to state-card MCP tools only — no filesystem
+    # or shell access, no sub-agents. Otherwise the agent treats the Loom repo
+    # (its cwd) as a codebase to refactor instead of editing cards.
+    if backstage_parent_id:
+        disallowed_list += [
+            "Read", "Write", "Edit", "NotebookEdit",
+            "Bash", "Glob", "Grep", "Agent",
+            "WebSearch", "WebFetch",
+        ]
     cc_args = ["-p", prompt,
                "--output-format", "stream-json",
                "--verbose",
-               "--disallowedTools", disallowed]
+               "--disallowedTools", ",".join(disallowed_list)]
 
     # Backstage: inject the state-cards MCP server scoped to the parent conv.
     # Inline JSON config — no temp file needed. The subprocess receives
