@@ -3165,6 +3165,12 @@ function showPermissionPrompt(data) {
     if (streamingDiv && !streamingDiv.isConnected) {
         streamingDiv = null;
     }
+    // Dedup: reconstruction loop + queued-during-reconstruct replay both fire
+    // showPermissionPrompt for the same request_id. Skip if already rendered
+    // anywhere in the document (stream div, draft message, etc.).
+    if (data.request_id && document.querySelector(`.permission-prompt[data-request-id="${data.request_id}"]`)) {
+        return;
+    }
     if (!streamingDiv) appendStreamingMessage();
     const contentEl = streamingDiv.querySelector('.message-content');
 
