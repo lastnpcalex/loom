@@ -344,6 +344,8 @@ async def _run_migrations(db):
         "ALTER TABLE conversations ADD COLUMN canvas_enabled INTEGER DEFAULT 0",
         # Vision model describe focus (sent only to vision model, never chat)
         "ALTER TABLE messages ADD COLUMN describe_context TEXT",
+        # Backstage: child conversation dedicated to editing this conv's state cards via an LLM agent
+        "ALTER TABLE conversations ADD COLUMN backstage_parent_id INTEGER",
     ]
     for sql in migrations:
         try:
@@ -407,6 +409,8 @@ async def _run_migrations(db):
             discovered_at REAL NOT NULL,
             updated_at REAL NOT NULL
         )""",
+        # Prevent two concurrent POSTs from creating two backstage children
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_backstage_parent ON conversations(backstage_parent_id) WHERE backstage_parent_id IS NOT NULL",
     ]
     for sql in table_migrations:
         await db.execute(sql)
@@ -528,13 +532,17 @@ async def _seed_builtin_schemas(db):
 
 
 async def create_conversation(
-    title: str, character_id: str = None, mode: str = "weave", project_dir: str = None
+    title: str,
+    character_id: str = None,
+    mode: str = "weave",
+    project_dir: str = None,
+    backstage_parent_id: int = None,
 ) -> dict:
     db = await get_db()
     now = time.time()
     cursor = await db.execute(
-        "INSERT INTO conversations (title, character_id, mode, project_dir, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (title, character_id, mode, project_dir, now, now),
+        "INSERT INTO conversations (title, character_id, mode, project_dir, backstage_parent_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (title, character_id, mode, project_dir, backstage_parent_id, now, now),
     )
     conv_id = cursor.lastrowid
     # Init style state
@@ -550,10 +558,37 @@ async def create_conversation(
 async def list_conversations() -> list[dict]:
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT * FROM conversations ORDER BY starred DESC, updated_at DESC"
+        "SELECT * FROM conversations WHERE backstage_parent_id IS NULL ORDER BY starred DESC, updated_at DESC"
     )
 
     return [dict(r) for r in rows]
+
+
+async def get_or_create_backstage(parent_conv_id: int) -> dict:
+    """Return the backstage child conv for this parent, creating if absent.
+
+    The backstage conv is a normal Loom (Braid/local by default — user can
+    switch to Anthropic) with an MCP server that exposes card-editing tools
+    scoped to the parent conversation.
+    """
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM conversations WHERE backstage_parent_id = ? LIMIT 1",
+        (parent_conv_id,),
+    )
+    if rows:
+        return dict(rows[0])
+    parent = await get_conversation(parent_conv_id)
+    if not parent:
+        raise ValueError(f"parent conversation {parent_conv_id} not found")
+    title = f"Backstage: {parent.get('title', 'Untitled')}"
+    return await create_conversation(
+        title=title,
+        character_id=parent.get("character_id"),
+        mode="claude",
+        project_dir=_os.getcwd(),
+        backstage_parent_id=parent_conv_id,
+    )
 
 
 async def search_conversations(query: str, limit: int = 20) -> list[dict]:
@@ -571,6 +606,7 @@ async def search_conversations(query: str, limit: int = 20) -> list[dict]:
            JOIN conversations c ON c.id = m.conversation_id
            WHERE m.content LIKE ?
              AND m.content IS NOT NULL AND m.content != ''
+             AND c.backstage_parent_id IS NULL
              AND (m.parent_id IS NULL
                   OR m.parent_id IN (SELECT id FROM messages))
            UNION
@@ -578,7 +614,7 @@ async def search_conversations(query: str, limit: int = 20) -> list[dict]:
                   NULL as message_id, NULL as role,
                   c.title as snippet
            FROM conversations c
-           WHERE c.title LIKE ? AND c.id NOT IN (
+           WHERE c.title LIKE ? AND c.backstage_parent_id IS NULL AND c.id NOT IN (
                SELECT DISTINCT m2.conversation_id FROM messages m2
                WHERE m2.content LIKE ?
                  AND m2.content IS NOT NULL AND m2.content != ''
@@ -622,6 +658,8 @@ async def get_conversation(conv_id: int) -> Optional[dict]:
 
 async def delete_conversation(conv_id: int):
     db = await get_db()
+    # Delete any backstage child before the parent (no FK cascade for this column)
+    await db.execute("DELETE FROM conversations WHERE backstage_parent_id = ?", (conv_id,))
     await db.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
     await db.commit()
 
@@ -663,6 +701,7 @@ async def update_conversation_fields(conv_id: int, **fields):
         "ooda_enabled",
         "canvas_enabled",
         "project_dir",
+        "backstage_parent_id",
     }
     updates = []
     params = []

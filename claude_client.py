@@ -321,7 +321,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                      model: str = "sonnet", effort: str = "high",
                      permission_mode: str = "default",
                      resume_session_id: str = None, fork_session: bool = False,
-                     use_ollama: bool = False):
+                     use_ollama: bool = False,
+                     backstage_parent_id: int | None = None):
     """Run Claude Code CLI and yield parsed events as an async generator.
 
     Returns (process, generator) so the caller can cancel via process.terminate().
@@ -341,6 +342,26 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                "--output-format", "stream-json",
                "--verbose",
                "--disallowedTools", disallowed]
+
+    # Backstage: inject the state-cards MCP server scoped to the parent conv.
+    # Inline JSON config — no temp file needed. The subprocess receives
+    # LOOM_API_URL / LOOM_BACKSTAGE_PARENT_ID via the server entry's env.
+    if backstage_parent_id:
+        mcp_script = str(Path(__file__).parent / "mcp_state_cards.py")
+        mcp_config = {
+            "mcpServers": {
+                "loom-state-cards": {
+                    "type": "stdio",
+                    "command": sys.executable,
+                    "args": [mcp_script],
+                    "env": {
+                        "LOOM_API_URL": f"http://127.0.0.1:{server_port}",
+                        "LOOM_BACKSTAGE_PARENT_ID": str(backstage_parent_id),
+                    },
+                }
+            }
+        }
+        cc_args.extend(["--mcp-config", json.dumps(mcp_config)])
 
     if not use_ollama:
         # Direct claude launch — model and effort are CC flags

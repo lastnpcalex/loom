@@ -1015,10 +1015,44 @@ async def api_delete_state_card(card_id: int):
     return {"ok": True}
 
 
+# Conversation-scoped variants — used by the backstage MCP server so a
+# compromised agent can't mutate cards in other conversations by guessing ids.
+@app.put("/api/conversations/{conv_id}/state/{card_id}")
+async def api_update_scoped_state_card(conv_id: int, card_id: int, data: dict):
+    existing = await db.get_state_card(card_id) if hasattr(db, "get_state_card") else None
+    if existing is None:
+        # Fallback: fetch via the conversation list
+        all_cards = await db.get_state_cards(conv_id)
+        existing = next((c for c in all_cards if c.get("id") == card_id), None)
+    if not existing or existing.get("conversation_id") != conv_id:
+        raise HTTPException(404, "Card not found in this conversation")
+    return await db.update_state_card(card_id, data.get("data", {}))
+
+
+@app.delete("/api/conversations/{conv_id}/state/{card_id}")
+async def api_delete_scoped_state_card(conv_id: int, card_id: int):
+    all_cards = await db.get_state_cards(conv_id)
+    if not any(c.get("id") == card_id for c in all_cards):
+        raise HTTPException(404, "Card not found in this conversation")
+    await db.delete_state_card(card_id)
+    return {"ok": True}
+
+
 @app.get("/api/conversations/{conv_id}/branch-state/{msg_id}")
 async def api_get_branch_state(conv_id: int, msg_id: int):
     """Get effective state for a specific branch point (base + deltas)."""
     return await db.get_branch_state(conv_id, msg_id)
+
+
+@app.post("/api/conversations/{conv_id}/backstage")
+async def api_get_or_create_backstage(conv_id: int):
+    """Return the backstage conversation for this parent, creating on first call."""
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    if conv.get("backstage_parent_id"):
+        raise HTTPException(400, "Cannot create backstage of a backstage conversation")
+    return await db.get_or_create_backstage(conv_id)
 
 
 @app.post("/api/conversations/{conv_id}/state/seed")
@@ -2660,6 +2694,15 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
         await _handle_local_generation(websocket, conv_id, conv, data)
         return
 
+    # Backstage convs always go through OODA so state card tools are available.
+    # The model is picked from cc-inline-controls in the UI and sent as cc_model;
+    # inject it as local_model so the OODA handler uses it for the Ollama call.
+    if conv.get("backstage_parent_id") and data.get("cc_model"):
+        conv = dict(conv)
+        conv["local_model"] = data["cc_model"]
+        # Also persist so the dropdown re-selects on next load
+        await db.update_conversation_fields(conv_id, local_model=data["cc_model"])
+
     if conv.get("ooda_enabled"):
         await _handle_ooda_generation(websocket, conv_id, conv, data)
     else:
@@ -3048,6 +3091,7 @@ async def _handle_claude_generation(
                     resume_session_id=resume_session_id if use_resume else None,
                     fork_session=fork_session,
                     use_ollama=use_ollama,
+                    backstage_parent_id=conv.get("backstage_parent_id"),
                 )
         except Exception as e:
             if use_resume:
@@ -3076,6 +3120,7 @@ async def _handle_claude_generation(
                         effort=cc_effort,
                         permission_mode=cc_permission_mode,
                         use_ollama=use_ollama,
+                        backstage_parent_id=conv.get("backstage_parent_id"),
                     )
                 use_resume = False
             else:
@@ -3427,6 +3472,7 @@ async def _handle_claude_generation(
                 effort=cc_effort,
                 permission_mode=cc_permission_mode,
                 use_ollama=use_ollama,
+                backstage_parent_id=conv.get("backstage_parent_id"),
             )
             _active_claude_procs[conv_id] = proc
 
@@ -4088,7 +4134,6 @@ async def _handle_ooda_generation(
                     },
                 )
 
-            # Execute state reads
             resolved = await execute_ooda_reads(conv_id, ooda["reads"])
             print(
                 f"[OODA] Resolved {len(resolved)} reads, applying {len(ooda['updates'])} updates, {len(ooda['creates'])} creates"

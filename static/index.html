@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=105">
+    <link rel="stylesheet" href="/static/style.css?v=110">
 </head>
 <body>
     <div id="blackhole-container"></div>
@@ -155,6 +155,13 @@
             </div>
         </div>
 
+        <!-- Backstage banner: sits outside both views so it shows in chat AND tree -->
+        <div id="backstage-banner" class="hidden">
+            <span class="backstage-banner-icon">🎭</span>
+            <span class="backstage-banner-text">Backstage — editing state cards via agent</span>
+            <button id="btn-backstage-return" title="Return to the main conversation">↩ Return</button>
+        </div>
+
         <!-- View: Tree Canvas -->
         <div id="view-tree" class="view">
             <div id="tree-toolbar">
@@ -222,6 +229,7 @@
                     <span class="ooda-toggle-label">OODA</span>
                 </label>
                 <button id="btn-state-panel-chat" title="View and edit state cards for this branch — character moods, scene details, and lore tracked by the OODA harness" class="hidden branch-state-btn"><span class="delta-glow">δ</span> Branch State</button>
+                <button id="btn-backstage" title="Backstage — chat with an agent to edit state cards" class="backstage-btn">🎭</button>
                 <div id="branch-count-control" class="branch-count-pill" title="Number of response branches to generate. Click to cycle.">
                     <span class="branch-count-icon">⑂</span>
                     <span class="branch-count-value" id="branch-count-value">1</span>
@@ -557,7 +565,7 @@ assistant: *Another example response*"></textarea>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=13"></script>
-    <script src="/static/app.js?v=72"></script>
+    <script src="/static/app.js?v=77"></script>
     <script src="/static/chat.js?v=124"></script>
     <script src="/static/tree.js?v=37"></script>
 </body>

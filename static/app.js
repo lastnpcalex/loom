@@ -967,6 +967,16 @@ async function loadConversation(convId) {
     State.currentConv = conv;
     State.treeData = treeData;
     State.bookmarks = bookmarks || [];
+
+    // Backstage UI: banner when viewing a backstage child, hide the entry
+    // button so you don't recurse into another backstage.
+    const isBackstage = !!conv.backstage_parent_id;
+    const banner = document.getElementById('backstage-banner');
+    if (banner) banner.classList.toggle('hidden', !isBackstage);
+    const backstageBtn = document.getElementById('btn-backstage');
+    if (backstageBtn) backstageBtn.classList.toggle('hidden', isBackstage);
+    // Backstage convs have mode="local" so updateInlineCCControls below will
+    // swap to the cc-inline-controls automatically — no special casing needed.
     // Load state cards if OODA is enabled
     if (conv.ooda_enabled) {
         State.stateCards = await API.get(`/api/conversations/${convId}/state`);
@@ -2015,6 +2025,25 @@ function setupEventListeners() {
     // New conversation
     document.getElementById('btn-new-conv-home')?.addEventListener('click', openNewConvModal);
     document.getElementById('btn-create-conv').addEventListener('click', createConversation);
+
+    // Backstage: open a child conversation dedicated to editing this conv's state cards
+    document.getElementById('btn-backstage')?.addEventListener('click', async () => {
+        if (State.isStreaming) { showToast('Wait for generation to finish before opening backstage', 'warning'); return; }
+        if (!State.currentConvId) return;
+        try {
+            const child = await API.post(`/api/conversations/${State.currentConvId}/backstage`, {});
+            if (!State.conversations.find(c => c.id === child.id)) {
+                State.conversations.unshift(child);
+            }
+            await loadConversation(child.id);
+        } catch (e) {
+            showToast(`Failed to open backstage: ${e.message || e}`, 'error');
+        }
+    });
+    document.getElementById('btn-backstage-return')?.addEventListener('click', async () => {
+        const parentId = State.currentConv?.backstage_parent_id;
+        if (parentId) await loadConversation(parentId);
+    });
 
     // Character creator + import
     document.getElementById('btn-create-char')?.addEventListener('click', () => openCharacterModal());
