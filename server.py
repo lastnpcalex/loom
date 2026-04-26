@@ -1645,30 +1645,46 @@ async def api_cc_models():
     return CC_MODELS
 
 
+_VISION_MODEL_CACHE: dict[tuple[str, str], bool] = {}
+
+
 @app.get("/api/ollama/vision-models")
 async def api_ollama_vision_models():
-    """Return Ollama models that support vision (have a projector/clip family or vision capability)."""
-    _VISION_FAMILIES = {"clip", "mllama", "mmproj"}
+    """Return Ollama models whose /api/show capabilities include 'vision'.
+
+    Results are cached by (name, digest) so repeat calls only re-check models
+    whose digest changed (e.g. pulled a new tag).
+    """
     host = config.ollama_host
     if host and not host.startswith(("http://", "https://")):
         host = f"http://{host}"
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(f"{host}/api/tags")
             resp.raise_for_status()
-            data = resp.json()
-            vision = []
-            for m in data.get("models", []):
-                details = m.get("details", {})
-                families = set(details.get("families") or [])
-                # Check families for known vision projector types
-                if families & _VISION_FAMILIES:
-                    vision.append(m["name"])
-                    continue
-                # Newer Ollama versions may include capabilities
-                caps = m.get("capabilities") or []
-                if "vision" in caps:
-                    vision.append(m["name"])
+            models = resp.json().get("models", [])
+
+            sem = asyncio.Semaphore(8)
+
+            async def _has_vision(name: str, digest: str) -> bool:
+                key = (name, digest)
+                if key in _VISION_MODEL_CACHE:
+                    return _VISION_MODEL_CACHE[key]
+                async with sem:
+                    try:
+                        r = await client.post(f"{host}/api/show", json={"model": name})
+                        r.raise_for_status()
+                        caps = r.json().get("capabilities") or []
+                        result = "vision" in caps
+                    except Exception:
+                        result = False
+                _VISION_MODEL_CACHE[key] = result
+                return result
+
+            checks = await asyncio.gather(
+                *(_has_vision(m["name"], m.get("digest", "")) for m in models)
+            )
+            vision = [m["name"] for m, ok in zip(models, checks) if ok]
             return {"models": vision}
     except Exception as e:
         return {"models": [], "error": str(e)}
@@ -2973,6 +2989,7 @@ async def _handle_claude_generation(
                 import shutil
 
                 file_notes = []
+                desc_map: dict[str, str] = {}
                 for ip in img_paths:
                     src = Path(ip).resolve()
                     file_ext = src.suffix.lower()
@@ -2999,6 +3016,7 @@ async def _handle_claude_generation(
                                 await _ws_send(conv_id, {"type": "status", "text": f"Describing image {src.name}..."})
                                 desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None, context=_describe_context), timeout=120)
                                 file_notes.append(f"[Image: {desc}]")
+                                desc_map[src.name] = desc
                             except asyncio.TimeoutError:
                                 print(f"[DESCRIBE] Timed out describing {src.name} (30s)")
                                 file_notes.append("[Image shared but description timed out]")
@@ -3014,6 +3032,19 @@ async def _handle_claude_generation(
                             )
                         else:
                             file_notes.append(str(src).replace("\\", "/"))
+                if desc_map:
+                    try:
+                        await db.update_message_image_alt(
+                            last_user_msg["id"], json.dumps(desc_map)
+                        )
+                        await _ws_send(conv_id, {
+                            "type": "image_describe",
+                            "message_id": last_user_msg["id"],
+                            "descriptions": desc_map,
+                            "model": config.vision_model or None,
+                        })
+                    except Exception as e:
+                        print(f"[DESCRIBE] Failed to persist/emit descriptions: {e}")
                 if file_notes:
                     files_str = "\n".join(f"  • {note}" for note in file_notes)
                     _has_img = any(note.startswith("[Image") for note in file_notes)
@@ -3434,6 +3465,7 @@ async def _handle_claude_generation(
                     import shutil
 
                     file_notes = []
+                    desc_map: dict[str, str] = {}
                     for ip in img_paths:
                         src = Path(ip).resolve()
                         file_ext = src.suffix.lower()
@@ -3460,6 +3492,7 @@ async def _handle_claude_generation(
                                     await _ws_send(conv_id, {"type": "status", "text": f"Describing image {src.name}..."})
                                     desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None, context=_describe_context), timeout=120)
                                     file_notes.append(f"[Image: {desc}]")
+                                    desc_map[src.name] = desc
                                 except asyncio.TimeoutError:
                                     print(f"[DESCRIBE] Timed out describing {src.name} (30s)")
                                     file_notes.append("[Image shared but description timed out]")
@@ -3475,6 +3508,19 @@ async def _handle_claude_generation(
                                 )
                             else:
                                 file_notes.append(str(src).replace("\\", "/"))
+                    if desc_map:
+                        try:
+                            await db.update_message_image_alt(
+                                last_user_msg["id"], json.dumps(desc_map)
+                            )
+                            await _ws_send(conv_id, {
+                                "type": "image_describe",
+                                "message_id": last_user_msg["id"],
+                                "descriptions": desc_map,
+                                "model": config.vision_model or None,
+                            })
+                        except Exception as e:
+                            print(f"[DESCRIBE] Failed to persist/emit descriptions: {e}")
                     if file_notes:
                         files_str = "\n".join(f"  • {note}" for note in file_notes)
                         _has_img = any(note.startswith("[Image") for note in file_notes)

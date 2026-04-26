@@ -415,6 +415,34 @@ function handleWSMessage(data) {
             showGenStatus(data.text || 'Looming...');
             break;
 
+        case 'image_describe': {
+            const msg = State.messages.find(m => m.id === data.message_id);
+            if (msg) {
+                let existing = {};
+                if (msg.image_alt) {
+                    try { existing = JSON.parse(msg.image_alt) || {}; } catch { existing = {}; }
+                }
+                msg.image_alt = JSON.stringify({ ...existing, ...(data.descriptions || {}) });
+            }
+            const msgEl = document.querySelector(`.message[data-msg-id="${data.message_id}"]`);
+            if (msgEl && data.descriptions) {
+                for (const [filename, desc] of Object.entries(data.descriptions)) {
+                    const figs = msgEl.querySelectorAll(`.message-image-figure[data-img-name="${CSS.escape(filename)}"]`);
+                    figs.forEach(fig => {
+                        let cap = fig.querySelector('.image-description');
+                        if (!cap) {
+                            cap = document.createElement('figcaption');
+                            cap.className = 'image-description';
+                            cap.title = 'From vision model';
+                            fig.appendChild(cap);
+                        }
+                        cap.textContent = desc;
+                    });
+                }
+            }
+            break;
+        }
+
         case 'stream_start': {
             // Check if this generation is for our current branch
             const parentId = data.parent_id;
@@ -767,8 +795,23 @@ function handleWSMessage(data) {
                     const activeWs = State.ws;
                     loadMessages(State.currentConvId).then(() => {
                         State._reconstructing = false;
-                        if (State.ws !== activeWs || !State.isStreaming) return;
-                        // Re-check branch after messages loaded (State.messages is now fresh)
+                        if (State.ws !== activeWs) return;
+                        // If the draft message has already landed from the DB
+                        // (loadMessages picked up the committed final response),
+                        // we're done — nothing to reconstruct.
+                        const draftLanded = snap.draft_msg_id && State.messages.some(
+                            m => m.id === snap.draft_msg_id && (m.content || '').trim()
+                        );
+                        if (draftLanded) {
+                            _drainPendingPermPrompts();
+                            return;
+                        }
+                        // Otherwise reconstruct from snapshot — covers the race
+                        // where stream_end fired during loadMessages but the
+                        // assistant row wasn't yet committed to the DB. Don't
+                        // gate on State.isStreaming: a fast/rate-limited turn
+                        // can finish before we get here, and we still need to
+                        // render the partial output until the final lands.
                         const freshIds = new Set(State.messages.map(m => m.id));
                         const stillOurs = !snap.parent_id || freshIds.has(snap.parent_id);
                         State._streamIsOurBranch = stillOurs;
@@ -790,9 +833,21 @@ function handleWSMessage(data) {
         }
 
         case 'generation_idle':
-            // Server confirms no generation running — reset any stuck streaming state
-            State._reconstructing = false;  // clear any stale reconstruction lock
-            if (State.isStreaming || (State.ws && State.ws._needsSync)) {
+            // Server confirms no generation running — reset any stuck streaming state.
+            // If we were mid-reconstruction, force a reload: a fast turn can finish
+            // (and commit its final assistant message) in the gap between
+            // generation_active and generation_idle, leaving the new row unrendered.
+            const wasReconstructing = State._reconstructing;
+            State._reconstructing = false;
+            // If a generate is stashed and about to fire, skip the reload —
+            // an in-flight renderMessages() races with the upcoming stream_start
+            // and wipes the streamingDiv mid-stream. The new stream will paint
+            // the response itself; no reload needed.
+            if (_pendingGenerate) {
+                if (State.ws) State.ws._needsSync = false;
+                break;
+            }
+            if (State.isStreaming || (State.ws && State.ws._needsSync) || wasReconstructing) {
                 State.isStreaming = false;
                 State._streamIsOurBranch = undefined;
                 State._followingGenId = null;
@@ -1998,7 +2053,7 @@ function _triggerParallelGenerate(count, parentId) {
     const stale = !ws
         || ws.readyState === WebSocket.CLOSED
         || ws.readyState === WebSocket.CLOSING
-        || (ws.readyState === WebSocket.OPEN && Date.now() - (ws._lastActivity || 0) > 10000)
+        || (ws.readyState === WebSocket.OPEN && Date.now() - (ws._lastActivity || 0) > 30000)
         || ws.readyState === WebSocket.CONNECTING;
     if (stale) {
         console.log('[WS] generate: socket stale or not open — reconnecting and stashing');
@@ -2147,12 +2202,20 @@ function createMessageElement(msg, cost) {
         const paths = parseImagePaths(msg.image_path);
         if (paths.length > 0) {
             const imageExts = ['.png', '.jpg', '.jpeg', '.gif', '.webp'];
+            let descMap = {};
+            if (msg.image_alt) {
+                try { descMap = JSON.parse(msg.image_alt) || {}; } catch { descMap = {}; }
+            }
             imgHtml = '<div class="message-images">' +
                 paths.map(p => {
                     const filename = p.split(/[\\/]/).pop();
                     const ext = '.' + filename.split('.').pop().toLowerCase();
                     if (imageExts.includes(ext)) {
-                        return '<img class="message-image" src="/uploads/' + filename + '" alt="Attached image">';
+                        const desc = descMap[filename];
+                        const descHtml = desc
+                            ? `<figcaption class="image-description" title="From vision model">${escapeHtml(desc)}</figcaption>`
+                            : '';
+                        return `<figure class="message-image-figure" data-img-name="${escapeHtml(filename)}"><img class="message-image" src="/uploads/${escapeHtml(filename)}" alt="Attached image">${descHtml}</figure>`;
                     }
                     return '<a class="message-file-attach" href="/uploads/' + filename + '" target="_blank" title="' + escapeHtml(filename) + '">&#128196; ' + escapeHtml(ext.toUpperCase().slice(1)) + ' file attached</a>';
                 }).join('') +
@@ -2691,7 +2754,12 @@ function appendStreamingMessage() {
     streamingDiv.innerHTML = '<div class="message-header">' +
         '<span class="message-role">' + escapeHtml(label) + '</span>' +
         '</div>' +
-        '<div class="message-content"></div>' +
+        '<div class="message-content">' +
+            '<span class="stream-waiting">' +
+                '<span class="stream-waiting-anim"></span>' +
+                '<span class="stream-waiting-text">waiting for first token...</span>' +
+            '</span>' +
+        '</div>' +
         '<div class="stream-thinking-footer">' +
         '<button onclick="cancelGeneration()" title="Cancel generation" class="cancel-draft-btn">&#x2298;</button>' +
         '<span class="loom-anim"></span><span class="looming-text"> Looming...</span>' +
@@ -2699,7 +2767,40 @@ function appendStreamingMessage() {
         '</div>';
     container.appendChild(streamingDiv);
     _startGenTimer();
+    _startStreamWaitingTicker();
     scrollToBottom();
+}
+
+let _streamWaitingTicker = null;
+let _streamWaitingFrame = 0;
+const _streamWaitingFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+function _startStreamWaitingTicker() {
+    if (_streamWaitingTicker) clearInterval(_streamWaitingTicker);
+    _streamWaitingFrame = 0;
+    const start = Date.now();
+    _streamWaitingTicker = setInterval(() => {
+        if (!streamingDiv) { _stopStreamWaitingTicker(); return; }
+        const animEl = streamingDiv.querySelector('.stream-waiting-anim');
+        const textEl = streamingDiv.querySelector('.stream-waiting-text');
+        if (!animEl || !textEl) { _stopStreamWaitingTicker(); return; }
+        animEl.textContent = _streamWaitingFrames[_streamWaitingFrame];
+        _streamWaitingFrame = (_streamWaitingFrame + 1) % _streamWaitingFrames.length;
+        const secs = Math.floor((Date.now() - start) / 1000);
+        if (secs > 10) {
+            textEl.textContent = `still working… (${secs}s — large context can take 30–90s before first token)`;
+        } else if (secs > 4) {
+            textEl.textContent = `waiting for first token… (${secs}s)`;
+        }
+    }, 80);
+}
+function _stopStreamWaitingTicker() {
+    if (_streamWaitingTicker) { clearInterval(_streamWaitingTicker); _streamWaitingTicker = null; }
+}
+function _removeStreamWaiting() {
+    _stopStreamWaitingTicker();
+    if (!streamingDiv) return;
+    const el = streamingDiv.querySelector('.stream-waiting');
+    if (el) el.remove();
 }
 
 let _streamBuffer = '';
@@ -2749,6 +2850,7 @@ function _flushStreamBuffer() {
         return;
     }
     if (!streamingDiv || !_streamBuffer) return;
+    _removeStreamWaiting();
     const contentEl = streamingDiv.querySelector('.message-content');
     // Find or create a text span to stream into (keeps text separate from tool blocks)
     let textSpan = contentEl.querySelector('.streaming-text:last-of-type');
@@ -2785,6 +2887,7 @@ function _flushStreamBuffer() {
 function finalizeStreamingMessage(msg, cost) {
     if (!streamingDiv) return;
     _stopGenTimer();
+    _stopStreamWaitingTicker();
 
     // Cancel any pending incremental flush — we're about to do a full markdown
     // render in one pass, so a trailing setTimeout would just waste work.
@@ -2806,6 +2909,7 @@ function finalizeStreamingMessage(msg, cost) {
 
 function removeStreamingMessage() {
     _stopGenTimer();
+    _stopStreamWaitingTicker();
     if (streamingDiv) {
         streamingDiv.remove();
         streamingDiv = null;
@@ -2816,6 +2920,7 @@ function removeStreamingMessage() {
 
 function appendToolBlock(name, toolId, isOoda) {
     if (!streamingDiv) return;
+    _removeStreamWaiting();
     // Add show-ooda class on first OODA block so they're visible during streaming
     if (isOoda && !streamingDiv.classList.contains('show-ooda')) {
         streamingDiv.classList.add('show-ooda');
@@ -2907,6 +3012,7 @@ function finalizeToolBlock(result, toolId, imageUrl, isError) {
 
 function appendThinkingChunk(text) {
     if (!streamingDiv) return;
+    _removeStreamWaiting();
     const contentEl = streamingDiv.querySelector('.message-content');
     let thinkingEl = contentEl.querySelector('.cc-thinking');
     if (!thinkingEl) {

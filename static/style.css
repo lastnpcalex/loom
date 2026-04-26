@@ -2408,6 +2408,31 @@ body::after {
 
 .message-image:hover { transform: scale(1.02); box-shadow: var(--glow-purple); }
 
+.message-image-figure {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 0;
+    max-width: 300px;
+}
+
+.image-description {
+    font-size: 0.85em;
+    color: var(--text-secondary);
+    font-style: italic;
+    padding: 4px 6px;
+    border-left: 2px solid var(--accent);
+    background: var(--bg-secondary);
+    border-radius: 4px;
+    line-height: 1.4;
+}
+.image-description::before {
+    content: "vision: ";
+    font-style: normal;
+    font-weight: 600;
+    opacity: 0.7;
+}
+
 .message-file-attach {
     display: inline-block;
     padding: 6px 12px;
@@ -2753,6 +2778,23 @@ body::after {
     margin-right: 6px;
     min-width: 13em;
     text-align: left;
+}
+
+.stream-waiting {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--cyan);
+    font-family: monospace;
+    font-size: 0.9em;
+    opacity: 0.85;
+    font-style: italic;
+}
+.stream-waiting-anim {
+    font-family: monospace;
+    letter-spacing: 1px;
+    color: var(--cyan);
+    text-shadow: 0 0 6px var(--cyan);
 }
 
 /* ── Input Area ── */
