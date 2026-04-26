@@ -183,7 +183,11 @@ async function loadMessages(convId) {
         // loadConversation() when switching conversations, not on message reload
 
         const prevCount = State.messages.length;
-        const prevIdSig = State.messages.map(m => m.id).join(',');
+        // Signature includes empty/non-empty content state so an empty draft
+        // filling in (same id, "" → real text) forces a re-render instead of
+        // being skipped by the cheap-diff bail below.
+        const _msgSig = m => `${m.id}:${(m.content || '').length > 0 ? 1 : 0}`;
+        const prevIdSig = State.messages.map(_msgSig).join(',');
         const treeData = await API.get(`/api/conversations/${convId}/tree`);
         State.treeData = treeData;  // keep branch indicators in sync
         hideRetryBar();
@@ -215,16 +219,22 @@ async function loadMessages(convId) {
         // Heartbeat-driven WS reconnects used to call loadMessages on every
         // generation_idle and wipe the DOM even when nothing actually changed
         // — that's what the user was seeing as flicker.
-        const newIdSig = State.messages.map(m => m.id).join(',');
+        const newIdSig = State.messages.map(_msgSig).join(',');
         if (newIdSig === prevIdSig && prevIdSig !== '' && !State.isStreaming) {
             // Same chain. Refresh tree decorations only and bail.
             if (typeof refreshTree === 'function') refreshTree();
             return;
         }
         renderMessages();
-        // If still streaming, re-create the streaming div (renderMessages destroyed it)
+        // If still streaming, renderMessages just destroyed the streaming div.
+        // Drop the stale ref and ask the server for a snapshot — the reply
+        // will rebuild the div with prior text intact, instead of an empty
+        // box that loses everything streamed before this reload.
+        if (streamingDiv && !streamingDiv.isConnected) streamingDiv = null;
         if (State.isStreaming && !streamingDiv) {
-            appendStreamingMessage();
+            if (State._streamIsOurBranch !== false) {
+                _requestSnapshotIfStreaming();
+            }
         }
         scrollToBottom();
         if (State.messages.length > prevCount && prevCount > 0 && !State.isStreaming) {
@@ -2562,6 +2572,20 @@ function hideThinkingIndicator() {
 // ── Streaming Message ──
 
 let streamingDiv = null;
+let _lastSnapshotRequestAt = 0;
+
+function _requestSnapshotIfStreaming() {
+    // Throttle: at most one request every 750ms — server reply ('generation_active')
+    // takes one round-trip and triggers _reconstructFromSnapshot which rebuilds the div.
+    const now = Date.now();
+    if (now - _lastSnapshotRequestAt < 750) return;
+    if (!State.ws || State.ws.readyState !== WebSocket.OPEN) return;
+    _lastSnapshotRequestAt = now;
+    try {
+        State.ws.send(JSON.stringify({ action: 'request_snapshot' }));
+    } catch {}
+}
+
 let _genTimerInterval = null;
 let _loomAnimInterval = null;
 const _loomFrames = [
@@ -2684,12 +2708,20 @@ let _streamFlushTimer = null;
 function appendStreamChunk(content) {
     // If the streamingDiv got detached (e.g. by a mid-stream renderMessages
     // that happens when loadMessages or reconstruct races with chunks),
-    // drop the stale ref so nothing appends into the void. The next flush
-    // will no-op, and the reconstruction path will rebuild.
+    // drop the stale ref and ask the server for a snapshot so we can rebuild
+    // without forcing the user to refresh the page.
     if (streamingDiv && !streamingDiv.isConnected) {
         streamingDiv = null;
     }
-    if (!streamingDiv) return;
+    if (!streamingDiv) {
+        // Drop this chunk (server snapshot already contains it) and ask for
+        // a fresh snapshot so the reconstruction path can rebuild the UI.
+        if (State.isStreaming && State._streamIsOurBranch !== false) {
+            _requestSnapshotIfStreaming();
+        }
+        _streamBuffer = '';
+        return;
+    }
     _streamBuffer += content;
     // Throttle DOM updates to max every 50ms
     if (!_streamFlushTimer) {
@@ -2708,6 +2740,14 @@ function _scrollDuringStream() {
 
 function _flushStreamBuffer() {
     _streamFlushTimer = null;
+    if (streamingDiv && !streamingDiv.isConnected) {
+        streamingDiv = null;
+        if (State.isStreaming && State._streamIsOurBranch !== false) {
+            _requestSnapshotIfStreaming();
+        }
+        _streamBuffer = '';
+        return;
+    }
     if (!streamingDiv || !_streamBuffer) return;
     const contentEl = streamingDiv.querySelector('.message-content');
     // Find or create a text span to stream into (keeps text separate from tool blocks)

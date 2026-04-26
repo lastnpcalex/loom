@@ -2128,6 +2128,41 @@ async def _ws_broadcast_all(data: dict):
                 _active_websockets.pop(cid, None)
 
 
+async def _send_active_gen_state(websocket: WebSocket, conv_id: int) -> bool:
+    """Send generation_active (with snapshots) or generation_idle to one ws.
+    Returns True if a generation is active, False otherwise."""
+    active_gen_keys = [
+        k for k, t in _active_generations.items() if k[0] == conv_id and not t.done()
+    ]
+    if not active_gen_keys:
+        await websocket.send_json({"type": "generation_idle"})
+        return False
+    snapshots = []
+    for gk in active_gen_keys:
+        snap = _generation_snapshots.get(gk)
+        if snap:
+            snapshots.append(
+                {
+                    "gen_id": gk[2],
+                    "parent_id": snap.get("parent_id"),
+                    "draft_msg_id": snap.get("draft_msg_id"),
+                    "full_text": snap.get("full_text", ""),
+                    "content_blocks": snap.get("content_blocks", []),
+                    "input_tokens": snap.get("input_tokens", 0),
+                    "output_tokens": snap.get("output_tokens", 0),
+                    "started_at": snap.get("started_at", 0),
+                    "mode": snap.get("mode", "claude"),
+                }
+            )
+    await websocket.send_json(
+        {
+            "type": "generation_active",
+            "snapshots": snapshots,
+        }
+    )
+    return True
+
+
 @app.websocket("/ws/chat/{conv_id}")
 async def ws_chat(websocket: WebSocket, conv_id: int):
     await websocket.accept()
@@ -2137,34 +2172,8 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
     _active_websockets[conv_id].add(websocket)
 
     # Tell the client whether a generation is running — include live snapshot if available
-    active_gen_keys = [
-        k for k, t in _active_generations.items() if k[0] == conv_id and not t.done()
-    ]
-    if active_gen_keys:
-        # Find the snapshot for the active generation(s)
-        snapshots = []
-        for gk in active_gen_keys:
-            snap = _generation_snapshots.get(gk)
-            if snap:
-                snapshots.append(
-                    {
-                        "gen_id": gk[2],
-                        "parent_id": snap.get("parent_id"),
-                        "draft_msg_id": snap.get("draft_msg_id"),
-                        "full_text": snap.get("full_text", ""),
-                        "content_blocks": snap.get("content_blocks", []),
-                        "input_tokens": snap.get("input_tokens", 0),
-                        "output_tokens": snap.get("output_tokens", 0),
-                        "started_at": snap.get("started_at", 0),
-                        "mode": snap.get("mode", "claude"),
-                    }
-                )
-        await websocket.send_json(
-            {
-                "type": "generation_active",
-                "snapshots": snapshots,
-            }
-        )
+    has_active = await _send_active_gen_state(websocket, conv_id)
+    if has_active:
         # Resend ALL pending permission requests (broadcast globally now)
         for rid, pending in list(_pending_hook_permissions.items()):
             if pending.get("response"):
@@ -2185,7 +2194,6 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 # tearing down ws_chat before the receive loop started.
                 print(f"[WS] Failed to resend pending permission {rid}: {e!r} — skipping")
     else:
-        await websocket.send_json({"type": "generation_idle"})
         # Even when idle, resend any pending permissions from other conversations
         for rid, pending in list(_pending_hook_permissions.items()):
             if pending.get("response"):
@@ -2216,6 +2224,16 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                     await websocket.send_json({"type": "pong"})
                 except Exception:
                     pass
+                continue
+
+            if action == "request_snapshot":
+                # Client noticed its streaming UI is detached/missing while a
+                # generation is still running — re-emit current state so it can
+                # rebuild without a full page refresh.
+                try:
+                    await _send_active_gen_state(websocket, conv_id)
+                except Exception as e:
+                    print(f"[WS] request_snapshot failed for conv={conv_id}: {e!r}")
                 continue
 
             if action == "cancel":

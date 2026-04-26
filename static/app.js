@@ -446,7 +446,7 @@ async function init() {
     renderHomeLore();
     setupEventListeners();
     initInlineCCControls();
-    populateCCModelDropdowns('sonnet');
+    await populateCCModelDropdowns();
     // Paste handler registered in setupEventListeners
     // Restore last page: view first, then conversation if applicable
     // sessionStorage is per-tab and survives refresh; localStorage is the cross-tab default
