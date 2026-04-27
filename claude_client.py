@@ -433,6 +433,12 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         }
         cc_args.extend(["--mcp-config", json.dumps(mcp_config)])
 
+        # Append a backstage-specific system prompt so the agent knows it's
+        # editing state cards for a parent RP conv, not assisting with code.
+        backstage_md = Path(__file__).parent / "backstage.md"
+        if backstage_md.exists():
+            cc_args.extend(["--append-system-prompt", backstage_md.read_text(encoding="utf-8")])
+
     if not use_ollama:
         # Direct claude launch — model and effort are CC flags
         cc_args.extend(["--model", model, "--effort", effort])
