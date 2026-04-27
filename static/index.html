@@ -205,6 +205,7 @@
                 <div id="messages"></div>
                 <div id="generation-status" class="hidden">
                     <div class="gen-status-dot"></div>
+                    <span id="gen-status-spinner" class="hidden"></span>
                     <span id="gen-status-text">Sending...</span>
                 </div>
                 <div id="streaming-indicator" class="hidden">
@@ -218,7 +219,7 @@
             <div id="image-preview" class="hidden"></div>
             <div id="describe-context-bar" class="hidden">
                 <label for="describe-context" title="Extra focus for vision model image description — not sent to chat model">Describe focus</label>
-                <input type="text" id="describe-context" placeholder="e.g. focus on body language and composition" autocomplete="off" spellcheck="false">
+                <textarea id="describe-context" rows="2" placeholder="e.g. focus on body language and composition" autocomplete="off" spellcheck="false"></textarea>
             </div>
             <div id="weave-inline-controls" class="hidden">
                 <select id="weave-model-inline" title="Ollama model">
@@ -252,7 +253,7 @@
             </div>
             <div id="input-row">
                 <label id="btn-attach" title="Attach file">
-                    <input type="file" id="file-input" accept="image/*,.md,.txt,.pdf,.json,.csv,.py,.js,.ts,.html,.css" hidden>
+                    <input type="file" id="file-input" multiple hidden>
                     📎
                 </label>
                 <textarea id="user-input" placeholder="Write your message... (Shift+Enter to send)" rows="1"></textarea>

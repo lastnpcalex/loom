@@ -384,6 +384,162 @@ async def tool_comfyui_free():
         return JSONResponse({"status": "error", "output": f"Error: {e}"})
 
 
+# ── Ollama / ComfyUI process control ──────────────────────────────────────
+# Tracked launches go in _child_procs under fixed keys so stop knows which
+# proc to kill if we started it. Stop also taskkills by image name as a
+# fallback (covers desktop-app-launched / pre-existing instances).
+
+OLLAMA_LAUNCH_CMD = os.getenv("OLLAMA_LAUNCH_CMD", "ollama serve")
+COMFYUI_LAUNCH_CMD = os.getenv(
+    "COMFYUI_LAUNCH_CMD",
+    r'"C:\Users\exast\Downloads\ComfyUI_windows_portable_nvidia\ComfyUI_windows_portable\run_nvidia_gpu.bat"',
+)
+
+
+def _spawn_detached(cmd: str, cwd: str | None = None) -> subprocess.Popen:
+    """Spawn a long-running command in a detached process group on Windows."""
+    env = os.environ.copy()
+    if "ollama" in cmd.lower():
+        env["OLLAMA_KV_CACHE_TYPE"] = env.get("OLLAMA_KV_CACHE_TYPE", "q8_0")
+
+    return subprocess.Popen(
+        cmd,
+        shell=True,
+        cwd=cwd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
+        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+    )
+
+
+@app.post("/tools/ollama-start")
+async def tool_ollama_start():
+    """Launch Ollama if not already running. Inherits current env."""
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get("http://127.0.0.1:11434/api/tags")
+            if r.status_code == 200:
+                return JSONResponse({"status": "ok", "output": "Ollama is already running on :11434"})
+    except Exception:
+        pass
+    try:
+        proc = _spawn_detached(OLLAMA_LAUNCH_CMD)
+        _child_procs["ollama"] = proc
+        # Wait briefly for it to become reachable
+        for i in range(15):
+            await asyncio.sleep(1)
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    r = await client.get("http://127.0.0.1:11434/api/tags")
+                    if r.status_code == 200:
+                        return JSONResponse({
+                            "status": "ok",
+                            "output": f"Ollama launched and ready after {i+1}s (PID {proc.pid}).",
+                        })
+            except Exception:
+                continue
+        return JSONResponse({
+            "status": "ok",
+            "output": f"Ollama launched (PID {proc.pid}) but not yet responding after 15s. May still be coming up.",
+        })
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": f"Failed to launch Ollama: {e}"})
+
+
+@app.post("/tools/ollama-stop")
+async def tool_ollama_stop():
+    """Kill all ollama.exe processes (and any tracked Ollama launch)."""
+    lines = []
+    proc = _child_procs.pop("ollama", None)
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+            lines.append(f"Terminated tracked Ollama proc (PID {proc.pid}).")
+        except Exception as e:
+            lines.append(f"Failed to terminate tracked proc: {e}")
+    try:
+        r = subprocess.run(
+            ["taskkill", "/F", "/IM", "ollama.exe", "/T"],
+            capture_output=True, text=True, timeout=10,
+        )
+        out = (r.stdout or r.stderr or "").strip()
+        lines.append(out or f"taskkill exit {r.returncode}")
+    except Exception as e:
+        lines.append(f"taskkill failed: {e}")
+    return JSONResponse({"status": "ok", "output": "\n".join(lines) or "No Ollama processes found."})
+
+
+@app.post("/tools/comfyui-start")
+async def tool_comfyui_start():
+    """Launch ComfyUI if not already running."""
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(f"{COMFYUI_URL}/system_stats")
+            if r.status_code == 200:
+                return JSONResponse({"status": "ok", "output": "ComfyUI is already running on :8188"})
+    except Exception:
+        pass
+    try:
+        proc = _spawn_detached(COMFYUI_LAUNCH_CMD)
+        _child_procs["comfyui"] = proc
+        # Wait briefly for it to become reachable (ComfyUI cold-starts can be slow)
+        for i in range(30):
+            await asyncio.sleep(1)
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    r = await client.get(f"{COMFYUI_URL}/system_stats")
+                    if r.status_code == 200:
+                        return JSONResponse({
+                            "status": "ok",
+                            "output": f"ComfyUI launched and ready after {i+1}s (PID {proc.pid}).",
+                        })
+            except Exception:
+                continue
+        return JSONResponse({
+            "status": "ok",
+            "output": f"ComfyUI launched (PID {proc.pid}) but not responding after 30s. Cold-start may need more time — try ComfyUI Status in a moment.",
+        })
+    except Exception as e:
+        return JSONResponse({
+            "status": "error",
+            "output": f"Failed to launch ComfyUI: {e}\n\nCommand: {COMFYUI_LAUNCH_CMD}\nSet env COMFYUI_LAUNCH_CMD to override.",
+        })
+
+
+@app.post("/tools/comfyui-stop")
+async def tool_comfyui_stop():
+    """Kill ComfyUI: terminate tracked proc + taskkill any python.exe in the
+    portable ComfyUI directory tree (matches by command-line). Falls back to
+    just terminating the tracked handle if WMIC isn't available."""
+    lines = []
+    proc = _child_procs.pop("comfyui", None)
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+            lines.append(f"Terminated tracked ComfyUI proc (PID {proc.pid}).")
+        except Exception as e:
+            lines.append(f"Failed to terminate tracked proc: {e}")
+    # Best-effort: kill main.py-launched python.exe (covers portable .bat)
+    try:
+        r = subprocess.run(
+            ["wmic", "process", "where",
+             "name='python.exe' and CommandLine like '%ComfyUI%main.py%'",
+             "delete"],
+            capture_output=True, text=True, timeout=10,
+        )
+        out = (r.stdout or r.stderr or "").strip()
+        if "deleted successfully" in out.lower() or "instances of" in out.lower():
+            lines.append("Killed ComfyUI python.exe via WMIC.")
+        elif out:
+            lines.append(out[:300])
+    except Exception as e:
+        lines.append(f"WMIC fallback failed: {e}")
+    return JSONResponse({"status": "ok", "output": "\n".join(lines) or "No ComfyUI processes found."})
+
+
 @app.post("/tools/disk-usage")
 async def tool_disk_usage():
     """Show disk usage for the Loom directory and DB files."""
@@ -541,10 +697,21 @@ async def dashboard():
     .spinner {{ display: inline-block; width: 14px; height: 14px; border: 2px solid #0ff; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; }}
     @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
     .terminal-input {{ width: 100%; box-sizing: border-box; font-family: 'Consolas', monospace; font-size: 12px; padding: 8px; background: #111; border: 1px solid #0ff; color: #0f6; border-radius: 4px; }}
+    .quick-links {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }}
+    .quick-link {{ padding: 8px 14px; border: 1px solid #0ff; border-radius: 6px; color: #0ff; text-decoration: none; font-size: 13px; background: rgba(0,255,255,0.05); transition: 0.2s; }}
+    .quick-link:hover {{ background: rgba(0,255,255,0.18); }}
 </style>
 </head>
 <body>
 <h1>Loom Admin</h1>
+
+<div class="quick-links">
+    <a href="https://localhost:3000" target="_blank" class="quick-link">&#127760; Main Loom (:3000)</a>
+    <a href="http://localhost:3001" target="_blank" class="quick-link">&#129514; Test Server (:3001)</a>
+    <a href="http://localhost:11434" target="_blank" class="quick-link">&#129303; Ollama (:11434)</a>
+    <a href="http://localhost:8188" target="_blank" class="quick-link">&#127912; ComfyUI (:8188)</a>
+</div>
+
 <table id="instances-table">
     <tr><th>Instance</th><th>Port</th><th>Database</th><th>PID</th><th>Actions</th></tr>
     <tbody id="instances-body">{rows}</tbody>
@@ -582,6 +749,14 @@ async def dashboard():
         <span class="icon">&#128451;</span> Model List
         <span class="label">Available models</span>
     </button>
+    <button class="tool-btn" onclick="runTool('ollama-start')">
+        <span class="icon">&#9658;</span> Start Ollama
+        <span class="label">Launch ollama serve</span>
+    </button>
+    <button class="tool-btn" onclick="confirmTool('ollama-stop', 'Kill all ollama.exe processes?')">
+        <span class="icon">&#9209;</span> Stop Ollama
+        <span class="label">Kill all ollama.exe</span>
+    </button>
     <button class="tool-btn" onclick="runTool('comfyui-status')">
         <span class="icon">&#127912;</span> ComfyUI Status
         <span class="label">Is it running?</span>
@@ -589,6 +764,14 @@ async def dashboard():
     <button class="tool-btn" onclick="runTool('comfyui-free')">
         <span class="icon">&#128165;</span> ComfyUI Free
         <span class="label">Unload models &amp; free VRAM</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('comfyui-start')">
+        <span class="icon">&#9658;</span> Start ComfyUI
+        <span class="label">Launch run_nvidia_gpu.bat</span>
+    </button>
+    <button class="tool-btn" onclick="confirmTool('comfyui-stop', 'Kill ComfyUI?')">
+        <span class="icon">&#9209;</span> Stop ComfyUI
+        <span class="label">Terminate ComfyUI process</span>
     </button>
     <button class="tool-btn" onclick="runTool('disk-usage')">
         <span class="icon">&#128190;</span> Disk Usage
@@ -731,6 +914,10 @@ async def dashboard():
 
     // Kick off first refresh shortly after load (server already SSRed initial state).
     scheduleRefresh(2000);
+
+    function confirmTool(name, msg) {{
+        if (confirm(msg)) runTool(name);
+    }}
 
     async function runTool(name) {{
         clearTimeout(refreshTimer);

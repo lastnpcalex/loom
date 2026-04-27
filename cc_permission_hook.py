@@ -93,7 +93,8 @@ def main():
     sys.stderr.write("[PERM-HOOK] Hook started\n")
     port = os.environ.get("LOOM_PORT", "3000")
     conv_id = os.environ.get("LOOM_CONV_ID", "")
-    sys.stderr.write(f"[PERM-HOOK] port={port} conv={conv_id}\n")
+    backstage_parent = os.environ.get("LOOM_BACKSTAGE_PARENT_ID", "")
+    sys.stderr.write(f"[PERM-HOOK] port={port} conv={conv_id} backstage={backstage_parent}\n")
 
     if not conv_id:
         # Not running under Loom — pass through
@@ -109,6 +110,16 @@ def main():
     # Detect provider from hook_event_name (both Claude and Gemini include this)
     event_name = request.get("hook_event_name", "PreToolUse")
     tool_name = request.get("tool_name", "")
+
+    # BACKSTAGE LOCKDOWN:
+    # If this is a backstage session, we strictly deny file-writing and shell tools.
+    # This forces the agent to use the 'loom-state-cards' MCP server instead.
+    if backstage_parent:
+        deny_list = {
+            "Write", "Edit", "NotebookEdit", "Bash", "Replace", "write_file", "run_shell_command", "replace"
+        }
+        if tool_name in deny_list:
+            deny(f"Tool {tool_name} is disabled in Backstage mode. Use the 'loom-state-cards' MCP tools to manage character and scene data.", event_name=event_name)
 
     # Auto-approve read-only tools
     if tool_name in READ_ONLY:

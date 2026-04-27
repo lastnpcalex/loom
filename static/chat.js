@@ -245,11 +245,40 @@ async function loadMessages(convId) {
     }
 }
 
+let _genStatusSpinnerTicker = null;
+let _genStatusSpinnerFrame = 0;
+const _GEN_STATUS_SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+function _startGenStatusSpinner() {
+    const spinner = document.getElementById('gen-status-spinner');
+    const dot = document.querySelector('#generation-status .gen-status-dot');
+    if (!spinner) return;
+    spinner.classList.remove('hidden');
+    if (dot) dot.classList.add('hidden');
+    if (_genStatusSpinnerTicker) clearInterval(_genStatusSpinnerTicker);
+    _genStatusSpinnerFrame = 0;
+    _genStatusSpinnerTicker = setInterval(() => {
+        spinner.textContent = _GEN_STATUS_SPINNER_FRAMES[_genStatusSpinnerFrame];
+        _genStatusSpinnerFrame = (_genStatusSpinnerFrame + 1) % _GEN_STATUS_SPINNER_FRAMES.length;
+    }, 80);
+}
+
+function _stopGenStatusSpinner() {
+    const spinner = document.getElementById('gen-status-spinner');
+    const dot = document.querySelector('#generation-status .gen-status-dot');
+    if (_genStatusSpinnerTicker) { clearInterval(_genStatusSpinnerTicker); _genStatusSpinnerTicker = null; }
+    if (spinner) { spinner.classList.add('hidden'); spinner.textContent = ''; }
+    if (dot) dot.classList.remove('hidden');
+}
+
 function showGenStatus(text, reconnecting = false) {
     const el = document.getElementById('generation-status');
     document.getElementById('gen-status-text').textContent = text;
     el.classList.toggle('reconnecting', reconnecting);
     el.classList.remove('hidden');
+    // Use the braille spinner for vision-describe status; the dot for everything else.
+    if (/^describing\b/i.test(text)) _startGenStatusSpinner();
+    else _stopGenStatusSpinner();
     scrollToBottom();
 }
 
@@ -257,6 +286,7 @@ function hideGenStatus() {
     const el = document.getElementById('generation-status');
     el.classList.add('hidden');
     el.classList.remove('reconnecting');
+    _stopGenStatusSpinner();
 }
 
 function showRetryBar(errorMsg) {
@@ -316,7 +346,19 @@ function _isOurBranch(data) {
     return true;
 }
 
+// Event types that indicate the model/runtime is actively producing output
+// or doing tool work — any of these should clear the pre-first-token
+// "still working" indicator so it never lingers when activity is visible.
+const _ACTIVITY_EVENT_TYPES = new Set([
+    'stream_chunk', 'thinking_chunk',
+    'tool_start', 'tool_input_chunk', 'tool_result', 'tool_use',
+    'permission_request', 'ask_user_question',
+    'state_update', 'compact_boundary', 'compact_summary_ready', 'compact_done',
+    'plan_ready', 'plan_landed', 'canvas_updated', 'image_describe',
+]);
+
 function handleWSMessage(data) {
+    if (_ACTIVITY_EVENT_TYPES.has(data.type)) _removeStreamWaiting();
     switch (data.type) {
         case 'context_info':
             if (!_isOurBranch(data)) break;
@@ -514,11 +556,13 @@ function handleWSMessage(data) {
 
         case 'tool_input_chunk':
             if (!State._streamIsOurBranch) break;
+            _removeStreamWaiting();
             appendToolInput(data.content, data.tool_id);
             break;
 
         case 'tool_result':
             if (!State._streamIsOurBranch) break;
+            _removeStreamWaiting();
             finalizeToolBlock(data.content, data.tool_id, data.image_url, data.is_error);
             break;
 
@@ -534,6 +578,9 @@ function handleWSMessage(data) {
                 tokEl.textContent = '↑' + _fmtTok(data.input_tokens) + ' ↓' + _fmtTok(data.output_tokens) + ' · ';
                 tokEl.dataset.hasUsage = '1';  // stop timer from overwriting with chunk count
             }
+            // If output tokens registered, work is happening — drop the
+            // pre-first-token indicator even if no chunks/tools fired yet.
+            if ((data.output_tokens || 0) > 0) _removeStreamWaiting();
             // Compaction banner removed — branch fork is the visual cue now
             break;
         }
@@ -554,6 +601,9 @@ function handleWSMessage(data) {
             break;
 
         case 'permission_request':
+            // Permission request landing means tool work is happening — drop the
+            // "still waiting for first token" indicator.
+            _removeStreamWaiting();
             // Always add to notification bell (works from any conversation)
             addPermissionNotification(data);
             // Also render inline if we're viewing the right conversation.
@@ -1482,6 +1532,18 @@ async function editQueuedMessage(msg) {
     textarea.rows = Math.max(3, msg.content.split('\n').length);
     contentEl.replaceWith(textarea);
     textarea.focus();
+    const _resizeQueuedEdit = () => {
+        const clone = textarea.cloneNode(true);
+        clone.style.position = 'absolute';
+        clone.style.visibility = 'hidden';
+        clone.style.height = 'auto';
+        clone.style.width = textarea.offsetWidth + 'px';
+        textarea.parentNode.appendChild(clone);
+        textarea.style.height = Math.min(clone.scrollHeight, 600) + 'px';
+        clone.remove();
+    };
+    textarea.addEventListener('input', _resizeQueuedEdit);
+    requestAnimationFrame(_resizeQueuedEdit);
 
     const btnRow = document.createElement('div');
     btnRow.className = 'edit-message-actions';
@@ -3066,6 +3128,20 @@ function editMessage(msgId) {
     textarea.rows = Math.max(3, msg.content.split('\n').length);
     contentEl.replaceWith(textarea);
     textarea.focus();
+    // Auto-grow as the user types/pastes — clone-measure to avoid flex flicker.
+    const _resizeEditTextarea = () => {
+        const clone = textarea.cloneNode(true);
+        clone.style.position = 'absolute';
+        clone.style.visibility = 'hidden';
+        clone.style.height = 'auto';
+        clone.style.width = textarea.offsetWidth + 'px';
+        textarea.parentNode.appendChild(clone);
+        textarea.style.height = Math.min(clone.scrollHeight, 600) + 'px';
+        clone.remove();
+    };
+    textarea.addEventListener('input', _resizeEditTextarea);
+    // Defer once so the textarea is laid out before we measure.
+    requestAnimationFrame(_resizeEditTextarea);
 
     // File preview area (above buttons)
     const filePreview = document.createElement('div');
@@ -3097,7 +3173,7 @@ function editMessage(msgId) {
     describeRow.className = 'edit-describe-context hidden';
     describeRow.innerHTML = `
         <label title="Extra focus for vision model image description — not sent to chat model">Describe focus</label>
-        <input type="text" class="edit-describe-input" placeholder="e.g. focus on body language and composition" autocomplete="off" spellcheck="false" value="${escapeHtml(msg.describe_context || '')}">
+        <textarea class="edit-describe-input" rows="2" placeholder="e.g. focus on body language and composition" autocomplete="off" spellcheck="false">${escapeHtml(msg.describe_context || '')}</textarea>
     `;
     filePreview.after(describeRow);
 
@@ -3120,7 +3196,7 @@ function editMessage(msgId) {
     const pillHtml = isWeave ? `<div class="branch-count-pill pill-compact" title="Branches to generate (click to cycle)"><span class="branch-count-icon">⑂</span><span class="branch-count-value">${State.branchCount}</span></div>` : '';
     btnRow.innerHTML = `
         <label class="btn-small edit-attach" title="Attach file(s) — you can also paste or drop files onto the textarea">
-            <input type="file" class="edit-file-input" accept="image/*,.md,.txt,.pdf,.json,.csv,.py,.js,.ts,.html,.css" multiple hidden>
+            <input type="file" class="edit-file-input" multiple hidden>
             📎
         </label>
         <button class="btn-small edit-save" title="Send as new branch (Shift+Enter)">Send as new branch</button>

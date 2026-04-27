@@ -333,10 +333,13 @@ async def _ensure_ollama():
 
     print(f"[STARTUP] Ollama not responding — launching: {ollama_path} serve")
     try:
+        env = os.environ.copy()
+        env["OLLAMA_KV_CACHE_TYPE"] = env.get("OLLAMA_KV_CACHE_TYPE", "q8_0")
         subprocess.Popen(
             [ollama_path, "serve"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=env,
             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -2272,7 +2275,10 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                     snap = _generation_snapshots.pop(key, None)
                     if snap and snap.get("draft_msg_id"):
                         msg = await db.get_message(snap["draft_msg_id"])
-                        if msg and not (msg.get("content") or "").strip():
+                        # Only delete if it's completely empty AND has no content blocks (like tool calls)
+                        has_content = (msg.get("content") or "").strip()
+                        has_blocks = (msg.get("content_blocks") or "").strip() not in ("", "[]")
+                        if msg and not has_content and not has_blocks:
                             await db.delete_branch(snap["draft_msg_id"])
                 # Send cancelled event immediately so UI responds
                 await _ws_send(conv_id, {"type": "cancelled"})
@@ -3127,6 +3133,7 @@ async def _handle_claude_generation(
                     permission_mode=cc_permission_mode,
                     resume_session_id=resume_session_id if use_resume else None,
                     fork_session=fork_session,
+                    backstage_parent_id=conv.get("backstage_parent_id"),
                 )
             else:
                 proc, event_stream = await claude_client.run_claude(

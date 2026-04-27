@@ -2797,6 +2797,15 @@ body::after {
     text-shadow: 0 0 6px var(--cyan);
 }
 
+#gen-status-spinner {
+    font-family: monospace;
+    color: var(--cyan);
+    text-shadow: 0 0 6px var(--cyan);
+    margin-right: 4px;
+    display: inline-block;
+    min-width: 1ch;
+}
+
 /* ── Input Area ── */
 #input-area {
     flex-shrink: 0;
@@ -2897,7 +2906,7 @@ body::after {
 
 #describe-context-bar {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 8px;
     margin-bottom: 4px;
     padding: 4px 8px;
@@ -2910,6 +2919,7 @@ body::after {
     color: var(--text-muted);
     white-space: nowrap;
     cursor: help;
+    padding-top: 6px;
 }
 #describe-context {
     flex: 1;
@@ -2917,9 +2927,13 @@ body::after {
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     color: var(--text-primary);
+    font-family: inherit;
     font-size: 12px;
     padding: 4px 8px;
     outline: none;
+    resize: vertical;
+    min-height: 2.4em;
+    line-height: 1.4;
 }
 #describe-context:focus {
     border-color: var(--cyan);
@@ -2930,7 +2944,7 @@ body::after {
 }
 .edit-describe-context {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 8px;
     margin: 4px 0;
 }
@@ -2939,6 +2953,7 @@ body::after {
     color: var(--text-muted);
     white-space: nowrap;
     cursor: help;
+    padding-top: 6px;
 }
 .edit-describe-input {
     flex: 1;
@@ -2946,9 +2961,13 @@ body::after {
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     color: var(--text-primary);
+    font-family: inherit;
     font-size: 12px;
     padding: 4px 8px;
     outline: none;
+    resize: vertical;
+    min-height: 2.4em;
+    line-height: 1.4;
 }
 .edit-describe-input:focus {
     border-color: var(--cyan);
@@ -2981,7 +3000,7 @@ body::after {
     max-height: 60px;
     max-width: 80px;
     border-radius: var(--radius-sm);
-    object-fit: cover;
+    object-fit: contain;
     display: block;
 }
 

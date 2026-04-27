@@ -81,15 +81,31 @@ async def read_compact_summary(session_id: str, timeout_sec: float = 8.0) -> str
         delay = min(delay * 1.5, 1.0)
 
 
-def _process_event(raw: dict) -> list[dict]:
+def _process_event(raw: dict, state: dict | None = None) -> list[dict]:
     """Process a raw CC stream-json event and return simplified event dicts.
 
-    CC's stream-json format emits top-level NDJSON events:
+    With --include-partial-messages, CC emits incremental Anthropic SSE-style
+    `stream_event` records (content_block_start/_delta/_stop, message_delta,
+    etc.) AS the response is being generated, plus a final `assistant` event
+    at end-of-turn with the assembled content. We stream from the SSE deltas
+    and skip content emission from `assistant` to avoid duplication.
+
+    The `state` dict carries per-stream context across calls — primarily a
+    map of content_block index -> {type, name, tool_id, input_json} so we
+    can finalize tool calls (AskUserQuestion / ExitPlanMode) when their
+    accumulated input JSON parses on content_block_stop.
+
+    Top-level NDJSON events handled:
       - system: session info (session_id, cwd, model, tools)
-      - assistant: full message with content blocks (text, tool_use, thinking)
-      - tool_result: tool output
+      - stream_event: SSE-style incremental deltas (partial messages)
+      - assistant: end-of-turn message; usage extracted, content suppressed
+      - user / tool_result: tool output
       - result: turn complete (duration, final text)
     """
+    if state is None:
+        state = {}
+    blocks = state.setdefault("blocks", {})
+
     events = []
     etype = raw.get("type", "")
 
@@ -121,58 +137,94 @@ def _process_event(raw: dict) -> list[dict]:
                 "model": raw.get("model", ""),
             })
 
-    elif etype == "assistant":
-        message = raw.get("message", {})
-        content = message.get("content", [])
+    elif etype == "stream_event":
+        # Anthropic SSE-style partial-message events. Map deltas to our
+        # streaming events; track per-block state so tool input JSON can
+        # be reassembled and parsed at content_block_stop.
+        ev = raw.get("event", {})
+        evt_type = ev.get("type", "")
 
-        # content can be a string or a list of blocks
-        if isinstance(content, str):
-            if content:
-                events.append({"type": "text_delta", "text": content})
-        elif isinstance(content, list):
-            for block in content:
-                btype = block.get("type", "")
-                if btype == "text":
-                    text = block.get("text", "")
-                    if text:
-                        events.append({"type": "text_delta", "text": text})
-                elif btype == "tool_use":
-                    tool_id = block.get("id", "")
-                    tool_name = block.get("name", "")
-                    input_data = block.get("input", {})
+        if evt_type == "content_block_start":
+            idx = ev.get("index", 0)
+            block = ev.get("content_block", {})
+            btype = block.get("type", "")
+            if btype == "text":
+                blocks[idx] = {"type": "text"}
+            elif btype == "thinking":
+                blocks[idx] = {"type": "thinking"}
+            elif btype == "tool_use":
+                tool_id = block.get("id", "")
+                tool_name = block.get("name", "")
+                blocks[idx] = {
+                    "type": "tool_use",
+                    "tool_id": tool_id,
+                    "name": tool_name,
+                    "input_json": "",
+                }
+                events.append({
+                    "type": "tool_start",
+                    "name": tool_name,
+                    "tool_id": tool_id,
+                })
 
+        elif evt_type == "content_block_delta":
+            idx = ev.get("index", 0)
+            delta = ev.get("delta", {})
+            dtype = delta.get("type", "")
+            blk = blocks.get(idx) or {}
+            if dtype == "text_delta":
+                txt = delta.get("text", "")
+                if txt:
+                    events.append({"type": "text_delta", "text": txt})
+            elif dtype == "thinking_delta":
+                thinking = delta.get("thinking", "")
+                if thinking:
+                    events.append({"type": "thinking_delta", "text": thinking})
+            elif dtype == "input_json_delta":
+                pj = delta.get("partial_json", "")
+                if blk.get("type") == "tool_use":
+                    blk["input_json"] = blk.get("input_json", "") + pj
+                events.append({
+                    "type": "tool_input_delta",
+                    "json": pj,
+                    "tool_id": blk.get("tool_id", ""),
+                })
+
+        elif evt_type == "content_block_stop":
+            idx = ev.get("index", 0)
+            blk = blocks.get(idx) or {}
+            if blk.get("type") == "tool_use":
+                # Parse the accumulated input JSON for interactive tools.
+                try:
+                    input_data = json.loads(blk.get("input_json", "") or "{}")
+                except Exception:
+                    input_data = {}
+                tool_name = blk.get("name", "")
+                tool_id = blk.get("tool_id", "")
+                if tool_name == "AskUserQuestion" and isinstance(input_data, dict):
                     events.append({
-                        "type": "tool_start",
-                        "name": tool_name,
+                        "type": "ask_user_question",
+                        "questions": input_data.get("questions", []),
                         "tool_id": tool_id,
                     })
-                    if input_data:
-                        events.append({
-                            "type": "tool_input_delta",
-                            "json": json.dumps(input_data, indent=2),
-                            "tool_id": tool_id,
-                        })
+                elif tool_name == "ExitPlanMode" and isinstance(input_data, dict):
+                    events.append({
+                        "type": "plan_ready",
+                        "plan": input_data.get("plan", ""),
+                        "plan_file": input_data.get("planFilePath", ""),
+                        "tool_id": tool_id,
+                    })
+            blocks.pop(idx, None)
 
-                    # Emit structured events for interactive tools
-                    if tool_name == "AskUserQuestion" and isinstance(input_data, dict):
-                        events.append({
-                            "type": "ask_user_question",
-                            "questions": input_data.get("questions", []),
-                            "tool_id": tool_id,
-                        })
-                    elif tool_name == "ExitPlanMode" and isinstance(input_data, dict):
-                        events.append({
-                            "type": "plan_ready",
-                            "plan": input_data.get("plan", ""),
-                            "plan_file": input_data.get("planFilePath", ""),
-                            "tool_id": tool_id,
-                        })
-                elif btype == "thinking":
-                    thinking = block.get("thinking", "")
-                    if thinking:
-                        events.append({"type": "thinking_delta", "text": thinking})
+        # message_start / message_delta / message_stop carry usage and
+        # stop_reason; we extract canonical usage from the assistant event
+        # below to avoid double-counting in server.py's running totals.
 
-        # Extract usage if present
+    elif etype == "assistant":
+        # With --include-partial-messages, content has already streamed via
+        # stream_event deltas. Suppress content emission here. Still emit
+        # usage so server.py's per-turn totals get the canonical numbers.
+        message = raw.get("message", {})
         usage = message.get("usage", {})
         if usage:
             # input_tokens only counts non-cached tokens; add cache reads for the true total
@@ -351,8 +403,15 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         ]
     cc_args = ["-p", prompt,
                "--output-format", "stream-json",
+               "--include-partial-messages",
                "--verbose",
                "--disallowedTools", ",".join(disallowed_list)]
+
+    # Detect protocol (HTTPS if certs exist). Resolve relative to this script
+    # — the server's cwd may differ from the project root (e.g. worktree),
+    # which silently flips this to http:// and breaks the backstage MCP.
+    _certs_dir = Path(__file__).parent / "certs"
+    protocol = "https" if (_certs_dir / "cert.pem").exists() and (_certs_dir / "key.pem").exists() else "http"
 
     # Backstage: inject the state-cards MCP server scoped to the parent conv.
     # Inline JSON config — no temp file needed. The subprocess receives
@@ -366,7 +425,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                     "command": sys.executable,
                     "args": [mcp_script],
                     "env": {
-                        "LOOM_API_URL": f"http://127.0.0.1:{server_port}",
+                        "LOOM_API_URL": f"{protocol}://127.0.0.1:{server_port}",
                         "LOOM_BACKSTAGE_PARENT_ID": str(backstage_parent_id),
                     },
                 }
@@ -395,6 +454,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # Pass Loom connection info to the hook script via env vars
     env = {**os.environ}
     env["LOOM_CONV_ID"] = str(conv_id)
+    if backstage_parent_id:
+        env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
     env["LOOM_PORT"] = str(server_port)
     # Explicitly control CLAUDECODE so the launch method matches use_ollama.
     # When True: ollama launch claude needs CLAUDECODE=1 in its subprocess.
@@ -461,6 +522,9 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     asyncio.create_task(_read_stderr())
 
     async def _event_stream():
+        # Per-stream state carried across _process_event calls — content_block
+        # index map for assembling tool input JSON across deltas, etc.
+        stream_state: dict = {}
         async for line in proc.stdout:
             line = line.strip()
             if not line:
@@ -472,9 +536,11 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                 continue
 
             rtype = raw.get("type", "?")
-            print(f"[CC] event: {rtype}")
+            # stream_event fires per-token, suppress to keep logs readable
+            if rtype != "stream_event":
+                print(f"[CC] event: {rtype}")
 
-            for evt in _process_event(raw):
+            for evt in _process_event(raw, stream_state):
                 yield evt
 
             # `result` is the final event — stop reading so we don't hang

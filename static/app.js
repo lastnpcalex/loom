@@ -2297,8 +2297,13 @@ function setupEventListeners() {
 
     // Send message
     document.getElementById('btn-send').addEventListener('click', sendMessage);
+    
+    // A device is only considered "mobile" if it lacks a precise pointing device (mouse/trackpad)
+    const hasMouse = window.matchMedia('(any-pointer: fine)').matches;
     const isMobile = window.matchMedia('(pointer: coarse)').matches
-        && window.matchMedia('(max-width: 768px)').matches;
+        && window.matchMedia('(max-width: 768px)').matches
+        && !hasMouse;
+        
     document.getElementById('user-input').addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
             if (isMobile) return; // mobile: Enter = newline, use send button

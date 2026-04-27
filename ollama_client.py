@@ -19,8 +19,9 @@ _ollama_lock = asyncio.Lock()
 # Keep models resident in VRAM between turns so llama.cpp's prefix cache
 # hits on the shared prompt prefix. Ollama accepts durations ("30m") or
 # -1 for indefinite; 0 unloads immediately.
-KEEP_ALIVE_CHAT = "30m"
-KEEP_ALIVE_VISION = "5m"
+# Per-request keep_alive intentionally omitted from chat/vision payloads —
+# Ollama uses the OLLAMA_KEEP_ALIVE env var. Model eviction on swap is
+# handled explicitly by _prepare_model -> _unload_model below.
 
 # Tracks the model Ollama is currently holding resident so we can unload
 # it before loading a different one (avoids VRAM thrash when /describe
@@ -210,8 +211,8 @@ async def stream_chat(messages: list[dict],
             "model": target_model,
             "messages": _build_ollama_messages(messages),
             "stream": True,
-            "keep_alive": KEEP_ALIVE_CHAT,
             "options": {
+                "kv_cache_type": "q8_0",
                 "temperature": temperature or config.temperature,
                 "top_p": top_p or config.top_p,
                 "num_predict": num_predict,
@@ -285,8 +286,8 @@ async def sync_chat(messages: list[dict],
             "model": target_model,
             "messages": _build_ollama_messages(messages),
             "stream": False,
-            "keep_alive": KEEP_ALIVE_CHAT,
             "options": {
+                "kv_cache_type": "q8_0",
                 "temperature": temperature or config.temperature,
                 "num_predict": max_tokens or config.max_tokens,
             },
@@ -334,8 +335,8 @@ async def describe_image(image_path: str, model: str = None, context: str = None
             ],
             "stream": False,
             "think": False,  # Disable thinking to avoid vision output routing bug
-            "keep_alive": KEEP_ALIVE_VISION,
             "options": {
+                "kv_cache_type": "q8_0",
                 "temperature": 0.3,
                 "num_predict": 800,
             },
@@ -417,8 +418,8 @@ async def describe_image_with_data(image_path: str, model: str = None, context: 
             ],
             "stream": False,
             "think": False,
-            "keep_alive": KEEP_ALIVE_VISION,
             "options": {
+                "kv_cache_type": "q8_0",
                 "temperature": 0.3,
                 "num_predict": 800,
             },

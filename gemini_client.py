@@ -68,7 +68,7 @@ def _process_event(raw: dict) -> list[dict]:
     return events
 
 
-def _configure_permission_hook(cwd: str):
+def _configure_permission_hook(cwd: str, backstage_parent_id: int | None = None, server_port: int = 8000):
     """Configure BeforeTool hook + trust entry so Gemini CLI calls our permission hook."""
     gemini_dir = Path(cwd) / ".gemini"
     gemini_dir.mkdir(parents=True, exist_ok=True)
@@ -93,6 +93,12 @@ def _configure_permission_hook(cwd: str):
         }
     ]
 
+    # Detect protocol (HTTPS if certs exist). Resolve relative to this script
+    # — the server's cwd may differ from the project root (e.g. worktree),
+    # which silently flips this to http:// and breaks the backstage MCP.
+    _certs_dir = Path(__file__).parent / "certs"
+    protocol = "https" if (_certs_dir / "cert.pem").exists() and (_certs_dir / "key.pem").exists() else "http"
+
     # Write project-level settings.json (the one Gemini actually reads)
     settings_path = gemini_dir / "settings.json"
     existing = {}
@@ -101,6 +107,19 @@ def _configure_permission_hook(cwd: str):
         except: existing = {}
 
     existing["hooks"] = {"BeforeTool": hook_def}
+    
+    # Backstage: Inject MCP server for state cards
+    if backstage_parent_id:
+        existing["mcpServers"] = existing.get("mcpServers", {})
+        existing["mcpServers"]["loom-state-cards"] = {
+            "command": python_exe,
+            "args": [str(Path(__file__).parent / "mcp_state_cards.py")],
+            "env": {
+                "LOOM_API_URL": f"{protocol}://127.0.0.1:{server_port}",
+                "LOOM_BACKSTAGE_PARENT_ID": str(backstage_parent_id)
+            }
+        }
+    
     settings_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
     log.info(f"[GEMINI] Hook configured: {settings_path}")
 
@@ -148,8 +167,9 @@ def _ensure_hook_trusted(cwd: str, hook_command: str):
 async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
                      model: str = "sonnet", effort: str = "high",
                      permission_mode: str = "default",
-                     resume_session_id: str = None, fork_session: bool = False):
-    _configure_permission_hook(cwd)
+                     resume_session_id: str = None, fork_session: bool = False,
+                     backstage_parent_id: int | None = None):
+    _configure_permission_hook(cwd, backstage_parent_id, server_port)
 
     # Use YOLO mode to ensure tools are visible in headless mode.
     # Security is enforced by our hook script which fires even in YOLO mode.
@@ -160,10 +180,40 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     ]
     if resume_session_id:
         cc_args.extend(["--resume", resume_session_id])
+
+    # Backstage Lockdown: Use temporary policy to block file/shell tools
+    if backstage_parent_id:
+        policy_path = Path(cwd) / ".gemini" / "backstage_policy.toml"
+        policy_content = """
+[[rule]]
+toolName = "*"
+decision = "deny"
+priority = 0
+
+[[rule]]
+mcpServerName = "loom-state-cards"
+decision = "allow"
+priority = 1000
+
+[[rule]]
+toolName = "list_directory"
+decision = "allow"
+priority = 1000
+
+[[rule]]
+toolName = "read_file"
+decision = "allow"
+priority = 1000
+"""
+        policy_path.write_text(policy_content.strip(), encoding="utf-8")
+        cc_args.extend(["--policy", str(policy_path)])
+        cc_args.extend(["--allowed-mcp-server-names", "loom-state-cards"])
     
     gemini_exe = "gemini.cmd" if sys.platform == "win32" else "gemini"
 
     env = {**os.environ, "LOOM_CONV_ID": str(conv_id), "LOOM_PORT": str(server_port)}
+    if backstage_parent_id:
+        env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
 
     # Always pipe prompt via stdin on Windows — newlines in command-line args
     # get mangled by CreateProcess, causing Gemini to see only the first line.
