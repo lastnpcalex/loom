@@ -2482,9 +2482,11 @@ async function attachImage(file) {
 // Paste handler is registered in setupEventListeners via handleImagePaste
 
 async function handleImageSelect(e) {
-    const file = e.target.files[0];
-    if (!file) return;
-    await attachImage(file);
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+    for (const file of files) {
+        await attachImage(file);
+    }
     e.target.value = '';
 }
 

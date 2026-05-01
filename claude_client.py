@@ -236,6 +236,16 @@ def _process_event(raw: dict, state: dict | None = None) -> list[dict]:
                 "input_tokens": input_tok,
                 "output_tokens": usage.get("output_tokens", 0),
             })
+        # Detect CC-synthesized error messages (e.g. rate-limit 429s). CC
+        # fabricates these client-side and the wording — "monthly usage limit"
+        # for an hourly trip — is unreliable. Surface the diagnostic fields so
+        # server.py can annotate the saved message instead of trusting the text.
+        if message.get("model") == "<synthetic>" and raw.get("isApiErrorMessage"):
+            events.append({
+                "type": "cc_synthetic_error",
+                "error": raw.get("error", ""),
+                "status": raw.get("apiErrorStatus"),
+            })
 
     elif etype == "tool_result":
         content = raw.get("content", "")
@@ -291,7 +301,14 @@ def _process_event(raw: dict, state: dict | None = None) -> list[dict]:
         })
 
     elif etype == "rate_limit_event":
-        pass  # Ignore rate limit events silently
+        # Forward rate-limit details so server can surface accurate window/reset
+        # info instead of trusting CC's verbatim error wording (which has
+        # mislabeled hourly trips as "monthly").
+        log.info("CC rate_limit_event: %s", json.dumps(raw, default=str)[:1000])
+        events.append({
+            "type": "rate_limit",
+            "data": {k: v for k, v in raw.items() if k != "type"},
+        })
 
     else:
         # Forward unknown events for debugging
