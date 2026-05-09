@@ -1576,6 +1576,12 @@ _TEXT_EXTS = {
     ".tex",
     ".r",
     ".sql",
+    ".docx",
+    ".doc",
+    ".xlsx",
+    ".xls",
+    ".pptx",
+    ".ppt",
 }
 _ALLOWED_EXTS = _IMAGE_EXTS | _TEXT_EXTS
 
@@ -3165,6 +3171,8 @@ async def _handle_claude_generation(
         # Initialize accumulation vars before try so error handlers can reference them
         full_text = ""
         content_blocks = []
+        new_session_id = ""
+        actual_model = ""
 
         # Launch CC — with resume if available, with fallback on failure
         try:
@@ -3949,13 +3957,18 @@ async def _handle_claude_generation(
     except asyncio.CancelledError:
         _active_claude_procs.pop(conv_id, None)
         if draft_msg_id and (full_text or content_blocks):
-            # Save accumulated work to draft before cancelling
+            # Save accumulated work to draft before cancelling.
+            # Persist cc_session_id so the next turn's --resume walk finds this
+            # draft instead of skipping back past the cancelled prompt (which
+            # would cause amnesia + force a full-history rebuild).
             await db.update_message_content(
                 draft_msg_id,
                 content=full_text,
                 content_blocks=json.dumps(content_blocks) if content_blocks else None,
+                cc_session_id=new_session_id or None,
+                cc_model_used=(actual_model or cc_model) if (actual_model or cc_model) else None,
             )
-            print(f"[GEN] Saved partial draft {draft_msg_id} on cancel")
+            print(f"[GEN] Saved partial draft {draft_msg_id} on cancel (session={new_session_id or 'none'})")
         elif draft_msg_id:
             # No content produced — delete empty draft to avoid phantoms
             await db.delete_branch(draft_msg_id)

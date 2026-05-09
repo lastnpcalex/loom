@@ -174,9 +174,12 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # Use YOLO mode to ensure tools are visible in headless mode.
     # Security is enforced by our hook script which fires even in YOLO mode.
     cc_args = [
-        "--model", model, 
-        "--output-format", "stream-json", 
-        "--approval-mode", "yolo"
+        "--model", model,
+        "--output-format", "stream-json",
+        "--approval-mode", "yolo",
+        # Gemini CLI's "trusted folders" check otherwise overrides yolo back to
+        # default and aborts headless runs from arbitrary cwds.
+        "--skip-trust",
     ]
     if resume_session_id:
         cc_args.extend(["--resume", resume_session_id])
@@ -211,7 +214,13 @@ priority = 1000
     
     gemini_exe = "gemini.cmd" if sys.platform == "win32" else "gemini"
 
-    env = {**os.environ, "LOOM_CONV_ID": str(conv_id), "LOOM_PORT": str(server_port)}
+    env = {
+        **os.environ,
+        "LOOM_CONV_ID": str(conv_id),
+        "LOOM_PORT": str(server_port),
+        # Belt-and-suspenders for older Gemini CLI builds that ignore --skip-trust.
+        "GEMINI_CLI_TRUST_WORKSPACE": "true",
+    }
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
 
@@ -235,10 +244,16 @@ priority = 1000
         limit=16 * 1024 * 1024
     )
 
-    # Feed prompt via stdin if needed
+    # Feed prompt via stdin if needed in a background task to prevent pipe deadlocks
     if use_stdin and proc.stdin:
-        proc.stdin.write(prompt.encode("utf-8"))
-        proc.stdin.close()
+        async def _feed_stdin():
+            try:
+                proc.stdin.write(prompt.encode("utf-8"))
+                await proc.stdin.drain()
+                proc.stdin.close()
+            except Exception as e:
+                log.error(f"[GEMINI] Error feeding stdin: {e}")
+        asyncio.create_task(_feed_stdin())
 
     async def _read_stderr():
         async for line in proc.stderr:

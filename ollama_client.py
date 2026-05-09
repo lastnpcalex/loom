@@ -249,13 +249,16 @@ async def stream_chat(messages: list[dict],
                         msg = chunk.get("message", {})
                         thinking = msg.get("thinking", "")
                         token = msg.get("content", "")
-                        if thinking and not _was_thinking:
-                            _was_thinking = True
-                            yield {"type": "thinking_start"}
-                        if token and _was_thinking:
-                            _was_thinking = False
-                            yield {"type": "thinking_end"}
+                        if thinking:
+                            if not _was_thinking:
+                                _was_thinking = True
+                                yield {"type": "thinking_start"}
+                            yield thinking
+                        
                         if token:
+                            if _was_thinking:
+                                _was_thinking = False
+                                yield {"type": "thinking_end"}
                             _content_tokens += 1
                             yield token
                             # Enforce response token limit (thinking doesn't count)

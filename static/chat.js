@@ -585,6 +585,24 @@ function handleWSMessage(data) {
             break;
         }
 
+        case 'rate_limit_info': {
+            const rd = data.data || {};
+            let delayStr = '';
+            if (rd.retry_after_seconds) delayStr = ` (retry in ${rd.retry_after_seconds}s)`;
+            else if (rd.retry_delay_ms) delayStr = ` (retry in ${Math.round(rd.retry_delay_ms / 1000)}s)`;
+            else if (rd.resets_at) {
+                const diff = Math.round((new Date(rd.resets_at) - new Date()) / 1000);
+                if (diff > 0) delayStr = ` (retry in ${diff}s)`;
+            }
+            const note = `Rate limit hit — waiting on API${delayStr}`;
+            showToast(note, 'error');
+            if (State._streamIsOurBranch && streamingDiv) {
+                const waitEl = streamingDiv.querySelector('.generating-placeholder');
+                if (waitEl) waitEl.innerHTML = '<span class="thinking-dots"></span> ' + escapeHtml(note);
+            }
+            break;
+        }
+
         case 'ask_user_question':
             renderAskUserQuestion(data.questions, data.tool_id);
             break;
@@ -2989,11 +3007,11 @@ function appendToolBlock(name, toolId, isOoda) {
     }
     const contentEl = streamingDiv.querySelector('.message-content');
     const block = document.createElement('div');
-    block.className = 'tool-block' + (isOoda ? ' ooda-block' : '');
+    block.className = 'tool-block expanded' + (isOoda ? ' ooda-block' : '');
     block.dataset.toolId = toolId;
     block.innerHTML = '<div class="tool-block-header">' +
         '<span class="tool-name">' + escapeHtml(name) + '</span>' +
-        '<span class="tool-toggle">&#9656;</span>' +
+        '<span class="tool-toggle">&#9662;</span>' +
         '</div>' +
         '<div class="tool-block-body">' +
         '<div class="tool-block-input"></div>' +
@@ -3076,8 +3094,9 @@ function appendThinkingChunk(text) {
     if (!streamingDiv) return;
     _removeStreamWaiting();
     const contentEl = streamingDiv.querySelector('.message-content');
-    let thinkingEl = contentEl.querySelector('.cc-thinking');
-    if (!thinkingEl) {
+    // Find the LAST thinking block (if multiple exist) or create one if the last element isn't a thinking block
+    let thinkingEl = contentEl.lastElementChild;
+    if (!thinkingEl || !thinkingEl.classList.contains('cc-thinking')) {
         thinkingEl = document.createElement('div');
         thinkingEl.className = 'cc-thinking';
         thinkingEl.innerHTML = '<div class="cc-thinking-toggle">Thinking...</div>' +
@@ -3362,6 +3381,7 @@ async function refreshTree() {
     if (!State.currentConvId) return;
     try {
         State.treeData = await API.get(`/api/conversations/${State.currentConvId}/tree`);
+        if (typeof TREE !== 'undefined') TREE._skipCenter = true;
         renderTree();
     } catch {
         // Silently fail
