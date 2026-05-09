@@ -27,6 +27,26 @@ import uvicorn
 import httpx
 import io
 
+# Import the same Config the main server uses, so admin spawns Ollama / vLLM
+# with whatever the operator has saved in config.json. Falls back gracefully
+# if the import fails (admin still works, just without config-driven tuning).
+try:
+    from config import config as _loom_config
+except Exception as _cfg_err:
+    print(f"[ADMIN] Could not import Loom config ({_cfg_err}); using env-only defaults")
+    _loom_config = None
+
+
+def _reload_config():
+    """Re-read config.json so admin always sees the operator's latest tuning,
+    even if the main server wrote it after admin started."""
+    if _loom_config is not None:
+        try:
+            _loom_config.load()
+        except Exception as e:
+            print(f"[ADMIN] config reload failed: {e}")
+
+
 ADMIN_PORT = int(os.getenv("ADMIN_PORT", "3002"))
 
 # Known Loom instances to monitor
@@ -395,12 +415,128 @@ COMFYUI_LAUNCH_CMD = os.getenv(
     r'"C:\Users\exast\Downloads\ComfyUI_windows_portable_nvidia\ComfyUI_windows_portable\run_nvidia_gpu.bat"',
 )
 
+VLLM_PORT = int(os.getenv("VLLM_PORT", "8000"))
+
+
+def _build_ollama_env(env: dict) -> dict:
+    """Apply operator-tuned Ollama env vars from config.json on top of inherited env.
+    Existing env entries win so users can still pin via shell."""
+    if _loom_config is None:
+        # No config import — keep historical hardcoded defaults so admin still works.
+        env.setdefault("OLLAMA_KV_CACHE_TYPE", "q8_0")
+        env.setdefault("OLLAMA_FLASH_ATTENTION", "1")
+        env.setdefault("OLLAMA_KEEP_ALIVE", "30m")
+        return env
+    cfg = _loom_config
+    env.setdefault("OLLAMA_KV_CACHE_TYPE", cfg.ollama_kv_cache_type)
+    env.setdefault("OLLAMA_FLASH_ATTENTION", "1" if cfg.ollama_flash_attention else "0")
+    env.setdefault("OLLAMA_KEEP_ALIVE", cfg.ollama_keep_alive)
+    env.setdefault("OLLAMA_NUM_PARALLEL", str(cfg.ollama_num_parallel))
+    env.setdefault("OLLAMA_MAX_LOADED_MODELS", str(cfg.ollama_max_loaded_models))
+    env.setdefault("OLLAMA_CONTEXT_LENGTH", str(cfg.ollama_context_length))
+    return env
+
+
+def _build_vllm_cmd() -> str:
+    """Build the `vllm serve ...` command from saved config. Returns empty string
+    if no model is configured (caller must surface a friendly error)."""
+    # Operator can still hard-override the entire command via env.
+    override = os.getenv("VLLM_LAUNCH_CMD")
+    if override:
+        return override
+
+    model = (os.getenv("VLLM_MODEL") or
+             (_loom_config.vllm_model if _loom_config else "")).strip()
+    if not model:
+        return ""
+
+    # Pick which vllm binary to invoke. The config field is named "python path"
+    # for UX clarity, but vllm has no __main__ — we actually invoke vllm.exe
+    # from the same Scripts dir. If the operator pointed at python.exe, swap
+    # to the sibling vllm.exe; if they passed vllm.exe directly, use as-is;
+    # if empty, fall back to `vllm` on PATH.
+    vllm_py = (_loom_config.vllm_python_path if _loom_config else "").strip()
+    if vllm_py:
+        if vllm_py.lower().endswith("python.exe") or vllm_py.lower().endswith("python"):
+            vllm_exe = vllm_py.rsplit("/", 1)[0].rsplit("\\", 1)[0] + "/vllm.exe"
+        else:
+            vllm_exe = vllm_py
+        cmd_head = f'"{vllm_exe}" serve {model}'
+    else:
+        cmd_head = f"vllm serve {model}"
+    parts = [cmd_head, f"--port {VLLM_PORT}"]
+
+    if _loom_config is not None:
+        cfg = _loom_config
+        # vLLM accepts multiple --served-model-name values, so we register both:
+        #   1. The full HF id (so Weave/OODA dropdowns show a meaningful name)
+        #   2. The slash-free alias (so Claude Code can use it — CC chokes on "/")
+        # Both route to the same loaded model. Order matters for /v1/models —
+        # the FIRST name becomes the canonical id; we put the alias first so
+        # vllm-* prefix detection in the dispatcher stays predictable.
+        served_names = []
+        if cfg.vllm_served_name:
+            served_names.append(cfg.vllm_served_name)
+        if model and model not in served_names:
+            served_names.append(model)
+        if served_names:
+            parts.append("--served-model-name " + " ".join(served_names))
+        if cfg.vllm_quantization and cfg.vllm_quantization != "none":
+            parts.append(f"--quantization {cfg.vllm_quantization}")
+        if cfg.vllm_kv_cache_dtype and cfg.vllm_kv_cache_dtype != "auto":
+            parts.append(f"--kv-cache-dtype {cfg.vllm_kv_cache_dtype}")
+        parts.append(f"--max-model-len {cfg.vllm_max_model_len}")
+        parts.append(f"--gpu-memory-utilization {cfg.vllm_gpu_memory_utilization}")
+        parts.append(f"--max-num-seqs {cfg.vllm_max_num_seqs}")
+        if cfg.vllm_tensor_parallel_size > 1:
+            parts.append(f"--tensor-parallel-size {cfg.vllm_tensor_parallel_size}")
+        if cfg.vllm_enable_auto_tool_choice:
+            parts.append("--enable-auto-tool-choice")
+        if cfg.vllm_tool_call_parser and cfg.vllm_tool_call_parser != "none":
+            parts.append(f"--tool-call-parser {cfg.vllm_tool_call_parser}")
+        # Reasoning parser — required for Qwen3.6 thinking blocks + MTP.
+        if cfg.vllm_reasoning_parser and cfg.vllm_reasoning_parser != "none":
+            parts.append(f"--reasoning-parser {cfg.vllm_reasoning_parser}")
+        # Speculative / MTP config — passed verbatim. JSON gets quoted so the
+        # shell doesn't choke on the {} braces and embedded quotes.
+        spec = cfg.vllm_speculative_config.strip()
+        if spec:
+            spec_quoted = spec.replace('"', r'\"')
+            parts.append(f'--speculative-config "{spec_quoted}"')
+        # Override the chat template's enable_thinking default — Qwen3.6's
+        # template defaults to on, which produces multi-thousand-token reasoning
+        # prefixes before any text. Off here means CC requests get fast text;
+        # users opt in per-conv via chat_template_kwargs in their request.
+        thinking = "true" if cfg.vllm_thinking_default else "false"
+        parts.append(f'--default-chat-template-kwargs "{{\\"enable_thinking\\": {thinking}}}"')
+        if cfg.vllm_extra_args.strip():
+            parts.append(cfg.vllm_extra_args.strip())
+    else:
+        # Fallback when config isn't importable
+        extra = os.getenv("VLLM_EXTRA_ARGS",
+            "--quantization compressed-tensors --kv-cache-dtype fp8 --max-model-len 32768 "
+            "--gpu-memory-utilization 0.92 --enable-auto-tool-choice --tool-call-parser hermes")
+        parts.append(extra)
+    return " ".join(parts)
+
 
 def _spawn_detached(cmd: str, cwd: str | None = None) -> subprocess.Popen:
-    """Spawn a long-running command in a detached process group on Windows."""
+    """Spawn a long-running command in a detached process group on Windows.
+    Pulls Ollama tuning from config.json each time so saving the settings panel
+    takes effect on the next start without restarting admin."""
+    _reload_config()
     env = os.environ.copy()
     if "ollama" in cmd.lower():
-        env["OLLAMA_KV_CACHE_TYPE"] = env.get("OLLAMA_KV_CACHE_TYPE", "q8_0")
+        env = _build_ollama_env(env)
+    if cmd.startswith("vllm ") or "vllm.exe" in cmd.lower() or "-m vllm" in cmd:
+        env.setdefault("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
+        # flashinfer on Windows requires an explicit CUDA root path. Auto-detect
+        # from CUDA_PATH (set by the toolkit installer) if CUDA_LIB_PATH isn't
+        # already in env. Without this, vLLM crashes during attention backend init.
+        cuda_root = env.get("CUDA_LIB_PATH") or env.get("CUDA_PATH") or env.get("CUDA_HOME")
+        if cuda_root:
+            env.setdefault("CUDA_LIB_PATH", cuda_root)
+            env.setdefault("CUDA_HOME", cuda_root)
 
     return subprocess.Popen(
         cmd,
@@ -470,6 +606,102 @@ async def tool_ollama_stop():
     except Exception as e:
         lines.append(f"taskkill failed: {e}")
     return JSONResponse({"status": "ok", "output": "\n".join(lines) or "No Ollama processes found."})
+
+
+@app.post("/tools/vllm-start")
+async def tool_vllm_start():
+    """Launch vLLM (OpenAI-compat server) on VLLM_PORT if not already running.
+    The launch command is rebuilt from config.json each call so saved tuning
+    takes effect on the next start without restarting admin."""
+    _reload_config()
+    cmd = _build_vllm_cmd()
+    if not cmd:
+        return JSONResponse({
+            "status": "error",
+            "output": "vLLM model is not set. Either save a model in Settings → Advanced → vLLM, set VLLM_MODEL in env, or set VLLM_LAUNCH_CMD to the full command.",
+        })
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(f"http://127.0.0.1:{VLLM_PORT}/v1/models")
+            if r.status_code == 200:
+                return JSONResponse({"status": "ok", "output": f"vLLM is already running on :{VLLM_PORT}"})
+    except Exception:
+        pass
+    try:
+        proc = _spawn_detached(cmd)
+        _child_procs["vllm"] = proc
+        # vLLM cold-start with model load can be 30-90s depending on size.
+        for i in range(120):
+            await asyncio.sleep(1)
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    r = await client.get(f"http://127.0.0.1:{VLLM_PORT}/v1/models")
+                    if r.status_code == 200:
+                        return JSONResponse({
+                            "status": "ok",
+                            "output": f"vLLM launched and ready after {i+1}s (PID {proc.pid}).\nCmd: {cmd}",
+                        })
+            except Exception:
+                continue
+        return JSONResponse({
+            "status": "ok",
+            "output": f"vLLM launched (PID {proc.pid}) but not responding after 120s. Large models can need more — check again shortly.\nCmd: {cmd}",
+        })
+    except Exception as e:
+        return JSONResponse({
+            "status": "error",
+            "output": f"Failed to launch vLLM: {e}\n\nCmd: {cmd}",
+        })
+
+
+@app.post("/tools/vllm-stop")
+async def tool_vllm_stop():
+    """Terminate tracked vLLM proc; fall back to killing python on the port."""
+    lines = []
+    proc = _child_procs.pop("vllm", None)
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+            lines.append(f"Terminated tracked vLLM proc (PID {proc.pid}).")
+        except Exception as e:
+            lines.append(f"Failed to terminate tracked proc: {e}")
+    # Fallback: kill any python.exe whose command-line has 'vllm serve'
+    try:
+        r = subprocess.run(
+            ["wmic", "process", "where",
+             "name='python.exe' and CommandLine like '%vllm%serve%'",
+             "delete"],
+            capture_output=True, text=True, timeout=10,
+        )
+        out = (r.stdout or r.stderr or "").strip()
+        if out:
+            lines.append(out[:300])
+    except Exception as e:
+        lines.append(f"WMIC fallback failed: {e}")
+    return JSONResponse({"status": "ok", "output": "\n".join(lines) or "No vLLM processes found."})
+
+
+@app.post("/tools/vllm-restart")
+async def tool_vllm_restart():
+    """Stop the running vLLM (if any), wait for VRAM/port to free, then start
+    a fresh instance using the current saved config. Used by the Settings
+    panel's "Apply & Restart vLLM" button so changing vllm_model picks up
+    cleanly without an admin terminal."""
+    # Step 1 — tear down any existing instance
+    await tool_vllm_stop()
+    # Step 2 — give the socket and GPU a moment to release; vLLM holds onto
+    # the port for ~3-5s after the python procs exit.
+    for _ in range(10):
+        await asyncio.sleep(1)
+        try:
+            async with httpx.AsyncClient(timeout=1.0) as client:
+                r = await client.get(f"http://127.0.0.1:{VLLM_PORT}/v1/models")
+                if r.status_code != 200:
+                    break
+        except Exception:
+            break
+    # Step 3 — start fresh from the latest config
+    return await tool_vllm_start()
 
 
 @app.post("/tools/comfyui-start")
@@ -756,6 +988,14 @@ async def dashboard():
     <button class="tool-btn" onclick="confirmTool('ollama-stop', 'Kill all ollama.exe processes?')">
         <span class="icon">&#9209;</span> Stop Ollama
         <span class="label">Kill all ollama.exe</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('vllm-start')">
+        <span class="icon">&#9658;</span> Start vLLM
+        <span class="label">vllm serve (NVFP4)</span>
+    </button>
+    <button class="tool-btn" onclick="confirmTool('vllm-stop', 'Stop vLLM server?')">
+        <span class="icon">&#9209;</span> Stop vLLM
+        <span class="label">Terminate vLLM process</span>
     </button>
     <button class="tool-btn" onclick="runTool('comfyui-status')">
         <span class="icon">&#127912;</span> ComfyUI Status

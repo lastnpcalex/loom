@@ -12,6 +12,7 @@ if sys.platform == "win32":
 import asyncio
 import json
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -44,7 +45,7 @@ from character_loader import (
     save_lore,
     delete_lore,
 )
-from ollama_client import health_check, stream_chat, sync_chat, describe_image
+from local_llm import health_check, stream_chat, sync_chat, describe_image
 from ooda_harness import (
     build_ooda_system_prompt,
     parse_ooda_block,
@@ -155,6 +156,19 @@ async def lifespan(app):
     await _reload_pending_permissions()
     # Ensure Ollama is running (launches it if not)
     asyncio.create_task(_ensure_ollama())
+    # Warm the local-model caches once Ollama is up so the settings panel
+    # opens instantly. Runs as a background task so we don't block startup
+    # while waiting on a slow Ollama probe.
+    async def _warm_model_caches():
+        await asyncio.sleep(2)  # let _ensure_ollama finish first
+        try:
+            await _refresh_local_models_cache()
+            await _refresh_vision_models_cache()
+            await _refresh_all_engines_cache()
+            print(f"[CACHE] Warmed model caches: {len((_LOCAL_MODELS_CACHE or {}).get('models', []))} models, {len((_VISION_MODELS_CACHE or {}).get('models', []))} vision-capable, {len((_ALL_ENGINES_CACHE or {}).get('models', []))} cross-engine")
+        except Exception as e:
+            print(f"[CACHE] Initial warm failed (will fetch on demand): {e}")
+    asyncio.create_task(_warm_model_caches())
     yield
     await db.close_db()
 
@@ -577,8 +591,148 @@ async def api_health():
 
 @app.get("/api/ollama/models")
 async def api_ollama_models():
-    status = await health_check()
+    """Always returns Ollama's model list, regardless of which backend is
+    active (don't go through the dispatcher — that would surface vLLM models
+    when local_backend=vllm and they'd appear under the "Ollama" dropdown
+    label, which is just confusing)."""
+    import ollama_client as _oc
+    status = await _oc.health_check()
     return {"models": status.get("models", [])}
+
+
+# ── Local model list cache ────────────────────────────────────────────────
+# Hitting Ollama on every settings-panel open made the modal take ~30s. We
+# now snapshot the model list at startup (and on demand via /refresh-models)
+# and serve from RAM — going from 2.5s/call to <1ms. The cache is keyed by
+# (backend, host) so flipping local_backend invalidates implicitly.
+
+_LOCAL_MODELS_CACHE: dict | None = None
+_VISION_MODELS_CACHE: dict | None = None
+
+
+async def _refresh_local_models_cache() -> dict:
+    global _LOCAL_MODELS_CACHE
+    status = await health_check()
+    _LOCAL_MODELS_CACHE = {
+        "backend": config.local_backend,
+        "host": (config.vllm_host if config.local_backend == "vllm" else config.ollama_host),
+        "models": status.get("models", []),
+        "target_model": status.get("target_model"),
+        "available": status.get("model_available", False),
+        "fetched_at": time.time(),
+    }
+    return _LOCAL_MODELS_CACHE
+
+
+async def _refresh_vision_models_cache() -> dict:
+    """Vision models are expensive to compute on Ollama (one /api/show per
+    model) so this benefits the most from caching."""
+    global _VISION_MODELS_CACHE
+    if config.local_backend == "vllm":
+        status = await health_check()
+        models = status.get("models", [])
+    else:
+        result = await api_ollama_vision_models()
+        models = result.get("models", []) if isinstance(result, dict) else []
+    _VISION_MODELS_CACHE = {
+        "backend": config.local_backend,
+        "host": (config.vllm_host if config.local_backend == "vllm" else config.ollama_host),
+        "models": models,
+        "fetched_at": time.time(),
+    }
+    return _VISION_MODELS_CACHE
+
+
+def _cache_is_stale(cache: dict | None) -> bool:
+    """Returns True if the cache was built against a different backend/host
+    than the current config (so flipping the backend dropdown auto-invalidates)."""
+    if not cache:
+        return True
+    expected_host = config.vllm_host if config.local_backend == "vllm" else config.ollama_host
+    return cache.get("backend") != config.local_backend or cache.get("host") != expected_host
+
+
+@app.get("/api/local/models")
+async def api_local_models():
+    """Active-backend-aware model list, served from cache. Use
+    POST /api/local/refresh-models to force a re-fetch."""
+    if _cache_is_stale(_LOCAL_MODELS_CACHE):
+        await _refresh_local_models_cache()
+    return _LOCAL_MODELS_CACHE
+
+
+@app.get("/api/local/vision-models")
+async def api_local_vision_models():
+    """Vision-capable models from the active backend, served from cache."""
+    if _cache_is_stale(_VISION_MODELS_CACHE):
+        await _refresh_vision_models_cache()
+    return _VISION_MODELS_CACHE
+
+
+@app.post("/api/local/refresh-models")
+async def api_local_refresh_models():
+    """Force-refresh both model caches. Wired to the 'Refresh' button in
+    Settings → Model & Generation; also called when the user starts/stops
+    Ollama or vLLM since their model lists are likely to have changed."""
+    await _refresh_local_models_cache()
+    await _refresh_vision_models_cache()
+    return {
+        "models": _LOCAL_MODELS_CACHE.get("models", []),
+        "vision_models": _VISION_MODELS_CACHE.get("models", []),
+        "backend": config.local_backend,
+    }
+
+
+# ── All-engines model list ────────────────────────────────────────────────
+# Returns the union of Ollama models and vLLM-served names regardless of which
+# backend is currently active. Used by the Braid/Weave inline dropdown so the
+# user can pick from either engine without flipping local_backend in Settings.
+# Each entry is {name, backend} so the frontend can group/route correctly.
+
+import ollama_client as _ollama_client_mod
+import vllm_client as _vllm_client_mod
+
+_ALL_ENGINES_CACHE: dict | None = None
+
+
+async def _refresh_all_engines_cache() -> dict:
+    """Probe both backends in parallel; either returning empty is fine.
+    The active backend's main cache stays the source of truth for the settings
+    panel — this is purely a UX list for the inline dropdown."""
+    global _ALL_ENGINES_CACHE
+    ollama_status, vllm_status = await asyncio.gather(
+        _ollama_client_mod.health_check(),
+        _vllm_client_mod.health_check(),
+        return_exceptions=True,
+    )
+    out: list[dict] = []
+    if isinstance(ollama_status, dict) and not ollama_status.get("mock_mode"):
+        for m in ollama_status.get("models", []) or []:
+            out.append({"name": m, "backend": "ollama"})
+    if isinstance(vllm_status, dict) and not vllm_status.get("mock_mode"):
+        for m in vllm_status.get("models", []) or []:
+            out.append({"name": m, "backend": "vllm"})
+    _ALL_ENGINES_CACHE = {
+        "models": out,
+        "active_backend": config.local_backend,
+        "fetched_at": time.time(),
+    }
+    return _ALL_ENGINES_CACHE
+
+
+@app.get("/api/local/all-models")
+async def api_local_all_models():
+    """Returns models from BOTH Ollama and vLLM regardless of active backend.
+    Used by the Braid/Weave inline dropdown for cross-engine selection.
+    Stale-while-revalidate: serve from cache if present, refresh in background."""
+    if _ALL_ENGINES_CACHE is None:
+        await _refresh_all_engines_cache()
+    return _ALL_ENGINES_CACHE
+
+
+@app.post("/api/local/refresh-all-models")
+async def api_local_refresh_all_models():
+    return await _refresh_all_engines_cache()
 
 
 # ── Characters ──
@@ -2108,6 +2262,12 @@ async def _ws_send(conv_id: int, data: dict):
     if gen_key and "gen_id" not in data:
         data = {**data, "gen_id": gen_key[2]}
     clients = _active_websockets.get(conv_id)
+    # TEMP DEBUG: log every WS send target + count + payload type so we can
+    # verify whether content events are reaching the WebSocket layer at all.
+    _t = data.get("type", "?")
+    _content = data.get("content", "") or ""
+    _snippet = (_content[:30] + "…") if len(_content) > 30 else _content
+    print(f"[WS-TRACE] conv={conv_id} type={_t} clients={len(clients) if clients else 0} {_snippet!r}")
     if not clients:
         return
     dead = []
@@ -2665,9 +2825,11 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
         _ANTHROPIC_MODELS = {"sonnet", "opus", "haiku"}
         _base_model = cc_model.split("[")[0] if "[" in cc_model else cc_model
         is_anthropic = _base_model in _ANTHROPIC_MODELS
-        use_ollama = conv.get("_use_ollama", False) or not (is_anthropic or cc_model.startswith("gemini"))
-        if is_anthropic or cc_model.startswith("gemini"):
+        is_vllm = cc_model.startswith("vllm-")
+        use_ollama = conv.get("_use_ollama", False) or not (is_anthropic or cc_model.startswith("gemini") or is_vllm)
+        if is_anthropic or cc_model.startswith("gemini") or is_vllm:
             use_ollama = False
+        use_vllm = is_vllm and not use_ollama
 
         await _ws_send(conv_id, {"type": "status", "text": "Compacting context..."})
 
@@ -2687,6 +2849,9 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
             resume_session_id=session_id,
             fork_session=False,  # compact in place, don't fork
             use_ollama=use_ollama,
+            use_vllm=use_vllm,
+            vllm_base_url=config.vllm_host if use_vllm else None,
+            vllm_model_alias=cc_model if use_vllm else None,
         )
 
         # Get the current leaf — compact marker becomes its child,
@@ -2841,14 +3006,20 @@ async def _handle_claude_generation(
         _base_model = cc_model.split("[")[0] if "[" in cc_model else cc_model
         is_anthropic = _base_model in _ANTHROPIC_MODELS
         is_gemini = cc_model.startswith("gemini")
+        # vllm-* models go through Claude Code with ANTHROPIC_BASE_URL pointed
+        # at the local vLLM server (which speaks /v1/messages natively). Detected
+        # purely by name prefix so it slots in next to gemini-* and anthropic
+        # without any new DB columns.
+        is_vllm = cc_model.startswith("vllm-")
         # Only use Ollama when explicitly flagged (local mode) or when the model
-        # is not a known Anthropic/Gemini model.  The _use_ollama flag is set by
-        # _handle_local_generation on a shallow copy — it is never in the DB.
-        use_ollama = conv.get("_use_ollama", False) or not (is_anthropic or is_gemini)
-        # Belt-and-suspenders: NEVER route Anthropic/Gemini through Ollama
-        if is_anthropic or is_gemini:
+        # is not a known Anthropic/Gemini/vLLM model.  The _use_ollama flag is set
+        # by _handle_local_generation on a shallow copy — it is never in the DB.
+        use_ollama = conv.get("_use_ollama", False) or not (is_anthropic or is_gemini or is_vllm)
+        # Belt-and-suspenders: NEVER route Anthropic/Gemini/vLLM through Ollama
+        if is_anthropic or is_gemini or is_vllm:
             use_ollama = False
-        print(f"[CC] Model routing: cc_model={cc_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} use_ollama={use_ollama} conv._use_ollama={conv.get('_use_ollama')} conv.mode={conv.get('mode')}")
+        use_vllm = is_vllm and not use_ollama
+        print(f"[CC] Model routing: cc_model={cc_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} is_vllm={is_vllm} use_ollama={use_ollama} conv._use_ollama={conv.get('_use_ollama')} conv.mode={conv.get('mode')}")
 
         # --- Compact-handoff gate ---
         # Fast check: if the target model is a 1M Anthropic, skip. Otherwise
@@ -3193,6 +3364,9 @@ async def _handle_claude_generation(
                     resume_session_id=resume_session_id if use_resume else None,
                     fork_session=fork_session,
                     use_ollama=use_ollama,
+                    use_vllm=use_vllm,
+                    vllm_base_url=config.vllm_host if use_vllm else None,
+                    vllm_model_alias=cc_model if use_vllm else None,
                     backstage_parent_id=conv.get("backstage_parent_id"),
                 )
         except Exception as e:
@@ -3222,6 +3396,9 @@ async def _handle_claude_generation(
                         effort=cc_effort,
                         permission_mode=cc_permission_mode,
                         use_ollama=use_ollama,
+                        use_vllm=use_vllm,
+                        vllm_base_url=config.vllm_host if use_vllm else None,
+                        vllm_model_alias=cc_model if use_vllm else None,
                         backstage_parent_id=conv.get("backstage_parent_id"),
                     )
                 use_resume = False
@@ -3612,6 +3789,9 @@ async def _handle_claude_generation(
                 effort=cc_effort,
                 permission_mode=cc_permission_mode,
                 use_ollama=use_ollama,
+                use_vllm=use_vllm,
+                vllm_base_url=config.vllm_host if use_vllm else None,
+                vllm_model_alias=cc_model if use_vllm else None,
                 backstage_parent_id=conv.get("backstage_parent_id"),
             )
             _active_claude_procs[conv_id] = proc
@@ -3947,7 +4127,12 @@ async def _handle_claude_generation(
         )
 
     except asyncio.CancelledError:
-        _active_claude_procs.pop(conv_id, None)
+        proc = _active_claude_procs.pop(conv_id, None)
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         if draft_msg_id and (full_text or content_blocks):
             # Save accumulated work to draft before cancelling
             await db.update_message_content(

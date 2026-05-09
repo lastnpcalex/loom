@@ -1503,16 +1503,28 @@ body::after {
 }
 .tree-node-ghost {
     border-style: dashed;
-    opacity: 0.7;
-    animation: ghostPulse 2s ease-in-out infinite;
+    animation: ghostPulse 1.6s ease-in-out infinite;
 }
 .tree-node-ghost .tree-node-summary {
     font-style: italic;
     color: var(--text-muted);
 }
+/* Breathing pulse for the actively-streaming node — color and halo cycle to
+   give visible "alive" feedback during long generations. The transform is
+   tiny (1% scale) so it doesn't push surrounding nodes around. */
 @keyframes ghostPulse {
-    0%, 100% { opacity: 0.5; border-color: var(--cyan); }
-    50% { opacity: 0.9; border-color: var(--accent); }
+    0%, 100% {
+        opacity: 0.55;
+        border-color: var(--cyan);
+        box-shadow: 0 0 6px rgba(0, 255, 255, 0.25);
+        transform: scale(1);
+    }
+    50% {
+        opacity: 0.95;
+        border-color: var(--accent);
+        box-shadow: 0 0 18px rgba(0, 255, 255, 0.55), 0 0 32px rgba(191, 0, 255, 0.25);
+        transform: scale(1.015);
+    }
 }
 /* ── Child Branch Hint ── */
 .child-branch-hint {
@@ -1847,10 +1859,21 @@ body::after {
     border-color: rgba(191, 0, 255, 0.5);
 }
 
+/* Active branch path — every node along the currently-selected lineage gets
+   a brighter, slightly-scaled treatment so the eye can follow the loom's
+   "current line" at a glance. The scale is small (~3%) and uses transform
+   so it doesn't disturb the layout flow. */
 .tree-node-card.active {
-    box-shadow: 0 0 0 2px rgba(0, 255, 255, 0.4), 0 4px 20px rgba(0, 255, 255, 0.2);
+    box-shadow:
+        0 0 0 2px rgba(0, 255, 255, 0.55),
+        0 0 24px rgba(0, 255, 255, 0.32),
+        0 4px 28px rgba(191, 0, 255, 0.18);
+    transform: scale(1.03);
+    z-index: 2;
+    filter: brightness(1.08);
 }
-
+/* Hover wins over scale so click target doesn't drift on mouse-over */
+.tree-node-card.active:hover { transform: scale(1.03) translateY(-1px); }
 .tree-node-card.active.user { border-color: var(--cyan); }
 .tree-node-card.active.assistant { border-color: var(--purple); }
 
@@ -3420,9 +3443,159 @@ body::after {
 
 .lore-check input[type="checkbox"] { accent-color: var(--cyan); }
 
-.settings-toggle { margin-bottom: 16px; }
+.settings-toggle {
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+    overflow: visible;  /* let wrapped rows render fully */
+}
+/* Allow tab labels to shrink/wrap so 4 tabs fit narrow viewports.
+   Default flex-children won't shrink below their content min-width,
+   which is what was clipping "Display" / "Advanced" on mobile. */
+.settings-toggle .toggle-btn {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    text-align: center;
+    line-height: 1.2;
+}
+@media (max-width: 600px) {
+    .settings-toggle .toggle-btn {
+        flex: 1 1 45%;       /* two tabs per row on narrow screens */
+        padding: 8px 10px;
+        font-size: 12px;
+    }
+    /* Wrapped rows: drop the right-border on the 2nd-from-end of each row
+       so we don't get a stray vertical line in the middle. */
+    .settings-toggle .toggle-btn:nth-child(2n) { border-right: none; }
+}
 .settings-section { min-height: 80px; }
 .hint { font-size: 0.8em; color: var(--text-muted); font-weight: normal; }
+
+/* Settings — restructured panel */
+.settings-divider {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 20px 0 12px;
+    color: var(--text-muted);
+    font-size: 0.78em;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+.settings-divider::before,
+.settings-divider::after {
+    content: '';
+    flex: 1 1 auto;
+    height: 1px;
+    background: var(--border);
+}
+.settings-overrides { margin-bottom: 8px; }
+.form-row {
+    display: flex;
+    gap: 12px;
+}
+.form-row .form-group { flex: 1 1 0; }
+
+.toggle-row label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+}
+.toggle-row input[type="checkbox"] { accent-color: var(--cyan); }
+
+/* Servers tab */
+.server-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.server-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+.server-light {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    box-shadow: none;
+    transition: background 0.2s, box-shadow 0.2s;
+    flex-shrink: 0;
+}
+.server-light[data-state="up"]   { background: #4ade80; box-shadow: 0 0 6px #4ade80; }
+.server-light[data-state="down"] { background: #ef4444; }
+.server-light[data-state="unknown"] { background: var(--text-muted); }
+.server-link {
+    color: var(--cyan);
+    text-decoration: none;
+    flex: 1 1 auto;
+}
+.server-link:hover { text-decoration: underline; }
+.server-port {
+    color: var(--text-muted);
+    font-family: var(--font-mono, monospace);
+    font-size: 0.85em;
+}
+
+/* (Reserved for future light/dark theme variants — the Blackhole canvas
+   itself is controlled via window.LoomBlackhole, not via a body class.) */
+
+.label-with-action {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+    gap: 8px;
+}
+.label-with-action label { margin-bottom: 0; }
+.btn-mini {
+    padding: 2px 8px;
+    font-size: 0.78em;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: all var(--transition);
+    font-family: var(--font-main);
+}
+.btn-mini:hover:not(:disabled) {
+    color: var(--cyan);
+    border-color: var(--cyan);
+}
+.btn-mini:disabled { opacity: 0.5; cursor: progress; }
+
+/* Tuning sub-cards inside Advanced tab */
+.tuning-card {
+    margin-top: 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-tertiary);
+    padding: 0 12px;
+}
+.tuning-card[open] { padding-bottom: 12px; }
+.tuning-card > summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 10px 4px;
+    font-weight: 500;
+    color: var(--cyan);
+    user-select: none;
+}
+.tuning-card > summary::-webkit-details-marker { display: none; }
+.tuning-card > summary::before {
+    content: '▸';
+    display: inline-block;
+    margin-right: 8px;
+    transition: transform 0.15s;
+}
+.tuning-card[open] > summary::before { transform: rotate(90deg); }
+.tuning-card[open] > summary { border-bottom: 1px solid var(--border); margin-bottom: 12px; }
 
 .modal-actions {
     display: flex;

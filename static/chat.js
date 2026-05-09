@@ -2583,7 +2583,12 @@ function getCharacterName() {
     const conv = State.conversations.find(c => c.id === State.currentConvId);
     if (!conv) return 'Assistant';
     if (conv.mode === 'local') return conv.local_model || 'Local';
-    if (!conv.character_id) return 'Assistant';
+    if (!conv.character_id) {
+        // Weave/OODA without a character attached: show the model name (mirrors
+        // Braid's behavior). Falls through to "Assistant" if nothing's set.
+        if (conv.mode === 'weave' && conv.local_model) return conv.local_model;
+        return 'Assistant';
+    }
     const char = State.characters.find(c => c.id === conv.character_id);
     return char ? char.name : 'Assistant';
 }

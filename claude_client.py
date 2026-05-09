@@ -391,6 +391,9 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                      permission_mode: str = "default",
                      resume_session_id: str = None, fork_session: bool = False,
                      use_ollama: bool = False,
+                     use_vllm: bool = False,
+                     vllm_base_url: str | None = None,
+                     vllm_model_alias: str | None = None,
                      backstage_parent_id: int | None = None):
     """Run Claude Code CLI and yield parsed events as an async generator.
 
@@ -399,8 +402,15 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     When fork_session is True (with --resume), creates a new branch from that session.
     When use_ollama is True, launches via 'ollama launch claude --model <model> --yes --'
     so that Claude Code runs against a local Ollama model.
+    When use_vllm is True, launches plain `claude` with ANTHROPIC_BASE_URL/auth/model
+    env vars pointing at the local vLLM server (which speaks Anthropic's /v1/messages
+    natively). vllm_base_url defaults to http://localhost:8000; vllm_model_alias is
+    the --served-model-name vLLM was launched with (e.g. "vllm-local").
     Permission hooks route tool approvals through Loom's HTTP API.
     """
+    # Mutual exclusion — code paths below assume at most one engine override.
+    if use_ollama and use_vllm:
+        raise ValueError("use_ollama and use_vllm are mutually exclusive")
     # Configure the permission hook in the project directory (idempotent, skips if already set)
     # Skip on resume since the original session already configured the hook
     _configure_permission_hook(cwd) if not resume_session_id else None
@@ -457,7 +467,9 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             cc_args.extend(["--append-system-prompt", backstage_md.read_text(encoding="utf-8")])
 
     if not use_ollama:
-        # Direct claude launch — model and effort are CC flags
+        # Direct claude launch — model and effort are CC flags. For vLLM, the
+        # ANTHROPIC_DEFAULT_*_MODEL env vars below override CC's internal mapping
+        # so picking sonnet/opus/haiku here all route to the local vllm alias.
         cc_args.extend(["--model", model, "--effort", effort])
 
     if permission_mode and permission_mode != "default":
@@ -489,6 +501,27 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     else:
         env.pop("CLAUDECODE", None)
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+
+    # vLLM-as-CC-backend: point the Anthropic SDK's CC subprocess at vLLM's
+    # native /v1/messages endpoint. Both API_KEY and AUTH_TOKEN are set because
+    # different SDK code paths read different ones. The DEFAULT_*_MODEL env
+    # vars override CC's internal sonnet/opus/haiku → API-id mapping so the
+    # alias actually wins regardless of which preset the user picked.
+    # See https://docs.vllm.ai/en/stable/serving/integrations/claude_code/
+    if use_vllm:
+        base = (vllm_base_url or "http://localhost:8000").rstrip("/")
+        alias = vllm_model_alias or model
+        env["ANTHROPIC_BASE_URL"] = base
+        env["ANTHROPIC_API_KEY"] = "dummy"
+        env["ANTHROPIC_AUTH_TOKEN"] = "dummy"
+        env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = alias
+        env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = alias
+        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = alias
+        # CC injects a per-request hash into the system prompt that defeats
+        # prefix caching. vLLM ≥0.17.1 strips it server-side, but setting this
+        # belt-and-suspenders is harmless and improves cache hits on older
+        # builds the user might roll back to.
+        env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
 
     # If the prompt is too long for a command-line arg (Windows ~32K limit),
     # pipe it via stdin instead of -p
@@ -528,10 +561,16 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         limit=16 * 1024 * 1024,  # 16 MB line buffer (CC can emit large base64/tool results)
     )
 
-    # Feed prompt via stdin if needed
+    # Feed prompt via stdin if needed in a background task to prevent pipe deadlocks
     if use_stdin and proc.stdin:
-        proc.stdin.write(prompt.encode("utf-8"))
-        proc.stdin.close()
+        async def _feed_stdin():
+            try:
+                proc.stdin.write(prompt.encode("utf-8"))
+                await proc.stdin.drain()
+                proc.stdin.close()
+            except Exception as e:
+                print(f"[CC] Error feeding stdin: {e}")
+        asyncio.create_task(_feed_stdin())
 
     print(f"[CC] Process started, pid={proc.pid}")
 
@@ -559,8 +598,21 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                 continue
 
             rtype = raw.get("type", "?")
-            # stream_event fires per-token, suppress to keep logs readable
-            if rtype != "stream_event":
+            # TEMP DEBUG: log every event including stream_events so we can
+            # verify whether content deltas are flowing through CC for
+            # vllm-local generations. Restore the suppression after diagnosis.
+            if rtype == "stream_event":
+                _ev = raw.get("event", {}) or {}
+                _evt_type = _ev.get("type", "?")
+                _delta = _ev.get("delta", {}) or {}
+                _dtype = _delta.get("type", "")
+                _snippet = ""
+                if _dtype == "text_delta":
+                    _snippet = repr((_delta.get("text") or "")[:40])
+                elif _dtype == "thinking_delta":
+                    _snippet = repr((_delta.get("thinking") or "")[:40])
+                print(f"[CC-TRACE] stream_event {_evt_type}/{_dtype} {_snippet}")
+            else:
                 print(f"[CC] event: {rtype}")
 
             for evt in _process_event(raw, stream_state):
