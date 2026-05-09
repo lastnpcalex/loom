@@ -14,6 +14,42 @@
     const container = document.getElementById('blackhole-container');
     if (!container) return;
 
+    // Honor the user's saved preference before we even spin up Three.js. If the
+    // raytracer is disabled we never load textures, never compile shaders, and
+    // never start an animation loop — so disabling actually frees the GPU/CPU
+    // instead of just hiding the canvas.
+    var _enabled = (function () {
+        try { return localStorage.getItem('loom-blackhole-disabled') !== '1'; }
+        catch { return true; }
+    })();
+    var _rafId = null;
+    var _started = false;
+
+    // Public API for the settings toggle.
+    window.LoomBlackhole = {
+        isEnabled: function () { return _enabled; },
+        enable: function () {
+            if (_enabled) return;
+            _enabled = true;
+            try { localStorage.setItem('loom-blackhole-disabled', '0'); } catch {}
+            container.style.display = '';
+            // First-time enable after page load: kick off the loader.
+            if (!_started) { _bootstrap(); }
+            else if (typeof animate === 'function') { animate(); }
+        },
+        disable: function () {
+            _enabled = false;
+            try { localStorage.setItem('loom-blackhole-disabled', '1'); } catch {}
+            if (_rafId !== null) { cancelAnimationFrame(_rafId); _rafId = null; }
+            container.style.display = 'none';
+        },
+    };
+
+    // If disabled, hide the canvas now. We still let the rest of this IIFE
+    // run so all the helper functions (and _bootstrap below) are defined —
+    // window.LoomBlackhole.enable() needs to be able to fire them later.
+    if (!_enabled) container.style.display = 'none';
+
     if (typeof THREE === 'undefined') {
         console.warn('[Blackhole] Three.js not loaded, using CSS fallback');
         container.style.background = 'radial-gradient(ellipse at 50% 50%, #0a0015 0%, #05000a 40%, #000 100%)';
@@ -490,7 +526,8 @@ void main() {
     }
 
     function animate() {
-        requestAnimationFrame(animate);
+        if (!_enabled) { _rafId = null; return; }
+        _rafId = requestAnimationFrame(animate);
         render();
     }
 
@@ -503,18 +540,24 @@ void main() {
 
     // ── Start ──
 
-    try {
-        // Check WebGL support
-        var testCanvas = document.createElement('canvas');
-        var gl = testCanvas.getContext('webgl') || testCanvas.getContext('experimental-webgl');
-        if (!gl) throw new Error('WebGL not supported');
+    function _bootstrap() {
+        if (_started) return;
+        _started = true;
+        try {
+            // Check WebGL support
+            var testCanvas = document.createElement('canvas');
+            var gl = testCanvas.getContext('webgl') || testCanvas.getContext('experimental-webgl');
+            if (!gl) throw new Error('WebGL not supported');
 
-        loadTexture('stars', '/static/img/stars.png', THREE.NearestFilter);
-        loadTexture('accretion_disk', '/static/img/accretion-disk.png', THREE.LinearFilter);
-        loadAcidburnGalaxy();
-        loadTexture('spectra', '/static/img/spectra.png', THREE.LinearFilter);
-    } catch (e) {
-        console.warn('[Blackhole] WebGL init failed, using CSS fallback:', e);
-        container.style.background = 'radial-gradient(ellipse at 50% 50%, #0a0015 0%, #05000a 40%, #000 100%)';
+            loadTexture('stars', '/static/img/stars.png', THREE.NearestFilter);
+            loadTexture('accretion_disk', '/static/img/accretion-disk.png', THREE.LinearFilter);
+            loadAcidburnGalaxy();
+            loadTexture('spectra', '/static/img/spectra.png', THREE.LinearFilter);
+        } catch (e) {
+            console.warn('[Blackhole] WebGL init failed, using CSS fallback:', e);
+            container.style.background = 'radial-gradient(ellipse at 50% 50%, #0a0015 0%, #05000a 40%, #000 100%)';
+        }
     }
+
+    if (_enabled) _bootstrap();
 })();

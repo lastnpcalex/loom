@@ -1283,25 +1283,59 @@ function updateInlineCCControls(conv) {
     if (typeof updateCanvasVisibility === 'function') updateCanvasVisibility();
 }
 
-let _ollamaModelsCache = null;
+// Inline Weave/Braid model dropdown — populated from BOTH Ollama and vLLM
+// (when running) regardless of the active local_backend setting. Pick any
+// model and the server-side dispatch routes correctly:
+//   - vllm-* prefix → CC with ANTHROPIC_BASE_URL pointing at vLLM
+//   - any other name → Ollama (either ollama-launch-claude for Braid or direct
+//     ollama_client for Weave)
 async function _populateWeaveModelDropdown(select, currentModel) {
-    // Fetch models once, cache for session
-    if (!_ollamaModelsCache) {
-        try {
-            const data = await API.get('/api/ollama/models');
-            _ollamaModelsCache = (data.models || []).map(m => m.name || m);
-        } catch { _ollamaModelsCache = []; }
-    }
-    const models = _ollamaModelsCache;
+    let entries = [];           // [{name, backend}]
+    let activeBackend = '';
+    try {
+        const data = await API.get('/api/local/all-models');
+        entries = data.models || [];
+        activeBackend = data.active_backend || '';
+    } catch {}
     const prev = select.value;
     select.innerHTML = '<option value="">Default</option>';
-    for (const name of models) {
-        const opt = document.createElement('option');
-        opt.value = name;
-        opt.textContent = name;
-        select.appendChild(opt);
+
+    // Group by backend so the dropdown stays readable when both are populated.
+    // For vLLM: when multiple --served-model-name aliases exist (e.g. "vllm-local"
+    // alongside "sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP"), prefer the more
+    // descriptive one — it's the same loaded model under multiple labels and
+    // showing both is just noise.
+    const byBackend = entries.reduce((acc, e) => {
+        (acc[e.backend] = acc[e.backend] || []).push(e.name);
+        return acc;
+    }, {});
+    if (byBackend.vllm && byBackend.vllm.length > 1) {
+        const aliases = byBackend.vllm.filter(n => n.startsWith('vllm-'));
+        const descriptive = byBackend.vllm.filter(n => !n.startsWith('vllm-'));
+        // Show descriptive names if any, otherwise fall back to aliases.
+        byBackend.vllm = descriptive.length ? descriptive : aliases;
     }
-    select.value = currentModel || prev || '';
+    const order = ['vllm', 'ollama'];   // vLLM first (typically fewer entries)
+    for (const backend of order) {
+        const names = byBackend[backend];
+        if (!names || !names.length) continue;
+        const og = document.createElement('optgroup');
+        og.label = backend === 'vllm' ? 'vLLM' : 'Ollama';
+        for (const name of names) {
+            const opt = document.createElement('option');
+            opt.value = name;
+            opt.textContent = name;
+            og.appendChild(opt);
+        }
+        select.appendChild(og);
+    }
+
+    const allNames = entries.map(e => e.name);
+    let target = currentModel || prev || '';
+    if (target && !allNames.includes(target)) target = '';
+    if (!target && allNames.length === 1) target = allNames[0];
+    select.value = target;
+    select.title = activeBackend ? `Active backend: ${activeBackend.toUpperCase()}` : 'Local model';
 }
 
 function initBranchCountPill() {
@@ -1879,17 +1913,32 @@ async function fetchOllamaModels() {
 
 // ── Populate CC Model Dropdowns from Server ──
 let _ccModelsCache = null;
+// Sentinel: undefined = never fetched. null = fetched, no vLLM available.
+// Object = vLLM is up. Re-fetched every settings open via _invalidateModelCaches
+// so vLLM coming up mid-session shows up immediately.
+let _vllmServedNameCache;
 async function populateCCModelDropdowns(selectedValue) {
     if (!_ccModelsCache) {
         try { _ccModelsCache = await API.get('/api/cc-models'); } catch { return; }
     }
-    // Also fetch Ollama models for the "All Agents" dropdowns
-    if (!_ollamaModelsCache) {
+    if (_vllmServedNameCache === undefined) {
         try {
-            const data = await API.get('/api/ollama/models');
-            _ollamaModelsCache = (data.models || []).map(m => m.name || m);
-        } catch { _ollamaModelsCache = []; }
+            const cfg = await API.get('/api/config');
+            const all = await API.get('/api/local/all-models').catch(() => ({models: []}));
+            const vllmEntries = (all.models || []).filter(m => m.backend === 'vllm');
+            const alias = (cfg && cfg.vllm_served_name) || '';
+            const descriptive = vllmEntries.map(e => e.name).find(n => !n.startsWith('vllm-')) || alias;
+            _vllmServedNameCache = (alias.startsWith('vllm-') && vllmEntries.length > 0)
+                ? { value: alias, label: descriptive || alias }
+                : null;
+        } catch { _vllmServedNameCache = null; }
     }
+    // Also fetch a flat Ollama list for the "all CC engines" picker rows.
+    let ollamaModels = [];
+    try {
+        const data = await API.get('/api/ollama/models');
+        ollamaModels = (data.models || []).map(m => m.name || m);
+    } catch {}
     const selects = ['cc-model-inline', 'cc-model', 'cfg-cc-model'];
     for (const id of selects) {
         const sel = document.getElementById(id);
@@ -1907,11 +1956,25 @@ async function populateCCModelDropdowns(selectedValue) {
             }
             sel.appendChild(og);
         }
+        // Append local vLLM (if served). Single entry — vLLM only loads one
+        // model at a time. The displayed *label* is the descriptive HF id so
+        // users know what's loaded; the *value* sent to the server is the
+        // slash-free alias because Claude Code chokes on "/" in --model.
+        if (_vllmServedNameCache) {
+            const og = document.createElement('optgroup');
+            og.label = 'vLLM (local CC)';
+            const opt = document.createElement('option');
+            opt.value = _vllmServedNameCache.value;
+            opt.textContent = _vllmServedNameCache.label;
+            opt.title = `vLLM serves "${_vllmServedNameCache.label}" — passed to CC as alias "${_vllmServedNameCache.value}"`;
+            og.appendChild(opt);
+            sel.appendChild(og);
+        }
         // Append local Ollama models
-        if (_ollamaModelsCache.length > 0) {
+        if (ollamaModels.length > 0) {
             const og = document.createElement('optgroup');
             og.label = 'Ollama';
-            for (const name of _ollamaModelsCache) {
+            for (const name of ollamaModels) {
                 const opt = document.createElement('option');
                 opt.value = name;
                 opt.textContent = name;
@@ -2173,67 +2236,268 @@ function setupEventListeners() {
     function _switchSettingsTab(tab) {
         document.querySelectorAll('#settings-tabs .toggle-btn').forEach(b => b.classList.remove('active'));
         document.querySelector(`#settings-tabs [data-settings-tab="${tab}"]`).classList.add('active');
-        ['settings-global', 'settings-loom', 'settings-braid', 'settings-weave'].forEach(id => {
+        ['settings-model', 'settings-servers', 'settings-display', 'settings-advanced'].forEach(id => {
             document.getElementById(id).classList.toggle('hidden', id !== `settings-${tab}`);
         });
+        if (tab === 'servers') _refreshServerLights();
     }
     document.querySelectorAll('#settings-tabs .toggle-btn').forEach(btn => {
         btn.addEventListener('click', () => _switchSettingsTab(btn.dataset.settingsTab));
     });
 
-    async function _populateOllamaSelect(selectId, selectedModel) {
+    // Per-render cache so populating 3 model dropdowns from one settings open
+    // hits the network once instead of three times.
+    let _modelsFetch = null;
+    let _visionFetch = null;
+    function _invalidateModelCaches() {
+        _modelsFetch = null; _visionFetch = null;
+        _vllmServedNameCache = undefined;  // re-probe vLLM next time settings opens
+    }
+    function _fetchModels() {
+        if (!_modelsFetch) _modelsFetch = API.get('/api/local/models').catch(() => ({models: []}));
+        return _modelsFetch;
+    }
+    function _fetchVisionModels() {
+        if (!_visionFetch) _visionFetch = API.get('/api/local/vision-models').catch(() => ({models: []}));
+        return _visionFetch;
+    }
+
+    function _renderLocalSelect(sel, models, selectedModel, backendLabel) {
+        if (models.length > 0) {
+            sel.innerHTML = models.map(m =>
+                `<option value="${m}"${m === selectedModel ? ' selected' : ''}>${m}</option>`
+            ).join('');
+        } else {
+            sel.innerHTML = `<option value="${selectedModel || ''}">${selectedModel || `(no ${backendLabel || ''} models found)`}</option>`;
+        }
+    }
+
+    async function _populateLocalSelect(selectId, selectedModel) {
         const sel = document.getElementById(selectId);
         try {
-            const data = await API.get('/api/ollama/models');
+            const data = await _fetchModels();
             const models = (data.models || []).map(m => m.name || m);
-            if (models.length > 0) {
-                sel.innerHTML = models.map(m =>
-                    `<option value="${m}"${m === selectedModel ? ' selected' : ''}>${m}</option>`
-                ).join('');
-            } else {
-                sel.innerHTML = `<option value="${selectedModel || ''}">${selectedModel || '(no models found)'}</option>`;
-            }
-        } catch { sel.innerHTML = `<option value="${selectedModel || ''}">${selectedModel || '(Ollama unavailable)'}</option>`; }
+            _renderLocalSelect(sel, models, selectedModel, (data.backend || '').toUpperCase());
+        } catch { sel.innerHTML = `<option value="${selectedModel || ''}">${selectedModel || '(backend unavailable)'}</option>`; }
+    }
+    // Backwards-compat shim — older call sites still use the Ollama-named helper.
+    const _populateOllamaSelect = _populateLocalSelect;
+
+    async function _populateLocalVisionSelect(selectId, selectedModel) {
+        const sel = document.getElementById(selectId);
+        try {
+            const data = await _fetchVisionModels();
+            const models = (data.models || []).map(m => m.name || m);
+            sel.innerHTML = '<option value="">(use default model)</option>' +
+                models.map(m => `<option value="${m}"${m === (selectedModel || '') ? ' selected' : ''}>${m}</option>`).join('');
+        } catch {
+            sel.innerHTML = '<option value="">(use default model)</option>';
+            if (selectedModel) sel.innerHTML += `<option value="${selectedModel}" selected>${selectedModel}</option>`;
+        }
+    }
+
+    // Server-status lights: green = reachable, red = down, gray = unknown.
+    const _SERVER_PROBES = {
+        admin:   'http://localhost:3002/api/status',
+        ollama:  'http://localhost:11434/api/tags',
+        vllm:    'http://localhost:8000/v1/models',
+        comfyui: 'http://localhost:8188/system_stats',
+    };
+    async function _probeServer(url) {
+        try {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), 1500);
+            const resp = await fetch(url, { method: 'GET', mode: 'no-cors', signal: ctrl.signal });
+            clearTimeout(t);
+            // no-cors returns opaque — any non-throw means the port answered TCP.
+            return true;
+        } catch { return false; }
+    }
+    async function _refreshServerLights() {
+        const rows = document.querySelectorAll('#cfg-server-grid .server-row');
+        await Promise.all([...rows].map(async row => {
+            const key = row.dataset.server;
+            const url = _SERVER_PROBES[key];
+            if (!url) return;
+            const up = await _probeServer(url);
+            const dot = row.querySelector('.server-light');
+            if (dot) dot.dataset.state = up ? 'up' : 'down';
+        }));
+    }
+    let _serverLightTimer = null;
+    function _startServerLightPolling() {
+        _stopServerLightPolling();
+        _refreshServerLights();
+        _serverLightTimer = setInterval(_refreshServerLights, 5000);
+    }
+    function _stopServerLightPolling() {
+        if (_serverLightTimer) { clearInterval(_serverLightTimer); _serverLightTimer = null; }
     }
 
     document.getElementById('btn-settings').addEventListener('click', async () => {
+        // Reset the per-open fetch cache so the user sees a fresh snapshot on each
+        // modal open (cheap thanks to server-side caching — sub-ms after warmup).
+        _invalidateModelCaches();
         const cfg = await API.get('/api/config');
         State.config = cfg;
-        // Global
-        document.getElementById('cfg-host').value = cfg.ollama_host || '';
-        document.getElementById('cfg-model').value = cfg.ollama_model || '';
-        // Vision model dropdown
-        const visionSel = document.getElementById('cfg-vision-model');
-        try {
-            const vData = await API.get('/api/ollama/vision-models');
-            const vModels = (vData.models || []).map(m => m.name || m);
-            visionSel.innerHTML = '<option value="">(use default model)</option>' +
-                vModels.map(m => `<option value="${m}"${m === (cfg.vision_model || '') ? ' selected' : ''}>${m}</option>`).join('');
-        } catch {
-            visionSel.innerHTML = '<option value="">(use default model)</option>';
-            if (cfg.vision_model) visionSel.innerHTML += `<option value="${cfg.vision_model}" selected>${cfg.vision_model}</option>`;
-        }
-        // Loom
-        await populateCCModelDropdowns();
         const conv = State.currentConv;
-        document.getElementById('cfg-cc-model').value = (conv && conv.cc_model) || 'sonnet';
+
+        // Set non-async values up front so the UI doesn't appear empty.
+        document.getElementById('cfg-local-backend').value = cfg.local_backend || 'ollama';
+        document.getElementById('cfg-temp').value = cfg.temperature ?? 0.85;
+        document.getElementById('cfg-top-p').value = cfg.top_p ?? 0.92;
+        document.getElementById('cfg-max-tokens').value = cfg.max_tokens ?? 1024;
+        document.getElementById('cfg-repeat-penalty').value = cfg.repeat_penalty ?? 1.12;
         document.getElementById('cfg-cc-effort').value = (conv && conv.cc_effort) || 'high';
         document.getElementById('cfg-cc-permission').value = (conv && conv.cc_permission_mode) || 'default';
-        // Braid
-        _populateOllamaSelect('cfg-braid-model', (conv && conv.local_model) || cfg.ollama_model);
-        // Weave
-        _populateOllamaSelect('cfg-weave-model', (conv && conv.local_model) || cfg.ollama_model);
-        document.getElementById('cfg-temp').value = cfg.temperature || 0.85;
-        document.getElementById('cfg-top-p').value = cfg.top_p || 0.92;
-        document.getElementById('cfg-max-tokens').value = cfg.max_tokens || 1024;
-        document.getElementById('cfg-repeat-penalty').value = cfg.repeat_penalty || 1.12;
+
+        // Fan-out all the dropdown populations in parallel. The shared fetch
+        // promises mean models/vision-models each hit the server exactly once.
+        const localModel = (conv && conv.local_model) || cfg.ollama_model;
+        await Promise.all([
+            _populateLocalSelect('cfg-model', cfg.ollama_model || cfg.vllm_model || ''),
+            _populateLocalVisionSelect('cfg-vision-model', cfg.vision_model || ''),
+            _populateLocalSelect('cfg-braid-model', localModel),
+            _populateLocalSelect('cfg-weave-model', localModel),
+            populateCCModelDropdowns().then(() => {
+                document.getElementById('cfg-cc-model').value = (conv && conv.cc_model) || 'sonnet';
+            }),
+        ]);
+        const mode = conv ? conv.mode : null;
+        document.getElementById('cfg-overrides-loom').classList.toggle('hidden', mode !== 'claude');
+        document.getElementById('cfg-overrides-braid').classList.toggle('hidden', mode !== 'local');
+        document.getElementById('cfg-overrides-weave').classList.toggle('hidden', mode !== 'weave');
+        document.getElementById('cfg-conv-overrides-divider').classList.toggle('hidden', !mode);
+
+        // Advanced
+        document.getElementById('cfg-host').value = cfg.ollama_host || '';
+        document.getElementById('cfg-vllm-host').value = cfg.vllm_host || '';
+        document.getElementById('cfg-vllm-model').value = cfg.vllm_model || '';
         document.getElementById('cfg-context').value = cfg.max_context_tokens || 28000;
         document.getElementById('cfg-verbatim').value = cfg.verbatim_window || 8;
-        // Open to the relevant tab based on current context
-        const mode = conv ? conv.mode : null;
-        const startTab = mode === 'claude' ? 'loom' : mode === 'local' ? 'braid' : mode === 'weave' ? 'weave' : 'global';
-        _switchSettingsTab(startTab);
+        // Ollama tuning
+        document.getElementById('cfg-ol-kv').value = cfg.ollama_kv_cache_type || 'q8_0';
+        document.getElementById('cfg-ol-flashattn').checked = !!cfg.ollama_flash_attention;
+        document.getElementById('cfg-ol-keepalive').value = cfg.ollama_keep_alive || '30m';
+        document.getElementById('cfg-ol-numparallel').value = cfg.ollama_num_parallel ?? 1;
+        document.getElementById('cfg-ol-maxloaded').value = cfg.ollama_max_loaded_models ?? 0;
+        document.getElementById('cfg-ol-ctxlen').value = cfg.ollama_context_length ?? 128000;
+        // vLLM tuning
+        document.getElementById('cfg-vl-quant').value = cfg.vllm_quantization || 'modelopt';
+        document.getElementById('cfg-vl-kvdtype').value = cfg.vllm_kv_cache_dtype || 'fp8';
+        document.getElementById('cfg-vl-maxlen').value = cfg.vllm_max_model_len ?? 32768;
+        document.getElementById('cfg-vl-gpuutil').value = cfg.vllm_gpu_memory_utilization ?? 0.92;
+        document.getElementById('cfg-vl-maxseqs').value = cfg.vllm_max_num_seqs ?? 16;
+        document.getElementById('cfg-vl-tp').value = cfg.vllm_tensor_parallel_size ?? 1;
+        document.getElementById('cfg-vl-toolparser').value = cfg.vllm_tool_call_parser || 'hermes';
+        document.getElementById('cfg-vl-autotool').checked = !!cfg.vllm_enable_auto_tool_choice;
+        document.getElementById('cfg-vl-extra').value = cfg.vllm_extra_args || '';
+        document.getElementById('cfg-vl-reasoning').value = cfg.vllm_reasoning_parser || 'qwen3';
+        document.getElementById('cfg-vl-textonly').checked = !!cfg.vllm_text_only;
+        document.getElementById('cfg-vl-thinking').checked = !!cfg.vllm_thinking_default;
+        document.getElementById('cfg-vl-spec').value = cfg.vllm_speculative_config || '';
+        document.getElementById('cfg-vl-pypath').value = cfg.vllm_python_path || '';
+
+        // Display
+        document.getElementById('cfg-blackhole').checked =
+            (window.LoomBlackhole && window.LoomBlackhole.isEnabled())
+            || (typeof window.LoomBlackhole === 'undefined');  // assume on if controller missing
+
+        _switchSettingsTab('model');
         openModal('modal-settings');
+        _startServerLightPolling();
+    });
+
+    // Apply settings + restart vLLM. Saves whatever's in the panel right now
+    // (so vllm_model / quantization / kv-cache changes take effect), then
+    // calls admin's vllm-restart which stops + waits + starts fresh from
+    // config. ~30-60s for cold model load. Refreshes model caches when done.
+    document.getElementById('btn-vllm-restart').addEventListener('click', async () => {
+        const btn = document.getElementById('btn-vllm-restart');
+        const orig = btn.textContent;
+        btn.disabled = true;
+        // Save current panel values first so the restart picks them up.
+        document.getElementById('btn-save-settings').click();
+        btn.textContent = '↻ Restarting…';
+        try {
+            const adminUrl = 'http://localhost:3002/tools/vllm-restart';
+            const resp = await fetch(adminUrl, { method: 'POST' });
+            const data = await resp.json().catch(() => ({}));
+            if (data.status === 'ok') {
+                showToast('vLLM restarted: ' + (data.output || '').split('\n')[0]);
+                try { await API.post('/api/local/refresh-models', {}); } catch {}
+                _invalidateModelCaches();
+            } else {
+                showToast('vLLM restart failed: ' + (data.output || 'unknown error'), 'error');
+            }
+        } catch (e) {
+            showToast('vLLM restart failed: ' + (e.message || e) + ' (admin server reachable on :3002?)', 'error');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = orig;
+        }
+    });
+
+    // Manual refresh — forces the server to re-query Ollama/vLLM and rebuild
+    // the cache, then re-populates all dropdowns. Useful after `ollama pull`
+    // or after starting/stopping vLLM.
+    document.getElementById('btn-refresh-models').addEventListener('click', async () => {
+        const btn = document.getElementById('btn-refresh-models');
+        const orig = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '↻ Refreshing...';
+        try {
+            await API.post('/api/local/refresh-models', {});
+            _invalidateModelCaches();
+            await Promise.all([
+                _populateLocalSelect('cfg-model', document.getElementById('cfg-model').value),
+                _populateLocalVisionSelect('cfg-vision-model', document.getElementById('cfg-vision-model').value),
+                _populateLocalSelect('cfg-braid-model', document.getElementById('cfg-braid-model').value),
+                _populateLocalSelect('cfg-weave-model', document.getElementById('cfg-weave-model').value),
+            ]);
+            showToast('Models refreshed');
+        } catch (e) {
+            showToast('Refresh failed: ' + (e.message || e), 'error');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = orig;
+        }
+    });
+
+    // When the user flips the local backend, re-populate the model + vision-model
+    // dropdowns so they reflect the new backend's available models. The dispatcher
+    // server-side already routes to the correct backend on every call.
+    document.getElementById('cfg-local-backend').addEventListener('change', async () => {
+        // Persist the backend immediately so /api/local/models routes correctly.
+        const newBackend = document.getElementById('cfg-local-backend').value;
+        try {
+            await API.put('/api/config', { ...State.config, local_backend: newBackend });
+            State.config = { ...State.config, local_backend: newBackend };
+        } catch (e) { console.warn('failed to persist backend flip', e); }
+        // Backend changed → server's cache key is invalidated automatically,
+        // but our client cache also needs to drop so the new backend's models load.
+        _invalidateModelCaches();
+        await Promise.all([
+            _populateLocalSelect('cfg-model', document.getElementById('cfg-model').value),
+            _populateLocalVisionSelect('cfg-vision-model', document.getElementById('cfg-vision-model').value),
+            _populateLocalSelect('cfg-braid-model', document.getElementById('cfg-braid-model').value),
+            _populateLocalSelect('cfg-weave-model', document.getElementById('cfg-weave-model').value),
+        ]);
+        // Also re-populate the inline weave dropdown over the chat textbox if
+        // we're in a weave conv — backend changed, its model list did too.
+        const inlineWeave = document.getElementById('weave-model-inline');
+        if (inlineWeave && State.currentConv?.mode === 'weave') {
+            await _populateWeaveModelDropdown(inlineWeave, State.currentConv.local_model || '');
+        }
+    });
+
+    // Blackhole toggle — controls the WebGL raytracer background. Disabling
+    // cancels the requestAnimationFrame loop and hides the canvas, so it stops
+    // costing GPU/CPU. The controller persists its own state in localStorage.
+    document.getElementById('cfg-blackhole').addEventListener('change', e => {
+        if (!window.LoomBlackhole) return;
+        if (e.target.checked) window.LoomBlackhole.enable();
+        else window.LoomBlackhole.disable();
     });
 
     // Settings model change — toggle effort visibility
@@ -2244,13 +2508,15 @@ function setupEventListeners() {
     });
 
     document.getElementById('btn-save-settings').addEventListener('click', async () => {
-        // Save all tabs at once
+        // Save all sections at once
         const conv = State.currentConv;
-        // Global
         const globalCfg = {
             ...State.config,
+            local_backend: document.getElementById('cfg-local-backend').value,
             ollama_host: document.getElementById('cfg-host').value,
             ollama_model: document.getElementById('cfg-model').value,
+            vllm_host: document.getElementById('cfg-vllm-host').value,
+            vllm_model: document.getElementById('cfg-vllm-model').value,
             vision_model: document.getElementById('cfg-vision-model').value,
             temperature: parseFloat(document.getElementById('cfg-temp').value),
             top_p: parseFloat(document.getElementById('cfg-top-p').value),
@@ -2258,6 +2524,28 @@ function setupEventListeners() {
             repeat_penalty: parseFloat(document.getElementById('cfg-repeat-penalty').value),
             max_context_tokens: parseInt(document.getElementById('cfg-context').value),
             verbatim_window: parseInt(document.getElementById('cfg-verbatim').value),
+            // Ollama tuning
+            ollama_kv_cache_type: document.getElementById('cfg-ol-kv').value,
+            ollama_flash_attention: document.getElementById('cfg-ol-flashattn').checked,
+            ollama_keep_alive: document.getElementById('cfg-ol-keepalive').value,
+            ollama_num_parallel: parseInt(document.getElementById('cfg-ol-numparallel').value),
+            ollama_max_loaded_models: parseInt(document.getElementById('cfg-ol-maxloaded').value),
+            ollama_context_length: parseInt(document.getElementById('cfg-ol-ctxlen').value),
+            // vLLM tuning
+            vllm_quantization: document.getElementById('cfg-vl-quant').value,
+            vllm_kv_cache_dtype: document.getElementById('cfg-vl-kvdtype').value,
+            vllm_max_model_len: parseInt(document.getElementById('cfg-vl-maxlen').value),
+            vllm_gpu_memory_utilization: parseFloat(document.getElementById('cfg-vl-gpuutil').value),
+            vllm_max_num_seqs: parseInt(document.getElementById('cfg-vl-maxseqs').value),
+            vllm_tensor_parallel_size: parseInt(document.getElementById('cfg-vl-tp').value),
+            vllm_tool_call_parser: document.getElementById('cfg-vl-toolparser').value,
+            vllm_enable_auto_tool_choice: document.getElementById('cfg-vl-autotool').checked,
+            vllm_extra_args: document.getElementById('cfg-vl-extra').value,
+            vllm_reasoning_parser: document.getElementById('cfg-vl-reasoning').value,
+            vllm_text_only: document.getElementById('cfg-vl-textonly').checked,
+            vllm_thinking_default: document.getElementById('cfg-vl-thinking').checked,
+            vllm_speculative_config: document.getElementById('cfg-vl-spec').value,
+            vllm_python_path: document.getElementById('cfg-vl-pypath').value,
         };
         await API.put('/api/config', globalCfg);
         State.config = globalCfg;
@@ -2284,15 +2572,24 @@ function setupEventListeners() {
             }
         }
         closeModal('modal-settings');
+        _stopServerLightPolling();
         showToast('Settings saved');
     });
 
     // Close modals
     document.querySelectorAll('[data-close-modal]').forEach(btn => {
-        btn.addEventListener('click', () => btn.closest('.modal').classList.add('hidden'));
+        btn.addEventListener('click', () => {
+            const m = btn.closest('.modal');
+            m.classList.add('hidden');
+            if (m.id === 'modal-settings') _stopServerLightPolling();
+        });
     });
     document.querySelectorAll('.modal-backdrop').forEach(bd => {
-        bd.addEventListener('click', () => bd.closest('.modal').classList.add('hidden'));
+        bd.addEventListener('click', () => {
+            const m = bd.closest('.modal');
+            m.classList.add('hidden');
+            if (m.id === 'modal-settings') _stopServerLightPolling();
+        });
     });
 
     // Send message
