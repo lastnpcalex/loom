@@ -1232,13 +1232,16 @@ async def dashboard():
                     'After authenticating, paste the code from the callback page:<br>' +
                     '<input id="auth-code-input" type="text" placeholder="paste authorization code" ' +
                     'style="width:60%; min-width:280px; padding:6px; margin-top:6px; ' +
-                    'background:#111; color:#0ff; border:1px solid #0ff; font-family:monospace;" ' +
-                    'onkeydown="if(event.key===\'Enter\'){{submitAuthCode();}}">' +
+                    'background:#111; color:#0ff; border:1px solid #0ff; font-family:monospace;">' +
                     ' <button class="btn btn-cyan" onclick="submitAuthCode()" style="margin-left:6px;">Submit</button>' +
                     '</div>' +
                     '<br><span id="login-poll" style="color:#888;">Waiting for login to complete...</span>';
                 pollLoginStatus();
-                document.getElementById('auth-code-input')?.focus();
+                const inp = document.getElementById('auth-code-input');
+                if (inp) {{
+                    inp.addEventListener('keydown', (e) => {{ if (e.key === 'Enter') submitAuthCode(); }});
+                    inp.focus();
+                }}
                 return;
             }}
             out.textContent = d.output || '(no output)';
