@@ -997,25 +997,50 @@ function _reconstructFromSnapshot(snap) {
     const blocks = snap.content_blocks || [];
 
     if (blocks.length > 0) {
-        // Merge all text into one span, render thinking blocks in position,
-        // and collect tool blocks for after the text.
-        let mergedText = '';
-        const toolBlocks = [];
-        for (const block of blocks) {
+        // Walk blocks in chronological order: text spans, tool blocks, and
+        // thinking blocks land in the same sequence the model produced them.
+        // The trailing text span carries the streaming cursor.
+        let pendingText = '';
+        const flushText = (withCursor) => {
+            if (!pendingText) return;
+            const textSpan = document.createElement('span');
+            textSpan.className = 'streaming-text';
+            textSpan.dataset.rawContent = pendingText;
+            textSpan.innerHTML = formatContent(pendingText) + (withCursor ? '<span class="typing-cursor"></span>' : '');
+            contentEl.appendChild(textSpan);
+            pendingText = '';
+        };
+        for (let i = 0; i < blocks.length; i++) {
+            const block = blocks[i];
             if (block.type === 'text') {
-                mergedText += block.text || '';
-            } else if (block.type === 'tool_use') {
-                toolBlocks.push(block);
-            } else if (block.type === 'thinking') {
-                // Flush accumulated text before thinking block
-                if (mergedText.trim()) {
-                    const textSpan = document.createElement('span');
-                    textSpan.className = 'streaming-text';
-                    textSpan.dataset.rawContent = mergedText;
-                    textSpan.innerHTML = formatContent(mergedText);
-                    contentEl.appendChild(textSpan);
-                    mergedText = '';
+                pendingText += block.text || '';
+                continue;
+            }
+            // Flush any accumulated text before a non-text block.
+            flushText(false);
+            if (block.type === 'tool_use') {
+                if (block.result) {
+                    const toolDiv = document.createElement('div');
+                    toolDiv.className = 'tool-block';
+                    const inputPreview = (block.input || '').substring(0, 3000);
+                    const resultPreview = (block.result || '').substring(0, 2000);
+                    toolDiv.innerHTML =
+                        '<div class="tool-block-header" data-tool-toggle>' +
+                        '<span class="tool-toggle">&#9656;</span> ' +
+                        '<span class="tool-name">' + escapeHtml(block.name || 'Tool') + '</span>' +
+                        '</div>' +
+                        '<div class="tool-block-body">' +
+                        (inputPreview ? '<pre class="tool-block-input">' + escapeHtml(inputPreview) + '</pre>' : '') +
+                        '<div class="tool-block-result"><pre>' + escapeHtml(resultPreview) + '</pre></div>' +
+                        '</div>';
+                    contentEl.appendChild(toolDiv);
+                } else {
+                    appendToolBlock(block.name, block.tool_id, false);
+                    if (block.input) {
+                        appendToolInput(block.input, block.tool_id);
+                    }
                 }
+            } else if (block.type === 'thinking') {
                 const thinkDiv = document.createElement('div');
                 thinkDiv.className = 'cc-thinking';
                 thinkDiv.innerHTML =
@@ -1024,40 +1049,8 @@ function _reconstructFromSnapshot(snap) {
                 contentEl.appendChild(thinkDiv);
             }
         }
-
-        // Create streaming text span with cursor for remaining text
-        if (mergedText.trim()) {
-            const textSpan = document.createElement('span');
-            textSpan.className = 'streaming-text';
-            textSpan.dataset.rawContent = mergedText;
-            textSpan.innerHTML = formatContent(mergedText) + '<span class="typing-cursor"></span>';
-            contentEl.appendChild(textSpan);
-        }
-
-        // Render tool blocks after the merged text
-        for (const block of toolBlocks) {
-            if (block.result) {
-                const toolDiv = document.createElement('div');
-                toolDiv.className = 'tool-block';
-                const inputPreview = (block.input || '').substring(0, 3000);
-                const resultPreview = (block.result || '').substring(0, 2000);
-                toolDiv.innerHTML =
-                    '<div class="tool-block-header" data-tool-toggle>' +
-                    '<span class="tool-toggle">&#9656;</span> ' +
-                    '<span class="tool-name">' + escapeHtml(block.name || 'Tool') + '</span>' +
-                    '</div>' +
-                    '<div class="tool-block-body">' +
-                    (inputPreview ? '<pre class="tool-block-input">' + escapeHtml(inputPreview) + '</pre>' : '') +
-                    '<div class="tool-block-result"><pre>' + escapeHtml(resultPreview) + '</pre></div>' +
-                    '</div>';
-                contentEl.appendChild(toolDiv);
-            } else {
-                appendToolBlock(block.name, block.tool_id, false);
-                if (block.input) {
-                    appendToolInput(block.input, block.tool_id);
-                }
-            }
-        }
+        // Trailing text gets the live cursor since the stream may continue.
+        flushText(true);
     } else if (snap.full_text) {
         // No structured blocks — just raw text (Weave mode)
         const textSpan = document.createElement('span');
@@ -2480,25 +2473,41 @@ function renderToolBody(toolName, input, resultDisplay) {
 }
 
 function renderContentBlocks(blocks) {
+    // Render chronologically: text / tool / text / tool. A sentence split by
+    // a tool call shows as text-before, tool, text-after on consecutive lines
+    // — the tool sits visually within the paragraph rather than being banished
+    // to the bottom of the message.
     let html = '';
-    // Merge text across tool_use blocks so a sentence cut by a tool call flows
-    // as one paragraph. Thinking blocks still flush text (they're a mode change).
-    // Tool blocks are collected and rendered after the merged text to preserve
-    // the chronological rhythm without splitting the paragraph.
     let textBuf = '';
-    const toolBlocks = [];
     const flushText = () => {
         if (textBuf.trim()) html += formatContent(textBuf);
         textBuf = '';
     };
+    const renderToolBlockHtml = (block) => {
+        const name = block.name || 'Tool';
+        const rawInput = (block.input || '').trim();
+        const input = rawInput.length > 3000 ? rawInput.substring(0, 3000) + '\n... (truncated)' : rawInput;
+        const result = (block.result || '').trim();
+        const resultDisplay = result.length > 2000 ? result.substring(0, 2000) + '\n... (truncated)' : result;
+        const isEdit = (name === 'Edit');
+        const diffHtml = isEdit ? renderEditDiff(input) : null;
+        const bodyHtml = diffHtml || renderToolBody(name, input, resultDisplay);
+        return '<div class="tool-block">' +
+            '<div class="tool-block-header" data-tool-toggle>' +
+                '<span class="tool-name">' + escapeHtml(name) + '</span>' +
+                '<span class="tool-toggle">&#9656;</span>' +
+            '</div>' +
+            '<div class="tool-block-body">' + bodyHtml + '</div>' +
+        '</div>';
+    };
     for (const block of blocks) {
         if (block.type === 'text') {
-            if (!block.text) continue;
-            textBuf += block.text;
+            if (block.text) textBuf += block.text;
             continue;
         }
         if (block.type === 'tool_use') {
-            toolBlocks.push(block);
+            flushText();
+            html += renderToolBlockHtml(block);
             continue;
         }
         if (block.type === 'thinking') {
@@ -2512,38 +2521,8 @@ function renderContentBlocks(blocks) {
             }
             continue;
         }
-        flushText();
     }
     flushText();
-    // Render tool blocks after merged text
-    for (const block of toolBlocks) {
-        const name = block.name || 'Tool';
-        const rawInput = (block.input || '').trim();
-        const input = rawInput.length > 3000 ? rawInput.substring(0, 3000) + '\n... (truncated)' : rawInput;
-        const result = (block.result || '').trim();
-        const resultDisplay = result.length > 2000 ? result.substring(0, 2000) + '\n... (truncated)' : result;
-
-        // Special rendering for Edit tool
-        const isEdit = (name === 'Edit');
-        const diffHtml = isEdit ? renderEditDiff(input) : null;
-        const expanded = '';
-        const toggleChar = '&#9656;';
-
-        let bodyHtml;
-        if (diffHtml) {
-            bodyHtml = diffHtml;
-        } else {
-            bodyHtml = renderToolBody(name, input, resultDisplay);
-        }
-
-        html += '<div class="tool-block' + expanded + '">' +
-            '<div class="tool-block-header" data-tool-toggle>' +
-                '<span class="tool-name">' + escapeHtml(name) + '</span>' +
-                '<span class="tool-toggle">' + toggleChar + '</span>' +
-            '</div>' +
-            '<div class="tool-block-body">' + bodyHtml + '</div>' +
-        '</div>';
-    }
     return html;
 }
 
@@ -2981,9 +2960,21 @@ function _flushStreamBuffer() {
     if (!streamingDiv || !_streamBuffer) return;
     _removeStreamWaiting();
     const contentEl = streamingDiv.querySelector('.message-content');
-    // Always use the first text span so text flows as one paragraph across tool blocks.
-    // Tool blocks insert inline chronologically, but text stays in a single span.
-    let textSpan = contentEl.querySelector('.streaming-text:first-of-type');
+    // Append text to the trailing streaming-text span. If the most recent
+    // child is a tool block (or anything else), start a new span after it
+    // so text that arrives after a tool call renders below the tool —
+    // chronological order, no sentence-split-then-reassemble.
+    let textSpan = null;
+    for (let i = contentEl.children.length - 1; i >= 0; i--) {
+        const child = contentEl.children[i];
+        if (child.classList && child.classList.contains('streaming-text')) {
+            textSpan = child;
+            break;
+        }
+        if (child.classList && (child.classList.contains('tool-block') || child.classList.contains('cc-thinking'))) {
+            break;
+        }
+    }
     if (!textSpan) {
         textSpan = document.createElement('span');
         textSpan.className = 'streaming-text';
