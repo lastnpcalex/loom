@@ -589,6 +589,23 @@ async def api_health():
     return ollama_status
 
 
+@app.get("/api/admin-status")
+async def api_admin_status():
+    """Server-side proxy of the admin server's status endpoint. The admin
+    server runs plain HTTP on :3002 while main Loom is HTTPS, so a direct
+    browser probe would be blocked as mixed content. Probing server-side
+    sidesteps that and gives the settings panel a reliable signal."""
+    admin_port = int(os.environ.get("LOOM_ADMIN_PORT", "3002"))
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(f"http://127.0.0.1:{admin_port}/api/status")
+            if r.status_code == 200:
+                return {"up": True}
+    except Exception:
+        pass
+    return {"up": False}
+
+
 @app.get("/api/ollama/models")
 async def api_ollama_models():
     """Always returns Ollama's model list, regardless of which backend is
