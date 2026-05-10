@@ -2062,10 +2062,39 @@ async def handle_cc_permission(data: dict):
         "input_summary": input_summary,
     }
 
-    # Wait for user response (no timeout - CC waits indefinitely)
-    await _pending_hook_permissions[request_id]["event"].wait()
-    perm_data = _pending_hook_permissions.pop(request_id, {})
-    user_response = perm_data.get("response", {})
+    # Wait for user response with a timeout.
+    # Every 30s check whether any WebSocket is still connected for this conv —
+    # if not and we're past the initial grace period, auto-deny so Gemini
+    # doesn't hang waiting for a user who walked away.
+    # Total deadline: 15 min (matches the hook timeout in gemini_client.py).
+    _PERM_TOTAL_DEADLINE = 900  # 15 min
+    _PERM_GRACE = 60  # wait at least 60s before checking connectivity
+    _PERM_POLL_INTERVAL = 30
+
+    elapsed = 0
+    user_response = {}
+    while elapsed < _PERM_TOTAL_DEADLINE:
+        perm_data = _pending_hook_permissions.get(request_id)
+        if not perm_data:
+            break  # cleaned up by cancel/finally or already responded
+        if perm_data.get("response"):
+            user_response = perm_data["response"]
+            _pending_hook_permissions.pop(request_id, None)
+            break
+
+        # Check auto-deny: no client connected past grace period
+        clients = _active_websockets.get(conv_id, set())
+        if elapsed > _PERM_GRACE and not clients:
+            print(f"[PERM] Auto-deny: no WebSocket for conv={conv_id} after {elapsed}s")
+            _pending_hook_permissions.pop(request_id, None)
+            return {"allow": False, "message": "No client connected to approve — tool denied"}
+
+        # Wait on the event with a short timeout, then re-check
+        try:
+            await asyncio.wait_for(perm_data["event"].wait(), timeout=_PERM_POLL_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+        elapsed += _PERM_POLL_INTERVAL
 
     allowed = user_response.get("allow", False)
     print(f"[PERM] User decision: {'allow' if allowed else 'deny'}")
@@ -3338,6 +3367,9 @@ async def _handle_claude_generation(
                 "draft_msg_id": draft_msg_id,
             },
         )
+        # Mirror the FE's _streamStartTime so the persisted generation_ms
+        # matches what the user saw as the live timer.
+        _gen_start_t = _time.time()
 
         # Initialize accumulation vars before try so error handlers can reference them
         full_text = ""
@@ -3569,7 +3601,11 @@ async def _handle_claude_generation(
                 )
 
             elif etype == "usage":
-                total_input_tokens += evt.get("input_tokens", 0)
+                # Each API call within a turn carries the full cached prefix in
+                # input_tokens, so summing double-counts across tool-call cycles.
+                # Track the LAST value (= final context size at end of turn);
+                # output_tokens IS per-call delta so summing is correct there.
+                total_input_tokens = evt.get("input_tokens", 0)
                 total_output_tokens += evt.get("output_tokens", 0)
                 await _ws_send(
                     conv_id,
@@ -3645,6 +3681,14 @@ async def _handle_claude_generation(
                         "type": "status",
                         "text": f"API retry {attempt}/{max_retries} ({error}) — retrying in {delay_ms // 1000}s...",
                     },
+                )
+
+            elif etype == "auto_continue":
+                rnd = evt.get("round", 1)
+                suffix = f" (round {rnd})" if rnd > 1 else ""
+                await _ws_send(
+                    conv_id,
+                    {"type": "status", "text": f"Continuing long response{suffix}…"},
                 )
 
             elif etype == "cc_raw_event":
@@ -3935,7 +3979,10 @@ async def _handle_claude_generation(
                         conv_id, {"type": "thinking_chunk", "content": evt["text"]}
                     )
                 elif etype == "usage":
-                    total_input_tokens += evt.get("input_tokens", 0)
+                    # See the primary CC handler above — track LAST input,
+                    # SUM output. Each API call within a turn carries the full
+                    # cached prefix so summing input double-counts.
+                    total_input_tokens = evt.get("input_tokens", 0)
                     total_output_tokens += evt.get("output_tokens", 0)
                     await _ws_send(
                         conv_id,
@@ -4030,8 +4077,10 @@ async def _handle_claude_generation(
 
         # Extract cost info
         cost_usd = result_info.get("cost_usd", 0)
-        input_tokens = total_input_tokens
         output_tokens = total_output_tokens
+        # Final context size at end of turn — see the streaming usage handler
+        # above for why we don't sum input_tokens across API calls.
+        input_tokens = total_input_tokens
         new_session_id = result_info.get("session_id", "") or new_session_id
         duration_ms = result_info.get("duration_ms", 0)
 
@@ -4056,6 +4105,7 @@ async def _handle_claude_generation(
             )
 
         # Finalize the draft message with full content
+        _gen_ms = int((_time.time() - _gen_start_t) * 1000)
         await db.update_message_content(
             draft_msg_id,
             content=full_text,
@@ -4065,6 +4115,7 @@ async def _handle_claude_generation(
             turn_output_tokens=output_tokens,
             cc_session_id=new_session_id or None,
             cc_model_used=model_used_field,
+            generation_ms=_gen_ms,
         )
         msg = await db.get_message(draft_msg_id)
 
@@ -4146,12 +4197,14 @@ async def _handle_claude_generation(
             # Persist cc_session_id so the next turn's --resume walk finds this
             # draft instead of skipping back past the cancelled prompt (which
             # would cause amnesia + force a full-history rebuild).
+            _gen_ms_cancel = int((_time.time() - _gen_start_t) * 1000)
             await db.update_message_content(
                 draft_msg_id,
                 content=full_text,
                 content_blocks=json.dumps(content_blocks) if content_blocks else None,
                 cc_session_id=new_session_id or None,
                 cc_model_used=(actual_model or cc_model) if (actual_model or cc_model) else None,
+                generation_ms=_gen_ms_cancel,
             )
             print(f"[GEN] Saved partial draft {draft_msg_id} on cancel (session={new_session_id or 'none'})")
         elif draft_msg_id:
@@ -4429,6 +4482,7 @@ async def _handle_ooda_generation(
                 "draft_msg_id": draft_msg_id,
             },
         )
+        _ooda_start_t = _time.time()
 
         # ── Pass 1: Orient ──
         print(f"[OODA] Pass 1: Orient...")
@@ -4575,7 +4629,8 @@ async def _handle_ooda_generation(
                 return
 
         # Update draft with final content
-        await db.update_message_content(draft_msg_id, content=final_prose)
+        _ooda_gen_ms = int((_time.time() - _ooda_start_t) * 1000)
+        await db.update_message_content(draft_msg_id, content=final_prose, generation_ms=_ooda_gen_ms)
         await db.set_active_branch(conv_id, draft_msg_id)
         msg = await db.get_message(draft_msg_id)
         # Save branch-level state deltas (Tier 3)
@@ -4773,6 +4828,7 @@ async def _handle_weave_generation(
 
         # Initialize live snapshot for Weave generation
         import time as _time
+        _weave_start_t = _time.time()
 
         _gen_key_local = getattr(asyncio.current_task(), "_gen_key", None)
         if _gen_key_local:
@@ -4829,7 +4885,8 @@ async def _handle_weave_generation(
             return
 
         # Update draft with final content
-        await db.update_message_content(draft_msg_id, content=full_response)
+        _weave_gen_ms = int((_time.time() - _weave_start_t) * 1000)
+        await db.update_message_content(draft_msg_id, content=full_response, generation_ms=_weave_gen_ms)
         await db.set_active_branch(conv_id, draft_msg_id)
         msg = await db.get_message(draft_msg_id)
         await _ws_send(
@@ -4859,7 +4916,8 @@ async def _handle_weave_generation(
     except Exception as e:
         # Save partial content or clean up empty draft
         if draft_msg_id and full_response.strip():
-            await db.update_message_content(draft_msg_id, content=full_response)
+            _weave_partial_ms = int((_time.time() - _weave_start_t) * 1000)
+            await db.update_message_content(draft_msg_id, content=full_response, generation_ms=_weave_partial_ms)
         elif draft_msg_id:
             await db.delete_branch(draft_msg_id)
         print(f"[GEN] Weave generation error conv={conv_id}: {e}")

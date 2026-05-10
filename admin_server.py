@@ -523,13 +523,20 @@ def _build_vllm_cmd() -> str:
 def _spawn_detached(cmd: str, cwd: str | None = None) -> subprocess.Popen:
     """Spawn a long-running command in a detached process group on Windows.
     Pulls Ollama tuning from config.json each time so saving the settings panel
-    takes effect on the next start without restarting admin."""
+    takes effect on the next start without restarting admin.
+
+    Routes stdout/stderr to a per-service log file in the working tree so that
+    crashes and request errors are debuggable without a console window."""
     _reload_config()
     env = os.environ.copy()
+    log_name = None
     if "ollama" in cmd.lower():
         env = _build_ollama_env(env)
+        log_name = "ollama_admin.log"
     if cmd.startswith("vllm ") or "vllm.exe" in cmd.lower() or "-m vllm" in cmd:
         env.setdefault("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
+        # Force UTF-8 so vLLM's box-drawing banner doesn't crash logging on cp1252.
+        env.setdefault("PYTHONUTF8", "1")
         # flashinfer on Windows requires an explicit CUDA root path. Auto-detect
         # from CUDA_PATH (set by the toolkit installer) if CUDA_LIB_PATH isn't
         # already in env. Without this, vLLM crashes during attention backend init.
@@ -537,13 +544,27 @@ def _spawn_detached(cmd: str, cwd: str | None = None) -> subprocess.Popen:
         if cuda_root:
             env.setdefault("CUDA_LIB_PATH", cuda_root)
             env.setdefault("CUDA_HOME", cuda_root)
+        log_name = "vllm_admin.log"
+    if "comfyui" in cmd.lower() or "comfy" in cmd.lower():
+        log_name = log_name or "comfyui_admin.log"
+
+    log_dir = Path(__file__).parent
+    if log_name:
+        # Truncate-on-spawn so we don't accrete logs from prior runs.
+        log_path = log_dir / log_name
+        log_handle = open(log_path, "w", encoding="utf-8", errors="replace")
+        stdout_target = log_handle
+        stderr_target = subprocess.STDOUT
+    else:
+        stdout_target = subprocess.DEVNULL
+        stderr_target = subprocess.DEVNULL
 
     return subprocess.Popen(
         cmd,
         shell=True,
         cwd=cwd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=stdout_target,
+        stderr=stderr_target,
         env=env,
         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
         | getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -1029,6 +1050,18 @@ async def dashboard():
 <p class="refresh-note">Live updates via AJAX (no page reload) &mdash; admin running on :{ADMIN_PORT}</p>
 <div id="toast"></div>
 <script>
+    // Rewrite the static localhost hrefs in the quick-links to use the page's
+    // own hostname, so the row of "Main Loom / Test / Ollama / ComfyUI" links
+    // works over Tailscale without hardcoding the host IP.
+    document.addEventListener('DOMContentLoaded', () => {{
+        document.querySelectorAll('a[href*="localhost"], a[href*="127.0.0.1"]').forEach(a => {{
+            try {{
+                const u = new URL(a.href);
+                u.hostname = location.hostname;
+                a.href = u.toString();
+            }} catch (e) {{}}
+        }});
+    }});
     function showToast(msg) {{
         const t = document.getElementById('toast');
         t.textContent = msg;
@@ -1207,8 +1240,9 @@ async def dashboard():
         }}
     }}
 
-    // Terminal WebSocket
-    const termSocket = new WebSocket(`ws://localhost:{{ ADMIN_PORT }}/ws/terminal`);
+    // Terminal WebSocket — use the page's own host so this works over
+    // Tailscale (or any non-localhost access) without hardcoding the IP.
+    const termSocket = new WebSocket(`ws://${{location.host}}/ws/terminal`);
     termSocket.onopen = () => {{
         document.getElementById('term-input')?.focus();
     }};

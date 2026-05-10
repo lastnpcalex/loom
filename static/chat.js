@@ -575,7 +575,7 @@ function handleWSMessage(data) {
             if (!State._streamIsOurBranch || !streamingDiv) break;
             const tokEl = streamingDiv.querySelector('.gen-token-info');
             if (tokEl) {
-                tokEl.textContent = '↑' + _fmtTok(data.input_tokens) + ' ↓' + _fmtTok(data.output_tokens) + ' · ';
+                tokEl.textContent = (data.input_tokens ? '↑' + _fmtTok(data.input_tokens) + ' ' : '') + '↓' + _fmtTok(data.output_tokens) + ' · ';
                 tokEl.dataset.hasUsage = '1';  // stop timer from overwriting with chunk count
             }
             // If output tokens registered, work is happening — drop the
@@ -997,60 +997,65 @@ function _reconstructFromSnapshot(snap) {
     const blocks = snap.content_blocks || [];
 
     if (blocks.length > 0) {
-        // Replay content_blocks: render completed blocks as static HTML,
-        // and the last block as a live streaming element
-        for (let i = 0; i < blocks.length; i++) {
-            const block = blocks[i];
-            const isLast = i === blocks.length - 1;
-
+        // Merge all text into one span, render thinking blocks in position,
+        // and collect tool blocks for after the text.
+        let mergedText = '';
+        const toolBlocks = [];
+        for (const block of blocks) {
             if (block.type === 'text') {
-                if (isLast) {
-                    // Last text block — render as streaming text span (cursor shows it's live)
+                mergedText += block.text || '';
+            } else if (block.type === 'tool_use') {
+                toolBlocks.push(block);
+            } else if (block.type === 'thinking') {
+                // Flush accumulated text before thinking block
+                if (mergedText.trim()) {
                     const textSpan = document.createElement('span');
                     textSpan.className = 'streaming-text';
-                    textSpan.dataset.rawContent = block.text || '';
-                    textSpan.innerHTML = formatContent(block.text || '') + '<span class="typing-cursor"></span>';
+                    textSpan.dataset.rawContent = mergedText;
+                    textSpan.innerHTML = formatContent(mergedText);
                     contentEl.appendChild(textSpan);
-                } else {
-                    // Completed text block
-                    const div = document.createElement('div');
-                    div.innerHTML = formatContent(block.text || '');
-                    contentEl.appendChild(div);
+                    mergedText = '';
                 }
-            } else if (block.type === 'tool_use') {
-                // Render tool block — if it has a result, it's finalized; otherwise still in progress
-                if (block.result) {
-                    // Completed tool — render as collapsed block
-                    const toolDiv = document.createElement('div');
-                    toolDiv.className = 'tool-block expanded';
-                    const inputPreview = (block.input || '').substring(0, 3000);
-                    const resultPreview = (block.result || '').substring(0, 2000);
-                    toolDiv.innerHTML =
-                        '<div class="tool-header" onclick="this.parentElement.classList.toggle(\'expanded\')">' +
-                        '<span class="tool-toggle">&#9656;</span> ' +
-                        '<span class="tool-name">' + escapeHtml(block.name || 'Tool') + '</span>' +
-                        '</div>' +
-                        '<div class="tool-body">' +
-                        (inputPreview ? '<pre class="tool-input">' + escapeHtml(inputPreview) + '</pre>' : '') +
-                        '<div class="tool-result"><pre>' + escapeHtml(resultPreview) + '</pre></div>' +
-                        '</div>';
-                    contentEl.appendChild(toolDiv);
-                } else {
-                    // In-progress tool — show as active
-                    appendToolBlock(block.name, block.tool_id, false);
-                    if (block.input) {
-                        appendToolInput(block.input, block.tool_id);
-                    }
-                }
-            } else if (block.type === 'thinking') {
-                // Thinking blocks — show as collapsed
                 const thinkDiv = document.createElement('div');
-                thinkDiv.className = 'thinking-block';
+                thinkDiv.className = 'cc-thinking';
                 thinkDiv.innerHTML =
-                    '<div class="thinking-header" onclick="this.parentElement.classList.toggle(\'expanded\')">' +
-                    '<span class="thinking-toggle">&#9656;</span> Thinking</div>' +
-                    '<div class="thinking-content"><pre>' + escapeHtml(block.text || '') + '</pre></div>';
+                    '<div class="cc-thinking-toggle">Thinking...</div>' +
+                    '<div class="cc-thinking-content" style="display:none;">' + escapeHtml(block.text || '') + '</div>';
                 contentEl.appendChild(thinkDiv);
+            }
+        }
+
+        // Create streaming text span with cursor for remaining text
+        if (mergedText.trim()) {
+            const textSpan = document.createElement('span');
+            textSpan.className = 'streaming-text';
+            textSpan.dataset.rawContent = mergedText;
+            textSpan.innerHTML = formatContent(mergedText) + '<span class="typing-cursor"></span>';
+            contentEl.appendChild(textSpan);
+        }
+
+        // Render tool blocks after the merged text
+        for (const block of toolBlocks) {
+            if (block.result) {
+                const toolDiv = document.createElement('div');
+                toolDiv.className = 'tool-block';
+                const inputPreview = (block.input || '').substring(0, 3000);
+                const resultPreview = (block.result || '').substring(0, 2000);
+                toolDiv.innerHTML =
+                    '<div class="tool-block-header" data-tool-toggle>' +
+                    '<span class="tool-toggle">&#9656;</span> ' +
+                    '<span class="tool-name">' + escapeHtml(block.name || 'Tool') + '</span>' +
+                    '</div>' +
+                    '<div class="tool-block-body">' +
+                    (inputPreview ? '<pre class="tool-block-input">' + escapeHtml(inputPreview) + '</pre>' : '') +
+                    '<div class="tool-block-result"><pre>' + escapeHtml(resultPreview) + '</pre></div>' +
+                    '</div>';
+                contentEl.appendChild(toolDiv);
+            } else {
+                appendToolBlock(block.name, block.tool_id, false);
+                if (block.input) {
+                    appendToolInput(block.input, block.tool_id);
+                }
             }
         }
     } else if (snap.full_text) {
@@ -2197,7 +2202,12 @@ function showGenerateBar() {
     scrollToBottom();
 }
 
-function createMessageElement(msg, cost) {
+function createMessageElement(msg, cost, elapsed) {
+    // Fall back to the persisted generation duration when the caller didn't
+    // supply a live timer value — so the M:SS badge survives a page refresh.
+    if ((elapsed === undefined || elapsed === null || elapsed === 0) && msg && msg.generation_ms) {
+        elapsed = Math.round(msg.generation_ms / 1000);
+    }
     const isErrorMsg = msg.role === 'assistant' && msg.content?.startsWith('[Error:');
     const isDraft = msg.role === 'assistant' && !msg.content?.trim() && !isErrorMsg;
     const div = document.createElement('div');
@@ -2262,16 +2272,28 @@ function createMessageElement(msg, cost) {
         contentHtml = formatContent(msg.content);
     }
 
+    // Elapsed time badge in header (matches streaming timer format M:SS)
+    let elapsedHtml = '';
+    if (elapsed && elapsed > 0) {
+        const em = Math.floor(elapsed / 60);
+        const es = String(elapsed % 60).padStart(2, '0');
+        elapsedHtml = `<span class="gen-timer" title="${elapsed}s">${em}:${es}</span>`;
+    }
+
     // Cost footer
     let costHtml = '';
-    if (cost || msg.turn_cost_usd) {
+    if (cost || msg.turn_cost_usd || msg.generation_ms) {
         const c = cost || {};
         const usd = c.cost_usd || msg.turn_cost_usd || 0;
         const inTok = c.input_tokens || msg.turn_input_tokens || 0;
         const outTok = c.output_tokens || msg.turn_output_tokens || 0;
-        const durMs = c.duration_ms || 0;
+        const durMs = c.duration_ms || (msg.generation_ms || 0);
         const parts = [];
-        if (inTok || outTok) parts.push(`${(inTok/1000).toFixed(1)}k in / ${(outTok/1000).toFixed(1)}k out`);
+        if (outTok) {
+            parts.push(inTok
+                ? `${(inTok/1000).toFixed(1)}k in / ${(outTok/1000).toFixed(1)}k out`
+                : `${(outTok/1000).toFixed(1)}k out`);
+        }
         if (usd) parts.push(`$${usd.toFixed(4)}`);
         if (durMs) parts.push(`${(durMs/1000).toFixed(1)}s`);
         if (parts.length) costHtml = `<div class="cost-footer">${parts.join(' · ')}</div>`;
@@ -2349,7 +2371,7 @@ function createMessageElement(msg, cost) {
             '<span class="message-role">' + escapeHtml(roleLabel) + '</span>' +
             (localModelTag ? `<span class="local-model-label">${localModelTag}</span>` : '') + (branchLabel ? '<span class="message-branch-label" title="' + escapeHtml(branchLabelFull) + ' — click to copy branch path">' + escapeHtml(branchLabel) + '</span>' : '') +
         '</div>' +
-        '<div class="message-actions">' + branchPlaceholder + actionsHtml + '</div>' +
+        '<div class="message-actions">' + elapsedHtml + branchPlaceholder + actionsHtml + '</div>' +
         '</div>' +
         '<div class="message-content">' + contentHtml + '</div>' +
         imgHtml + projectImgHtml + costHtml;
@@ -2459,46 +2481,68 @@ function renderToolBody(toolName, input, resultDisplay) {
 
 function renderContentBlocks(blocks) {
     let html = '';
+    // Merge text across tool_use blocks so a sentence cut by a tool call flows
+    // as one paragraph. Thinking blocks still flush text (they're a mode change).
+    // Tool blocks are collected and rendered after the merged text to preserve
+    // the chronological rhythm without splitting the paragraph.
+    let textBuf = '';
+    const toolBlocks = [];
+    const flushText = () => {
+        if (textBuf.trim()) html += formatContent(textBuf);
+        textBuf = '';
+    };
     for (const block of blocks) {
         if (block.type === 'text') {
-            if (!block.text || !block.text.trim()) continue;
-            html += formatContent(block.text);
-        } else if (block.type === 'tool_use') {
-            const name = block.name || 'Tool';
-            const rawInput = (block.input || '').trim();
-            const input = rawInput.length > 3000 ? rawInput.substring(0, 3000) + '\n... (truncated)' : rawInput;
-            const result = (block.result || '').trim();
-            const resultDisplay = result.length > 2000 ? result.substring(0, 2000) + '\n... (truncated)' : result;
-
-            // Special rendering for Edit tool
-            const isEdit = (name === 'Edit');
-            const diffHtml = isEdit ? renderEditDiff(input) : null;
-            const autoExpand = false; // Collapse all tool blocks in saved messages for performance
-            const expanded = autoExpand ? ' expanded' : '';
-            const toggleChar = autoExpand ? '&#9662;' : '&#9656;';
-
-            let bodyHtml;
-            if (diffHtml) {
-                bodyHtml = diffHtml;
-            } else {
-                bodyHtml = renderToolBody(name, input, resultDisplay);
-            }
-
-            html += '<div class="tool-block' + expanded + '">' +
-                '<div class="tool-block-header" data-tool-toggle>' +
-                    '<span class="tool-name">' + escapeHtml(name) + '</span>' +
-                    '<span class="tool-toggle">' + toggleChar + '</span>' +
-                '</div>' +
-                '<div class="tool-block-body">' + bodyHtml + '</div>' +
-            '</div>';
-        } else if (block.type === 'thinking') {
-            const text = (block.text || '').trim();
-            if (!text) continue;
-            html += '<div class="cc-thinking">' +
-                '<div class="cc-thinking-toggle">Thinking...</div>' +
-                '<div class="cc-thinking-content" style="display:none;">' + escapeHtml(text) + '</div>' +
-            '</div>';
+            if (!block.text) continue;
+            textBuf += block.text;
+            continue;
         }
+        if (block.type === 'tool_use') {
+            toolBlocks.push(block);
+            continue;
+        }
+        if (block.type === 'thinking') {
+            flushText();
+            const text = (block.text || '').trim();
+            if (text) {
+                html += '<div class="cc-thinking">' +
+                    '<div class="cc-thinking-toggle">Thinking...</div>' +
+                    '<div class="cc-thinking-content" style="display:none;">' + escapeHtml(text) + '</div>' +
+                '</div>';
+            }
+            continue;
+        }
+        flushText();
+    }
+    flushText();
+    // Render tool blocks after merged text
+    for (const block of toolBlocks) {
+        const name = block.name || 'Tool';
+        const rawInput = (block.input || '').trim();
+        const input = rawInput.length > 3000 ? rawInput.substring(0, 3000) + '\n... (truncated)' : rawInput;
+        const result = (block.result || '').trim();
+        const resultDisplay = result.length > 2000 ? result.substring(0, 2000) + '\n... (truncated)' : result;
+
+        // Special rendering for Edit tool
+        const isEdit = (name === 'Edit');
+        const diffHtml = isEdit ? renderEditDiff(input) : null;
+        const expanded = '';
+        const toggleChar = '&#9656;';
+
+        let bodyHtml;
+        if (diffHtml) {
+            bodyHtml = diffHtml;
+        } else {
+            bodyHtml = renderToolBody(name, input, resultDisplay);
+        }
+
+        html += '<div class="tool-block' + expanded + '">' +
+            '<div class="tool-block-header" data-tool-toggle>' +
+                '<span class="tool-name">' + escapeHtml(name) + '</span>' +
+                '<span class="tool-toggle">' + toggleChar + '</span>' +
+            '</div>' +
+            '<div class="tool-block-body">' + bodyHtml + '</div>' +
+        '</div>';
     }
     return html;
 }
@@ -2937,22 +2981,13 @@ function _flushStreamBuffer() {
     if (!streamingDiv || !_streamBuffer) return;
     _removeStreamWaiting();
     const contentEl = streamingDiv.querySelector('.message-content');
-    // Find or create a text span to stream into (keeps text separate from tool blocks)
-    let textSpan = contentEl.querySelector('.streaming-text:last-of-type');
-    // If last child is a tool/thinking block, start a new text span after it
-    const lastChild = contentEl.lastElementChild;
-    if (!textSpan || (lastChild && !lastChild.classList.contains('streaming-text'))) {
+    // Always use the first text span so text flows as one paragraph across tool blocks.
+    // Tool blocks insert inline chronologically, but text stays in a single span.
+    let textSpan = contentEl.querySelector('.streaming-text:first-of-type');
+    if (!textSpan) {
         textSpan = document.createElement('span');
         textSpan.className = 'streaming-text';
-        // Cursor lives as a sibling of the text, so we can append text nodes
-        // directly without touching cursor markup on every flush.
         contentEl.appendChild(textSpan);
-        // Ensure a single cursor span exists on the contentEl as last child
-        if (!contentEl.querySelector('.typing-cursor')) {
-            const cur = document.createElement('span');
-            cur.className = 'typing-cursor';
-            contentEl.appendChild(cur);
-        }
     }
     // Append-only: just tack on a text node with the new delta. O(1) per flush
     // regardless of total message size. We accept raw markdown chars visible
@@ -2986,7 +3021,8 @@ function finalizeStreamingMessage(msg, cost) {
     // fully rendered message element. This is the ONE markdown parse pass per
     // turn — O(N) instead of O(N²) from per-chunk reparsing.
     State.messages.push(msg);
-    const newEl = createMessageElement(msg, cost);
+    const elapsed = _streamStartTime ? Math.round((Date.now() - _streamStartTime) / 1000) : 0;
+    const newEl = createMessageElement(msg, cost, elapsed);
     streamingDiv.replaceWith(newEl);
     streamingDiv = null;
     scrollToBottom();

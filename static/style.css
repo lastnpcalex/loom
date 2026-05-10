@@ -2154,6 +2154,15 @@ body::after {
     color: var(--cyan);
 }
 
+/* Elapsed time badge in message header (matches streaming timer) */
+.message-actions .gen-timer {
+    font-family: var(--font-mono, monospace);
+    font-size: 11px;
+    opacity: 0.55;
+    margin-right: 4px;
+    white-space: nowrap;
+}
+
 .msg-menu {
     position: relative;
 }

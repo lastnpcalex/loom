@@ -2297,11 +2297,16 @@ function setupEventListeners() {
     }
 
     // Server-status lights: green = reachable, red = down, gray = unknown.
+    // Use the page's own hostname so links and probes work over Tailscale (or
+    // any non-localhost access) without hardcoding IPs.
+    function _localUrl(scheme, port, path) {
+        return `${scheme}://${location.hostname}:${port}${path || ''}`;
+    }
     const _SERVER_PROBES = {
-        admin:   'http://localhost:3002/api/status',
-        ollama:  'http://localhost:11434/api/tags',
-        vllm:    'http://localhost:8000/v1/models',
-        comfyui: 'http://localhost:8188/system_stats',
+        admin:   _localUrl('http', 3002, '/api/status'),
+        ollama:  _localUrl('http', 11434, '/api/tags'),
+        vllm:    _localUrl('http', 8000, '/v1/models'),
+        comfyui: _localUrl('http', 8188, '/system_stats'),
     };
     async function _probeServer(url) {
         try {
@@ -2420,7 +2425,7 @@ function setupEventListeners() {
         document.getElementById('btn-save-settings').click();
         btn.textContent = '↻ Restarting…';
         try {
-            const adminUrl = 'http://localhost:3002/tools/vllm-restart';
+            const adminUrl = _localUrl('http', 3002, '/tools/vllm-restart');
             const resp = await fetch(adminUrl, { method: 'POST' });
             const data = await resp.json().catch(() => ({}));
             if (data.status === 'ok') {
@@ -3482,6 +3487,19 @@ function scrollToBottom(force) {
         });
     });
 })();
+
+// Rewrite static localhost/127.0.0.1 hrefs to use whatever hostname the page
+// was loaded from. Lets the settings server-links work over Tailscale without
+// hardcoding the host's IP.
+document.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('a[href*="localhost"], a[href*="127.0.0.1"]').forEach(a => {
+        try {
+            const u = new URL(a.href);
+            u.hostname = location.hostname;
+            a.href = u.toString();
+        } catch {}
+    });
+});
 
 // ── Start ──
 document.addEventListener('DOMContentLoaded', init);

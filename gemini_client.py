@@ -88,7 +88,7 @@ def _configure_permission_hook(cwd: str, backstage_parent_id: int | None = None,
             "hooks": [{
                 "type": "command",
                 "command": hook_command,
-                "timeout": 300000,  # 5 min — user needs time to approve in Loom UI
+                "timeout": 900000,  # 15 min — user needs time to approve in Loom UI
             }]
         }
     ]

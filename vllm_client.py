@@ -222,6 +222,12 @@ async def stream_chat(messages: list[dict],
     effective_max = max_tokens or config.max_tokens
     win = verbatim_window if verbatim_window is not None else config.verbatim_window
 
+    # Pad for thinking budget so the model has room to reason AND produce content,
+    # but clamp to ~90% of max_model_len — vLLM rejects max_tokens > max_model_len,
+    # and we still need headroom for the prompt itself.
+    max_len = getattr(config, "vllm_max_model_len", 0) or 32768
+    padded_max = min(effective_max + 8192, max(effective_max, int(max_len * 0.9)))
+
     payload = {
         "model": target_model,
         "messages": _build_vllm_messages(messages, verbatim_window=win),
@@ -230,7 +236,7 @@ async def stream_chat(messages: list[dict],
         "temperature": temperature if temperature is not None else config.temperature,
         "top_p": top_p if top_p is not None else config.top_p,
         # vLLM enforces this absolutely; we keep our own thinking-aware cap below.
-        "max_tokens": effective_max + 8192,
+        "max_tokens": padded_max,
         # vLLM-specific extension passed through on the OpenAI request body.
         "repetition_penalty": repeat_penalty if repeat_penalty is not None else config.repeat_penalty,
     }
@@ -283,7 +289,12 @@ async def stream_chat(messages: list[dict],
                         continue
                     delta = choices[0].get("delta") or {}
 
-                    reasoning = delta.get("reasoning_content") or ""
+                    # vLLM streaming emits the reasoning delta under "reasoning"
+                    # (0.20+) — the non-streaming response uses "reasoning_content".
+                    # Accept either so we don't silently drop thinking tokens.
+                    reasoning = (delta.get("reasoning")
+                                 or delta.get("reasoning_content")
+                                 or "")
                     token = delta.get("content") or ""
 
                     if reasoning:

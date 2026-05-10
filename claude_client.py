@@ -12,6 +12,112 @@ log = logging.getLogger(__name__)
 # Absolute path to the hook script (same directory as this file)
 _HOOK_SCRIPT = str(Path(__file__).parent / "cc_permission_hook.py")
 
+# Cap auto-continue relaunches so a runaway model can't loop forever. Five
+# rounds covers any realistic max_tokens trip without becoming a token bomb.
+_AUTO_CONTINUE_MAX = 5
+_AUTO_CONTINUE_PROMPT = (
+    "Continue from where your previous response was cut off. "
+    "Do not restate context, apologize, or repeat what you already wrote — "
+    "just resume the next token."
+)
+
+
+class _CCHandle:
+    """Proxy over the active CC subprocess so the caller's reference stays
+    valid across auto-continue relaunches. server.py stores this once in
+    `_active_claude_procs[conv_id]`; when the inner stream relaunches CC on
+    a max_tokens stop, we swap the underlying proc and `.kill()` / `.pid`
+    keep targeting whichever subprocess is currently streaming."""
+
+    __slots__ = ("_proc", "_cancelled")
+
+    def __init__(self, proc):
+        self._proc = proc
+        # Set when the caller cancels via kill()/terminate(). The relaunch
+        # path checks this after spawning a new proc so a cancel that lands
+        # during the spawn await doesn't orphan the just-started subprocess.
+        self._cancelled = False
+
+    def _swap(self, new_proc) -> bool:
+        """Adopt new_proc as the active subprocess. Returns False (and kills
+        new_proc) if a cancel landed during the spawn await — the caller
+        should break out of the relaunch loop instead of streaming on."""
+        if self._cancelled:
+            try:
+                new_proc.kill()
+            except Exception:
+                pass
+            return False
+        self._proc = new_proc
+        return True
+
+    @property
+    def cancelled(self):
+        return self._cancelled
+
+    @property
+    def pid(self):
+        return self._proc.pid
+
+    @property
+    def returncode(self):
+        return self._proc.returncode
+
+    @property
+    def stdin(self):
+        return self._proc.stdin
+
+    @property
+    def stdout(self):
+        return self._proc.stdout
+
+    @property
+    def stderr(self):
+        return self._proc.stderr
+
+    def kill(self):
+        self._cancelled = True
+        try:
+            self._proc.kill()
+        except Exception:
+            pass
+
+    def terminate(self):
+        self._cancelled = True
+        try:
+            self._proc.terminate()
+        except Exception:
+            pass
+
+    async def wait(self):
+        return await self._proc.wait()
+
+
+def _build_continue_cmd(orig_cmd: list, session_id: str, continue_prompt: str) -> list:
+    """Mutate a CC command list for an auto-continue relaunch:
+    - swap the -p prompt to the continue text (or replace stdin sentinel)
+    - replace existing --resume value or append a new --resume session_id pair
+    - drop --fork-session (we extend the same session, not branch from it)
+    """
+    new = list(orig_cmd)
+    try:
+        i = new.index("-p")
+        if i + 1 < len(new):
+            new[i + 1] = continue_prompt
+    except ValueError:
+        new.extend(["-p", continue_prompt])
+    try:
+        i = new.index("--resume")
+        if i + 1 < len(new):
+            new[i + 1] = session_id
+        else:
+            new.append(session_id)
+    except ValueError:
+        new.extend(["--resume", session_id])
+    if "--fork-session" in new:
+        new.remove("--fork-session")
+    return new
+
 
 def _extract_message_text(content) -> str:
     """Pull readable text out of a CC transcript record's message.content."""
@@ -109,6 +215,14 @@ def _process_event(raw: dict, state: dict | None = None) -> list[dict]:
     events = []
     etype = raw.get("type", "")
 
+    # Track the latest session_id from any event that carries one. CC mints a
+    # new session_id at compact_boundary, so capturing only from the initial
+    # `system` init event would leave the auto-continue loop --resume'ing the
+    # wrong (pre-compact) session.
+    sid_in_raw = raw.get("session_id")
+    if sid_in_raw:
+        state["session_id"] = sid_in_raw
+
     if etype == "system":
         subtype = raw.get("subtype", "")
         if subtype == "compact_boundary":
@@ -143,6 +257,25 @@ def _process_event(raw: dict, state: dict | None = None) -> list[dict]:
         # be reassembled and parsed at content_block_stop.
         ev = raw.get("event", {})
         evt_type = ev.get("type", "")
+
+        # message_delta carries the canonical per-API-call final usage and the
+        # turn's stop_reason. With --include-partial-messages the `assistant`
+        # event's usage is a stale snapshot from message_start (output_tokens
+        # under-reported), so this is now our sole usage source.
+        if evt_type == "message_delta":
+            sr = (ev.get("delta") or {}).get("stop_reason")
+            if sr:
+                state["stop_reason"] = sr
+            usage = ev.get("usage") or {}
+            if usage:
+                input_tok = (usage.get("input_tokens", 0)
+                             + usage.get("cache_read_input_tokens", 0)
+                             + usage.get("cache_creation_input_tokens", 0))
+                events.append({
+                    "type": "usage",
+                    "input_tokens": input_tok,
+                    "output_tokens": usage.get("output_tokens", 0),
+                })
 
         if evt_type == "content_block_start":
             idx = ev.get("index", 0)
@@ -216,26 +349,12 @@ def _process_event(raw: dict, state: dict | None = None) -> list[dict]:
                     })
             blocks.pop(idx, None)
 
-        # message_start / message_delta / message_stop carry usage and
-        # stop_reason; we extract canonical usage from the assistant event
-        # below to avoid double-counting in server.py's running totals.
-
     elif etype == "assistant":
         # With --include-partial-messages, content has already streamed via
-        # stream_event deltas. Suppress content emission here. Still emit
-        # usage so server.py's per-turn totals get the canonical numbers.
+        # stream_event deltas and canonical usage comes from message_delta.
+        # Suppress both here to avoid duplicating content and double-counting
+        # tokens (the assistant event's usage is a stale message_start snapshot).
         message = raw.get("message", {})
-        usage = message.get("usage", {})
-        if usage:
-            # input_tokens only counts non-cached tokens; add cache reads for the true total
-            input_tok = (usage.get("input_tokens", 0)
-                         + usage.get("cache_read_input_tokens", 0)
-                         + usage.get("cache_creation_input_tokens", 0))
-            events.append({
-                "type": "usage",
-                "input_tokens": input_tok,
-                "output_tokens": usage.get("output_tokens", 0),
-            })
         # Detect CC-synthesized error messages (e.g. rate-limit 429s). CC
         # fabricates these client-side and the wording — "monthly usage limit"
         # for an hourly trip — is unreliable. Surface the diagnostic fields so
@@ -545,99 +664,174 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         else:
             cmd = ["claude"] + cc_args
 
+    async def _spawn_cc(spawn_cmd: list, spawn_prompt: str | None, spawn_use_stdin: bool):
+        """Launch a CC subprocess and start its stderr drainer. Returns the
+        asyncio.subprocess.Process. Used for the initial run and each
+        auto-continue relaunch on max_tokens stop."""
+        p = await asyncio.create_subprocess_exec(
+            *spawn_cmd,
+            cwd=cwd,
+            env=env,
+            stdin=asyncio.subprocess.PIPE if spawn_use_stdin else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=16 * 1024 * 1024,
+        )
+        if spawn_use_stdin and p.stdin and spawn_prompt is not None:
+            async def _feed_stdin():
+                try:
+                    p.stdin.write(spawn_prompt.encode("utf-8"))
+                    await p.stdin.drain()
+                    p.stdin.close()
+                except Exception as e:
+                    print(f"[CC] Error feeding stdin: {e}")
+            asyncio.create_task(_feed_stdin())
+
+        async def _read_stderr():
+            async for line in p.stderr:
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    print(f"[CC-stderr] {text}")
+        asyncio.create_task(_read_stderr())
+        return p
+
     print(f"[CC] Starting subprocess in {cwd}")
     print(f"[CC] CMD: {' '.join(cmd[:8])}{'...' if len(cmd) > 8 else ''}")
     print(f"[CC] use_ollama={use_ollama} model={model} effort={effort}")
     print(f"[CC] Prompt length: {len(prompt)} chars (stdin={use_stdin})")
     print(f"[CC] Hook env: LOOM_CONV_ID={conv_id} LOOM_PORT={server_port}")
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=cwd,
-        env=env,
-        stdin=asyncio.subprocess.PIPE if use_stdin else asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=16 * 1024 * 1024,  # 16 MB line buffer (CC can emit large base64/tool results)
-    )
-
-    # Feed prompt via stdin if needed in a background task to prevent pipe deadlocks
-    if use_stdin and proc.stdin:
-        async def _feed_stdin():
-            try:
-                proc.stdin.write(prompt.encode("utf-8"))
-                await proc.stdin.drain()
-                proc.stdin.close()
-            except Exception as e:
-                print(f"[CC] Error feeding stdin: {e}")
-        asyncio.create_task(_feed_stdin())
-
+    proc = await _spawn_cc(cmd, prompt, use_stdin)
     print(f"[CC] Process started, pid={proc.pid}")
-
-    # Read stderr in background for debugging
-    async def _read_stderr():
-        async for line in proc.stderr:
-            text = line.decode("utf-8", errors="replace").strip()
-            if text:
-                print(f"[CC-stderr] {text}")
-
-    asyncio.create_task(_read_stderr())
+    handle = _CCHandle(proc)
 
     async def _event_stream():
         # Per-stream state carried across _process_event calls — content_block
-        # index map for assembling tool input JSON across deltas, etc.
+        # index map, captured session_id, captured stop_reason. Survives across
+        # auto-continue relaunches so the second run knows which session_id
+        # to --resume against and so accumulated tool_use blocks don't reset.
         stream_state: dict = {}
-        async for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
+        relaunches = 0
+        # Buffer the `result` event across relaunches: the caller treats it
+        # as "stream done", so we only emit it after we've decided not to
+        # relaunch. Cost / duration / num_turns get summed across rounds.
+        pending_result: dict | None = None
+        cum_cost_usd = 0.0
+        cum_duration_ms = 0
+        cum_turns = 0
+
+        while True:
+            active = handle._proc
+            saw_result = False
+            async for line in active.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    print(f"[CC] Non-JSON line: {line[:200]}")
+                    continue
+
+                rtype = raw.get("type", "?")
+                if rtype == "stream_event":
+                    _ev = raw.get("event", {}) or {}
+                    _evt_type = _ev.get("type", "?")
+                    _delta = _ev.get("delta", {}) or {}
+                    _dtype = _delta.get("type", "")
+                    _snippet = ""
+                    if _dtype == "text_delta":
+                        _snippet = repr((_delta.get("text") or "")[:40])
+                    elif _dtype == "thinking_delta":
+                        _snippet = repr((_delta.get("thinking") or "")[:40])
+                    print(f"[CC-TRACE] stream_event {_evt_type}/{_dtype} {_snippet}")
+                else:
+                    print(f"[CC] event: {rtype}")
+
+                for evt in _process_event(raw, stream_state):
+                    et = evt.get("type")
+                    if et == "result":
+                        # Aggregate across relaunches; emit once at the end.
+                        cum_cost_usd += float(evt.get("cost_usd") or 0)
+                        cum_duration_ms += int(evt.get("duration_ms") or 0)
+                        cum_turns += int(evt.get("num_turns") or 0)
+                        merged = dict(evt)
+                        merged["cost_usd"] = cum_cost_usd
+                        merged["duration_ms"] = cum_duration_ms
+                        merged["num_turns"] = cum_turns
+                        pending_result = merged
+                    elif et == "session_info" and relaunches > 0:
+                        # Suppress the relaunch's session_info — the UI already
+                        # has the session_id from the first invocation, and a
+                        # second one mid-stream confuses the message-finalize path.
+                        continue
+                    else:
+                        yield evt
+
+                if rtype == "result":
+                    saw_result = True
+                    print("[CC] Got result event, stopping stream reader")
+                    break
+
+            # Reap the just-finished proc before deciding whether to relaunch.
             try:
-                raw = json.loads(line.decode("utf-8", errors="replace"))
-            except json.JSONDecodeError:
-                print(f"[CC] Non-JSON line: {line[:200]}")
-                continue
+                rc = await asyncio.wait_for(active.wait(), timeout=10)
+                print(f"[CC] Process exited with code {rc}")
+            except asyncio.TimeoutError:
+                print("[CC] Process didn't exit within 10s (likely spawned background server), terminating")
+                active.terminate()
+                try:
+                    await asyncio.wait_for(active.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    active.kill()
 
-            rtype = raw.get("type", "?")
-            # TEMP DEBUG: log every event including stream_events so we can
-            # verify whether content deltas are flowing through CC for
-            # vllm-local generations. Restore the suppression after diagnosis.
-            if rtype == "stream_event":
-                _ev = raw.get("event", {}) or {}
-                _evt_type = _ev.get("type", "?")
-                _delta = _ev.get("delta", {}) or {}
-                _dtype = _delta.get("type", "")
-                _snippet = ""
-                if _dtype == "text_delta":
-                    _snippet = repr((_delta.get("text") or "")[:40])
-                elif _dtype == "thinking_delta":
-                    _snippet = repr((_delta.get("thinking") or "")[:40])
-                print(f"[CC-TRACE] stream_event {_evt_type}/{_dtype} {_snippet}")
-            else:
-                print(f"[CC] event: {rtype}")
-
-            for evt in _process_event(raw, stream_state):
-                yield evt
-
-            # `result` is the final event — stop reading so we don't hang
-            # if a background process (e.g. a server) inherited stdout
-            if rtype == "result":
-                print("[CC] Got result event, stopping stream reader")
+            sr = stream_state.get("stop_reason")
+            sid = stream_state.get("session_id")
+            should_continue = (
+                saw_result
+                and sr == "max_tokens"
+                and bool(sid)
+                and relaunches < _AUTO_CONTINUE_MAX
+            )
+            if not should_continue:
+                if sr == "max_tokens" and relaunches >= _AUTO_CONTINUE_MAX:
+                    print(f"[CC] Auto-continue cap ({_AUTO_CONTINUE_MAX}) reached; stopping")
                 break
 
-        # Wait for process exit with timeout — if a spawned server holds
-        # the process tree open, don't block forever
-        try:
-            rc = await asyncio.wait_for(proc.wait(), timeout=10)
-            print(f"[CC] Process exited with code {rc}")
-        except asyncio.TimeoutError:
-            print("[CC] Process didn't exit within 10s (likely spawned background server), terminating")
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                proc.kill()
+            relaunches += 1
+            print(f"[CC] Auto-continue #{relaunches}: stop=max_tokens, sid={sid[:8]}...")
+            # Surface a status banner immediately — without this the user sees
+            # a 1–2s silent gap while CC respawns before the next text_delta.
+            yield {"type": "auto_continue", "round": relaunches}
+            # Reset per-round state so the next round can capture its own
+            # stop_reason without inheriting "max_tokens" from this one.
+            stream_state["stop_reason"] = None
+            # Tool-use block index map is per-message; clear it so the
+            # continuation's content_block indexes don't collide with the
+            # truncated message's indexes.
+            stream_state["blocks"] = {}
 
-    return proc, _event_stream()
+            cont_cmd = _build_continue_cmd(cmd, sid, _AUTO_CONTINUE_PROMPT)
+            if handle.cancelled:
+                # User cancelled while we were reaping the previous proc.
+                print("[CC] Auto-continue aborted: cancel before relaunch")
+                break
+            try:
+                new_proc = await _spawn_cc(cont_cmd, _AUTO_CONTINUE_PROMPT, False)
+            except Exception as e:
+                print(f"[CC] Auto-continue spawn failed: {e}")
+                break
+            print(f"[CC] Auto-continue subprocess started, pid={new_proc.pid}")
+            if not handle._swap(new_proc):
+                # Cancel landed during the spawn await; _swap killed new_proc.
+                print("[CC] Auto-continue aborted: cancel during spawn")
+                break
+            # Loop back to drain the new proc's stdout.
+
+        if pending_result is not None:
+            yield pending_result
+
+    return handle, _event_stream()
 
 
 async def cancel_claude(proc):

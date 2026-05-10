@@ -346,6 +346,8 @@ async def _run_migrations(db):
         "ALTER TABLE messages ADD COLUMN describe_context TEXT",
         # Backstage: child conversation dedicated to editing this conv's state cards via an LLM agent
         "ALTER TABLE conversations ADD COLUMN backstage_parent_id INTEGER",
+        # Persisted generation duration so the M:SS timer survives a refresh.
+        "ALTER TABLE messages ADD COLUMN generation_ms INTEGER",
     ]
     for sql in migrations:
         try:
@@ -783,6 +785,7 @@ async def update_message_content(
     turn_output_tokens: int = None,
     cc_session_id: str = None,
     cc_model_used: str = None,
+    generation_ms: int = None,
 ):
     """Update a message's content and metadata (used for draft → final)."""
     db = await get_db()
@@ -811,6 +814,9 @@ async def update_message_content(
     if cc_model_used is not None:
         updates.append("cc_model_used = ?")
         params.append(cc_model_used)
+    if generation_ms is not None:
+        updates.append("generation_ms = ?")
+        params.append(generation_ms)
     if updates:
         params.append(msg_id)
         await db.execute(
