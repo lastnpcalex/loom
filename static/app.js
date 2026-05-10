@@ -2302,38 +2302,26 @@ function setupEventListeners() {
     function _localUrl(scheme, port, path) {
         return `${scheme}://${location.hostname}:${port}${path || ''}`;
     }
-    const _SERVER_PROBES = {
-        // Admin runs plain HTTP and main Loom is HTTPS, so a direct browser
-        // probe is blocked as mixed content. Proxy through main Loom instead.
-        admin:   { proxy: '/api/admin-status' },
-        ollama:  { url: _localUrl('http', 11434, '/api/tags') },
-        vllm:    { url: _localUrl('http', 8000, '/v1/models') },
-        comfyui: { url: _localUrl('http', 8188, '/system_stats') },
-    };
-    async function _probeServer(spec) {
+    // All co-located services (admin, ollama, vllm, comfyui) run plain HTTP,
+    // so a direct browser probe from HTTPS main Loom is blocked as mixed
+    // content. Probe each through main Loom's same-origin proxy instead.
+    async function _probeServer(target) {
         try {
             const ctrl = new AbortController();
-            const t = setTimeout(() => ctrl.abort(), 1500);
-            if (spec.proxy) {
-                const resp = await fetch(spec.proxy, { signal: ctrl.signal });
-                clearTimeout(t);
-                if (!resp.ok) return false;
-                const data = await resp.json().catch(() => ({}));
-                return !!data.up;
-            }
-            await fetch(spec.url, { method: 'GET', mode: 'no-cors', signal: ctrl.signal });
+            const t = setTimeout(() => ctrl.abort(), 2500);
+            const resp = await fetch(`/api/server-status/${target}`, { signal: ctrl.signal });
             clearTimeout(t);
-            // no-cors returns opaque — any non-throw means the port answered TCP.
-            return true;
+            if (!resp.ok) return false;
+            const data = await resp.json().catch(() => ({}));
+            return !!data.up;
         } catch { return false; }
     }
     async function _refreshServerLights() {
         const rows = document.querySelectorAll('#cfg-server-grid .server-row');
         await Promise.all([...rows].map(async row => {
             const key = row.dataset.server;
-            const spec = _SERVER_PROBES[key];
-            if (!spec) return;
-            const up = await _probeServer(spec);
+            if (!key) return;
+            const up = await _probeServer(key);
             const dot = row.querySelector('.server-light');
             if (dot) dot.dataset.state = up ? 'up' : 'down';
         }));

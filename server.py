@@ -589,21 +589,41 @@ async def api_health():
     return ollama_status
 
 
-@app.get("/api/admin-status")
-async def api_admin_status():
-    """Server-side proxy of the admin server's status endpoint. The admin
-    server runs plain HTTP on :3002 while main Loom is HTTPS, so a direct
-    browser probe would be blocked as mixed content. Probing server-side
-    sidesteps that and gives the settings panel a reliable signal."""
-    admin_port = int(os.environ.get("LOOM_ADMIN_PORT", "3002"))
+# Map of probe targets to (port, health_path). All run on localhost alongside
+# main Loom; main Loom proxies them so the settings panel can probe over HTTPS
+# without browser mixed-content blocking the direct HTTP request.
+_STATUS_TARGETS = {
+    "admin":   (3002, "/api/status"),
+    "ollama":  (11434, "/api/tags"),
+    "vllm":    (8000, "/v1/models"),
+    "comfyui": (8188, "/system_stats"),
+}
+
+
+@app.get("/api/server-status/{target}")
+async def api_server_status(target: str):
+    """Server-side proxy of a co-located service's health endpoint. The admin
+    server, Ollama, vLLM, and ComfyUI all run plain HTTP, so a browser probe
+    from HTTPS-served main Loom is blocked as mixed content. Probing from the
+    server (loopback HTTP) sidesteps that. Returns {up: bool}."""
+    spec = _STATUS_TARGETS.get(target)
+    if not spec:
+        return {"up": False}
+    port, path = spec
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
-            r = await client.get(f"http://127.0.0.1:{admin_port}/api/status")
+            r = await client.get(f"http://127.0.0.1:{port}{path}")
             if r.status_code == 200:
                 return {"up": True}
     except Exception:
         pass
     return {"up": False}
+
+
+@app.get("/api/admin-status")
+async def api_admin_status():
+    """Back-compat alias for the unified server-status endpoint."""
+    return await api_server_status("admin")
 
 
 @app.get("/api/ollama/models")
