@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 import httpx
@@ -229,6 +229,31 @@ async def tool_auth_login_status():
         return JSONResponse({"status": "ok", "output": "Login successful!"})
     else:
         return JSONResponse({"status": "error", "output": f"Login failed (exit code {rc})."})
+
+
+@app.post("/tools/auth-submit-code")
+async def tool_auth_submit_code(request: Request):
+    """Forward the OAuth authorization code from the browser callback into the
+    running `claude auth login` subprocess via stdin. Required when the host
+    is accessed over Tailscale/LAN — the login redirect lands on the user's
+    browser, not on the box running CC, so the subprocess can't intercept it
+    automatically and is left blocking on stdin for the pasted code."""
+    global _auth_login_proc
+    if _auth_login_proc is None:
+        return JSONResponse({"status": "error", "output": "No login in progress."})
+    if _auth_login_proc.poll() is not None:
+        _auth_login_proc = None
+        return JSONResponse({"status": "error", "output": "Login process already exited."})
+    body = await request.json()
+    code = (body.get("code") or "").strip()
+    if not code:
+        return JSONResponse({"status": "error", "output": "No code provided."})
+    try:
+        _auth_login_proc.stdin.write(code + "\n")
+        _auth_login_proc.stdin.flush()
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": f"Stdin write failed: {e}"})
+    return JSONResponse({"status": "ok", "output": "Code submitted — waiting for tokens…"})
 
 
 @app.post("/tools/clear-vram")
@@ -1203,8 +1228,17 @@ async def dashboard():
             if (d.status === 'login_started' && d.url) {{
                 out.innerHTML = d.output.replace(/\\n/g, '<br>') +
                     '<br><br><a href="' + d.url + '" target="_blank" style="color:#0ff; font-size:14px; word-break:break-all;">' + d.url + '</a>' +
-                    '<br><br><span id="login-poll" style="color:#888;">Waiting for login to complete...</span>';
+                    '<br><br><div style="margin-top:8px;">' +
+                    'After authenticating, paste the code from the callback page:<br>' +
+                    '<input id="auth-code-input" type="text" placeholder="paste authorization code" ' +
+                    'style="width:60%; min-width:280px; padding:6px; margin-top:6px; ' +
+                    'background:#111; color:#0ff; border:1px solid #0ff; font-family:monospace;" ' +
+                    'onkeydown="if(event.key===\'Enter\'){{submitAuthCode();}}">' +
+                    ' <button class="btn btn-cyan" onclick="submitAuthCode()" style="margin-left:6px;">Submit</button>' +
+                    '</div>' +
+                    '<br><span id="login-poll" style="color:#888;">Waiting for login to complete...</span>';
                 pollLoginStatus();
+                document.getElementById('auth-code-input')?.focus();
                 return;
             }}
             out.textContent = d.output || '(no output)';
@@ -1214,6 +1248,27 @@ async def dashboard():
             out.className = 'visible error';
         }}
         scheduleRefresh(30000);
+    }}
+
+    async function submitAuthCode() {{
+        const inp = document.getElementById('auth-code-input');
+        if (!inp) return;
+        const code = inp.value.trim();
+        if (!code) {{ showToast('Paste the authorization code first'); return; }}
+        inp.disabled = true;
+        try {{
+            const r = await fetch('/tools/auth-submit-code', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ code: code }}),
+            }});
+            const d = await r.json();
+            showToast(d.output || (d.status === 'ok' ? 'submitted' : 'failed'));
+            if (d.status !== 'ok') inp.disabled = false;
+        }} catch (e) {{
+            showToast('submit failed: ' + e);
+            inp.disabled = false;
+        }}
     }}
 
     async function pollLoginStatus() {{
