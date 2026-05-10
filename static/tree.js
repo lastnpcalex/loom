@@ -612,6 +612,11 @@ async function renderTree() {
     const container = document.getElementById('tree-nodes');
     if (!container) return;
 
+    // Render token: a newer render started after this one yields means we
+    // abort partway through instead of fighting the new render for the DOM.
+    const myToken = (TREE._renderToken = (TREE._renderToken || 0) + 1);
+    const isStale = () => TREE._renderToken !== myToken;
+
     // Restore layout preference before computing layout
     const savedVertical = localStorage.getItem('loom-tree-vertical');
     if (savedVertical !== null) TREE.vertical = savedVertical === 'true';
@@ -624,6 +629,7 @@ async function renderTree() {
             console.error('Failed to refresh tree data:', e);
         }
     }
+    if (isStale()) return;
 
     if (!State.treeData || State.treeData.length === 0) {
         // Switch to chat view so user can type
@@ -670,23 +676,35 @@ async function renderTree() {
     svg.style.pointerEvents = 'none';
     svg.style.overflow = 'visible';
 
-    // Create nodes
+    // Create nodes in batches, yielding to the main thread between batches
+    // so keystrokes/clicks can land while a large tree builds. A render token
+    // check after each yield aborts stale work if a newer render started.
     const pillEls = {};
     const positions = {};
-
-    for (const node of layout.nodes) {
-        const el = createNode(node, branchNames);
-        el.style.position = 'absolute';
-        el.style.left = node.x + 'px';
-        el.style.top = node.y + 'px';
-        el.style.width = node.width + 'px';
-        container.appendChild(el);
-        pillEls[node.data.id] = el;
-        positions[node.data.id] = {
-            x: node.x, y: node.y,
-            width: node.width,
-            height: el.offsetHeight || node.height,
-        };
+    const BATCH = 50;
+    for (let start = 0; start < layout.nodes.length; start += BATCH) {
+        const end = Math.min(start + BATCH, layout.nodes.length);
+        const frag = document.createDocumentFragment();
+        for (let i = start; i < end; i++) {
+            const node = layout.nodes[i];
+            const el = createNode(node, branchNames);
+            el.style.position = 'absolute';
+            el.style.left = node.x + 'px';
+            el.style.top = node.y + 'px';
+            el.style.width = node.width + 'px';
+            frag.appendChild(el);
+            pillEls[node.data.id] = el;
+            positions[node.data.id] = {
+                x: node.x, y: node.y,
+                width: node.width,
+                height: node.height,  // refined after rAF measures actual offsetHeight
+            };
+        }
+        container.appendChild(frag);
+        if (end < layout.nodes.length) {
+            await new Promise(r => setTimeout(r, 0));
+            if (isStale()) return;
+        }
     }
 
     // Canvas meta-root node (if enabled)
@@ -995,11 +1013,16 @@ function createNode(node, branchNames) {
 function drawConnectors(svg, nodes, positions) {
     svg.innerHTML = '';
     const vertical = TREE.vertical;
+    // O(N) parent-active lookup. The previous Array.find inside the loop
+    // was O(N²) — tens of thousands of ops on a tree with hundreds of nodes,
+    // and the dominant cost of view-switching to tree.
+    const nodeById = new Map();
+    for (const n of nodes) nodeById.set(n.data.id, n);
     for (const node of nodes) {
         if (node.parentId && positions[node.parentId] && positions[node.data.id]) {
             const parent = positions[node.parentId];
             const child = positions[node.data.id];
-            const isActive = node.isActive && nodes.find(n => n.data.id === node.parentId)?.isActive;
+            const isActive = node.isActive && nodeById.get(node.parentId)?.isActive;
 
             const color = isActive ? TREE.connectorActiveColor : TREE.connectorColor;
             const width = isActive ? 2.5 : 2;
