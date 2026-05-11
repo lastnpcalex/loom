@@ -25,8 +25,10 @@ from fastapi import (
     HTTPException,
 )
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from starlette.websockets import WebSocketState
+
+from canvas_slug import generate_canvas_slug, is_valid_slug
 
 import httpx
 import database as db
@@ -519,6 +521,7 @@ async def toggle_canvas(conv_id: int, data: dict = None):
         project_dir = str(workspace)
         await db.update_conversation_fields(conv_id, project_dir=project_dir)
 
+    canvas_slug = conv.get("canvas_slug") or ""
     if enabled:
         canvas_dir = Path(project_dir) / "canvas"
         canvas_dir.mkdir(parents=True, exist_ok=True)
@@ -540,8 +543,24 @@ async def toggle_canvas(conv_id: int, data: dict = None):
                 encoding="utf-8",
             )
 
+        # Mint a stable slug the first time canvas is enabled. Retry on the
+        # off chance the unique index rejects the generated slug.
+        if not canvas_slug:
+            for _ in range(5):
+                candidate = generate_canvas_slug()
+                if not await db.get_conversation_by_canvas_slug(candidate):
+                    canvas_slug = candidate
+                    break
+            if canvas_slug:
+                await db.update_conversation_fields(conv_id, canvas_slug=canvas_slug)
+
     await db.update_conversation_fields(conv_id, canvas_enabled=1 if enabled else 0)
-    return {"ok": True, "enabled": enabled, "project_dir": project_dir}
+    return {
+        "ok": True,
+        "enabled": enabled,
+        "project_dir": project_dir,
+        "canvas_slug": canvas_slug or None,
+    }
 
 
 @app.get("/api/canvas/{conv_id}")
@@ -578,6 +597,30 @@ async def serve_canvas_file(conv_id: int, file_path: str = "index.html"):
 @app.get("/")
 async def index():
     return FileResponse("static/index.html")
+
+
+@app.get("/{slug}")
+async def canvas_by_slug(slug: str):
+    """Direct-access wrapper: serve a full-viewport iframe of a conversation's canvas
+    when the URL path matches a canvas slug. Strict regex prevents collisions with
+    any other top-level path."""
+    if not is_valid_slug(slug):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    conv = await db.get_conversation_by_canvas_slug(slug)
+    if not conv or not conv.get("canvas_enabled"):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    # Title is user-controlled — escape for HTML safety.
+    from html import escape as _esc
+    title = _esc(conv.get("title") or slug)
+    html = (
+        '<!doctype html><meta charset="utf-8">'
+        f"<title>{title}</title>"
+        "<style>html,body{margin:0;height:100%;background:#000}"
+        "iframe{border:0;width:100vw;height:100vh;display:block;background:#fff}</style>"
+        '<iframe sandbox="allow-scripts allow-same-origin" '
+        f'src="/api/canvas/{conv["id"]}/index.html"></iframe>'
+    )
+    return HTMLResponse(html)
 
 
 # ── Health ──

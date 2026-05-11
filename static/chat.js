@@ -3665,10 +3665,12 @@ async function toggleCanvas() {
     const isEnabled = State.currentConv.canvas_enabled;
     const newState = !isEnabled;
     try {
-        await API.post(`/api/conversations/${State.currentConvId}/canvas`, { enabled: newState });
+        const resp = await API.post(`/api/conversations/${State.currentConvId}/canvas`, { enabled: newState });
         State.currentConv.canvas_enabled = newState ? 1 : 0;
+        if (resp && resp.canvas_slug) State.currentConv.canvas_slug = resp.canvas_slug;
         const btn = document.getElementById('btn-canvas-toggle');
         if (btn) btn.classList.toggle('active', newState);
+        updateCanvasSlugPill();
         // Re-render tree without resetting camera position
         if (typeof TREE !== 'undefined') TREE._skipCenter = true;
         if (typeof renderTree === 'function') renderTree();
@@ -3692,6 +3694,35 @@ function updateCanvasVisibility() {
 }
 
 document.getElementById('btn-canvas-toggle')?.addEventListener('click', toggleCanvas);
+
+// ── Canvas Slug Pill ──
+// Copy-to-clipboard pill showing the direct-access canvas URL (e.g. dark-penguin-x7k2)
+
+function updateCanvasSlugPill() {
+    const pill = document.getElementById('canvas-slug-pill');
+    if (!pill) return;
+    const slug = State.currentConv?.canvas_slug;
+    const enabled = !!State.currentConv?.canvas_enabled;
+    if (slug && enabled) {
+        pill.textContent = '🔗 ' + slug;
+        pill.classList.remove('hidden');
+        pill.onclick = () => {
+            navigator.clipboard.writeText(location.origin + '/' + slug).then(() => {
+                pill.textContent = 'Copied!';
+                setTimeout(() => { pill.textContent = '🔗 ' + slug; }, 1500);
+            });
+        };
+    } else {
+        pill.classList.add('hidden');
+    }
+}
+
+// Update pill visibility when conversation or view changes
+const _origUpdateCanvasVis = updateCanvasVisibility;
+updateCanvasVisibility = function () {
+    _origUpdateCanvasVis();
+    updateCanvasSlugPill();
+};
 
 // ── Canvas postMessage Bridge ──
 // Allows canvas iframes to trigger Loom actions via window.parent.postMessage

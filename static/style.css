@@ -1458,6 +1458,27 @@ body::after {
 #btn-canvas-focus {
 }
 
+.canvas-slug-pill {
+    display: inline-block;
+    background: rgba(191, 0, 255, 0.08);
+    border: 1px solid rgba(191, 0, 255, 0.2);
+    color: rgba(191, 0, 255, 0.7);
+    border-radius: 4px;
+    padding: 2px 8px;
+    margin-left: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    font-family: var(--mono-font, monospace);
+    white-space: nowrap;
+}
+.canvas-slug-pill:hover {
+    background: rgba(191, 0, 255, 0.2);
+    color: rgba(220, 180, 255, 0.95);
+}
+.canvas-slug-pill.hidden {
+    display: none;
+}
+
 #tree-canvas {
     flex: 1;
     min-height: 0;

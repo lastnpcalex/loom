@@ -348,6 +348,8 @@ async def _run_migrations(db):
         "ALTER TABLE conversations ADD COLUMN backstage_parent_id INTEGER",
         # Persisted generation duration so the M:SS timer survives a refresh.
         "ALTER TABLE messages ADD COLUMN generation_ms INTEGER",
+        # Canvas slug: human-readable shortcut for direct canvas access
+        "ALTER TABLE conversations ADD COLUMN canvas_slug TEXT",
     ]
     for sql in migrations:
         try:
@@ -413,6 +415,8 @@ async def _run_migrations(db):
         )""",
         # Prevent two concurrent POSTs from creating two backstage children
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_backstage_parent ON conversations(backstage_parent_id) WHERE backstage_parent_id IS NOT NULL",
+        # Canvas slug uniqueness (only enforced when slug is set)
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_canvas_slug ON conversations(canvas_slug) WHERE canvas_slug IS NOT NULL",
     ]
     for sql in table_migrations:
         await db.execute(sql)
@@ -662,6 +666,14 @@ async def get_conversation(conv_id: int) -> Optional[dict]:
     return dict(rows[0]) if rows else None
 
 
+async def get_conversation_by_canvas_slug(slug: str) -> Optional[dict]:
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM conversations WHERE canvas_slug = ?", (slug,)
+    )
+    return dict(rows[0]) if rows else None
+
+
 async def delete_conversation(conv_id: int):
     db = await get_db()
     # Delete any backstage child before the parent (no FK cascade for this column)
@@ -706,6 +718,7 @@ async def update_conversation_fields(conv_id: int, **fields):
         "cc_permission_mode",
         "ooda_enabled",
         "canvas_enabled",
+        "canvas_slug",
         "project_dir",
         "backstage_parent_id",
     }
