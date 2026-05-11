@@ -1137,6 +1137,15 @@ async def api_get_conversation(conv_id: int):
     conv = await db.get_conversation(conv_id)
     if not conv:
         raise HTTPException(404, "Conversation not found")
+    # Lazy-mint a slug for conversations that had canvas enabled before
+    # the canvas_slug column existed.
+    if conv.get("canvas_enabled") and not conv.get("canvas_slug"):
+        for _ in range(5):
+            candidate = generate_canvas_slug()
+            if not await db.get_conversation_by_canvas_slug(candidate):
+                conv["canvas_slug"] = candidate
+                await db.update_conversation_fields(conv_id, canvas_slug=candidate)
+                break
     return conv
 
 
