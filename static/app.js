@@ -499,6 +499,8 @@ function renderConversationList() {
         convs = convs.filter(c => c.mode === 'weave' || !c.mode);
     } else if (State.convFilter === 'local') {
         convs = convs.filter(c => c.mode === 'local');
+    } else if (State.convFilter === 'hermes') {
+        convs = convs.filter(c => c.mode === 'hermes');
     } else if (State.convFilter === 'claude') {
         convs = convs.filter(c => c.mode === 'claude');
     }
@@ -716,15 +718,18 @@ function buildConvItem(conv) {
     const isCC = conv.mode === 'claude';
     const isGemini = isCC && conv.cc_model && conv.cc_model.startsWith('gemini');
     const isLocal = conv.mode === 'local';
+    const isHermes = conv.mode === 'hermes';
     const charName = isGemini ? (conv.cc_model || 'Gemini')
         : isCC ? (conv.cc_model || 'Claude')
         : isLocal ? (conv.local_model || 'Ollama')
+        : isHermes ? (conv.local_model || 'Hermes')
         : conv.character_id
         ? (State.characters.find(c => c.id === conv.character_id)?.name || conv.character_id)
         : 'Freeform';
     const modeBadge = isGemini ? '<span class="mode-badge" title="Gemini CLI in the browser">Loom {Gemini}</span>'
         : isCC ? '<span class="mode-badge" title="Claude Code in the browser">Loom {Claude}</span>'
         : isLocal ? '<span class="mode-badge" title="Claude Code powered by a local Ollama model">Braid {Local}</span>'
+        : isHermes ? '<span class="mode-badge" title="Hermes Agent (ACP) powered by a local Ollama model">Hermes {Agent}</span>'
         : '<span class="mode-badge" title="Structured roleplay with local models">Weave</span>';
     const starred = conv.starred ? 1 : 0;
     const starChar = starred ? '★' : '☆';
@@ -1059,7 +1064,7 @@ async function createConversation() {
         return;
     }
 
-    if (mode === 'local') {
+    if (mode === 'local' || mode === 'hermes') {
         const localModel = document.getElementById('local-model').value;
         if (!localModel) {
             showToast('Select an Ollama model', 'error');
@@ -1068,7 +1073,7 @@ async function createConversation() {
         const localProjectDir = document.getElementById('project-dir').value.trim();
         const conv = await API.post('/api/conversations', {
             title,
-            mode: 'local',
+            mode,
             local_model: localModel,
             project_dir: localProjectDir || undefined,
         });
@@ -1232,10 +1237,11 @@ function updateInlineCCControls(conv) {
     const statePanelChat = document.getElementById('btn-state-panel-chat');
     if (!controls) return;
 
-    if (conv && (conv.mode === 'claude' || conv.mode === 'local')) {
+    if (conv && (conv.mode === 'claude' || conv.mode === 'local' || conv.mode === 'hermes')) {
+        const isSubprocessLocalAgent = conv.mode === 'local' || conv.mode === 'hermes';
         controls.classList.remove('hidden');
         weaveControls?.classList.add('hidden');
-        setBranchCount(1);  // CC/Braid: always single branch
+        setBranchCount(1);  // CC / Braid / Hermes: always single branch
         const modelSel = document.getElementById('cc-model-inline');
         const effortSel = document.getElementById('cc-effort-inline');
         const permSel = document.getElementById('cc-permission-mode-inline');
@@ -1245,8 +1251,11 @@ function updateInlineCCControls(conv) {
         if (permSel) permSel.value = conv.cc_permission_mode || 'default';
         const _baseModel = ccModel.includes('[') ? ccModel.split('[')[0] : ccModel;
         const isAnthropicModel = ['sonnet', 'opus', 'haiku'].includes(_baseModel);
-        modelSel.style.display = conv.mode === 'local' ? 'none' : '';
-        effortSel.style.display = (conv.mode === 'local' || !isAnthropicModel) ? 'none' : '';
+        // Braid/Hermes pick their model in Settings (cfg-braid-model / cfg-hermes-model);
+        // the cc-model/effort selects don't apply, so hide them.
+        modelSel.style.display = isSubprocessLocalAgent ? 'none' : '';
+        effortSel.style.display = (isSubprocessLocalAgent || !isAnthropicModel) ? 'none' : '';
+        if (permSel) permSel.style.display = conv.mode === 'hermes' ? 'none' : '';
         statePanelChat?.classList.add('hidden');
     } else if (conv && conv.mode === 'weave') {
         controls.classList.add('hidden');
@@ -2162,7 +2171,7 @@ function setupEventListeners() {
                 document.getElementById('cc-model-group').classList.remove('hidden');
                 document.getElementById('cc-effort-group').classList.remove('hidden');
                 showWeaveFields(false);
-            } else if (mode === 'local') {
+            } else if (mode === 'local' || mode === 'hermes') {
                 document.getElementById('local-model-group').classList.remove('hidden');
                 document.getElementById('project-dir-group').classList.remove('hidden');
                 showWeaveFields(false);
@@ -2360,6 +2369,7 @@ function setupEventListeners() {
             _populateLocalSelect('cfg-model', cfg.ollama_model || cfg.vllm_model || ''),
             _populateLocalVisionSelect('cfg-vision-model', cfg.vision_model || ''),
             _populateLocalSelect('cfg-braid-model', localModel),
+            _populateLocalSelect('cfg-hermes-model', localModel),
             _populateLocalSelect('cfg-weave-model', localModel),
             populateCCModelDropdowns().then(() => {
                 document.getElementById('cfg-cc-model').value = (conv && conv.cc_model) || 'sonnet';
@@ -2368,6 +2378,7 @@ function setupEventListeners() {
         const mode = conv ? conv.mode : null;
         document.getElementById('cfg-overrides-loom').classList.toggle('hidden', mode !== 'claude');
         document.getElementById('cfg-overrides-braid').classList.toggle('hidden', mode !== 'local');
+        document.getElementById('cfg-overrides-hermes').classList.toggle('hidden', mode !== 'hermes');
         document.getElementById('cfg-overrides-weave').classList.toggle('hidden', mode !== 'weave');
         document.getElementById('cfg-conv-overrides-divider').classList.toggle('hidden', !mode);
 
@@ -2560,6 +2571,8 @@ function setupEventListeners() {
                 updates.cc_permission_mode = document.getElementById('cfg-cc-permission').value;
             } else if (conv.mode === 'local') {
                 updates.local_model = document.getElementById('cfg-braid-model').value;
+            } else if (conv.mode === 'hermes') {
+                updates.local_model = document.getElementById('cfg-hermes-model').value;
             } else if (conv.mode === 'weave') {
                 updates.local_model = document.getElementById('cfg-weave-model').value;
             }
@@ -3406,7 +3419,7 @@ function renderSearchResults(results, query) {
         item.className = 'search-result-item';
 
         const modeClass = r.mode || 'weave';
-        const modeLabel = r.mode === 'claude' ? 'Loom' : r.mode === 'local' ? 'Braid' : 'Weave';
+        const modeLabel = r.mode === 'claude' ? 'Loom' : r.mode === 'local' ? 'Braid' : r.mode === 'hermes' ? 'Hermes' : 'Weave';
         const titleHtml = escapeHtml(r.title || 'Untitled').replace(re, '<mark>$1</mark>');
 
         let snippetHtml = '';
