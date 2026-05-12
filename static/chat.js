@@ -457,6 +457,24 @@ function handleWSMessage(data) {
             showGenStatus(data.text || 'Looming...');
             break;
 
+        case 'hermes_commands':
+            // Hermes advertised its own slash commands — use them in the "/"
+            // autocomplete for this conv (in place of Loom's meta commands).
+            if (Array.isArray(data.commands) && data.commands.length) {
+                State.hermesCommands = data.commands;
+            }
+            break;
+
+        case 'conv_field_update':
+            // Server resolved a field after the fact (e.g. the model Hermes
+            // actually used when the conv had none pinned).
+            if (State.currentConv) {
+                for (const [k, v] of Object.entries(data)) {
+                    if (k !== 'type') State.currentConv[k] = v;
+                }
+            }
+            break;
+
         case 'image_describe': {
             const msg = State.messages.find(m => m.id === data.message_id);
             if (msg) {
@@ -1099,6 +1117,37 @@ async function _loadSkills() {
     return _cachedSkills;
 }
 
+// Hermes' own ACP slash commands. Used as the "/" autocomplete list for Hermes
+// convs (instead of Loom's meta commands). Self-corrects if Hermes advertises a
+// different set via the `hermes_commands` WS event (stored in State.hermesCommands).
+const _HERMES_SLASH_COMMANDS = [
+    { name: 'help', description: 'List Hermes commands' },
+    { name: 'model', description: "Show or switch this turn's model" },
+    { name: 'tools', description: 'List Hermes tools' },
+    { name: 'context', description: 'Show context usage' },
+    { name: 'reset', description: 'Clear conversation history (this ACP session)' },
+    { name: 'compact', description: 'Compress context' },
+    { name: 'steer', description: 'Inject guidance into the running turn' },
+    { name: 'queue', description: 'Queue a prompt for after this turn' },
+    { name: 'version', description: 'Show Hermes version' },
+];
+
+/** Candidates for the "/" autocomplete — Hermes commands for Hermes convs, else Loom skills. */
+async function _slashCandidates() {
+    if (State.currentConv && State.currentConv.mode === 'hermes') {
+        const raw = (Array.isArray(State.hermesCommands) && State.hermesCommands.length)
+            ? State.hermesCommands : _HERMES_SLASH_COMMANDS;
+        return raw.map(c => ({
+            name: c.name,
+            command: '/' + c.name,
+            description: c.description || '',
+            source: 'system',
+            mode: 'hermes',
+        }));
+    }
+    return _loadSkills();
+}
+
 function _invalidateSkillsCache() { _cachedSkills = null; }
 
 /**
@@ -1299,7 +1348,7 @@ function _initSlashAutocomplete() {
             dropdown.innerHTML = '<div class="slash-item slash-loading"><span class="slash-desc">Loading commands...</span></div>';
             dropdown.classList.remove('hidden');
         }
-        const skills = await _loadSkills();
+        const skills = await _slashCandidates();
         // Filter by prefix first (for Tab completion), then fuzzy
         const prefixMatches = skills.filter(s =>
             s.name.toLowerCase().startsWith(query) ||
@@ -2211,14 +2260,21 @@ function createMessageElement(msg, cost, elapsed) {
     const msgModel = msg.cc_model_used || State.currentConv?.cc_model || '';
     const isGemini = isClaudeMode && msgModel.startsWith('gemini');
     const isLocalMode = State.currentConv && State.currentConv.mode === 'local';
+    const isHermesMode = State.currentConv && State.currentConv.mode === 'hermes';
     const roleLabel = msg.role === 'system' ? 'System'
         : msg.role === 'user' ? 'You'
         : isGemini ? 'Gemini'
         : isClaudeMode ? 'Claude'
         : isLocalMode ? (State.currentConv.local_model || 'Local')
+        : isHermesMode ? (State.currentConv.local_model || 'Hermes')
         : getCharacterName();
-    // Local model tag to show alongside Claude label
-    const localModelTag = isLocalMode ? `<span class="local-model-tag">({${escapeHtml(State.currentConv.local_model || 'local')} model})</span>` : '';
+    // Local model tag to show alongside the Braid/Hermes label
+    const _lmName = State.currentConv && State.currentConv.local_model;
+    const localModelTag = (isLocalMode || isHermesMode)
+        ? (_lmName
+            ? `<span class="local-model-tag">({${escapeHtml(_lmName)} model})</span>`
+            : `<span class="local-model-tag">(${isHermesMode ? 'Hermes' : 'local model'})</span>`)
+        : '';
     const branchLabelFull = State.branchNames?.[msg.id] || '';
     // Middle-truncate long branch labels so they don't push action buttons off
     // the row (matches tree nodes + breadcrumb).
@@ -2320,7 +2376,7 @@ function createMessageElement(msg, cost, elapsed) {
 
     // Detect project-relative image paths in assistant CC/local messages
     let projectImgHtml = '';
-    if (msg.role === 'assistant' && (isClaudeMode || isLocalMode) && State.currentConv) {
+    if (msg.role === 'assistant' && (isClaudeMode || isLocalMode || isHermesMode) && State.currentConv) {
         const allText = (msg.content || '') + ' ' + (typeof msg.content_blocks === 'string' ? msg.content_blocks : JSON.stringify(msg.content_blocks || ''));
         const imgRegex = /[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)/gi;
         const matches = allText.match(imgRegex) || [];
@@ -2624,6 +2680,7 @@ function getCharacterName() {
     const conv = State.conversations.find(c => c.id === State.currentConvId);
     if (!conv) return 'Assistant';
     if (conv.mode === 'local') return conv.local_model || 'Local';
+    if (conv.mode === 'hermes') return conv.local_model || 'Hermes';
     if (!conv.character_id) {
         // Weave/OODA without a character attached: show the model name (mirrors
         // Braid's behavior). Falls through to "Assistant" if nothing's set.
@@ -2855,9 +2912,11 @@ function appendStreamingMessage() {
     const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
     const isGemini = isClaudeMode && State.currentConv.cc_model && State.currentConv.cc_model.startsWith('gemini');
     const isLocalMode = State.currentConv && State.currentConv.mode === 'local';
+    const isHermesMode = State.currentConv && State.currentConv.mode === 'hermes';
     const label = isGemini ? 'Gemini'
         : isClaudeMode ? 'Claude'
         : isLocalMode ? (State.currentConv.local_model || 'Local')
+        : isHermesMode ? (State.currentConv.local_model || 'Hermes')
         : getCharacterName();
     streamingDiv.innerHTML = '<div class="message-header">' +
         '<span class="message-role">' + escapeHtml(label) + '</span>' +

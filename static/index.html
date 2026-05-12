@@ -93,6 +93,7 @@
                         <button class="conv-filter-btn active" data-filter="all">All</button>
                         <button class="conv-filter-btn" data-filter="claude" title="Claude Code in the browser via Anthropic API">Loom {All Agents}</button>
                         <button class="conv-filter-btn" data-filter="local" title="Claude Code powered by a local Ollama model">Braid {Local Agents}</button>
+                        <button class="conv-filter-btn" data-filter="hermes" title="Hermes Agent (ACP) powered by a local Ollama model">Hermes {Agent}</button>
                         <button class="conv-filter-btn" data-filter="weave" title="Structured roleplay with local models">Weave {Chat}</button>
                     </div>
                     <div id="conv-list"></div>
@@ -273,6 +274,7 @@
                 <div id="mode-toggle" class="toggle-group">
                     <button class="toggle-btn active" data-value="claude">Loom</button>
                     <button class="toggle-btn" data-value="local">Braid</button>
+                    <button class="toggle-btn" data-value="hermes">Hermes</button>
                     <button class="toggle-btn" data-value="weave">Weave</button>
                 </div>
             </div>
@@ -425,6 +427,13 @@
                     <div class="form-group">
                         <label for="cfg-braid-model">Braid Local Model</label>
                         <select id="cfg-braid-model" class="form-select"></select>
+                    </div>
+                </div>
+                <!-- Hermes (ACP agent) overrides -->
+                <div class="settings-overrides" id="cfg-overrides-hermes">
+                    <div class="form-group">
+                        <label for="cfg-hermes-model">Hermes Local Model</label>
+                        <select id="cfg-hermes-model" class="form-select"></select>
                     </div>
                 </div>
                 <!-- Weave overrides -->
@@ -799,8 +808,8 @@ assistant: *Another example response*"></textarea>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=14"></script>
-    <script src="/static/app.js?v=87"></script>
-    <script src="/static/chat.js?v=126"></script>
+    <script src="/static/app.js?v=89"></script>
+    <script src="/static/chat.js?v=128"></script>
     <script src="/static/tree.js?v=37"></script>
 </body>
 </html>

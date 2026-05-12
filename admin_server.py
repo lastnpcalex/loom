@@ -380,6 +380,94 @@ async def tool_comfyui_status():
         return JSONResponse({"status": "error", "output": f"Error checking ComfyUI: {e}"})
 
 
+def _hermes_exe_path() -> str:
+    """Resolve the `hermes` CLI path the same way the main server does."""
+    if _loom_config is not None:
+        try:
+            return _loom_config.hermes_executable()
+        except Exception:
+            pass
+    explicit = os.environ.get("HERMES_EXE")
+    if explicit:
+        return explicit
+    home = os.environ.get(
+        "HERMES_HOME",
+        os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "hermes"),
+    )
+    exe_name = "hermes.exe" if os.name == "nt" else "hermes"
+    cand = os.path.join(home, "hermes-agent", ".venv",
+                        "Scripts" if os.name == "nt" else "bin", exe_name)
+    return cand if os.path.exists(cand) else "hermes"
+
+
+@app.post("/tools/hermes-status")
+async def tool_hermes_status():
+    """Probe whether Hermes Agent (ACP mode) is installed and reachable.
+
+    Mirrors the comfyui-status / vLLM probes: checks the `hermes` CLI runs,
+    reports the version + HERMES_HOME, and confirms the local Ollama endpoint
+    (which Hermes is configured to use) is up. Does NOT do a full `hermes acp`
+    JSON-RPC round-trip here — that's heavy for a status poke.
+    """
+    home = os.environ.get(
+        "HERMES_HOME",
+        os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "hermes"),
+    )
+    exe = _hermes_exe_path()
+    lines: list[str] = []
+    available = False
+    version = ""
+    try:
+        env = {**os.environ, "HERMES_HOME": home}
+        proc = await asyncio.create_subprocess_exec(
+            exe, "--version",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("`hermes --version` timed out after 15s")
+        text = (out or b"").decode("utf-8", "replace").strip()
+        if proc.returncode == 0:
+            available = True
+            version = text.splitlines()[0] if text else ""
+            lines.append(f"Hermes Agent is INSTALLED ({version})")
+            lines.append(f"  exe: {exe}")
+            lines.append(f"  HERMES_HOME: {home}")
+            cfg = os.path.join(home, "config.yaml")
+            lines.append(f"  config.yaml: {'present' if os.path.exists(cfg) else 'MISSING'}")
+            for extra in text.splitlines()[1:]:
+                lines.append(f"  {extra.strip()}")
+        else:
+            lines.append(f"Hermes CLI exited {proc.returncode}:")
+            lines.append(text or "(no output)")
+    except FileNotFoundError:
+        lines.append(f"Hermes is NOT installed — `{exe}` not found.")
+        lines.append("Install: irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex")
+    except Exception as e:
+        lines.append(f"Error probing Hermes: {e}")
+
+    # Ollama reachability (Hermes is configured to talk to it via config.yaml).
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get("http://localhost:11434/api/tags")
+        if r.status_code == 200:
+            n = len(r.json().get("models", []))
+            lines.append(f"\nOllama: reachable on :11434 ({n} models)")
+        else:
+            lines.append(f"\nOllama: :11434 responded {r.status_code}")
+    except Exception:
+        lines.append("\nOllama: NOT reachable on :11434 — Hermes turns will fail")
+
+    return JSONResponse({
+        "status": "ok" if available else "error",
+        "available": available,
+        "version": version,
+        "output": "\n".join(lines),
+    })
+
+
 @app.post("/tools/comfyui-free")
 async def tool_comfyui_free():
     """Free ComfyUI VRAM by unloading models and freeing memory."""

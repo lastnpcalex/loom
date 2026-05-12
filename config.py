@@ -80,6 +80,19 @@ class Config:
     max_tokens: int = 1024
     repeat_penalty: float = 1.08
 
+    # --- Hermes Agent (ACP mode) — native Windows install ---
+    # NousResearch's install.ps1 (and our manual `uv pip install -e .[acp]`)
+    # puts Hermes under %LOCALAPPDATA%\hermes; config.yaml / .env live there.
+    # Not persisted to config.json — these are install-specific, set via env.
+    hermes_home: str = os.getenv(
+        "HERMES_HOME",
+        os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "hermes"),
+    )
+    # Explicit path to the `hermes` CLI executable. Empty -> derive from hermes_home.
+    hermes_exe: str = os.getenv("HERMES_EXE", "")
+    # Master switch for Hermes mode. The Phase-4 UI stays hidden until this is on.
+    enable_hermes: bool = _envbool("LOOM_ENABLE_HERMES", False)
+
     # Ollama runtime tuning — applied as env vars when admin_server spawns Ollama.
     # Env vars override these defaults so CLI users can still pin behavior.
     ollama_kv_cache_type: str = os.getenv("OLLAMA_KV_CACHE_TYPE", "q8_0")  # f16 | q8_0 | q4_0
@@ -120,6 +133,18 @@ class Config:
     # tasks (and RP with state) leans on the reasoning scratch space. Flip
     # OFF when you specifically want fast bare-text responses.
     vllm_thinking_default: bool = _envbool("VLLM_THINKING_DEFAULT", True)
+
+    def hermes_executable(self) -> str:
+        """Resolve the `hermes` CLI path: explicit HERMES_EXE if set, else the
+        venv Scripts binary under hermes_home, else bare 'hermes' on PATH."""
+        if self.hermes_exe:
+            return self.hermes_exe
+        exe_name = "hermes.exe" if os.name == "nt" else "hermes"
+        cand = os.path.join(
+            self.hermes_home, "hermes-agent", ".venv",
+            "Scripts" if os.name == "nt" else "bin", exe_name,
+        )
+        return cand if os.path.exists(cand) else "hermes"
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in _PERSISTED_KEYS}
