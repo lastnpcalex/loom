@@ -65,6 +65,7 @@ from prompt_engine import (
 from context_manager import get_context_for_generation
 import claude_client
 import gemini_client
+import hermes_client
 import model_context
 from skill_scanner import get_all_skills, BUILTIN_COMMANDS
 
@@ -449,6 +450,8 @@ _active_generations: dict[tuple[int, int | None, int], asyncio.Task] = {}
 _gen_seq = 0  # monotonic counter for unique gen keys
 # Active Claude Code subprocesses (for cancellation)
 _active_claude_procs: dict[int, asyncio.subprocess.Process] = {}
+# Active Hermes (ACP) subprocesses (for cancellation) — parallel to _active_claude_procs
+_active_hermes_procs: dict[int, asyncio.subprocess.Process] = {}
 # Active WebSocket connections per conversation — multiple clients can watch the same conv
 _active_websockets: dict[int, set[WebSocket]] = {}
 # Pending hook-based permission requests: request_id -> {event, response, conv_id}
@@ -4438,6 +4441,208 @@ async def _handle_local_generation(
     conv["cc_model"] = conv.get("local_model") or config.ollama_model
     conv["_use_ollama"] = True
     await _handle_claude_generation(websocket, conv_id, conv, data)
+
+
+async def _handle_hermes_generation(
+    websocket: WebSocket, conv_id: int, conv: dict, data: dict
+):
+    """Handle Hermes mode — drive a per-turn `hermes acp` subprocess.
+
+    Sibling of _handle_claude_generation (NOT templated off it — none of CC's
+    compact-handoff / cross-provider-resume / cc_model plumbing applies). v1 is
+    history-replay: every turn opens a fresh ACP session and the full branch is
+    rendered into the prompt, so Loom's fork-every-turn invariant holds trivially.
+
+    Not wired into _handle_generation's dispatch yet — that, plus DB-mode
+    acceptance and the admin status probe, is Phase 3.
+    """
+    import time as _time
+    draft_msg_id = None
+    full_text = ""
+    proc = None
+    start_t = _time.time()
+    try:
+        action = data.get("action")
+        parent_id = data.get("parent_id")
+        if action == "generate" and parent_id is None:
+            leaf = await db.get_active_leaf(conv_id)
+            parent_id = leaf["id"] if leaf else None
+
+        project_dir = conv.get("project_dir") or "."
+        if project_dir != "." and not os.path.isdir(project_dir):
+            await _ws_send(conv_id, {"type": "error",
+                                     "error": f"Working directory not found: {project_dir}"})
+            return
+
+        # Build the prompt from the branch (history replay — no ACP session resume in v1).
+        branch = await db.get_branch_to_root(parent_id) if parent_id else []
+        prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
+
+        model = conv.get("local_model") or None  # None -> Hermes uses its config.yaml default
+
+        # Draft message so the tree shows a ghost node while streaming.
+        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
+        draft_msg_id = draft_msg["id"]
+        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id,
+                                 "draft_msg_id": draft_msg_id})
+
+        try:
+            proc, event_stream = await hermes_client.run_hermes(
+                prompt,
+                conv_id=conv_id,
+                model=model,
+                cwd=project_dir,
+                loom_port=config.port,
+                hermes_exe=config.hermes_executable(),
+                hermes_home=config.hermes_home,
+            )
+        except Exception as e:
+            if draft_msg_id:
+                await db.delete_branch(draft_msg_id)
+            await _ws_send(conv_id, {"type": "error", "error": f"Failed to start Hermes: {e}"})
+            return
+
+        _active_hermes_procs[conv_id] = proc
+        try:
+            await db.register_active_generation(
+                draft_msg_id=draft_msg_id, conv_id=conv_id, pid=proc.pid,
+                project_dir=project_dir, mode="hermes",
+            )
+        except Exception as e:
+            print(f"[Hermes] Failed to register active generation: {e}")
+
+        content_blocks: list[dict] = []
+        current_block = None
+        new_session_id = ""
+        total_input_tokens = 0
+        total_output_tokens = 0
+        result_info: dict = {}
+
+        async for evt in event_stream:
+            etype = evt.get("type")
+            if etype == "session_info":
+                new_session_id = evt.get("session_id", "") or new_session_id
+                try:
+                    await db.update_active_generation_session(draft_msg_id, new_session_id)
+                except Exception:
+                    pass
+            elif etype == "text_delta":
+                full_text += evt["text"]
+                if current_block and current_block["type"] == "text":
+                    current_block["text"] += evt["text"]
+                else:
+                    current_block = {"type": "text", "text": evt["text"]}
+                    content_blocks.append(current_block)
+                await _ws_send(conv_id, {"type": "stream_chunk", "content": evt["text"]})
+            elif etype == "thinking_delta":
+                if current_block and current_block["type"] == "thinking":
+                    current_block["text"] += evt["text"]
+                else:
+                    current_block = {"type": "thinking", "text": evt["text"]}
+                    content_blocks.append(current_block)
+                await _ws_send(conv_id, {"type": "thinking_chunk", "content": evt["text"]})
+            elif etype == "tool_start":
+                current_block = {"type": "tool_use", "name": evt["name"],
+                                 "tool_id": evt.get("tool_id", ""), "input": "", "result": ""}
+                content_blocks.append(current_block)
+                await _ws_send(conv_id, {"type": "tool_start", "name": evt["name"],
+                                         "tool_id": evt.get("tool_id", "")})
+            elif etype == "tool_input_delta":
+                if current_block and current_block["type"] == "tool_use":
+                    current_block["input"] += evt["json"]
+                await _ws_send(conv_id, {"type": "tool_input_chunk", "content": evt["json"],
+                                         "tool_id": evt.get("tool_id", "")})
+            elif etype == "tool_result":
+                tool_id = evt.get("tool_id", "")
+                for block in reversed(content_blocks):
+                    if block["type"] == "tool_use" and block.get("tool_id") == tool_id:
+                        block["result"] = evt.get("content", "")
+                        break
+                current_block = None
+                await _ws_send(conv_id, {"type": "tool_result", "content": evt.get("content", ""),
+                                         "tool_id": tool_id})
+                await db.update_message_content(draft_msg_id, content=full_text,
+                                                content_blocks=json.dumps(content_blocks))
+            elif etype == "permission_request":
+                # The browser modal is driven by /api/cc-permission (the hermes
+                # client POSTs there from an async bridge task). Surface a status
+                # so the UI shows *something* while we wait.
+                await _ws_send(conv_id, {"type": "status",
+                                         "text": f"Hermes requested permission: {evt.get('tool_name', 'tool')}"})
+            elif etype == "usage":
+                total_input_tokens = evt.get("input_tokens", 0) or total_input_tokens
+                total_output_tokens += evt.get("output_tokens", 0)
+                await _ws_send(conv_id, {"type": "usage", "input_tokens": total_input_tokens,
+                                         "output_tokens": total_output_tokens})
+            elif etype == "hermes_usage_update":
+                used = evt.get("used")
+                if used is not None:
+                    await _ws_send(conv_id, {"type": "context_info", "total_tokens": used})
+            elif etype == "plan_update":
+                await _ws_send(conv_id, {"type": "status", "text": "Hermes updated its plan."})
+            elif etype == "error":
+                await _ws_send(conv_id, {"type": "status", "text": f"Hermes: {evt.get('error', '')}"})
+            elif etype == "result":
+                result_info = evt
+                new_session_id = evt.get("session_id", "") or new_session_id
+            # hermes_commands / hermes_raw_update: ignored in v1.
+
+        _active_hermes_procs.pop(conv_id, None)
+
+        if not full_text.strip() and not any(b["type"] == "tool_use" for b in content_blocks):
+            if draft_msg_id:
+                await db.delete_branch(draft_msg_id)
+            await _ws_send(conv_id, {"type": "error",
+                                     "error": "Hermes returned an empty response — try again"})
+            return
+
+        gen_ms = int((_time.time() - start_t) * 1000)
+        await db.update_message_content(
+            draft_msg_id, content=full_text, content_blocks=json.dumps(content_blocks),
+            cc_session_id=new_session_id or None,
+            cc_model_used=f"hermes:{model}" if model else "hermes:default",
+            generation_ms=gen_ms,
+        )
+        await db.set_active_branch(conv_id, draft_msg_id)
+        msg = await db.get_message(draft_msg_id)
+        await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
+        preview = (full_text or "").replace("#", "").replace("*", "").strip()[:120]
+        await _ws_broadcast_all({"type": "branch_landed", "conv_id": conv_id,
+                                 "conv_title": conv.get("title", "Conversation"),
+                                 "message_id": draft_msg_id, "preview": preview})
+
+    except asyncio.CancelledError:
+        if proc is not None:
+            try:
+                await hermes_client.cancel_hermes(proc)
+            except Exception:
+                pass
+        if draft_msg_id:
+            if full_text.strip():
+                try:
+                    await db.update_message_content(draft_msg_id, content=full_text)
+                except Exception:
+                    pass
+            else:
+                await db.delete_branch(draft_msg_id)
+        await _ws_send(conv_id, {"type": "cancelled"})
+    except Exception as e:
+        if draft_msg_id and full_text.strip():
+            try:
+                await db.update_message_content(draft_msg_id, content=full_text)
+            except Exception:
+                pass
+        elif draft_msg_id:
+            await db.delete_branch(draft_msg_id)
+        print(f"[Hermes] generation error conv={conv_id}: {e}")
+        await _ws_send(conv_id, {"type": "error", "error": str(e)})
+    finally:
+        _active_hermes_procs.pop(conv_id, None)
+        if proc is not None and proc.returncode is None:
+            try:
+                await hermes_client.cancel_hermes(proc)
+            except Exception:
+                pass
 
 
 async def _handle_ooda_generation(
