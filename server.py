@@ -2552,6 +2552,9 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 proc = _active_claude_procs.pop(conv_id, None)
                 if proc:
                     await claude_client.cancel_claude(proc)
+                hproc = _active_hermes_procs.pop(conv_id, None)
+                if hproc:
+                    await hermes_client.cancel_hermes(hproc)
                 # Clean up pending permissions from memory and DB
                 for rid in list(_pending_hook_permissions):
                     if _pending_hook_permissions[rid].get("conv_id") == conv_id:
@@ -2603,10 +2606,16 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 # Check conversation mode to decide parallel policy
                 conv = await db.get_conversation(conv_id)
                 mode = conv.get("mode", "weave") if conv else "weave"
-                is_cc = mode == "claude"
+                # CLI-agent subprocess modes — Claude Code (claude), Braid (local,
+                # = CC via Ollama), and Hermes (hermes acp). All three drive a
+                # single subprocess per conversation, so parallel generations on
+                # different branches would race the same child. (Including "local"
+                # here fixes a latent Braid bug — it was previously treated like
+                # Weave/OODA and allowed to spawn parallel CC subprocesses.)
+                is_subprocess_agent = mode in ("claude", "local", "hermes")
 
-                if is_cc:
-                    # CC mode: only one generation per conversation
+                if is_subprocess_agent:
+                    # Only one agent generation per conversation
                     cc_busy = any(
                         k[0] == conv_id and not t.done()
                         for k, t in _active_generations.items()
@@ -2626,7 +2635,7 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                             await websocket.send_json(
                                 {
                                     "type": "error",
-                                    "error": "Claude Code generation already running on another branch. Wait for it to finish or cancel it first.",
+                                    "error": "An agent generation is already running on another branch. Wait for it to finish or cancel it first.",
                                 }
                             )
                             continue
@@ -2924,6 +2933,9 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
             return
 
         mode = conv.get("mode", "weave") if conv else "weave"
+        if mode == "hermes":
+            await _ws_send(conv_id, {"type": "error", "error": "/compact is not supported in Hermes mode yet"})
+            return
         if mode != "claude":
             await _ws_send(conv_id, {"type": "error", "error": "/compact is only available in Claude mode"})
             return
@@ -3070,6 +3082,10 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
 
     if mode == "local":
         await _handle_local_generation(websocket, conv_id, conv, data)
+        return
+
+    if mode == "hermes":
+        await _handle_hermes_generation(websocket, conv_id, conv, data)
         return
 
     # Backstage convs always go through OODA so state card tools are available.
