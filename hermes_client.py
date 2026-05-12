@@ -50,6 +50,28 @@ _PERMISSION_HTTP_TIMEOUT = 900.0
 _STREAM_LIMIT = 16 * 1024 * 1024
 
 
+def _loom_mcp_servers() -> list[dict]:
+    """ACP `mcpServers` to register on every Hermes session.
+
+    Hermes' built-in ``web_search`` / ``web_extract`` need API keys (Exa,
+    Firecrawl, Tavily, …) that aren't set. Loom ships a keyless MCP server —
+    ``mcp_web_tools.py`` (DuckDuckGo search + trafilatura fetch, the same one
+    Claude Code uses for local models) — so we hand it to Hermes here. The ACP
+    stdio MCP shape is ``{name, command, args, env:[{name,value}]}``; Hermes
+    wraps registration in a try/except, so a bad entry just logs a warning
+    rather than failing ``session/new``.
+    """
+    web_tools = Path(__file__).resolve().parent / "mcp_web_tools.py"
+    if not web_tools.is_file():
+        return []
+    return [{
+        "name": "web-tools",
+        "command": sys.executable,
+        "args": [str(web_tools)],
+        "env": [],
+    }]
+
+
 def default_hermes_exe(hermes_home: str | None = None) -> str:
     """Best-effort path to the `hermes` CLI: the venv Scripts binary under the
     install root, falling back to bare `hermes` on PATH."""
@@ -406,7 +428,7 @@ async def run_hermes(
             log.info("[Hermes] connected: %s", agent_info)
 
             new_result = await rpc_request_via_reader(
-                rpc, "session/new", {"cwd": acp_cwd, "mcpServers": []}, proc, state)
+                rpc, "session/new", {"cwd": acp_cwd, "mcpServers": _loom_mcp_servers()}, proc, state)
             session_id = (new_result or {}).get("sessionId") or (new_result or {}).get("session_id") or ""
             yield {"type": "session_info", "session_id": session_id,
                    "model": ((new_result or {}).get("models") or {}).get("currentModelId", "")}
