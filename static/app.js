@@ -1237,11 +1237,22 @@ function updateInlineCCControls(conv) {
     const statePanelChat = document.getElementById('btn-state-panel-chat');
     if (!controls) return;
 
-    if (conv && (conv.mode === 'claude' || conv.mode === 'local' || conv.mode === 'hermes')) {
-        const isSubprocessLocalAgent = conv.mode === 'local' || conv.mode === 'hermes';
+    // Weave-only bits inside the weave inline bar — hidden when we borrow that
+    // bar for Hermes (which has none of OODA / backstage / branch-state / multi-branch).
+    const _oodaLabel = document.getElementById('ooda-toggle-inline')?.closest('.ooda-toggle');
+    const _backstageBtn = document.getElementById('btn-backstage');
+    const _branchCountCtl = document.getElementById('branch-count-control');
+    const _setWeaveOnlyBits = (show) => {
+        _oodaLabel?.classList.toggle('hidden', !show);
+        _backstageBtn?.classList.toggle('hidden', !show);
+        _branchCountCtl?.classList.toggle('hidden', !show);
+    };
+
+    if (conv && (conv.mode === 'claude' || conv.mode === 'local')) {
+        const isBraid = conv.mode === 'local';
         controls.classList.remove('hidden');
         weaveControls?.classList.add('hidden');
-        setBranchCount(1);  // CC / Braid / Hermes: always single branch
+        setBranchCount(1);  // CC / Braid: always single branch
         const modelSel = document.getElementById('cc-model-inline');
         const effortSel = document.getElementById('cc-effort-inline');
         const permSel = document.getElementById('cc-permission-mode-inline');
@@ -1251,15 +1262,26 @@ function updateInlineCCControls(conv) {
         if (permSel) permSel.value = conv.cc_permission_mode || 'default';
         const _baseModel = ccModel.includes('[') ? ccModel.split('[')[0] : ccModel;
         const isAnthropicModel = ['sonnet', 'opus', 'haiku'].includes(_baseModel);
-        // Braid/Hermes pick their model in Settings (cfg-braid-model / cfg-hermes-model);
-        // the cc-model/effort selects don't apply, so hide them.
-        modelSel.style.display = isSubprocessLocalAgent ? 'none' : '';
-        effortSel.style.display = (isSubprocessLocalAgent || !isAnthropicModel) ? 'none' : '';
-        if (permSel) permSel.style.display = conv.mode === 'hermes' ? 'none' : '';
+        // Braid picks its model in Settings (cfg-braid-model); the cc-model/effort
+        // selects don't apply, so hide them.
+        modelSel.style.display = isBraid ? 'none' : '';
+        effortSel.style.display = (isBraid || !isAnthropicModel) ? 'none' : '';
+        if (permSel) permSel.style.display = '';
         statePanelChat?.classList.add('hidden');
+    } else if (conv && conv.mode === 'hermes') {
+        // Borrow the Weave inline bar for its Ollama model dropdown, but strip
+        // the weave-only controls — Hermes is single-branch, no OODA/backstage.
+        controls.classList.add('hidden');
+        weaveControls?.classList.remove('hidden');
+        _setWeaveOnlyBits(false);
+        statePanelChat?.classList.add('hidden');
+        setBranchCount(1);
+        const weaveSel = document.getElementById('weave-model-inline');
+        if (weaveSel) _populateWeaveModelDropdown(weaveSel, conv.local_model || '');
     } else if (conv && conv.mode === 'weave') {
         controls.classList.add('hidden');
         weaveControls?.classList.remove('hidden');
+        _setWeaveOnlyBits(true);
         const oodaToggle = document.getElementById('ooda-toggle-inline');
         if (oodaToggle) oodaToggle.checked = !!conv.ooda_enabled;
         if (conv.ooda_enabled) {
