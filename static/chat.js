@@ -2995,6 +2995,18 @@ function _flushStreamBuffer() {
     _scrollDuringStream();
 }
 
+// Flush any buffered text deltas synchronously. Call this before appending a
+// tool/thinking block: stream_chunk text is throttled through a 50ms timer,
+// but tool_start fires immediately — without this, a tool block jumps ahead of
+// text that arrived before it, splitting a sentence (even mid-word) around it.
+function _flushStreamBufferNow() {
+    if (_streamFlushTimer) {
+        clearTimeout(_streamFlushTimer);
+        _streamFlushTimer = null;
+    }
+    _flushStreamBuffer();
+}
+
 function finalizeStreamingMessage(msg, cost) {
     if (!streamingDiv) return;
     _stopGenTimer();
@@ -3032,6 +3044,7 @@ function removeStreamingMessage() {
 
 function appendToolBlock(name, toolId, isOoda) {
     if (!streamingDiv) return;
+    _flushStreamBufferNow();  // land any pending text before this block
     _removeStreamWaiting();
     // Add show-ooda class on first OODA block so they're visible during streaming
     if (isOoda && !streamingDiv.classList.contains('show-ooda')) {
@@ -3124,6 +3137,7 @@ function finalizeToolBlock(result, toolId, imageUrl, isError) {
 
 function appendThinkingChunk(text) {
     if (!streamingDiv) return;
+    _flushStreamBufferNow();  // land any pending text before this block
     _removeStreamWaiting();
     const contentEl = streamingDiv.querySelector('.message-content');
     // Find the LAST thinking block (if multiple exist) or create one if the last element isn't a thinking block
