@@ -457,6 +457,24 @@ function handleWSMessage(data) {
             showGenStatus(data.text || 'Looming...');
             break;
 
+        case 'hermes_commands':
+            // Hermes advertised its own slash commands — use them in the "/"
+            // autocomplete for this conv (in place of Loom's meta commands).
+            if (Array.isArray(data.commands) && data.commands.length) {
+                State.hermesCommands = data.commands;
+            }
+            break;
+
+        case 'conv_field_update':
+            // Server resolved a field after the fact (e.g. the model Hermes
+            // actually used when the conv had none pinned).
+            if (State.currentConv) {
+                for (const [k, v] of Object.entries(data)) {
+                    if (k !== 'type') State.currentConv[k] = v;
+                }
+            }
+            break;
+
         case 'image_describe': {
             const msg = State.messages.find(m => m.id === data.message_id);
             if (msg) {
@@ -1099,6 +1117,37 @@ async function _loadSkills() {
     return _cachedSkills;
 }
 
+// Hermes' own ACP slash commands. Used as the "/" autocomplete list for Hermes
+// convs (instead of Loom's meta commands). Self-corrects if Hermes advertises a
+// different set via the `hermes_commands` WS event (stored in State.hermesCommands).
+const _HERMES_SLASH_COMMANDS = [
+    { name: 'help', description: 'List Hermes commands' },
+    { name: 'model', description: "Show or switch this turn's model" },
+    { name: 'tools', description: 'List Hermes tools' },
+    { name: 'context', description: 'Show context usage' },
+    { name: 'reset', description: 'Clear conversation history (this ACP session)' },
+    { name: 'compact', description: 'Compress context' },
+    { name: 'steer', description: 'Inject guidance into the running turn' },
+    { name: 'queue', description: 'Queue a prompt for after this turn' },
+    { name: 'version', description: 'Show Hermes version' },
+];
+
+/** Candidates for the "/" autocomplete — Hermes commands for Hermes convs, else Loom skills. */
+async function _slashCandidates() {
+    if (State.currentConv && State.currentConv.mode === 'hermes') {
+        const raw = (Array.isArray(State.hermesCommands) && State.hermesCommands.length)
+            ? State.hermesCommands : _HERMES_SLASH_COMMANDS;
+        return raw.map(c => ({
+            name: c.name,
+            command: '/' + c.name,
+            description: c.description || '',
+            source: 'system',
+            mode: 'hermes',
+        }));
+    }
+    return _loadSkills();
+}
+
 function _invalidateSkillsCache() { _cachedSkills = null; }
 
 /**
@@ -1299,7 +1348,7 @@ function _initSlashAutocomplete() {
             dropdown.innerHTML = '<div class="slash-item slash-loading"><span class="slash-desc">Loading commands...</span></div>';
             dropdown.classList.remove('hidden');
         }
-        const skills = await _loadSkills();
+        const skills = await _slashCandidates();
         // Filter by prefix first (for Tab completion), then fuzzy
         const prefixMatches = skills.filter(s =>
             s.name.toLowerCase().startsWith(query) ||
@@ -2220,7 +2269,12 @@ function createMessageElement(msg, cost, elapsed) {
         : isHermesMode ? (State.currentConv.local_model || 'Hermes')
         : getCharacterName();
     // Local model tag to show alongside the Braid/Hermes label
-    const localModelTag = (isLocalMode || isHermesMode) ? `<span class="local-model-tag">({${escapeHtml(State.currentConv.local_model || 'local')} model})</span>` : '';
+    const _lmName = State.currentConv && State.currentConv.local_model;
+    const localModelTag = (isLocalMode || isHermesMode)
+        ? (_lmName
+            ? `<span class="local-model-tag">({${escapeHtml(_lmName)} model})</span>`
+            : `<span class="local-model-tag">(${isHermesMode ? 'Hermes' : 'local model'})</span>`)
+        : '';
     const branchLabelFull = State.branchNames?.[msg.id] || '';
     // Middle-truncate long branch labels so they don't push action buttons off
     // the row (matches tree nodes + breadcrumb).

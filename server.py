@@ -1044,7 +1044,7 @@ async def api_create_conversation(data: dict = None):
         cc_effort=cc_effort,
         ooda_enabled=1 if mode == "weave" else 0,
     )
-    if mode == "local" and local_model:
+    if mode in ("local", "hermes") and local_model:
         fields["local_model"] = local_model
     await db.update_conversation_fields(conv["id"], **fields)
     # Refresh conv data
@@ -4542,6 +4542,24 @@ async def _handle_hermes_generation(
                     await db.update_active_generation_session(draft_msg_id, new_session_id)
                 except Exception:
                     pass
+                # If the conv has no pinned model, record the one Hermes actually
+                # resolved (config.yaml default) so the chat header / model picker
+                # show it instead of a bare "(local model)".
+                if not conv.get("local_model"):
+                    resolved = (evt.get("model") or "").split(":", 1)[-1].strip() if ":" in (evt.get("model") or "") else (evt.get("model") or "").strip()
+                    if resolved:
+                        conv["local_model"] = resolved
+                        try:
+                            await db.update_conversation_fields(conv_id, local_model=resolved)
+                        except Exception:
+                            pass
+                        await _ws_send(conv_id, {"type": "conv_field_update", "local_model": resolved})
+            elif etype == "hermes_commands":
+                # Forward Hermes' own slash-command list so the chat input's
+                # "/" autocomplete shows them (in place of Loom's meta commands).
+                cmds = evt.get("commands") or []
+                if cmds:
+                    await _ws_send(conv_id, {"type": "hermes_commands", "commands": cmds})
             elif etype == "text_delta":
                 full_text += evt["text"]
                 if current_block and current_block["type"] == "text":
