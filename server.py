@@ -674,9 +674,9 @@ BSKY_PUBLIC_API = "https://public.api.bsky.app/xrpc"
 
 # Endpoints available on the read-only public API (no auth needed)
 # Verified: 200 with real data on public.api.bsky.app
+# getTimeline requires auth on both APIs — intentionally excluded
 _BSKY_PUBLIC_ENDPOINTS = {
     "app.bsky.feed.getAuthorFeed",
-    "app.bsky.feed.getTimeline",
     "app.bsky.actor.getProfile",
     "app.bsky.graph.getFollows",
 }
@@ -766,6 +766,37 @@ async def proxy_bsky_post(path: str, body: dict = Body(default={}), authorizatio
 async def proxy_bsky_get(path: str, query_params: dict = {}, authorization: str = Header(None)):
     """Proxy Bluesky ATProto XRPC GET calls."""
     return await _do_bsky_proxy("GET", path, query_params=query_params if query_params else None, auth_header=authorization)
+
+
+# ── Bluesky token storage (canvas uses this to persist session tokens) ──
+
+@app.get("/api/bluesky-token/{conv_id}")
+async def get_bsky_token(conv_id: int):
+    """Return the stored Bluesky access token for a conversation."""
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    token = conv.get("bsky_token")
+    if not token:
+        return JSONResponse({"error": "no token stored"}, status_code=404)
+    return {"token": token}
+
+
+@app.put("/api/bluesky-token/{conv_id}")
+async def set_bsky_token(conv_id: int, data: dict = Body(default={})):
+    """Store a Bluesky access token for a conversation."""
+    token = data.get("token")
+    if not token:
+        return JSONResponse({"error": "no token provided"}, status_code=400)
+    await db.update_conversation_fields(conv_id, bsky_token=token)
+    return {"ok": True}
+
+
+@app.delete("/api/bluesky-token/{conv_id}")
+async def delete_bsky_token(conv_id: int):
+    """Clear the stored Bluesky access token for a conversation."""
+    await db.update_conversation_fields(conv_id, bsky_token=None)
+    return {"ok": True}
 
 
 @app.get("/api/admin-status")

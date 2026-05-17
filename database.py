@@ -350,6 +350,8 @@ async def _run_migrations(db):
         "ALTER TABLE messages ADD COLUMN generation_ms INTEGER",
         # Canvas slug: human-readable shortcut for direct canvas access
         "ALTER TABLE conversations ADD COLUMN canvas_slug TEXT",
+        # Bluesky access token for canvas proxy auth
+        "ALTER TABLE conversations ADD COLUMN bsky_token TEXT",
     ]
     for sql in migrations:
         try:
@@ -721,6 +723,7 @@ async def update_conversation_fields(conv_id: int, **fields):
         "canvas_slug",
         "project_dir",
         "backstage_parent_id",
+        "bsky_token",
     }
     updates = []
     params = []
