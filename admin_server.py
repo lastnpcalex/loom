@@ -1542,8 +1542,7 @@ async def action_start(name: str):
         cwd=str(server_dir),
         stdout=log_handle,
         stderr=log_handle,
-        creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
-                    | getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        creationflags=0x08000000 | 0x00000200, # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
     )
     _child_procs[name] = proc
 
@@ -1617,8 +1616,7 @@ async def admin_restart():
         [sys.executable, "-c", spawn_code],
         env=os.environ.copy(),
         cwd=str(admin_dir),
-        creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
-                    | getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        creationflags=0x08000000 | 0x00000200, # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
     )
 
     async def _exit_soon():
@@ -1633,12 +1631,25 @@ async def admin_restart():
 
 
 if __name__ == "__main__":
+    base_dir = Path(__file__).resolve().parent
+    ssl_cert = os.getenv("LOOM_SSL_CERT", str(base_dir / "certs" / "cert.pem"))
+    ssl_key = os.getenv("LOOM_SSL_KEY", str(base_dir / "certs" / "key.pem"))
+    print(f"[ADMIN] Checking certs at: {ssl_cert}")
+    ssl_kwargs = {}
+    if os.path.exists(ssl_cert) and os.path.exists(ssl_key):
+        print(f"[ADMIN] SSL enabled — cert={ssl_cert}")
+        ssl_kwargs = {"ssl_certfile": ssl_cert, "ssl_keyfile": ssl_key}
+    else:
+        print(f"[ADMIN] SSL NOT enabled — files missing")
+
     print(f"[ADMIN] Starting admin server on :{ADMIN_PORT}")
-    print(f"[ADMIN] Dashboard: http://localhost:{ADMIN_PORT}")
+    scheme = "https" if ssl_kwargs else "http"
+    print(f"[ADMIN] Dashboard: {scheme}://localhost:{ADMIN_PORT}")
 
     uv_config = uvicorn.Config(
         app, host="0.0.0.0", port=ADMIN_PORT,
         log_level="warning",
+        **ssl_kwargs
     )
     server = uvicorn.Server(uv_config)
     _server_ref.append(server)

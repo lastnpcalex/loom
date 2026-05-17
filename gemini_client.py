@@ -237,11 +237,18 @@ priority = 1000
     print(f"[GEMINI] Prompt length: {len(prompt)} chars (stdin={use_stdin})")
     print(f"[GEMINI] Prompt preview: {repr(prompt[:200])}")
 
+    kwargs = {}
+    if sys.platform == "win32":
+        import subprocess
+        # Use CREATE_NO_WINDOW (0x08000000) and CREATE_NEW_PROCESS_GROUP (0x00000200)
+        kwargs["creationflags"] = 0x08000000 | 0x00000200
+
     proc = await asyncio.create_subprocess_exec(
         *cmd, cwd=cwd, env=env,
         stdin=asyncio.subprocess.PIPE if use_stdin else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        limit=16 * 1024 * 1024
+        limit=16 * 1024 * 1024,
+        **kwargs
     )
 
     # Feed prompt via stdin if needed in a background task to prevent pipe deadlocks

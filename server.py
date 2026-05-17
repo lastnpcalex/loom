@@ -18,7 +18,9 @@ import uuid
 from pathlib import Path
 
 from fastapi import (
+    Body,
     FastAPI,
+    Header,
     WebSocket,
     WebSocketDisconnect,
     UploadFile,
@@ -665,6 +667,105 @@ async def api_server_status(target: str):
     except Exception:
         pass
     return {"up": False}
+
+
+BSKY_API = "https://bsky.social/xrpc"
+BSKY_PUBLIC_API = "https://public.api.bsky.app/xrpc"
+
+# Endpoints available on the read-only public API (no auth needed)
+# Verified: 200 with real data on public.api.bsky.app
+_BSKY_PUBLIC_ENDPOINTS = {
+    "app.bsky.feed.getAuthorFeed",
+    "app.bsky.feed.getTimeline",
+    "app.bsky.actor.getProfile",
+    "app.bsky.graph.getFollows",
+}
+
+
+async def _resolve_bsky_handle(handle: str) -> str | None:
+    """Resolve a Bluesky handle to its DID via the public identity API.
+    Returns the original string if it's already a DID, or the resolved DID.
+    Returns None on failure."""
+    import urllib.request, urllib.parse
+    import asyncio, ssl
+
+    # Already a DID — nothing to resolve
+    if handle.startswith("did:"):
+        return handle
+
+    def _resolve():
+        ctx = ssl.create_default_context()
+        url = f"https://bsky.social/xrpc/com.atproto.identity.resolveHandle?handle={urllib.parse.quote(handle)}"
+        req = urllib.request.Request(url, method="GET")
+        try:
+            resp = urllib.request.urlopen(req, timeout=5, context=ctx)
+            data = json.loads(resp.read())
+            return data.get("did")
+        except Exception:
+            return None
+
+    return await asyncio.to_thread(_resolve)
+
+
+async def _do_bsky_proxy(method: str, path: str, body: dict = None, query_params: dict = None, auth_header: str = None):
+    """Core handler for the Bluesky XRPC proxy.
+    Uses urllib (not httpx) because httpx gets blocked by bsky's AWS WAF while urllib works fine.
+    Public read endpoints route to public.api.bsky.app, everything else goes to bsky.social.
+    Auto-resolves handle values in actor/author query params to DIDs."""
+    import urllib.request, urllib.parse
+    import asyncio, ssl
+
+    target = BSKY_PUBLIC_API if method == "GET" and path in _BSKY_PUBLIC_ENDPOINTS else BSKY_API
+
+    # Resolve any handle values in actor/author params to DIDs
+    if query_params:
+        for key in ("actor", "author"):
+            val = query_params.get(key)
+            if val and not val.startswith("did:"):
+                resolved = await _resolve_bsky_handle(val)
+                if resolved:
+                    query_params[key] = resolved
+                    print(f"[BSKY] Resolved handle {val} -> {resolved}")
+
+    url = f"{target}/{path}"
+    if query_params:
+        qs = urllib.parse.urlencode(query_params, doseq=True)
+        url = f"{url}?{qs}"
+
+    data = json.dumps(body).encode("utf-8") if body else None
+    fwd_headers = {"Content-Type": "application/json"}
+    if auth_header:
+        fwd_headers["Authorization"] = auth_header
+
+    print(f"[BSKY] {method} {path} target={target.split('//')[1].split('/')[0]} params={query_params} auth={bool(auth_header)}")
+
+    def _fetch():
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(url, data=data, headers=fwd_headers, method=method)
+        try:
+            resp = urllib.request.urlopen(req, timeout=10, context=ctx)
+            return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    status, raw = await asyncio.to_thread(_fetch)
+    try:
+        content = json.loads(raw)
+        return JSONResponse(status_code=status, content=content)
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse(status_code=status, content={"_raw": raw.decode("utf-8", errors="replace")})
+
+
+@app.post("/api/proxy/bsky/{path:path}")
+async def proxy_bsky_post(path: str, body: dict = Body(default={}), authorization: str = Header(None)):
+    """Proxy Bluesky ATProto XRPC POST calls so the browser isn't blocked by CORS."""
+    return await _do_bsky_proxy("POST", path, body, auth_header=authorization)
+
+
+@app.get("/api/proxy/bsky/{path:path}")
+async def proxy_bsky_get(path: str, query_params: dict = {}, authorization: str = Header(None)):
+    """Proxy Bluesky ATProto XRPC GET calls."""
+    return await _do_bsky_proxy("GET", path, query_params=query_params if query_params else None, auth_header=authorization)
 
 
 @app.get("/api/admin-status")
@@ -2546,10 +2647,12 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
             if action == "cancel":
                 # Cancel all active generations for this conversation
                 cancelled_keys = [k for k in _active_generations if k[0] == conv_id]
+                cancelled_tasks = []
                 for key in cancelled_keys:
                     task = _active_generations.pop(key, None)
                     if task:
                         task.cancel()
+                        cancelled_tasks.append(task)
                 proc = _active_claude_procs.pop(conv_id, None)
                 if proc:
                     await claude_client.cancel_claude(proc)
@@ -2561,16 +2664,18 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                     if _pending_hook_permissions[rid].get("conv_id") == conv_id:
                         _pending_hook_permissions.pop(rid, None)
                         await db.delete_pending_permission(rid)
-                # Delete empty draft messages left by cancelled generations
+                # Wait for tasks to finish their CancelledError handler (saves partial content).
+                # Pop snapshots — the task handlers save/delete drafts themselves.
                 for key in cancelled_keys:
-                    snap = _generation_snapshots.pop(key, None)
-                    if snap and snap.get("draft_msg_id"):
-                        msg = await db.get_message(snap["draft_msg_id"])
-                        # Only delete if it's completely empty AND has no content blocks (like tool calls)
-                        has_content = (msg.get("content") or "").strip()
-                        has_blocks = (msg.get("content_blocks") or "").strip() not in ("", "[]")
-                        if msg and not has_content and not has_blocks:
-                            await db.delete_branch(snap["draft_msg_id"])
+                    _generation_snapshots.pop(key, None)
+                if cancelled_tasks:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*cancelled_tasks, return_exceptions=True),
+                            timeout=8.0,
+                        )
+                    except asyncio.TimeoutError:
+                        pass  # tasks hung — already cleaned up, continue
                 # Send cancelled event immediately so UI responds
                 await _ws_send(conv_id, {"type": "cancelled"})
                 continue
@@ -4547,7 +4652,19 @@ async def _handle_hermes_generation(
                 # resolved (config.yaml default) so the chat header / model picker
                 # show it instead of a bare "(local model)".
                 if not conv.get("local_model"):
-                    resolved = (evt.get("model") or "").split(":", 1)[-1].strip() if ":" in (evt.get("model") or "") else (evt.get("model") or "").strip()
+                    resolved = (evt.get("model") or "").strip()
+                    for prefix in ("custom:", "ollama:"):
+                        if resolved.startswith(prefix):
+                            resolved = resolved[len(prefix):].strip()
+                            break
+                    
+                    # Heuristic: if Hermes returned a mangled suffix (like '27b' for 'qwen3.6:27b'),
+                    # re-expand it so we don't save a broken model name that fails next turn.
+                    if resolved and ":" in config.ollama_model:
+                        base, tag = config.ollama_model.rsplit(":", 1)
+                        if resolved == tag or resolved == config.ollama_model.split(":")[-1]:
+                            resolved = config.ollama_model
+
                     if resolved:
                         conv["local_model"] = resolved
                         try:

@@ -223,11 +223,15 @@ async def _bridge_permission(rpc: _RpcConn, req_id: Any, params: dict,
         "tool_input": {"toolCall": tool_call},
         "hook_event_name": "PreToolUse",
     }
+    # Detect protocol (HTTPS if certs exist). Resolve relative to this script.
+    _certs_dir = Path(__file__).parent / "certs"
+    protocol = "https" if (_certs_dir / "cert.pem").exists() and (_certs_dir / "key.pem").exists() else "http"
+
     allow = False
     try:
-        async with httpx.AsyncClient() as c:
+        async with httpx.AsyncClient(verify=False) as c:
             r = await c.post(
-                f"http://127.0.0.1:{loom_port}/api/cc-permission",
+                f"{protocol}://127.0.0.1:{loom_port}/api/cc-permission",
                 json=body, timeout=_PERMISSION_HTTP_TIMEOUT,
             )
             resp = r.json()
@@ -382,6 +386,12 @@ async def run_hermes(
     acp_cwd = str(Path(work_dir)).replace("\\", "/")
 
     log.info("[Hermes] spawning: %s (cwd=%s, model=%s, HERMES_HOME=%s)", cmd, work_dir, model, home)
+    kwargs = {}
+    if sys.platform == "win32":
+        import subprocess
+        # Use CREATE_NO_WINDOW (0x08000000) and CREATE_NEW_PROCESS_GROUP (0x00000200)
+        kwargs["creationflags"] = 0x08000000 | 0x00000200
+
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=work_dir,
@@ -390,6 +400,7 @@ async def run_hermes(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=_STREAM_LIMIT,
+        **kwargs
     )
 
     async def _drain_stderr() -> None:
@@ -435,9 +446,13 @@ async def run_hermes(
 
             if model:
                 try:
+                    # If it has a colon, it's likely an Ollama model (e.g. qwen:27b).
+                    # Hermes' 'custom' provider often mangles these by splitting on ':'.
+                    # Try 'ollama:' prefix which Hermes supports more natively for these.
+                    prefix = "ollama" if ":" in model else "custom"
                     await rpc_request_via_reader(
                         rpc, "session/set_model",
-                        {"sessionId": session_id, "modelId": f"custom:{model}"}, proc, state)
+                        {"sessionId": session_id, "modelId": f"{prefix}:{model}"}, proc, state)
                 except Exception as e:  # noqa: BLE001
                     log.warning("[Hermes] set_model(%s) failed: %s", model, e)
 

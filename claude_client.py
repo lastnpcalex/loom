@@ -668,6 +668,11 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         """Launch a CC subprocess and start its stderr drainer. Returns the
         asyncio.subprocess.Process. Used for the initial run and each
         auto-continue relaunch on max_tokens stop."""
+        kwargs = {}
+        if sys.platform == "win32":
+            import subprocess
+            # Use CREATE_NO_WINDOW (0x08000000) and CREATE_NEW_PROCESS_GROUP (0x00000200)
+            kwargs["creationflags"] = 0x08000000 | 0x00000200
         p = await asyncio.create_subprocess_exec(
             *spawn_cmd,
             cwd=cwd,
@@ -676,6 +681,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=16 * 1024 * 1024,
+            **kwargs
         )
         if spawn_use_stdin and p.stdin and spawn_prompt is not None:
             async def _feed_stdin():
