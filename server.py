@@ -26,6 +26,7 @@ from fastapi import (
     UploadFile,
     File,
     HTTPException,
+    Request,
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -763,9 +764,10 @@ async def proxy_bsky_post(path: str, body: dict = Body(default={}), authorizatio
 
 
 @app.get("/api/proxy/bsky/{path:path}")
-async def proxy_bsky_get(path: str, query_params: dict = {}, authorization: str = Header(None)):
+async def proxy_bsky_get(request: Request, path: str, authorization: str = Header(None)):
     """Proxy Bluesky ATProto XRPC GET calls."""
-    return await _do_bsky_proxy("GET", path, query_params=query_params if query_params else None, auth_header=authorization)
+    qp = dict(request.query_params) if len(request.query_params) > 0 else None
+    return await _do_bsky_proxy("GET", path, query_params=qp, auth_header=authorization)
 
 
 # ── Bluesky token storage (canvas uses this to persist session tokens) ──
