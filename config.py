@@ -43,7 +43,7 @@ class Config:
 
     # Local-model backend: "ollama" (default) or "vllm". Selects which client
     # the Weave / OODA paths use. Loom/Braid (CC) are unaffected.
-    local_backend: str = os.getenv("LOOM_LOCAL_BACKEND", "ollama")
+    local_backend: str = os.getenv("LOOM_LOCAL_BACKEND", "vllm")
     vllm_host: str = os.getenv("VLLM_HOST", "http://localhost:8000")
     vllm_model: str = os.getenv("VLLM_MODEL", "")  # empty = fall back to ollama_model
 

@@ -550,6 +550,41 @@ def _build_ollama_env(env: dict) -> dict:
     return env
 
 
+def _kill_stale_vllm():
+    """Kill orphaned vLLM / EngineCore processes from a previous crashed run.
+
+    vLLM spawns child EngineCore processes that hold ZMQ IPC ports.  If the
+    parent API server crashes, those children survive and block the next launch
+    with 'zmq.error.ZMQError: Address in use'.  We kill them pre-emptively.
+    """
+    if sys.platform != "win32":
+        return  # Linux handles this via process groups
+    import subprocess
+    # Look for any python process whose command line contains 'vllm'
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*vllm*' -and $_.Name -like '*python*' } | Select-Object -ExpandProperty ProcessId"],
+            capture_output=True, text=True, timeout=10,
+        )
+        pids = [
+            line.strip() for line in result.stdout.splitlines()
+            if line.strip().isdigit()
+        ]
+        if pids:
+            for pid in pids:
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", pid],
+                        capture_output=True, timeout=5,
+                    )
+                    print(f"[ADMIN] Killed stale vLLM process PID {pid}")
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[ADMIN] Stale vLLM cleanup skipped: {e}")
+
+
 def _build_vllm_cmd() -> str:
     """Build the `vllm serve ...` command from saved config. Returns empty string
     if no model is configured (caller must surface a friendly error)."""
@@ -761,6 +796,10 @@ async def tool_vllm_start():
                 return JSONResponse({"status": "ok", "output": f"vLLM is already running on :{VLLM_PORT}"})
     except Exception:
         pass
+    # Kill stale vLLM/EngineCore processes that may hold ZMQ ports from a
+    # previous crash.  Without this, the new launch fails with
+    # "zmq.error.ZMQError: Address in use".
+    _kill_stale_vllm()
     try:
         proc = _spawn_detached(cmd)
         _child_procs["vllm"] = proc

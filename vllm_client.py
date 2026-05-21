@@ -211,7 +211,8 @@ async def stream_chat(messages: list[dict],
     """
     global _mock_mode
     if _mock_mode:
-        print("[VLLM] WARNING: running in MOCK MODE")
+        print("[VLLM] WARNING: running in MOCK MODE — vLLM server is not reachable.")
+        print(f"[VLLM] Check that vLLM is running at {_vllm_host()} (use admin panel to start).")
         async for tok in _mock_stream(messages):
             yield tok
         return
@@ -319,6 +320,9 @@ async def stream_chat(messages: list[dict],
                 }
                 return
     except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as e:
+        print(f"[VLLM] Connection failed: {e}")
+        print(f"[VLLM] Ensure vLLM is running at {_vllm_host()} — use the admin panel to start it.")
+        _mock_mode = True
         raise RuntimeError(f"Cannot reach vLLM at {_vllm_host()}: {e}")
 
 
@@ -355,69 +359,8 @@ async def sync_chat(messages: list[dict],
                 return ""
             msg = choices[0].get("message") or {}
             return msg.get("content") or msg.get("reasoning_content") or ""
-    except (httpx.ConnectError, httpx.ConnectTimeout, OSError):
+    except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as e:
+        print(f"[VLLM] sync_chat connection failed: {e}")
+        print(f"[VLLM] Ensure vLLM is running at {_vllm_host()} — use the admin panel to start it.")
         _mock_mode = True
-        return "Summary: The conversation continues with escalating tension and mutual wariness."
-
-
-async def describe_image(image_path: str, model: str = None, context: str = None) -> str:
-    """Describe an image via vLLM's native vision (single model, no fallback chain)."""
-    global _mock_mode
-    if _mock_mode:
-        return "An image was shared."
-
-    url = _image_to_data_url(image_path)
-    if not url:
-        return "An image was shared but could not be read."
-
-    prompt = (
-        "Describe this image in thorough detail. Include: subjects and their appearance "
-        "(clothing, expression, physical features), their physical pose and body language "
-        "(how they are positioned, what their limbs are doing, spatial arrangement relative "
-        "to each other and the environment), setting and environment, lighting and mood, "
-        "composition and framing, any text or symbols visible, and notable artistic or "
-        "photographic qualities. Describe what you observe objectively and completely without "
-        "editorializing or omitting details. No preamble."
-    )
-    if context:
-        prompt += f"\n\nAdditional focus: {context}"
-
-    payload = {
-        "model": _resolve_vllm_model(model or config.vision_model),
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": url}},
-            ],
-        }],
-        "stream": False,
-        "temperature": 0.3,
-        "max_tokens": 800,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
-            resp = await client.post(f"{_vllm_host()}/v1/chat/completions", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            choices = data.get("choices") or []
-            if not choices:
-                return "An image was shared."
-            msg = choices[0].get("message") or {}
-            return msg.get("content") or msg.get("reasoning_content") or "An image was shared."
-    except Exception as e:
-        print(f"[VLLM-DESCRIBE] {type(e).__name__}: {str(e)[:200]}")
-        return "An image was shared."
-
-
-async def describe_image_with_data(image_path: str, model: str = None, context: str = None) -> tuple[str, dict]:
-    """Returns (description, image_payload). image_payload uses the legacy
-    {'images': [b64]} shape so the existing Ollama-shaped consumers still work."""
-    try:
-        with open(image_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-    except (IOError, OSError):
-        return ("An image was shared but could not be read.", {})
-    desc = await describe_image(image_path, model=model, context=context)
-    return (desc, {"images": [b64]})
+        raise RuntimeError(f"Cannot reach vLLM at {_vllm_host()} for sync_chat: {e}")
