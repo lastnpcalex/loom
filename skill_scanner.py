@@ -57,10 +57,6 @@ BUILTIN_COMMANDS = [
      "prompt_template": "Manage scheduled agents/triggers. {args}"},
     {"name": "batch",           "command": "/batch",           "description": "Run a prompt against multiple files or inputs in parallel", "mode": "headless",
      "prompt_template": "Run the following operation in batch across the specified files or inputs: {args}"},
-    {"name": "goal",            "command": "/goal",            "description": "Run a long-running task with extra thoroughness until fully achieved", "mode": "headless",
-     "prompt_template": "I want you to be extra thorough and not stop until this goal is fully achieved. Do not ask for confirmation — keep working autonomously until done: {args}"},
-    {"name": "grill-me",        "command": "/grill-me",        "description": "Interactive design-alignment interview to resolve decisions", "mode": "headless",
-     "prompt_template": "I want to align on a plan through an interactive interview. Ask me probing questions one at a time to resolve design decisions, trade-offs, and ambiguities before we proceed. Topic: {args}"},
 
     # ── Context & memory ──
     {"name": "context",         "command": "/context",         "description": "View or manage conversation context and included files", "mode": "headless",

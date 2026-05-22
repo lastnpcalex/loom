@@ -1,14 +1,4 @@
-"""Antigravity (agy) CLI subprocess wrapper with stream parser.
-
-Replaces the legacy Gemini CLI wrapper. `agy` is invoked in headless mode
-via `agy chat -p` and streams text output which we parse into Loom events.
-
-The `PreToolUse` hook is written to `.gemini/settings.json` (same format
-as the legacy Gemini CLI) so tool permission requests route through
-cc_permission_hook.py → Loom HTTP API → browser UI.
-
-Session resume uses `--conversation <id>`.
-"""
+"""Gemini Code CLI subprocess wrapper with NDJSON stream parser."""
 
 import asyncio
 import json
@@ -23,34 +13,8 @@ log = logging.getLogger(__name__)
 _HOOK_SCRIPT = str(Path(__file__).parent / "cc_permission_hook.py")
 
 
-def _find_agy_exe() -> str:
-    """Find the `agy` executable. Checks PATH first, then known install locations."""
-    # Check if agy is on PATH
-    agy_name = "agy.exe" if sys.platform == "win32" else "agy"
-    
-    # Known Windows install location
-    if sys.platform == "win32":
-        local_app_data = os.environ.get("LOCALAPPDATA", "")
-        known_path = os.path.join(local_app_data, "agy", "bin", "agy.exe")
-        if os.path.exists(known_path):
-            return known_path
-        # Fallback: the older Antigravity install
-        known_path2 = os.path.join(
-            os.environ.get("LOCALAPPDATA", ""),
-            "Programs", "Antigravity", "bin", "antigravity.cmd"
-        )
-        if os.path.exists(known_path2):
-            return known_path2
-
-    return agy_name  # Rely on PATH
-
-
 def _process_event(raw: dict) -> list[dict]:
-    """Process a raw stream-json event and return simplified event dicts.
-    
-    agy uses the same NDJSON stream format as Gemini CLI when invoked with
-    --output-format stream-json.
-    """
+    """Process a raw Gemini stream-json event and return simplified event dicts."""
     events = []
     etype = raw.get("type", "")
 
@@ -105,17 +69,14 @@ def _process_event(raw: dict) -> list[dict]:
 
 
 def _configure_permission_hook(cwd: str, backstage_parent_id: int | None = None, server_port: int = 8000):
-    """Configure PreToolUse / BeforeTool hook so agy routes tool approvals through Loom.
-    
-    Writes to .gemini/settings.json (agy reads this) and ensures the hook
-    command is trusted.
-    """
+    """Configure BeforeTool hook + trust entry so Gemini CLI calls our permission hook."""
     gemini_dir = Path(cwd) / ".gemini"
     gemini_dir.mkdir(parents=True, exist_ok=True)
 
     python_exe = sys.executable
     hook_path = _HOOK_SCRIPT
-    # agy runs hooks via PowerShell on Windows — use & (call operator)
+    # Gemini CLI runs hooks via PowerShell on Windows — "exe" "arg" syntax fails.
+    # Use & (call operator) to handle quoted paths correctly in PowerShell.
     if sys.platform == "win32":
         hook_command = f'& "{python_exe}" "{hook_path}"'
     else:
@@ -132,19 +93,20 @@ def _configure_permission_hook(cwd: str, backstage_parent_id: int | None = None,
         }
     ]
 
-    # Detect protocol (HTTPS if certs exist)
+    # Detect protocol (HTTPS if certs exist). Resolve relative to this script
+    # — the server's cwd may differ from the project root (e.g. worktree),
+    # which silently flips this to http:// and breaks the backstage MCP.
     _certs_dir = Path(__file__).parent / "certs"
     protocol = "https" if (_certs_dir / "cert.pem").exists() and (_certs_dir / "key.pem").exists() else "http"
 
-    # Write project-level settings.json
+    # Write project-level settings.json (the one Gemini actually reads)
     settings_path = gemini_dir / "settings.json"
     existing = {}
     if settings_path.exists():
         try: existing = json.loads(settings_path.read_text(encoding="utf-8"))
         except: existing = {}
 
-    # agy uses PreToolUse (like Claude Code), not BeforeTool (like legacy Gemini)
-    existing["hooks"] = {"PreToolUse": hook_def}
+    existing["hooks"] = {"BeforeTool": hook_def}
     
     # Backstage: Inject MCP server for state cards
     if backstage_parent_id:
@@ -159,14 +121,24 @@ def _configure_permission_hook(cwd: str, backstage_parent_id: int | None = None,
         }
     
     settings_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-    log.info(f"[AGY] Hook configured: {settings_path}")
+    log.info(f"[GEMINI] Hook configured: {settings_path}")
 
-    # Add hook command to trusted hooks
+    # Remove settings.local.json if it has stale Claude-style PreToolUse hooks
+    local_path = gemini_dir / "settings.local.json"
+    if local_path.exists():
+        try:
+            local = json.loads(local_path.read_text(encoding="utf-8"))
+            if "PreToolUse" in local.get("hooks", {}):
+                del local["hooks"]["PreToolUse"]
+                local_path.write_text(json.dumps(local, indent=2), encoding="utf-8")
+        except: pass
+
+    # Add hook command to ~/.gemini/trusted_hooks.json so Gemini doesn't skip it
     _ensure_hook_trusted(cwd, hook_command)
 
 
 def _ensure_hook_trusted(cwd: str, hook_command: str):
-    """Add our hook command to the trusted_hooks.json for this project path."""
+    """Add our hook command to Gemini's trusted_hooks.json for this project path."""
     if sys.platform == "win32":
         home = Path(os.environ.get("USERPROFILE", Path.home()))
     else:
@@ -178,7 +150,9 @@ def _ensure_hook_trusted(cwd: str, hook_command: str):
         try: trusted = json.loads(trusted_path.read_text(encoding="utf-8"))
         except: trusted = {}
 
+    # Gemini stores trust entries with a colon prefix on the command string
     trust_key = f":{hook_command}"
+    # Normalize the cwd to match Gemini's path format
     norm_cwd = str(Path(cwd).resolve())
 
     project_hooks = trusted.get(norm_cwd, [])
@@ -187,7 +161,7 @@ def _ensure_hook_trusted(cwd: str, hook_command: str):
         trusted[norm_cwd] = project_hooks
         trusted_path.parent.mkdir(parents=True, exist_ok=True)
         trusted_path.write_text(json.dumps(trusted, indent=2), encoding="utf-8")
-        log.info(f"[AGY] Hook trusted for {norm_cwd}")
+        log.info(f"[GEMINI] Hook trusted for {norm_cwd}")
 
 
 async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
@@ -195,27 +169,20 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                      permission_mode: str = "default",
                      resume_session_id: str = None, fork_session: bool = False,
                      backstage_parent_id: int | None = None):
-    """Launch agy (Antigravity CLI) in headless mode and stream events.
-    
-    Returns (process, async_generator) matching the interface expected by
-    server.py's generation loop.
-    
-    Function name kept as run_gemini for backwards compatibility with server.py
-    imports.
-    """
     _configure_permission_hook(cwd, backstage_parent_id, server_port)
 
-    agy_exe = _find_agy_exe()
-
-    # agy uses the 'chat' subcommand for headless prompting
+    # Use YOLO mode to ensure tools are visible in headless mode.
+    # Security is enforced by our hook script which fires even in YOLO mode.
     cc_args = [
-        "chat",
         "--model", model,
         "--output-format", "stream-json",
-        "--dangerously-skip-permissions",
+        "--approval-mode", "yolo",
+        # Gemini CLI's "trusted folders" check otherwise overrides yolo back to
+        # default and aborts headless runs from arbitrary cwds.
+        "--skip-trust",
     ]
     if resume_session_id:
-        cc_args.extend(["--conversation", resume_session_id])
+        cc_args.extend(["--resume", resume_session_id])
 
     # Backstage Lockdown: Use temporary policy to block file/shell tools
     if backstage_parent_id:
@@ -244,33 +211,36 @@ priority = 1000
         policy_path.write_text(policy_content.strip(), encoding="utf-8")
         cc_args.extend(["--policy", str(policy_path)])
         cc_args.extend(["--allowed-mcp-server-names", "loom-state-cards"])
+    
+    gemini_exe = "gemini.cmd" if sys.platform == "win32" else "gemini"
 
     env = {
         **os.environ,
         "LOOM_CONV_ID": str(conv_id),
         "LOOM_PORT": str(server_port),
+        # Belt-and-suspenders for older Gemini CLI builds that ignore --skip-trust.
+        "GEMINI_CLI_TRUST_WORKSPACE": "true",
     }
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
 
     # Always pipe prompt via stdin on Windows — newlines in command-line args
-    # get mangled by CreateProcess.
+    # get mangled by CreateProcess, causing Gemini to see only the first line.
     use_stdin = sys.platform == "win32" or len(prompt) > 20000
     if use_stdin:
         cc_args.extend(["-p", "-"])  # read prompt from stdin
     else:
         cc_args.extend(["-p", prompt])
 
-    cmd = [agy_exe] + cc_args
+    cmd = [gemini_exe] + cc_args
 
-    print(f"[AGY] Launching: {' '.join(cmd[:6])}...")
-    print(f"[AGY] Prompt length: {len(prompt)} chars (stdin={use_stdin})")
-    print(f"[AGY] Prompt preview: {repr(prompt[:200])}")
+    print(f"[GEMINI] Prompt length: {len(prompt)} chars (stdin={use_stdin})")
+    print(f"[GEMINI] Prompt preview: {repr(prompt[:200])}")
 
     kwargs = {}
     if sys.platform == "win32":
         import subprocess
-        # Use CREATE_NO_WINDOW and CREATE_NEW_PROCESS_GROUP
+        # Use CREATE_NO_WINDOW (0x08000000) and CREATE_NEW_PROCESS_GROUP (0x00000200)
         kwargs["creationflags"] = 0x08000000 | 0x00000200
 
     proc = await asyncio.create_subprocess_exec(
@@ -281,7 +251,7 @@ priority = 1000
         **kwargs
     )
 
-    # Feed prompt via stdin if needed
+    # Feed prompt via stdin if needed in a background task to prevent pipe deadlocks
     if use_stdin and proc.stdin:
         async def _feed_stdin():
             try:
@@ -289,13 +259,13 @@ priority = 1000
                 await proc.stdin.drain()
                 proc.stdin.close()
             except Exception as e:
-                log.error(f"[AGY] Error feeding stdin: {e}")
+                log.error(f"[GEMINI] Error feeding stdin: {e}")
         asyncio.create_task(_feed_stdin())
 
     async def _read_stderr():
         async for line in proc.stderr:
             text = line.decode("utf-8", errors="replace").strip()
-            if text: print(f"[AGY-stderr] {text}")
+            if text: print(f"[GEMINI-stderr] {text}")
     asyncio.create_task(_read_stderr())
 
     async def _event_stream():
@@ -312,7 +282,6 @@ priority = 1000
     return proc, _event_stream()
 
 async def cancel_gemini(proc):
-    """Cancel the agy subprocess. Name kept for backwards compat with server.py."""
     if proc.returncode is None:
         if sys.platform == 'win32':
             import subprocess

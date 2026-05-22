@@ -310,14 +310,6 @@ async def sync_chat(messages: list[dict],
         return "Summary: The conversation continues with escalating tension and mutual wariness."
 
 
-def load_image_base64(image_path: str) -> str:
-    """Read an image file and return its base64 encoded representation."""
-    try:
-        with open(image_path, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
-    except (IOError, OSError):
-        return ""
-
 async def describe_image(image_path: str, model: str = None, context: str = None) -> str:
     """Use a multimodal Ollama model to describe an image in detail."""
     global _mock_mode
@@ -325,8 +317,10 @@ async def describe_image(image_path: str, model: str = None, context: str = None
     if _mock_mode:
         return "An image was shared."
 
-    img_data = load_image_base64(image_path)
-    if not img_data:
+    try:
+        with open(image_path, "rb") as f:
+            img_data = base64.b64encode(f.read()).decode("utf-8")
+    except (IOError, OSError):
         return "An image was shared but could not be read."
 
     try:

@@ -719,17 +719,17 @@ function buildConvItem(conv) {
     const isGemini = isCC && conv.cc_model && conv.cc_model.startsWith('gemini');
     const isLocal = conv.mode === 'local';
     const isHermes = conv.mode === 'hermes';
-    const charName = isGemini ? (conv.cc_model || 'Antigravity')
+    const charName = isGemini ? (conv.cc_model || 'Gemini')
         : isCC ? (conv.cc_model || 'Claude')
         : isLocal ? (conv.local_model || 'Ollama')
         : isHermes ? (conv.local_model || 'Hermes')
         : conv.character_id
         ? (State.characters.find(c => c.id === conv.character_id)?.name || conv.character_id)
         : 'Freeform';
-    const modeBadge = isGemini ? '<span class="mode-badge" title="Antigravity CLI in the browser">Loom {Antigravity}</span>'
+    const modeBadge = isGemini ? '<span class="mode-badge" title="Gemini CLI in the browser">Loom {Gemini}</span>'
         : isCC ? '<span class="mode-badge" title="Claude Code in the browser">Loom {Claude}</span>'
-        : isLocal ? '<span class="mode-badge" title="Claude Code powered by a local model">Braid {Local}</span>'
-        : isHermes ? '<span class="mode-badge" title="Hermes Agent (ACP) powered by a local model">Hermes {Agent}</span>'
+        : isLocal ? '<span class="mode-badge" title="Claude Code powered by a local Ollama model">Braid {Local}</span>'
+        : isHermes ? '<span class="mode-badge" title="Hermes Agent (ACP) powered by a local Ollama model">Hermes {Agent}</span>'
         : '<span class="mode-badge" title="Structured roleplay with local models">Weave</span>';
     const starred = conv.starred ? 1 : 0;
     const starChar = starred ? '★' : '☆';
@@ -2188,7 +2188,7 @@ function setupEventListeners() {
             document.getElementById('cc-model-group').classList.add('hidden');
             document.getElementById('cc-effort-group').classList.add('hidden');
             document.getElementById('local-model-group').classList.add('hidden');
-            if (mode === 'claude' || mode === 'pi' || mode === 'opencode') {
+            if (mode === 'claude') {
                 document.getElementById('project-dir-group').classList.remove('hidden');
                 document.getElementById('cc-model-group').classList.remove('hidden');
                 document.getElementById('cc-effort-group').classList.remove('hidden');

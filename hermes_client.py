@@ -331,7 +331,7 @@ def _dispatch_session_update(update: dict, state: dict) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 async def run_hermes(
-    prompt: str | list,
+    prompt: str,
     *,
     conv_id: int = 0,
     model: str | None = None,
@@ -461,10 +461,9 @@ async def run_hermes(
             prompt_req_id = rpc._alloc_id()
             prompt_fut: asyncio.Future = asyncio.get_event_loop().create_future()
             rpc._pending[prompt_req_id] = prompt_fut
-            prompt_payload = prompt if isinstance(prompt, list) else [{"type": "text", "text": prompt}]
             await rpc._write({"jsonrpc": "2.0", "id": prompt_req_id, "method": "session/prompt",
                               "params": {"sessionId": session_id,
-                                         "prompt": prompt_payload}})
+                                         "prompt": [{"type": "text", "text": prompt}]}})
 
             assert proc.stdout is not None
             async for raw in proc.stdout:

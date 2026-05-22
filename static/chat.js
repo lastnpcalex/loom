@@ -2263,7 +2263,7 @@ function createMessageElement(msg, cost, elapsed) {
     const isHermesMode = State.currentConv && State.currentConv.mode === 'hermes';
     const roleLabel = msg.role === 'system' ? 'System'
         : msg.role === 'user' ? 'You'
-        : isGemini ? 'Antigravity'
+        : isGemini ? 'Gemini'
         : isClaudeMode ? 'Claude'
         : isLocalMode ? (State.currentConv.local_model || 'Local')
         : isHermesMode ? (State.currentConv.local_model || 'Hermes')
@@ -2321,14 +2321,12 @@ function createMessageElement(msg, cost, elapsed) {
         contentHtml = formatContent(msg.content);
     }
 
-    // Elapsed time badge in header — HH:MM:SS (drops leading zero-padded units)
+    // Elapsed time badge in header (matches streaming timer format M:SS)
     let elapsedHtml = '';
     if (elapsed && elapsed > 0) {
-        const eh = Math.floor(elapsed / 3600);
-        const em = Math.floor((elapsed % 3600) / 60);
+        const em = Math.floor(elapsed / 60);
         const es = String(elapsed % 60).padStart(2, '0');
-        const timeStr = eh > 0 ? `${eh}:${String(em).padStart(2, '0')}:${es}` : `${em}:${es}`;
-        elapsedHtml = `<span class="gen-timer" title="${elapsed}s">${timeStr}</span>`;
+        elapsedHtml = `<span class="gen-timer" title="${elapsed}s">${em}:${es}</span>`;
     }
 
     // Cost footer
@@ -2346,14 +2344,7 @@ function createMessageElement(msg, cost, elapsed) {
                 : `${(outTok/1000).toFixed(1)}k out`);
         }
         if (usd) parts.push(`$${usd.toFixed(4)}`);
-        if (durMs) {
-            const totalSec = Math.round(durMs / 1000);
-            const dh = Math.floor(totalSec / 3600);
-            const dm = Math.floor((totalSec % 3600) / 60);
-            const ds = String(totalSec % 60).padStart(2, '0');
-            const durStr = dh > 0 ? `${dh}:${String(dm).padStart(2, '0')}:${ds}` : `${dm}:${ds}`;
-            parts.push(durStr);
-        }
+        if (durMs) parts.push(`${(durMs/1000).toFixed(1)}s`);
         if (parts.length) costHtml = `<div class="cost-footer">${parts.join(' · ')}</div>`;
     }
 
@@ -2892,12 +2883,7 @@ function _startGenTimer() {
         if (!streamingDiv || !_streamStartTime) return;
         const secs = Math.floor((Date.now() - _streamStartTime) / 1000);
         const timerEl = streamingDiv.querySelector('.gen-timer');
-        if (timerEl) {
-            const h = Math.floor(secs / 3600);
-            const m = Math.floor((secs % 3600) / 60);
-            const s = String(secs % 60).padStart(2, '0');
-            timerEl.textContent = h > 0 ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
-        }
+        if (timerEl) timerEl.textContent = Math.floor(secs / 60) + ':' + String(secs % 60).padStart(2, '0');
         const tokEl = streamingDiv.querySelector('.gen-token-info');
         if (tokEl && _streamTokenCount > 0 && !tokEl.dataset.hasUsage) {
             tokEl.textContent = '↓' + _fmtTok(_streamTokenCount) + ' · ';
@@ -2927,7 +2913,7 @@ function appendStreamingMessage() {
     const isGemini = isClaudeMode && State.currentConv.cc_model && State.currentConv.cc_model.startsWith('gemini');
     const isLocalMode = State.currentConv && State.currentConv.mode === 'local';
     const isHermesMode = State.currentConv && State.currentConv.mode === 'hermes';
-    const label = isGemini ? 'Antigravity'
+    const label = isGemini ? 'Gemini'
         : isClaudeMode ? 'Claude'
         : isLocalMode ? (State.currentConv.local_model || 'Local')
         : isHermesMode ? (State.currentConv.local_model || 'Hermes')

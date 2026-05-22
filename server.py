@@ -51,7 +51,7 @@ from character_loader import (
     save_lore,
     delete_lore,
 )
-from local_llm import health_check, stream_chat, sync_chat
+from local_llm import health_check, stream_chat, sync_chat, describe_image
 from ooda_harness import (
     build_ooda_system_prompt,
     parse_ooda_block,
@@ -833,7 +833,7 @@ async def _refresh_local_models_cache() -> dict:
     status = await health_check()
     _LOCAL_MODELS_CACHE = {
         "backend": config.local_backend,
-        "host": (config.vllm_host if config.local_backend in ("vllm", "trtllm") else config.ollama_host),
+        "host": (config.vllm_host if config.local_backend == "vllm" else config.ollama_host),
         "models": status.get("models", []),
         "target_model": status.get("target_model"),
         "available": status.get("model_available", False),
@@ -846,7 +846,7 @@ async def _refresh_vision_models_cache() -> dict:
     """Vision models are expensive to compute on Ollama (one /api/show per
     model) so this benefits the most from caching."""
     global _VISION_MODELS_CACHE
-    if config.local_backend in ("vllm", "trtllm"):
+    if config.local_backend == "vllm":
         status = await health_check()
         models = status.get("models", [])
     else:
@@ -854,7 +854,7 @@ async def _refresh_vision_models_cache() -> dict:
         models = result.get("models", []) if isinstance(result, dict) else []
     _VISION_MODELS_CACHE = {
         "backend": config.local_backend,
-        "host": (config.vllm_host if config.local_backend in ("vllm", "trtllm") else config.ollama_host),
+        "host": (config.vllm_host if config.local_backend == "vllm" else config.ollama_host),
         "models": models,
         "fetched_at": time.time(),
     }
@@ -866,7 +866,7 @@ def _cache_is_stale(cache: dict | None) -> bool:
     than the current config (so flipping the backend dropdown auto-invalidates)."""
     if not cache:
         return True
-    expected_host = config.vllm_host if config.local_backend in ("vllm", "trtllm") else config.ollama_host
+    expected_host = config.vllm_host if config.local_backend == "vllm" else config.ollama_host
     return cache.get("backend") != config.local_backend or cache.get("host") != expected_host
 
 
@@ -1179,7 +1179,7 @@ async def api_create_conversation(data: dict = None):
         cc_effort=cc_effort,
         ooda_enabled=1 if mode == "weave" else 0,
     )
-    if mode in ("local", "hermes", "pi", "opencode") and local_model:
+    if mode in ("local", "hermes") and local_model:
         fields["local_model"] = local_model
     await db.update_conversation_fields(conv["id"], **fields)
     # Refresh conv data
@@ -2020,7 +2020,6 @@ CC_MODELS = [
         {"value": "haiku", "label": "Haiku"},
     ]},
     {"group": "Gemini", "models": [
-        {"value": "gemini-3.5-flash", "label": "Gemini 3.5 Flash"},
         {"value": "gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro Preview"},
         {"value": "gemini-3-flash-preview", "label": "Gemini 3 Flash Preview"},
         {"value": "gemini-3.1-flash-lite-preview", "label": "Gemini 3.1 Flash Lite Preview"},
@@ -2752,7 +2751,7 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 # different branches would race the same child. (Including "local"
                 # here fixes a latent Braid bug — it was previously treated like
                 # Weave/OODA and allowed to spawn parallel CC subprocesses.)
-                is_subprocess_agent = mode in ("claude", "local", "hermes", "pi", "opencode")
+                is_subprocess_agent = mode in ("claude", "local", "hermes")
 
                 if is_subprocess_agent:
                     # Only one agent generation per conversation
@@ -3228,13 +3227,6 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
         await _handle_hermes_generation(websocket, conv_id, conv, data)
         return
 
-    # Pi and OpenCode modes — route through Claude generation handler for now.
-    # When dedicated pi_client / opencode_client are implemented, these will
-    # get their own _handle_*_generation functions.
-    if mode in ("pi", "opencode"):
-        await _handle_claude_generation(websocket, conv_id, conv, data)
-        return
-
     # Backstage convs always go through OODA so state card tools are available.
     # The model is picked from cc-inline-controls in the UI and sent as cc_model;
     # inject it as local_model so the OODA handler uses it for the Ollama call.
@@ -3522,14 +3514,20 @@ async def _handle_claude_generation(
                             f"[UPLOAD] Failed to copy file {src.name} to attached_files/: {e}"
                         )
                     if use_ollama:
-                        # Local mode: pass the image directly to the model.
+                        # Local mode: describe image via Ollama's native multimodal API
+                        # since CC's view_image tool returns file paths that local models can't parse
                         if file_ext in _IMAGE_EXTS:
-                            file_notes.append(f"[Attached image: {src.name}]")
-                            # We store the path to be used by the message builder
-                            # which now handles the base64 reading natively.
-                            # We can also store the path in a metadata object
-                            # that the message list will pick up.
-                            desc_map[src.name] = f"Attached image: {src.name}"
+                            try:
+                                await _ws_send(conv_id, {"type": "status", "text": f"Describing image {src.name}..."})
+                                desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None, context=_describe_context), timeout=120)
+                                file_notes.append(f"[Image: {desc}]")
+                                desc_map[src.name] = desc
+                            except asyncio.TimeoutError:
+                                print(f"[DESCRIBE] Timed out describing {src.name} (30s)")
+                                file_notes.append("[Image shared but description timed out]")
+                            except Exception as e:
+                                print(f"[DESCRIBE] Failed to describe image {src.name}: {e}")
+                                file_notes.append("[Image shared but description unavailable]")
                         else:
                             file_notes.append(f"{src.name} (in attached_files/)")
                     else:
@@ -3596,7 +3594,7 @@ async def _handle_claude_generation(
 
         # Let the client know we're launching
         if is_gemini:
-            launch_label = f"Launching Antigravity CLI ({cc_model})..."
+            launch_label = f"Launching Gemini CLI ({cc_model})..."
         elif use_ollama:
             launch_label = f"Launching {cc_model} via Ollama..."
         else:
@@ -4039,14 +4037,20 @@ async def _handle_claude_generation(
                                 f"[UPLOAD] Failed to copy file {src.name} to attached_files/: {e}"
                             )
                         if use_ollama:
-                            # Local mode: pass the image directly to the model.
+                            # Local mode: describe image via Ollama's native multimodal API
+                            # since CC's view_image tool returns file paths that local models can't parse
                             if file_ext in _IMAGE_EXTS:
-                                file_notes.append(f"[Attached image: {src.name}]")
-                                # We store the path to be used by the message builder
-                                # which now handles the base64 reading natively.
-                                # We can also store the path in a metadata object
-                                # that the message list will pick up.
-                                desc_map[src.name] = f"Attached image: {src.name}"
+                                try:
+                                    await _ws_send(conv_id, {"type": "status", "text": f"Describing image {src.name}..."})
+                                    desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None, context=_describe_context), timeout=120)
+                                    file_notes.append(f"[Image: {desc}]")
+                                    desc_map[src.name] = desc
+                                except asyncio.TimeoutError:
+                                    print(f"[DESCRIBE] Timed out describing {src.name} (30s)")
+                                    file_notes.append("[Image shared but description timed out]")
+                                except Exception as e:
+                                    print(f"[DESCRIBE] Failed to describe image {src.name}: {e}")
+                                    file_notes.append("[Image shared but description unavailable]")
                             else:
                                 file_notes.append(f"{src.name} (in attached_files/)")
                         else:
@@ -4275,7 +4279,7 @@ async def _handle_claude_generation(
         # If CC produced no output at all, mark draft as error (don't delete)
         if not full_text and not any(b["type"] == "tool_use" for b in content_blocks):
             provider_name = (
-                "Antigravity CLI"
+                "Gemini CLI"
                 if is_gemini
                 else ("Ollama" if use_ollama else "Claude Code")
             )
@@ -4627,34 +4631,7 @@ async def _handle_hermes_generation(
 
         # Build the prompt from the branch (history replay — no ACP session resume in v1).
         branch = await db.get_branch_to_root(parent_id) if parent_id else []
-        prompt_text = _build_claude_history_prompt(branch, project_dir) or "(continue)"
-
-        import base64
-        import mimetypes
-        prompt = []
-        # Gather images from the branch to pass natively — Hermes lacks fs tools to read the paths.
-        for msg in branch:
-            if msg.get("role") == "user" and msg.get("image_path"):
-                img_paths = _parse_image_paths(msg["image_path"])
-                for ip in img_paths:
-                    p = Path(ip)
-                    if project_dir and p.is_file():
-                        try:
-                            mime = mimetypes.guess_type(p.name)[0]
-                            if not mime or not mime.startswith("image/"):
-                                mime = "image/jpeg"
-                            b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
-                            prompt.append({
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": mime,
-                                    "data": b64
-                                }
-                            })
-                        except Exception as e:
-                            print(f"[Hermes] Failed to encode image {p.name}: {e}")
-        prompt.append({"type": "text", "text": prompt_text})
+        prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
 
         model = conv.get("local_model") or None  # None -> Hermes uses its config.yaml default
 
