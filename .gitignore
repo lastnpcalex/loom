@@ -84,3 +84,70 @@ cc_permission_hook-*.py
 test_ooda_live.py
 CLAUDE.md
 backstage_workspaces/
+
+# Gemini CLI / Antigravity settings (contain user paths + PII)
+.gemini/
+.antigravitycli/
+
+# Claude Code plans (auto-generated per session)
+.plans/
+
+# Canvas workspaces (generated per-conversation)
+canvas_workspaces/
+
+# Scratch / ad-hoc dev scripts
+scratch/
+
+# Test / debug / probe scripts (not part of the product)
+test_*.py
+test_*.txt
+debug_*.py
+check_*.py
+smoke_*.py
+probe_*.py
+smoke_*.py
+*_test.py
+*_test_*.py
+_test_*.py
+
+# Temporary / backup files
+temp_*
+*.bak
+agent_trace.ndjson
+
+# One-off utility scripts
+query.py
+repair_db.py
+refresh_creds.py
+patch_mcp.py
+persistent_start.ps1
+ask_updated.py
+ask_backup.py
+
+# Experimental / abandoned work
+nrol_*.py
+nrol_*.toml
+mcp_nrol_engine.py
+loom_test2.dev
+{0}
+
+# Generated character images
+character-creator/*.png
+
+# Duplicate project copy (has its own DBs, uploads, etc.)
+gemini-loom-2/
+
+# Architecture docs (generated from code reading, not source)
+LOOM_ARCHITECTURE.md
+LOOM_EXPLAINED.md
+
+# Test / planning docs
+BUGFIX_SUMMARY.md
+TEST_INSTRUCTIONS.md
+TEST_INSTRUCTIONS_FIXED.md
+PLAN_canvas_view.md
+SKILL_updated.md
+haikus.md
+
+# pytest cache
+.pytest_cache/

@@ -4980,7 +4980,8 @@ async def _handle_ooda_generation(
         # Check if cancelled during the sync call
         if asyncio.current_task().cancelled():
             raise asyncio.CancelledError()
-        cleaned_pass1 = _re.sub(r"<think>[\s\S]*?</think>\s*", "", raw_pass1).strip()
+        cleaned_pass1 = _re.sub(r"<think>[\s\S]*?</think>", "", raw_pass1)
+        cleaned_pass1 = _re.sub(r"<think>[\s\S]*?</think>\s*", "", cleaned_pass1).strip()
         print(f"[OODA] Pass 1 done: {len(cleaned_pass1)} chars")
         print(f"[OODA] Raw OODA output:\n{cleaned_pass1[:1500]}")
 
@@ -5322,28 +5323,37 @@ async def _handle_weave_generation(
             )
 
         full_response = ""
+        _thinking_buffer = ""
         weave_model = conv.get("local_model") or None
-        async for token in stream_chat(messages, model=weave_model):
-            if isinstance(token, dict):
-                # Thinking status events
-                await _ws_send(conv_id, token)
+        async for item in stream_chat(messages, model=weave_model):
+            if isinstance(item, dict):
+                if item.get("type") == "thinking_delta":
+                    _thinking_buffer += item["text"]
+                    await _ws_send(
+                        conv_id, {"type": "thinking_chunk", "content": item["text"]}
+                    )
+                else:
+                    # thinking_start, thinking_end, usage — forward as-is
+                    await _ws_send(conv_id, item)
                 continue
-            full_response += token
+            full_response += item
             await _ws_send(
                 conv_id,
                 {
                     "type": "stream_chunk",
-                    "content": token,
+                    "content": item,
                 },
             )
             # Keep live snapshot in sync
             if _gen_key_local:
                 _update_gen_snapshot(_gen_key_local, full_text=full_response)
 
-        # Strip <think>...</think> blocks (thinking models like qwen3)
+        # Strip thinking blocks from models that include tags in their content field
+        # (qwen3 uses <think>.../», DeepSeek/llama.cpp uses <think>...</think>)
         import re as _re
 
-        cleaned = _re.sub(r"<think>[\s\S]*?</think>\s*", "", full_response).strip()
+        cleaned = _re.sub(r"<think>[\s\S]*?</think>\s*", "", full_response)
+        cleaned = _re.sub(r"<think>[\s\S]*?</think>\s*", "", cleaned).strip()
         if cleaned:
             full_response = cleaned
 

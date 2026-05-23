@@ -206,7 +206,7 @@ async def stream_chat(messages: list[dict],
 
     Yields:
       str token chunks for content,
-      {"type": "thinking_start"} / {"type": "thinking_end"} for reasoning_content,
+      {"type": "thinking_start"} / {"type": "thinking_delta", "text": ...} / {"type": "thinking_end"} for reasoning_content,
       {"type": "usage", "input_tokens": N, "output_tokens": N} as the final event.
     """
     global _mock_mode
@@ -301,7 +301,7 @@ async def stream_chat(messages: list[dict],
                         if not _was_thinking:
                             _was_thinking = True
                             yield {"type": "thinking_start"}
-                        yield reasoning
+                        yield {"type": "thinking_delta", "text": reasoning}
                     
                     if token:
                         if _was_thinking:

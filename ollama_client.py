@@ -186,7 +186,13 @@ async def stream_chat(messages: list[dict],
                       max_tokens: int = None,
                       repeat_penalty: float = None,
                       model: str = None) -> AsyncGenerator[str, None]:
-    """Stream chat completion tokens from Ollama (or mock)."""
+    """Stream chat completion tokens from Ollama (or mock).
+
+    Yields:
+      str token chunks for content,
+      {"type": "thinking_start"} / {"type": "thinking_delta", "text": ...} / {"type": "thinking_end"} for thinking,
+      {"type": "usage", "input_tokens": N, "output_tokens": N} as the final event.
+    """
     global _mock_mode
 
     # Try real Ollama first, fall back to mock
@@ -253,8 +259,8 @@ async def stream_chat(messages: list[dict],
                             if not _was_thinking:
                                 _was_thinking = True
                                 yield {"type": "thinking_start"}
-                            yield thinking
-                        
+                            yield {"type": "thinking_delta", "text": thinking}
+
                         if token:
                             if _was_thinking:
                                 _was_thinking = False
