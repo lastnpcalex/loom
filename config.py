@@ -34,7 +34,7 @@ class Config:
     # Llama Server binary and models directory
     llama_server_exe: str = os.getenv(
         "LLAMA_SERVER_EXE",
-        r"C:\Users\exast\OneDrive\Documents\LS\bin\llama-server.exe",
+        "llama-server",
     )
     llama_models_dir: str = os.getenv("LLAMA_MODELS_DIR", r"C:\LlamaServer\models")
 

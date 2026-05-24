@@ -530,14 +530,14 @@ async def tool_comfyui_free():
 
 LLAMA_SERVER_EXE = os.getenv(
     "LLAMA_SERVER_EXE",
-    r"C:\Users\exast\OneDrive\Documents\LS\bin\llama-server.exe",
+    "llama-server",
 )
 LLAMA_MODELS_DIR = os.getenv("LLAMA_MODELS_DIR", r"C:\LlamaServer\models")
 LLAMA_PORT = 11434
 
 COMFYUI_LAUNCH_CMD = os.getenv(
     "COMFYUI_LAUNCH_CMD",
-    r'"C:\Users\exast\Downloads\ComfyUI_windows_portable_nvidia\ComfyUI_windows_portable\run_nvidia_gpu.bat"',
+    "run_nvidia_gpu.bat",
 )
 
 
