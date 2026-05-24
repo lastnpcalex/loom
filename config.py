@@ -16,36 +16,27 @@ def _envbool(name: str, default: bool) -> bool:
 # Keys persisted to config.json. Centralized so to_dict / update_from_dict /
 # load all stay in sync without three places to edit.
 _PERSISTED_KEYS = (
-    "ollama_host", "ollama_model", "vision_model",
-    "local_backend", "vllm_host", "vllm_model",
+    "llama_host", "llama_model", "llama_server_exe", "llama_models_dir",
+    "vision_model",
     "max_context_tokens", "verbatim_window",
     "temperature", "top_p", "max_tokens", "repeat_penalty",
-    # Ollama tuning
-    "ollama_kv_cache_type", "ollama_flash_attention", "ollama_keep_alive",
-    "ollama_num_parallel", "ollama_max_loaded_models", "ollama_context_length",
-    # vLLM tuning
-    "vllm_quantization", "vllm_kv_cache_dtype", "vllm_max_model_len",
-    "vllm_gpu_memory_utilization", "vllm_max_num_seqs",
-    "vllm_tensor_parallel_size", "vllm_tool_call_parser",
-    "vllm_enable_auto_tool_choice", "vllm_extra_args",
-    "vllm_speculative_config", "vllm_text_only", "vllm_reasoning_parser",
-    "vllm_python_path", "vllm_served_name", "vllm_thinking_default",
 )
-_HOST_KEYS = ("ollama_host", "vllm_host")
+_HOST_KEYS = ("llama_host",)
 
 
 @dataclass
 class Config:
-    # Ollama connection
-    ollama_host: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-    ollama_model: str = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
-    vision_model: str = os.getenv("VISION_MODEL", "")  # small/fast model for image description; empty = use ollama_model
+    # Llama Server connection
+    llama_host: str = os.getenv("LLAMA_HOST", "http://localhost:8000")
+    llama_model: str = os.getenv("LLAMA_MODEL", "Qwen3.6-27B-NVFP4.gguf")
+    vision_model: str = os.getenv("VISION_MODEL", "")  # for image description; empty = use llama_model
 
-    # Local-model backend: "ollama" (default) or "vllm". Selects which client
-    # the Weave / OODA paths use. Loom/Braid (CC) are unaffected.
-    local_backend: str = os.getenv("LOOM_LOCAL_BACKEND", "ollama")
-    vllm_host: str = os.getenv("VLLM_HOST", "http://localhost:8000")
-    vllm_model: str = os.getenv("VLLM_MODEL", "")  # empty = fall back to ollama_model
+    # Llama Server binary and models directory
+    llama_server_exe: str = os.getenv(
+        "LLAMA_SERVER_EXE",
+        r"C:\Users\exast\OneDrive\Documents\LS\bin\llama-server.exe",
+    )
+    llama_models_dir: str = os.getenv("LLAMA_MODELS_DIR", r"C:\LlamaServer\models")
 
     # Context budget
     max_context_tokens: int = 32768
@@ -93,47 +84,6 @@ class Config:
     # Master switch for Hermes mode. The Phase-4 UI stays hidden until this is on.
     enable_hermes: bool = _envbool("LOOM_ENABLE_HERMES", False)
 
-    # Ollama runtime tuning — applied as env vars when admin_server spawns Ollama.
-    # Env vars override these defaults so CLI users can still pin behavior.
-    ollama_kv_cache_type: str = os.getenv("OLLAMA_KV_CACHE_TYPE", "q8_0")  # f16 | q8_0 | q4_0
-    ollama_flash_attention: bool = _envbool("OLLAMA_FLASH_ATTENTION", True)
-    ollama_keep_alive: str = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
-    ollama_num_parallel: int = int(os.getenv("OLLAMA_NUM_PARALLEL", "1"))
-    ollama_max_loaded_models: int = int(os.getenv("OLLAMA_MAX_LOADED_MODELS", "0"))  # 0 = auto
-    ollama_context_length: int = int(os.getenv("OLLAMA_CONTEXT_LENGTH", "128000"))
-
-    # vLLM launch tuning — built into CLI flags when admin_server spawns vLLM.
-    vllm_quantization: str = os.getenv("VLLM_QUANTIZATION", "modelopt")  # none|awq|gptq|fp8|modelopt|nvfp4
-    vllm_kv_cache_dtype: str = os.getenv("VLLM_KV_CACHE_DTYPE", "fp8")    # auto|fp8|fp8_e5m2
-    vllm_max_model_len: int = int(os.getenv("VLLM_MAX_MODEL_LEN", "32768"))
-    vllm_gpu_memory_utilization: float = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.92"))
-    vllm_max_num_seqs: int = int(os.getenv("VLLM_MAX_NUM_SEQS", "16"))
-    vllm_tensor_parallel_size: int = int(os.getenv("VLLM_TENSOR_PARALLEL_SIZE", "1"))
-    vllm_tool_call_parser: str = os.getenv("VLLM_TOOL_CALL_PARSER", "hermes")  # hermes|mistral|llama3_json|none
-    vllm_enable_auto_tool_choice: bool = _envbool("VLLM_ENABLE_AUTO_TOOL_CHOICE", True)
-    vllm_extra_args: str = os.getenv("VLLM_EXTRA_ARGS_EXTRA", "")  # escape hatch for unmodeled flags
-    # MTP / speculative decoding — JSON string passed to --speculative-config.
-    # Example for Qwen3.6 MTP: {"method":"qwen3_next_mtp","num_speculative_tokens":2}
-    vllm_speculative_config: str = os.getenv("VLLM_SPECULATIVE_CONFIG", "")
-    # When True, vLLM serves a text-only model (e.g., the MTP-tuned variant)
-    # and image describes get routed back to Ollama instead of the active backend.
-    vllm_text_only: bool = _envbool("VLLM_TEXT_ONLY", False)
-    # Reasoning parser for Qwen3.6 thinking/tool blocks. Required for MTP+thinking.
-    vllm_reasoning_parser: str = os.getenv("VLLM_REASONING_PARSER", "qwen3")
-    # Path to the venv-installed vllm executable. Empty = use system PATH.
-    vllm_python_path: str = os.getenv("VLLM_PYTHON_PATH", "")
-    # Short alias vLLM exposes alongside the full model id, used as the
-    # Loom/Braid model picker entry that routes Claude Code at vLLM. Must start
-    # with "vllm-" — server.py's dispatcher uses that prefix to detect the
-    # engine. Default "vllm-local"; users can rename per-model (e.g. "vllm-qwen").
-    vllm_served_name: str = os.getenv("VLLM_SERVED_NAME", "vllm-local")
-    # Default value for the chat template's `enable_thinking` flag. ON by
-    # default to match Qwen3.6's training distribution — its MTP draft was
-    # trained with thinking enabled, and the model's quality on multi-step
-    # tasks (and RP with state) leans on the reasoning scratch space. Flip
-    # OFF when you specifically want fast bare-text responses.
-    vllm_thinking_default: bool = _envbool("VLLM_THINKING_DEFAULT", True)
-
     def hermes_executable(self) -> str:
         """Resolve the `hermes` CLI path: explicit HERMES_EXE if set, else the
         venv Scripts binary under hermes_home, else bare 'hermes' on PATH."""
@@ -145,6 +95,13 @@ class Config:
             "Scripts" if os.name == "nt" else "bin", exe_name,
         )
         return cand if os.path.exists(cand) else "hermes"
+
+    def llama_host_url(self) -> str:
+        """Return the Llama Server host URL with http:// prefix."""
+        host = self.llama_host
+        if host and not host.startswith(("http://", "https://")):
+            host = f"http://{host}"
+        return host
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in _PERSISTED_KEYS}

@@ -5179,6 +5179,80 @@ pre.tool-output {
     opacity: 0.7;
 }
 
+/* ── Describe Step ─────────────────────────────────────────────────────── */
+.message.system.message-describing {
+    border: 1px solid rgba(191, 0, 255, 0.4);
+    background: rgba(191, 0, 255, 0.05);
+    border-radius: var(--radius);
+    padding: 12px 16px;
+    margin-bottom: 12px;
+}
+.describe-label {
+    color: #e2b714;
+    text-shadow: 0 0 8px rgba(226, 183, 20, 0.3);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+}
+.describe-content {
+    color: var(--text-secondary);
+    font-style: italic;
+    font-size: 0.9em;
+    line-height: 1.6;
+    margin-top: 8px;
+}
+.describe-content p {
+    margin: 0 0 8px 0;
+}
+.describe-content p:last-child {
+    margin-bottom: 0;
+}
+.describe-spinner {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--cyan);
+    font-style: italic;
+}
+.describe-spinner .loom-anim {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    min-width: 1.5em;
+    text-align: center;
+}
+.describe-spinner .loom-anim::after {
+    content: "⠋";
+    animation: loom 0.8s steps(10, end) infinite;
+}
+@keyframes loom {
+    0% { content: "⠋"; }
+    10% { content: "⠙"; }
+    20% { content: "⠹"; }
+    30% { content: "⠸"; }
+    40% { content: "⠼"; }
+    50% { content: "⠴"; }
+    60% { content: "⠦"; }
+    70% { content: "⠧"; }
+    80% { content: "⠇"; }
+    90% { content: "⠏"; }
+}
+.describe-reroll {
+    background: none;
+    border: 1px solid rgba(0, 255, 255, 0.2);
+    color: var(--cyan);
+    font-size: 16px;
+    padding: 4px 8px;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: all var(--transition);
+}
+.describe-reroll:hover {
+    background: rgba(0, 255, 255, 0.1);
+    text-shadow: 0 0 6px rgba(0, 255, 255, 0.4);
+}
+
 /* ── Backstage ─────────────────────────────────────────────────────────── */
 .backstage-btn {
     background: transparent;

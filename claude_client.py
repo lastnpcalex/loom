@@ -509,35 +509,25 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                      model: str = "sonnet", effort: str = "high",
                      permission_mode: str = "default",
                      resume_session_id: str = None, fork_session: bool = False,
-                     use_ollama: bool = False,
-                     use_vllm: bool = False,
-                     vllm_base_url: str | None = None,
-                     vllm_model_alias: str | None = None,
+                     use_llama: bool = False,
                      backstage_parent_id: int | None = None):
     """Run Claude Code CLI and yield parsed events as an async generator.
 
     Returns (process, generator) so the caller can cancel via process.terminate().
     When resume_session_id is provided, uses --resume to continue an existing session.
     When fork_session is True (with --resume), creates a new branch from that session.
-    When use_ollama is True, launches via 'ollama launch claude --model <model> --yes --'
-    so that Claude Code runs against a local Ollama model.
-    When use_vllm is True, launches plain `claude` with ANTHROPIC_BASE_URL/auth/model
-    env vars pointing at the local vLLM server (which speaks Anthropic's /v1/messages
-    natively). vllm_base_url defaults to http://localhost:8000; vllm_model_alias is
-    the --served-model-name vLLM was launched with (e.g. "vllm-local").
+    When use_llama is True, launches plain `claude` with ANTHROPIC_BASE_URL/auth/model
+    env vars pointing at the local llama-server (which speaks Anthropic's /v1/messages
+    natively on port 11434). The model filename (e.g. Qwen3.6-27B-NVFP4.gguf) is set
+    as all three DEFAULT_*_MODEL env vars so CC routes to it regardless of preset.
     Permission hooks route tool approvals through Loom's HTTP API.
     """
-    # Mutual exclusion — code paths below assume at most one engine override.
-    if use_ollama and use_vllm:
-        raise ValueError("use_ollama and use_vllm are mutually exclusive")
     # Configure the permission hook in the project directory (idempotent, skips if already set)
     # Skip on resume since the original session already configured the hook
     _configure_permission_hook(cwd) if not resume_session_id else None
 
-    # Build the Claude Code arguments (common to both launch methods)
+    # Build the Claude Code arguments
     disallowed_list = ["AskUserQuestion"]
-    if use_ollama:
-        disallowed_list += ["WebSearch", "WebFetch"]
     # Backstage: lock the agent down to state-card MCP tools only — no filesystem
     # or shell access, no sub-agents. Otherwise the agent treats the Loom repo
     # (its cwd) as a codebase to refactor instead of editing cards.
@@ -585,11 +575,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         if backstage_md.exists():
             cc_args.extend(["--append-system-prompt", backstage_md.read_text(encoding="utf-8")])
 
-    if not use_ollama:
-        # Direct claude launch — model and effort are CC flags. For vLLM, the
-        # ANTHROPIC_DEFAULT_*_MODEL env vars below override CC's internal mapping
-        # so picking sonnet/opus/haiku here all route to the local vllm alias.
-        cc_args.extend(["--model", model, "--effort", effort])
+    # Always launch plain claude — use_llama overrides via env vars below.
+    cc_args.extend(["--model", model, "--effort", effort])
 
     if permission_mode and permission_mode != "default":
         cc_args.extend(["--permission-mode", permission_mode])
@@ -599,11 +586,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         if fork_session:
             cc_args.append("--fork-session")
 
-    if use_ollama:
-        # Launch via: ollama launch claude --model <model> -- <cc_args>
-        cmd = ["ollama", "launch", "claude", "--model", model, "--"] + cc_args
-    else:
-        cmd = ["claude"] + cc_args
+    cmd = ["claude"] + cc_args
 
     # Pass Loom connection info to the hook script via env vars
     env = {**os.environ}
@@ -611,35 +594,26 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
     env["LOOM_PORT"] = str(server_port)
-    # Explicitly control CLAUDECODE so the launch method matches use_ollama.
-    # When True: ollama launch claude needs CLAUDECODE=1 in its subprocess.
-    # When False: plain claude must NOT see CLAUDECODE or it routes to Ollama.
-    if use_ollama:
-        env["CLAUDECODE"] = "1"
-        env["CLAUDE_CODE_ENTRYPOINT"] = "cli"
-    else:
-        env.pop("CLAUDECODE", None)
-        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    # Always clear ollama-style entrypoint flags — we never use ollama launch anymore.
+    env.pop("CLAUDECODE", None)
+    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
-    # vLLM-as-CC-backend: point the Anthropic SDK's CC subprocess at vLLM's
+    # Llama Server as CC backend: point the Anthropic SDK at llama-server's
     # native /v1/messages endpoint. Both API_KEY and AUTH_TOKEN are set because
-    # different SDK code paths read different ones. The DEFAULT_*_MODEL env
-    # vars override CC's internal sonnet/opus/haiku → API-id mapping so the
-    # alias actually wins regardless of which preset the user picked.
-    # See https://docs.vllm.ai/en/stable/serving/integrations/claude_code/
-    if use_vllm:
-        base = (vllm_base_url or "http://localhost:8000").rstrip("/")
-        alias = vllm_model_alias or model
+    # different SDK code paths read different env vars. The DEFAULT_*_MODEL vars
+    # override CC's internal preset→API-id mapping so the .gguf filename routes
+    # correctly regardless of which preset (sonnet/opus/haiku) the user picked.
+    if use_llama:
+        from config import config as _loom_config
+        base = _loom_config.llama_host_url()
+        alias = model  # e.g. "Qwen3.6-27B-NVFP4.gguf"
         env["ANTHROPIC_BASE_URL"] = base
         env["ANTHROPIC_API_KEY"] = "dummy"
         env["ANTHROPIC_AUTH_TOKEN"] = "dummy"
         env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = alias
         env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = alias
         env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = alias
-        # CC injects a per-request hash into the system prompt that defeats
-        # prefix caching. vLLM ≥0.17.1 strips it server-side, but setting this
-        # belt-and-suspenders is harmless and improves cache hits on older
-        # builds the user might roll back to.
+        # Suppress the per-request attribution hash that defeats KV-cache prefix.
         env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
 
     # If the prompt is too long for a command-line arg (Windows ~32K limit),
@@ -659,10 +633,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             use_stdin = False
 
         # Rebuild cmd with updated cc_args
-        if use_ollama:
-            cmd = ["ollama", "launch", "claude", "--model", model, "--"] + cc_args
-        else:
-            cmd = ["claude"] + cc_args
+        cmd = ["claude"] + cc_args
 
     async def _spawn_cc(spawn_cmd: list, spawn_prompt: str | None, spawn_use_stdin: bool):
         """Launch a CC subprocess and start its stderr drainer. Returns the
@@ -703,7 +674,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
 
     print(f"[CC] Starting subprocess in {cwd}")
     print(f"[CC] CMD: {' '.join(cmd[:8])}{'...' if len(cmd) > 8 else ''}")
-    print(f"[CC] use_ollama={use_ollama} model={model} effort={effort}")
+    print(f"[CC] use_llama={use_llama} model={model} effort={effort}")
     print(f"[CC] Prompt length: {len(prompt)} chars (stdin={use_stdin})")
     print(f"[CC] Hook env: LOOM_CONV_ID={conv_id} LOOM_PORT={server_port}")
 

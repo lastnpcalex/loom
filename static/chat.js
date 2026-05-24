@@ -503,6 +503,110 @@ function handleWSMessage(data) {
             break;
         }
 
+        case 'describe_start': {
+            // Create a describe message element with spinner
+            const parentMsgEl = document.querySelector(`.message[data-parent-msg-id="${data.parent_msg_id}"]`)
+                || document.querySelector(`.message[data-msg-id="${data.parent_msg_id}"]`);
+            const container = document.getElementById('messages');
+            const describeDiv = document.createElement('div');
+            describeDiv.className = 'message system message-describing';
+            describeDiv.dataset.parentMsgId = data.parent_msg_id;
+            describeDiv.dataset.describePending = 'true';
+
+            const modelLabel = data.model || 'vision model';
+            describeDiv.innerHTML =
+                '<div class="message-header">' +
+                    '<div class="message-header-left">' +
+                        '<span class="describe-label">Describing Image — ' + escapeHtml(modelLabel) + '</span>' +
+                    '</div>' +
+                    '<div class="message-actions">' +
+                        '<span class="gen-timer">0:00</span>' +
+                    '</div>' +
+                '</div>' +
+                '<div class="describe-content">' +
+                    '<span class="describe-spinner">' +
+                        '<span class="loom-anim"></span>' +
+                        ' Describing...' +
+                    '</span>' +
+                '</div>';
+
+            if (parentMsgEl && parentMsgEl.nextSibling) {
+                container.insertBefore(describeDiv, parentMsgEl.nextSibling);
+            } else {
+                container.appendChild(describeDiv);
+            }
+
+            // Start timer
+            if (!State._describeTimers) State._describeTimers = {};
+            State._describeTimers[data.parent_msg_id] = {
+                start: Date.now(),
+                element: describeDiv,
+                interval: setInterval(() => {
+                    const elapsed = Math.floor((Date.now() - State._describeTimers[data.parent_msg_id].start) / 1000);
+                    const timerEl = describeDiv.querySelector('.gen-timer');
+                    if (timerEl) timerEl.textContent = _formatElapsed(elapsed);
+                }, 1000)
+            };
+
+            showGenStatus('Describing image (' + modelLabel + ')...');
+            break;
+        }
+
+        case 'describe_done': {
+            // Update the describe message with results
+            const describeDiv = document.querySelector(`.message-describing[data-parent-msg-id="${data.parent_msg_id}"]`);
+
+            // Also update image_describe for backwards compat
+            const msg = State.messages.find(m => m.id === data.parent_msg_id);
+            if (msg) {
+                let existing = {};
+                if (msg.image_alt) {
+                    try { existing = JSON.parse(msg.image_alt) || {}; } catch { existing = {}; }
+                }
+                msg.image_alt = JSON.stringify({ ...existing, ...(data.descriptions || {}) });
+            }
+
+            if (describeDiv) {
+                const timerData = State._describeTimers && State._describeTimers[data.parent_msg_id];
+                if (timerData && timerData.interval) {
+                    clearInterval(timerData.interval);
+                    const elapsed = Math.floor(data.elapsed_ms / 1000);
+                    const timerEl = describeDiv.querySelector('.gen-timer');
+                    if (timerEl) timerEl.textContent = _formatElapsed(elapsed);
+                }
+
+                // Build description text
+                let descText = '';
+                if (data.descriptions) {
+                    for (const [filename, desc] of Object.entries(data.descriptions)) {
+                        if (descText) descText += '\n\n';
+                        descText += desc;
+                    }
+                }
+
+                const contentDiv = describeDiv.querySelector('.describe-content');
+                if (contentDiv) {
+                    contentDiv.innerHTML = formatContent(descText);
+                }
+
+                // Add reroll button
+                const actionsDiv = describeDiv.querySelector('.message-actions');
+                if (actionsDiv && !describeDiv.querySelector('.describe-reroll')) {
+                    const rerollBtn = document.createElement('button');
+                    rerollBtn.className = 'btn-small describe-reroll';
+                    rerollBtn.innerHTML = '&#x21BB;';
+                    rerollBtn.title = 'Re-describe';
+                    rerollBtn.onclick = () => rerollDescribe(State.currentConvId, data.parent_msg_id);
+                    actionsDiv.insertBefore(rerollBtn, actionsDiv.firstChild);
+                }
+
+                describeDiv.dataset.describePending = 'false';
+            }
+
+            showGenStatus('Image described — Generating...');
+            break;
+        }
+
         case 'stream_start': {
             // Check if this generation is for our current branch
             const parentId = data.parent_id;
@@ -1558,12 +1662,10 @@ async function sendMessage() {
             renderMessages();
             scrollToBottom(true);
 
-            // Request generation via WebSocket
-            if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-                const count = State.branchCount || 1;
-                showGenStatus(count > 1 ? `Generating ${count} branches...` : 'Sending...');
-                _triggerParallelGenerate(count, msg.id);
-            }
+            // Request generation via WebSocket — queue if socket isn't ready yet
+            const count = State.branchCount || 1;
+            showGenStatus(count > 1 ? `Generating ${count} branches...` : 'Sending...');
+            _triggerParallelGenerate(count, msg.id);
         }
     } catch (err) {
         showToast('Failed to send message', 'error');
@@ -2252,8 +2354,9 @@ function createMessageElement(msg, cost, elapsed) {
     }
     const isErrorMsg = msg.role === 'assistant' && msg.content?.startsWith('[Error:');
     const isDraft = msg.role === 'assistant' && !msg.content?.trim() && !isErrorMsg;
+    const isDescribeMsg = msg.role === 'system' && typeof msg.content === 'string' && msg.content.trimStart().startsWith('[Image description —');
     const div = document.createElement('div');
-    div.className = `message ${msg.role}${isErrorMsg ? ' message-error' : ''}${isDraft ? ' message-generating' : ''}`;
+    div.className = `message ${msg.role}${isErrorMsg ? ' message-error' : ''}${isDraft ? ' message-generating' : ''}${isDescribeMsg ? ' message-describing' : ''}`;
     div.dataset.msgId = msg.id;
 
     const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
@@ -2286,8 +2389,9 @@ function createMessageElement(msg, cost, elapsed) {
     const bmBtn = `<button onclick="toggleChatBookmark(${msg.id})" title="${isBm ? 'Remove bookmark' : 'Bookmark'}" class="chat-bookmark-btn${isBm ? ' active' : ''}">${isBm ? '⏣' : '⬡'}</button>`;
     let actionsHtml = '';
     if (msg.role === 'system') {
-        // No actions for system messages (compact markers, etc.)
-        actionsHtml = '';
+        if (isDescribeMsg) {
+            actionsHtml = '<button class="btn-small describe-reroll" onclick="rerollDescribe(State.currentConvId, ' + msg.parent_id + ')" title="Re-describe">&#x21BB;</button>';
+        }
     } else if (msg.role === 'assistant') {
         actionsHtml = '<button onclick="regenerateMessage(' + msg.id + ')" title="Regenerate">&#x21BB;</button>' +
             '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
@@ -2313,6 +2417,17 @@ function createMessageElement(msg, cost, elapsed) {
     if (isDraft) {
         contentHtml = '<span class="generating-placeholder"><span class="thinking-dots"></span> Generating...</span>'
             + ' <button onclick="cancelGeneration()" title="Cancel generation" class="cancel-draft-btn">&#x2298;</button>';
+    } else if (msg.role === 'system' && typeof msg.content === 'string' && msg.content.trimStart().startsWith('[Image description —')) {
+        // Render as describe message
+        const modelMatch = msg.content.match(/^\[Image description — ([^\]]+)\]/);
+        const modelLabel = modelMatch ? modelMatch[1] : 'vision model';
+        const descText = msg.content.replace(/^\[Image description — [^\]]+\]\s*/, '').trim();
+        contentHtml = '<div class="describe-label">Describing Image — ' + escapeHtml(modelLabel) + '</div>' +
+            '<div class="describe-content">' + formatContent(descText) + '</div>';
+        // Set data-parent-msg-id and reroll button for persisted describe messages
+        if (msg.parent_id) {
+            div.dataset.parentMsgId = msg.parent_id;
+        }
     } else if (msg.role === 'system' && typeof msg.content === 'string' && msg.content.trimStart().startsWith('[CC context compactified')) {
         contentHtml = renderCompactMarker(msg.content, msg.id);
     } else if (blocks && blocks.length > 0) {
@@ -2321,12 +2436,10 @@ function createMessageElement(msg, cost, elapsed) {
         contentHtml = formatContent(msg.content);
     }
 
-    // Elapsed time badge in header (matches streaming timer format M:SS)
+    // Elapsed time badge in header
     let elapsedHtml = '';
     if (elapsed && elapsed > 0) {
-        const em = Math.floor(elapsed / 60);
-        const es = String(elapsed % 60).padStart(2, '0');
-        elapsedHtml = `<span class="gen-timer" title="${elapsed}s">${em}:${es}</span>`;
+        elapsedHtml = `<span class="gen-timer" title="${elapsed}s">${_formatElapsed(elapsed)}</span>`;
     }
 
     // Cost footer
@@ -2344,7 +2457,14 @@ function createMessageElement(msg, cost, elapsed) {
                 : `${(outTok/1000).toFixed(1)}k out`);
         }
         if (usd) parts.push(`$${usd.toFixed(4)}`);
-        if (durMs) parts.push(`${(durMs/1000).toFixed(1)}s`);
+        if (durMs) {
+            const secs = Math.round(durMs / 1000);
+            if (secs >= 60) {
+                parts.push(_formatElapsed(secs));
+            } else {
+                parts.push(`${(durMs/1000).toFixed(1)}s`);
+            }
+        }
         if (parts.length) costHtml = `<div class="cost-footer">${parts.join(' · ')}</div>`;
     }
 
@@ -2380,15 +2500,13 @@ function createMessageElement(msg, cost, elapsed) {
         const allText = (msg.content || '') + ' ' + (typeof msg.content_blocks === 'string' ? msg.content_blocks : JSON.stringify(msg.content_blocks || ''));
         const imgRegex = /[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)/gi;
         const matches = allText.match(imgRegex) || [];
-        console.log('[IMG] Regex matches:', matches);
         // Dedup by filename — keep the shortest relative path
         // (absolute paths from content_blocks get blocked by path traversal)
         const byFilename = new Map();
         for (const m of matches) {
             const norm = m.replace(/\\/g, '/');
             // Skip absolute paths (start with / or X:/)
-            if (norm.startsWith('/') || /^[A-Za-z]:/.test(norm)) {
-                console.log('[IMG] Skipped absolute:', norm);
+ if (norm.startsWith('/') || /^[A-Za-z]:/.test(norm)) {
                 continue;
             }
             const filename = norm.split('/').pop();
@@ -2404,8 +2522,7 @@ function createMessageElement(msg, cost, elapsed) {
                 name: filename,
             });
         }
-        console.log('[IMG] Final entries:', imgEntries);
-        if (imgEntries.length > 0) {
+ if (imgEntries.length > 0) {
             projectImgHtml = '<div class="detected-images">' +
                 imgEntries.map(e =>
                     `<figure class="detected-image-figure">` +
@@ -2757,6 +2874,16 @@ function renderCompactMarker(content, msgId) {
             '</div>' +
         '</div>'
     );
+}
+
+/** Format elapsed seconds: <60s shows seconds, >=60s shows MM:SS, >=3600s shows HH:MM:SS */
+function _formatElapsed(seconds) {
+    if (seconds < 60) return seconds + 's';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    if (h > 0) return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+    return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
 }
 
 function formatContent(text) {
@@ -3452,6 +3579,76 @@ function copyMessage(msgId) {
             () => showToast('Copied'),
             () => showToast('Copy failed', 'error')
         );
+    }
+}
+
+/** Re-describe all images attached to a user message */
+async function rerollDescribe(convId, msgId) {
+    const describeDiv = document.querySelector(`.message-describing[data-parent-msg-id="${msgId}"]`);
+    if (!describeDiv) return;
+
+    // Show spinner state
+    const contentDiv = describeDiv.querySelector('.describe-content');
+    if (contentDiv) {
+        contentDiv.innerHTML = '<span class="describe-spinner"><span class="loom-anim"></span> Re-describing...</span>';
+    }
+    const timerEl = describeDiv.querySelector('.gen-timer');
+    if (timerEl) timerEl.textContent = '0:00';
+
+    // Remove old reroll button
+    const oldBtn = describeDiv.querySelector('.describe-reroll');
+    if (oldBtn) oldBtn.remove();
+
+    // Start timer
+    const startTime = Date.now();
+    const timer = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        if (timerEl) timerEl.textContent = _formatElapsed(elapsed);
+    }, 1000);
+
+    try {
+        const resp = await API.post(`/api/conversations/${convId}/redescribe/${msgId}`);
+        clearInterval(timer);
+
+        if (resp && resp.descriptions) {
+            let descText = '';
+            for (const [filename, desc] of Object.entries(resp.descriptions)) {
+                if (descText) descText += '\n\n';
+                descText += desc;
+            }
+            if (contentDiv) contentDiv.innerHTML = formatContent(descText);
+            if (timerEl) timerEl.textContent = _formatElapsed(Math.floor(resp.elapsed_ms / 1000));
+
+            // Add reroll button back
+            const actionsDiv = describeDiv.querySelector('.message-actions');
+            if (actionsDiv) {
+                const rerollBtn = document.createElement('button');
+                rerollBtn.className = 'btn-small describe-reroll';
+                rerollBtn.innerHTML = '&#x21BB;';
+                rerollBtn.title = 'Re-describe';
+                rerollBtn.onclick = () => rerollDescribe(convId, msgId);
+                actionsDiv.insertBefore(rerollBtn, actionsDiv.firstChild);
+            }
+
+            // Update state
+            const msg = State.messages.find(m => m.id === msgId);
+            if (msg) {
+                let existing = {};
+                if (msg.image_alt) {
+                    try { existing = JSON.parse(msg.image_alt) || {}; } catch { existing = {}; }
+                }
+                msg.image_alt = JSON.stringify({ ...existing, ...resp.descriptions });
+            }
+            const modelLabel = resp.model || 'vision model';
+            const sysMsg = State.messages.find(m => m.role === 'system' && m.parent_id === msgId && m.content?.trimStart()?.startsWith('[Image description —'));
+            if (sysMsg) {
+                sysMsg.content = `[Image description — ${modelLabel}]\n\n` + descText;
+            }
+        }
+    } catch (e) {
+        clearInterval(timer);
+        showToast('Re-describe failed: ' + (e.message || e), 'error');
+        if (contentDiv) contentDiv.innerHTML = '<span style="color:var(--danger)">Re-describe failed</span>';
     }
 }
 

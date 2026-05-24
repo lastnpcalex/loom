@@ -92,8 +92,8 @@
                     <div id="conv-filter-bar">
                         <button class="conv-filter-btn active" data-filter="all">All</button>
                         <button class="conv-filter-btn" data-filter="claude" title="Claude Code in the browser via Anthropic API">Loom {All Agents}</button>
-                        <button class="conv-filter-btn" data-filter="local" title="Claude Code powered by a local Ollama model">Braid {Local Agents}</button>
-                        <button class="conv-filter-btn" data-filter="hermes" title="Hermes Agent (ACP) powered by a local Ollama model">Hermes {Agent}</button>
+                        <button class="conv-filter-btn" data-filter="local" title="Claude Code powered by a local Llama model">Braid {Local Agents}</button>
+                        <button class="conv-filter-btn" data-filter="hermes" title="Hermes Agent (ACP) powered by a local Llama model">Hermes {Agent}</button>
                         <button class="conv-filter-btn" data-filter="weave" title="Structured roleplay with local models">Weave {Chat}</button>
                     </div>
                     <div id="conv-list"></div>
@@ -223,7 +223,7 @@
                 <textarea id="describe-context" rows="2" placeholder="e.g. focus on body language and composition" autocomplete="off" spellcheck="false"></textarea>
             </div>
             <div id="weave-inline-controls" class="hidden">
-                <select id="weave-model-inline" title="Ollama model">
+                <select id="weave-model-inline" title="Llama Server model">
                     <option value="">Default</option>
                 </select>
                 <label class="ooda-toggle" title="OODA Harness — cognitive scaffolding for better RP">
@@ -279,7 +279,7 @@
                 </div>
             </div>
             <div class="form-group hidden" id="local-model-group">
-                <label for="local-model">Ollama Model</label>
+                <label for="local-model">Local Model</label>
                 <select id="local-model" class="form-select">
                     <option value="">Loading models...</option>
                 </select>
@@ -357,16 +357,9 @@
             <!-- Model & Generation -->
             <div id="settings-model" class="settings-section">
                 <div class="form-group">
-                    <label for="cfg-local-backend">Local Backend <span class="hint">(used by Weave / OODA / Braid)</span></label>
-                    <select id="cfg-local-backend" class="form-select">
-                        <option value="ollama">Ollama</option>
-                        <option value="vllm">vLLM</option>
-                    </select>
-                </div>
-                <div class="form-group">
+                    <label for="cfg-model">Default Local Model <span class="hint">(Llama Server)</span></label>
                     <div class="label-with-action">
-                        <label for="cfg-model">Default Local Model</label>
-                        <button type="button" class="btn-mini" id="btn-refresh-models" title="Re-fetch the model list from the active backend">↻ Refresh</button>
+                        <button type="button" class="btn-mini" id="btn-refresh-models" title="Re-fetch the model list from Llama Server">↻ Refresh</button>
                     </div>
                     <select id="cfg-model" class="form-select"></select>
                 </div>
@@ -394,6 +387,18 @@
                     <div class="form-group">
                         <label for="cfg-repeat-penalty">Repeat Penalty</label>
                         <input type="number" id="cfg-repeat-penalty" step="0.01" min="1" max="2">
+                    </div>
+                </div>
+
+                <div class="settings-divider"><span>Conversation Context</span></div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="cfg-context">Max Context Tokens <span class="hint">(weave/braid context budget)</span></label>
+                        <input type="number" id="cfg-context" step="4096" min="4096" max="262144">
+                    </div>
+                    <div class="form-group">
+                        <label for="cfg-verbatim">Verbatim Window <span class="hint">(turns kept word-for-word)</span></label>
+                        <input type="number" id="cfg-verbatim" step="1" min="2" max="50">
                     </div>
                 </div>
 
@@ -451,18 +456,13 @@
                 <div class="server-grid" id="cfg-server-grid">
                     <div class="server-row" data-server="admin">
                         <span class="server-light" data-state="unknown"></span>
-                        <a href="http://localhost:3002" target="_blank" rel="noopener" class="server-link">Admin Dashboard</a>
+                        <a href="https://localhost:3002" target="_blank" rel="noopener" class="server-link">Admin Dashboard</a>
                         <span class="server-port">:3002</span>
                     </div>
-                    <div class="server-row" data-server="ollama">
+                    <div class="server-row" data-server="llama">
                         <span class="server-light" data-state="unknown"></span>
-                        <a href="http://localhost:11434" target="_blank" rel="noopener" class="server-link">Ollama</a>
+                        <a href="http://localhost:11434" target="_blank" rel="noopener" class="server-link">Llama Server</a>
                         <span class="server-port">:11434</span>
-                    </div>
-                    <div class="server-row" data-server="vllm">
-                        <span class="server-light" data-state="unknown"></span>
-                        <a href="http://localhost:8000/v1/models" target="_blank" rel="noopener" class="server-link">vLLM</a>
-                        <span class="server-port">:8000</span>
                     </div>
                     <div class="server-row" data-server="comfyui">
                         <span class="server-light" data-state="unknown"></span>
@@ -484,190 +484,85 @@
                 <div class="hint" style="margin-top:0.5rem">Tree node glow controls will land here next.</div>
             </div>
 
-            <!-- Advanced -->
+ <!-- Advanced -->
             <div id="settings-advanced" class="settings-section hidden">
                 <div class="form-group">
-                    <label for="cfg-host">Ollama Host</label>
+                    <label for="cfg-host">Llama Server Host</label>
                     <input type="text" id="cfg-host" placeholder="http://localhost:11434">
                 </div>
                 <div class="form-group">
-                    <label for="cfg-vllm-host">vLLM Host</label>
-                    <input type="text" id="cfg-vllm-host" placeholder="http://localhost:8000">
+                    <label for="cfg-llama-model-select">Model (from models folder)</label>
+                    <select id="cfg-llama-model-select" class="form-select"></select>
                 </div>
                 <div class="form-group">
                     <div class="label-with-action">
-                        <label for="cfg-vllm-model">vLLM Model <span class="hint">(HF id or local path — vLLM serves one at a time)</span></label>
-                        <button type="button" class="btn-mini" id="btn-vllm-restart" title="Save settings, then stop and restart vLLM with the configured model. Takes ~30-60s for cold load.">↻ Apply &amp; Restart vLLM</button>
+                        <label for="cfg-llama-server-exe">Llama Server Path</label>
+                        <button type="button" class="btn-mini" id="btn-vllm-restart" title="Save settings, then stop and restart Llama Server with the selected model.">↻ Apply &amp; Restart</button>
                     </div>
-                    <input type="text" id="cfg-vllm-model" placeholder="">
-                </div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="cfg-context">Max Context Tokens</label>
-                        <input type="number" id="cfg-context" step="4096" min="4096" max="262144">
-                    </div>
-                    <div class="form-group">
-                        <label for="cfg-verbatim">Verbatim Window (turns)</label>
-                        <input type="number" id="cfg-verbatim" step="1" min="2" max="50">
-                    </div>
+                    <input type="text" id="cfg-llama-server-exe" placeholder="C:\Users\exast\OneDrive\Documents\LS\bin\llama-server.exe">
                 </div>
 
-                <details class="tuning-card">
-                    <summary>Ollama tuning <span class="hint">(applied next time admin starts Ollama)</span></summary>
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="cfg-ol-kv">KV Cache Type</label>
-                            <select id="cfg-ol-kv" class="form-select">
-                                <option value="f16">f16 (best quality)</option>
-                                <option value="q8_0">q8_0 (balanced)</option>
-                                <option value="q4_0">q4_0 (smallest)</option>
-                            </select>
+                <!-- Per-model tuning panel -->
+                <div id="model-tuning-panel" class="tuning-card" style="margin-top:1rem">
+                    <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;font-weight:600" onclick="const f=document.getElementById('model-tuning-fields');f.classList.toggle('hidden')">
+                        <span style="font-size:0.95rem">Model Settings <span class="hint" id="model-tuning-model-name">(select a model)</span></span>
+                        <span class="hint">▼</span>
+                    </div>
+                    <div id="model-tuning-fields" class="hidden">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="cfg-mc-ctx-size">Context Size</label>
+                                <input type="number" id="cfg-mc-ctx-size" step="2048" min="2048" max="1048576">
+                            </div>
+                            <div class="form-group">
+                                <label for="cfg-mc-ngl">GPU Layers <span class="hint">(999 = all that fits)</span></label>
+                                <input type="number" id="cfg-mc-ngl" min="0" max="999" placeholder="999">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="cfg-mc-kv-quant">KV Cache Quant <span class="hint">(saves VRAM)</span></label>
+                                <select id="cfg-mc-kv-quant" class="form-select"></select>
+                            </div>
+                            <div class="form-group">
+                                <label for="cfg-mc-threads">Threads</label>
+                                <input type="number" id="cfg-mc-threads" min="1" max="64" placeholder="auto">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="cfg-mc-batch">Batch Size</label>
+                                <input type="number" id="cfg-mc-batch" min="1" max="32768" placeholder="auto">
+                            </div>
+                            <div class="form-group">
+                                <label for="cfg-mc-ubatch">Upload Batch</label>
+                                <input type="number" id="cfg-mc-ubatch" min="1" max="32768" placeholder="auto">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group toggle-row">
+                                <label for="cfg-mc-flash-attn">
+                                    <input type="checkbox" id="cfg-mc-flash-attn" checked>
+                                    Flash Attention
+                                </label>
+                            </div>
+                            <div class="form-group toggle-row">
+                                <label for="cfg-mc-mlock">
+                                    <input type="checkbox" id="cfg-mc-mlock">
+                                    Lock memory (no swap)
+                                </label>
+                            </div>
                         </div>
                         <div class="form-group">
-                            <label for="cfg-ol-keepalive">Keep Alive</label>
-                            <input type="text" id="cfg-ol-keepalive" placeholder="30m or -1">
+                            <label for="cfg-mc-mmproj">Vision MMProj <span class="hint">(separate projector for multimodal models)</span></label>
+                            <select id="cfg-mc-mmproj" class="form-select"></select>
+                        </div>
+                        <div class="form-group">
+                            <label for="cfg-mc-extra">Extra args <span class="hint">(appended verbatim)</span></label>
+                            <input type="text" id="cfg-mc-extra" placeholder="--no-mmap">
                         </div>
                     </div>
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="cfg-ol-numparallel">Num Parallel</label>
-                            <input type="number" id="cfg-ol-numparallel" min="1" max="16">
-                        </div>
-                        <div class="form-group">
-                            <label for="cfg-ol-maxloaded">Max Loaded Models <span class="hint">(0 = auto)</span></label>
-                            <input type="number" id="cfg-ol-maxloaded" min="0" max="16">
-                        </div>
-                    </div>
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="cfg-ol-ctxlen">Default Context Length</label>
-                            <input type="number" id="cfg-ol-ctxlen" step="2048" min="2048" max="1048576">
-                        </div>
-                        <div class="form-group toggle-row">
-                            <label for="cfg-ol-flashattn">
-                                <input type="checkbox" id="cfg-ol-flashattn">
-                                Flash Attention
-                            </label>
-                        </div>
-                    </div>
-                </details>
-
-                <details class="tuning-card">
-                    <summary>vLLM tuning <span class="hint">(applied next time admin starts vLLM)</span></summary>
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="cfg-vl-quant">Quantization</label>
-                            <select id="cfg-vl-quant" class="form-select">
-                                <option value="none">none</option>
-                                <option value="awq">awq</option>
-                                <option value="gptq">gptq</option>
-                                <option value="fp8">fp8</option>
-                                <option value="modelopt">modelopt</option>
-                                <option value="compressed-tensors">compressed-tensors (sakamakismile NVFP4)</option>
-                                <option value="nvfp4">nvfp4</option>
-                                <option value="bitsandbytes">bitsandbytes</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label for="cfg-vl-kvdtype">KV Cache dtype</label>
-                            <select id="cfg-vl-kvdtype" class="form-select">
-                                <option value="auto">auto (model default)</option>
-                                <optgroup label="FP8">
-                                    <option value="fp8">fp8 (8 bits, balanced)</option>
-                                    <option value="fp8_e4m3">fp8_e4m3</option>
-                                    <option value="fp8_e5m2">fp8_e5m2</option>
-                                </optgroup>
-                                <optgroup label="NVFP4 (Blackwell native, this fork)">
-                                    <option value="nvfp4">nvfp4 (4 bits, max throughput on 5090)</option>
-                                </optgroup>
-                                <optgroup label="TurboQuant (this fork — bigger context)">
-                                    <option value="turboquant_k8v4">turboquant_k8v4 (k=8b, v=4b)</option>
-                                    <option value="turboquant_4bit_nc">turboquant_4bit_nc (4 bits, no cal)</option>
-                                    <option value="turboquant_k3v4_nc">turboquant_k3v4_nc (more aggressive)</option>
-                                    <option value="turboquant_3bit_nc">turboquant_3bit_nc (most compression)</option>
-                                </optgroup>
-                                <optgroup label="Per-head">
-                                    <option value="int8_per_token_head">int8_per_token_head</option>
-                                    <option value="fp8_per_token_head">fp8_per_token_head</option>
-                                </optgroup>
-                            </select>
-                        </div>
-                    </div>
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="cfg-vl-maxlen">Max Model Len</label>
-                            <input type="number" id="cfg-vl-maxlen" step="2048" min="2048" max="1048576">
-                        </div>
-                        <div class="form-group">
-                            <label for="cfg-vl-gpuutil">GPU Mem Util <span class="hint">(0.0–1.0)</span></label>
-                            <input type="number" id="cfg-vl-gpuutil" step="0.01" min="0.1" max="1">
-                        </div>
-                    </div>
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="cfg-vl-maxseqs">Max Num Seqs</label>
-                            <input type="number" id="cfg-vl-maxseqs" min="1" max="256">
-                        </div>
-                        <div class="form-group">
-                            <label for="cfg-vl-tp">Tensor Parallel Size</label>
-                            <input type="number" id="cfg-vl-tp" min="1" max="8">
-                        </div>
-                    </div>
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="cfg-vl-toolparser">Tool-call Parser</label>
-                            <select id="cfg-vl-toolparser" class="form-select">
-                                <option value="none">none</option>
-                                <option value="hermes">hermes (Qwen-family)</option>
-                                <option value="mistral">mistral</option>
-                                <option value="llama3_json">llama3_json</option>
-                                <option value="pythonic">pythonic</option>
-                            </select>
-                        </div>
-                        <div class="form-group toggle-row">
-                            <label for="cfg-vl-autotool">
-                                <input type="checkbox" id="cfg-vl-autotool">
-                                Enable Auto Tool Choice
-                            </label>
-                        </div>
-                    </div>
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="cfg-vl-reasoning">Reasoning Parser</label>
-                            <select id="cfg-vl-reasoning" class="form-select">
-                                <option value="none">none</option>
-                                <option value="qwen3">qwen3 (Qwen3.5/3.6 thinking)</option>
-                                <option value="deepseek_r1">deepseek_r1</option>
-                            </select>
-                        </div>
-                        <div class="form-group toggle-row">
-                            <label for="cfg-vl-textonly">
-                                <input type="checkbox" id="cfg-vl-textonly">
-                                vLLM is text-only
-                                <span class="hint">(route describe-image to Ollama)</span>
-                            </label>
-                        </div>
-                    </div>
-                    <div class="form-group toggle-row">
-                        <label for="cfg-vl-thinking">
-                            <input type="checkbox" id="cfg-vl-thinking">
-                            Thinking ON by default
-                            <span class="hint">(off = CC requests get fast text; on = reasoning-heavy, slower TTFT)</span>
-                        </label>
-                    </div>
-                    <div class="form-group">
-                        <label for="cfg-vl-spec">Speculative / MTP Config <span class="hint">(JSON — e.g. <code>{"method":"qwen3_next_mtp","num_speculative_tokens":2}</code>)</span></label>
-                        <input type="text" id="cfg-vl-spec" placeholder='{"method":"qwen3_next_mtp","num_speculative_tokens":2}'>
-                    </div>
-                    <div class="form-group">
-                        <label for="cfg-vl-pypath">vLLM Python Path <span class="hint">(empty = system PATH; venv example: <code>C:\Users\you\vllm-env\Scripts\python.exe</code>)</span></label>
-                        <input type="text" id="cfg-vl-pypath" placeholder="">
-                    </div>
-                    <div class="form-group">
-                        <label for="cfg-vl-extra">Extra args <span class="hint">(escape hatch — appended verbatim)</span></label>
-                        <input type="text" id="cfg-vl-extra" placeholder="--enforce-eager --trust-remote-code">
-                    </div>
-                </details>
+                </div>
             </div>
             <div class="modal-actions">
                 <button class="btn-secondary" data-close-modal>Cancel</button>

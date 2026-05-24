@@ -176,6 +176,8 @@ async def lifespan(app):
         except Exception as e:
             print(f"[CACHE] Initial warm failed (will fetch on demand): {e}")
     asyncio.create_task(_warm_model_caches())
+    # Sync model IDs from the running Llama Server into config
+    asyncio.create_task(_update_model_ids_on_startup())
     yield
     await db.close_db()
 
@@ -652,19 +654,32 @@ _STATUS_TARGETS = {
 
 @app.get("/api/server-status/{target}")
 async def api_server_status(target: str):
-    """Server-side proxy of a co-located service's health endpoint. The admin
-    server, Ollama, vLLM, and ComfyUI all run plain HTTP, so a browser probe
-    from HTTPS-served main Loom is blocked as mixed content. Probing from the
-    server (loopback HTTP) sidesteps that. Returns {up: bool}."""
-    spec = _STATUS_TARGETS.get(target)
-    if not spec:
-        return {"up": False}
-    port, path = spec
+    """Server-side proxy of a co-located service's health endpoint.
+    Browser probes from HTTPS are blocked as mixed content, so we probe from
+    the server trying HTTPS first, then HTTP. Returns {up: bool}."""
+    if target == "llama":
+        from urllib.parse import urlparse
+        try:
+            url = config.llama_host_url()
+            parsed = urlparse(url)
+            port = parsed.port or 8000
+        except Exception:
+            port = 8000
+        path = "/v1/models"
+    else:
+        spec = _STATUS_TARGETS.get(target)
+        if not spec:
+            return {"up": False}
+        port, path = spec
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
-            r = await client.get(f"http://127.0.0.1:{port}{path}")
-            if r.status_code == 200:
-                return {"up": True}
+            for scheme in ("https", "http"):
+                try:
+                    r = await client.get(f"{scheme}://127.0.0.1:{port}{path}")
+                    if r.status_code == 200:
+                        return {"up": True}
+                except Exception:
+                    pass
     except Exception:
         pass
     return {"up": False}
@@ -807,22 +822,9 @@ async def api_admin_status():
     return await api_server_status("admin")
 
 
-@app.get("/api/ollama/models")
-async def api_ollama_models():
-    """Always returns Ollama's model list, regardless of which backend is
-    active (don't go through the dispatcher — that would surface vLLM models
-    when local_backend=vllm and they'd appear under the "Ollama" dropdown
-    label, which is just confusing)."""
-    import ollama_client as _oc
-    status = await _oc.health_check()
-    return {"models": status.get("models", [])}
-
 
 # ── Local model list cache ────────────────────────────────────────────────
-# Hitting Ollama on every settings-panel open made the modal take ~30s. We
-# now snapshot the model list at startup (and on demand via /refresh-models)
-# and serve from RAM — going from 2.5s/call to <1ms. The cache is keyed by
-# (backend, host) so flipping local_backend invalidates implicitly.
+# Serves the .gguf file list from disk so the UI model dropdown is instant.
 
 _LOCAL_MODELS_CACHE: dict | None = None
 _VISION_MODELS_CACHE: dict | None = None
@@ -830,12 +832,22 @@ _VISION_MODELS_CACHE: dict | None = None
 
 async def _refresh_local_models_cache() -> dict:
     global _LOCAL_MODELS_CACHE
+    # Prefer live server models; fall back to directory scan
     status = await health_check()
+    live_models = status.get("models", [])
+    import llama_client as _lc
+    disk_models = _lc.list_local_models()
+    # Combine: live first, then any disk models not yet loaded
+    all_models = list(live_models)
+    for m in disk_models:
+        if m not in all_models:
+            all_models.append(m)
     _LOCAL_MODELS_CACHE = {
-        "backend": config.local_backend,
-        "host": (config.vllm_host if config.local_backend == "vllm" else config.ollama_host),
-        "models": status.get("models", []),
-        "target_model": status.get("target_model"),
+        "backend": "llama",
+        "host": config.llama_host,
+        "models": all_models,
+        "disk_models": disk_models,
+        "target_model": config.llama_model,
         "available": status.get("model_available", False),
         "fetched_at": time.time(),
     }
@@ -843,31 +855,24 @@ async def _refresh_local_models_cache() -> dict:
 
 
 async def _refresh_vision_models_cache() -> dict:
-    """Vision models are expensive to compute on Ollama (one /api/show per
-    model) so this benefits the most from caching."""
+    """Vision model list — same as main models (llama-server uses same model for all tasks)."""
     global _VISION_MODELS_CACHE
-    if config.local_backend == "vllm":
-        status = await health_check()
-        models = status.get("models", [])
-    else:
-        result = await api_ollama_vision_models()
-        models = result.get("models", []) if isinstance(result, dict) else []
+    import llama_client as _lc
+    disk_models = _lc.list_local_models()
     _VISION_MODELS_CACHE = {
-        "backend": config.local_backend,
-        "host": (config.vllm_host if config.local_backend == "vllm" else config.ollama_host),
-        "models": models,
+        "backend": "llama",
+        "host": config.llama_host,
+        "models": disk_models,
         "fetched_at": time.time(),
     }
     return _VISION_MODELS_CACHE
 
 
 def _cache_is_stale(cache: dict | None) -> bool:
-    """Returns True if the cache was built against a different backend/host
-    than the current config (so flipping the backend dropdown auto-invalidates)."""
+    """Returns True if the cache was built against a different host than current config."""
     if not cache:
         return True
-    expected_host = config.vllm_host if config.local_backend == "vllm" else config.ollama_host
-    return cache.get("backend") != config.local_backend or cache.get("host") != expected_host
+    return cache.get("backend") != "llama" or cache.get("host") != config.llama_host
 
 
 @app.get("/api/local/models")
@@ -890,49 +895,36 @@ async def api_local_vision_models():
 @app.post("/api/local/refresh-models")
 async def api_local_refresh_models():
     """Force-refresh both model caches. Wired to the 'Refresh' button in
-    Settings → Model & Generation; also called when the user starts/stops
-    Ollama or vLLM since their model lists are likely to have changed."""
+    Settings; also called after llama-server starts/stops."""
     await _refresh_local_models_cache()
     await _refresh_vision_models_cache()
     return {
         "models": _LOCAL_MODELS_CACHE.get("models", []),
         "vision_models": _VISION_MODELS_CACHE.get("models", []),
-        "backend": config.local_backend,
+        "backend": "llama",
     }
 
 
-# ── All-engines model list ────────────────────────────────────────────────
-# Returns the union of Ollama models and vLLM-served names regardless of which
-# backend is currently active. Used by the Braid/Weave inline dropdown so the
-# user can pick from either engine without flipping local_backend in Settings.
-# Each entry is {name, backend} so the frontend can group/route correctly.
-
-import ollama_client as _ollama_client_mod
-import vllm_client as _vllm_client_mod
+# ── All models list ───────────────────────────────────────────────────────
+# Returns .gguf models from disk + any live server models.
+# Used by the Braid/Weave inline dropdown.
 
 _ALL_ENGINES_CACHE: dict | None = None
 
 
 async def _refresh_all_engines_cache() -> dict:
-    """Probe both backends in parallel; either returning empty is fine.
-    The active backend's main cache stays the source of truth for the settings
-    panel — this is purely a UX list for the inline dropdown."""
+    """Scan disk for .gguf files and probe llama-server for loaded models."""
     global _ALL_ENGINES_CACHE
-    ollama_status, vllm_status = await asyncio.gather(
-        _ollama_client_mod.health_check(),
-        _vllm_client_mod.health_check(),
-        return_exceptions=True,
-    )
+    import llama_client as _lc
+    disk_models = _lc.list_local_models()
+    status = await _lc.health_check()
+    live_models = status.get("models", [])
     out: list[dict] = []
-    if isinstance(ollama_status, dict) and not ollama_status.get("mock_mode"):
-        for m in ollama_status.get("models", []) or []:
-            out.append({"name": m, "backend": "ollama"})
-    if isinstance(vllm_status, dict) and not vllm_status.get("mock_mode"):
-        for m in vllm_status.get("models", []) or []:
-            out.append({"name": m, "backend": "vllm"})
+    for m in disk_models:
+        out.append({"name": m, "backend": "llama", "loaded": m in live_models})
     _ALL_ENGINES_CACHE = {
         "models": out,
-        "active_backend": config.local_backend,
+        "active_backend": "llama",
         "fetched_at": time.time(),
     }
     return _ALL_ENGINES_CACHE
@@ -940,9 +932,8 @@ async def _refresh_all_engines_cache() -> dict:
 
 @app.get("/api/local/all-models")
 async def api_local_all_models():
-    """Returns models from BOTH Ollama and vLLM regardless of active backend.
-    Used by the Braid/Weave inline dropdown for cross-engine selection.
-    Stale-while-revalidate: serve from cache if present, refresh in background."""
+    """Returns all local .gguf models plus live llama-server models.
+    Used by the inline dropdown for model selection."""
     if _ALL_ENGINES_CACHE is None:
         await _refresh_all_engines_cache()
     return _ALL_ENGINES_CACHE
@@ -951,6 +942,176 @@ async def api_local_all_models():
 @app.post("/api/local/refresh-all-models")
 async def api_local_refresh_all_models():
     return await _refresh_all_engines_cache()
+
+
+# ── Per-model configuration ────────────────────────────────────────────────
+# models_config.json lives in the project root next to config.json.
+# Format: { "ModelName.gguf": { ctx_size, ngl, flash_attn, kv_quant, threads,
+#             batch, ubatch, mlock, extra_args } }
+
+MODEL_CONFIG_PATH = Path(__file__).parent / "models_config.json"
+_KV_QUANT_OPTIONS = ["none", "K4", "K4_0", "K5", "K5_0", "K8", "K8_0"]
+
+
+def _load_model_configs() -> dict:
+    if MODEL_CONFIG_PATH.exists():
+        try:
+            with open(MODEL_CONFIG_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_model_configs(cfg: dict):
+    try:
+        with open(MODEL_CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"[SERVER] Failed to save models_config.json: {e}")
+
+
+def _default_ctx(name: str) -> int:
+    """Guess context size from model name. Check larger sizes first."""
+    import re
+    # Match patterns like "27b", "32b" etc. - largest match wins
+    m = re.search(r'(\d+)b', name, re.IGNORECASE)
+    if m:
+        size = int(m.group(1))
+        if size <= 3:
+            return 200000
+        if size <= 8:
+            return 150000
+        if size <= 14:
+            return 100000
+        if size <= 27:
+            return 80000
+        if size <= 70:
+            return 40000
+    return 150000
+
+
+def _new_model_default(name: str) -> dict:
+    return {
+        "ctx_size": _default_ctx(name),
+        "ngl": 999,
+        "flash_attn": True,
+        "kv_quant": "none",
+        "threads": None,
+        "batch": None,
+        "ubatch": None,
+        "mlock": False,
+        "mmproj": None,
+        "extra_args": "",
+        "server_model_id": None,
+    }
+
+
+def _sync_disk_models():
+    """Add new .gguf files to config with defaults. Never deletes."""
+    import llama_client as _lc
+    cfg = _load_model_configs()
+    disk = _lc.list_local_models()
+    for m in disk:
+        if m not in cfg:
+            cfg[m] = _new_model_default(m)
+    _save_model_configs(cfg)
+    return cfg
+
+
+@app.get("/api/models-config")
+async def api_get_models_config():
+    """Return models_config.json (synced with disk)."""
+    cfg = _sync_disk_models()
+    return {"models": cfg, "kv_quant_options": _KV_QUANT_OPTIONS}
+
+
+@app.put("/api/models-config")
+async def api_update_models_config(data: dict):
+    """Update all model configs. Only saves entries for models that exist on disk."""
+    import llama_client as _lc
+    disk_set = set(_lc.list_local_models())
+    cfg = {}
+    for name, settings in data.get("models", {}).items():
+        if name in disk_set:
+            cfg[name] = settings
+    _save_model_configs(cfg)
+    return {"status": "ok", "saved": len(cfg)}
+
+
+@app.get("/api/disk-models")
+async def api_get_disk_models():
+    """Return list of .gguf files in the models directory."""
+    import llama_client as _lc
+    models = _lc.list_local_models()
+    return {"models": models}
+
+
+@app.post("/api/update-model-ids")
+async def api_update_model_ids():
+    """Update server_model_id in config by querying the running Llama Server.
+
+    Matches the server-registered model ID to the active config model name
+    and persists it in models_config.json.
+    """
+    import httpx
+    import llama_client as _lc
+    cfg = _load_model_configs()
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{config.llama_host_url()}/v1/models")
+            resp.raise_for_status()
+            data = resp.json()
+            server_models = [m["id"] for m in data.get("data", [])]
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+    # Match server IDs to local model configs
+    active = config.llama_model or ""
+    active_norm = active.lower().replace("-", "").replace("_", "").replace(".", "").replace(":", "")
+    for model_file in cfg:
+        norm = model_file.lower().replace("-", "").replace("_", "").replace(".", "").replace(":", "")
+        for srv_id in server_models:
+            srv_norm = srv_id.lower().replace("-", "").replace("_", "").replace(".", "").replace(":", "")
+            if norm and (norm in srv_norm or srv_norm in norm):
+                cfg[model_file]["server_model_id"] = srv_id
+
+    _save_model_configs(cfg)
+    return {"status": "ok", "updated": len(server_models), "config": cfg}
+
+
+async def _update_model_ids_on_startup():
+    """On server startup, sync server_model_id from the running Llama Server."""
+    await asyncio.sleep(3)  # let Llama Server finish starting
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{config.llama_host_url()}/v1/models")
+            resp.raise_for_status()
+            data = resp.json()
+            server_models = [m["id"] for m in data.get("data", [])]
+    except Exception as e:
+        print(f"[MODEL-IDS] Could not fetch server models: {e}")
+        return
+
+    cfg = _load_model_configs()
+    for model_file in cfg:
+        norm = model_file.lower().replace("-", "").replace("_", "").replace(".", "").replace(":", "")
+        for srv_id in server_models:
+            srv_norm = srv_id.lower().replace("-", "").replace("_", "").replace(".", "").replace(":", "")
+            if norm and (norm in srv_norm or srv_norm in norm):
+                cfg[model_file]["server_model_id"] = srv_id
+
+    _save_model_configs(cfg)
+    for k, v in cfg.items():
+        sid = v.get("server_model_id")
+        if sid:
+            print(f"[MODEL-IDS] {k} -> {sid}")
+
+
+# ── Characters ──
+
+
 
 
 # ── Characters ──
@@ -1775,6 +1936,73 @@ async def api_regenerate(conv_id: int, msg_id: int):
     return {"parent_id": msg["parent_id"], "original_id": msg_id}
 
 
+@app.post("/api/conversations/{conv_id}/redescribe/{msg_id}")
+async def api_redescribe(conv_id: int, msg_id: int):
+    """Re-describe all images attached to a user message.
+
+    Emits describe_start/describe_done WebSocket events so the UI can show
+    a spinner and updated description.
+    """
+    msg = await db.get_message(msg_id)
+    if not msg or not msg.get("image_path"):
+        raise HTTPException(404, "Message not found or has no images")
+
+    img_paths = _parse_image_paths(msg["image_path"])
+    desc_map: dict[str, str] = {}
+    _describe_model = config.vision_model or config.llama_model
+
+    # Get describe context from the message
+    _ctx = msg.get("describe_context") or None
+
+    await _ws_send(conv_id, {
+        "type": "describe_start",
+        "parent_msg_id": msg_id,
+        "image_count": len(img_paths),
+        "model": _describe_model,
+        "started_at": _time.time()
+    })
+
+    _desc_start = _time.time()
+    for ip in img_paths:
+        src = Path(ip).resolve()
+        try:
+            desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None, context=_ctx), timeout=120)
+            desc_map[src.name] = desc
+        except asyncio.TimeoutError:
+            print(f"[DESCRIBE] Timed out describing {src.name}")
+        except Exception as e:
+            print(f"[DESCRIBE] Failed to describe image {src.name}: {e}")
+
+    _elapsed = (_time.time() - _desc_start) * 1000
+
+    if desc_map:
+        try:
+            await db.update_message_image_alt(msg_id, json.dumps(desc_map))
+
+            _describe_content = f"[Image description — {_describe_model}]\n\n" + "\n\n".join(desc_map.values())
+            _db = await db.get_db()
+            existing_rows = await _db.execute_fetchall(
+                "SELECT id FROM messages WHERE conversation_id=? AND role='system' AND parent_id=? AND content LIKE ?",
+                (conv_id, msg_id, "[Image description —%")
+            )
+            if existing_rows:
+                await _db.execute("UPDATE messages SET content=? WHERE id=?", (_describe_content, existing_rows[0]["id"]))
+            else:
+                await db.add_message(conv_id, "system", _describe_content, parent_id=msg_id)
+        except Exception as e:
+            print(f"[DESCRIBE] Failed to persist descriptions: {e}")
+
+    await _ws_send(conv_id, {
+        "type": "describe_done",
+        "parent_msg_id": msg_id,
+        "descriptions": desc_map,
+        "model": _describe_model,
+        "elapsed_ms": _elapsed
+    })
+
+    return {"descriptions": desc_map, "elapsed_ms": _elapsed, "model": _describe_model}
+
+
 @app.post("/api/conversations/{conv_id}/fork/{msg_id}")
 async def api_fork_conversation(conv_id: int, msg_id: int):
     """Fork a conversation from a specific message, creating a new conversation."""
@@ -2038,46 +2266,18 @@ async def api_cc_models():
 _VISION_MODEL_CACHE: dict[tuple[str, str], bool] = {}
 
 
-@app.get("/api/ollama/vision-models")
-async def api_ollama_vision_models():
-    """Return Ollama models whose /api/show capabilities include 'vision'.
-
-    Results are cached by (name, digest) so repeat calls only re-check models
-    whose digest changed (e.g. pulled a new tag).
-    """
-    host = config.ollama_host
-    if host and not host.startswith(("http://", "https://")):
-        host = f"http://{host}"
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(f"{host}/api/tags")
-            resp.raise_for_status()
-            models = resp.json().get("models", [])
-
-            sem = asyncio.Semaphore(8)
-
-            async def _has_vision(name: str, digest: str) -> bool:
-                key = (name, digest)
-                if key in _VISION_MODEL_CACHE:
-                    return _VISION_MODEL_CACHE[key]
-                async with sem:
-                    try:
-                        r = await client.post(f"{host}/api/show", json={"model": name})
-                        r.raise_for_status()
-                        caps = r.json().get("capabilities") or []
-                        result = "vision" in caps
-                    except Exception:
-                        result = False
-                _VISION_MODEL_CACHE[key] = result
-                return result
-
-            checks = await asyncio.gather(
-                *(_has_vision(m["name"], m.get("digest", "")) for m in models)
-            )
-            vision = [m["name"] for m, ok in zip(models, checks) if ok]
-            return {"models": vision}
-    except Exception as e:
-        return {"models": [], "error": str(e)}
+@app.get("/api/llama/models")
+async def api_llama_models():
+    """Return .gguf models from disk plus any models reported by live llama-server."""
+    import llama_client as _lc
+    disk_models = _lc.list_local_models()
+    status = await _lc.health_check()
+    live = status.get("models", [])
+    all_m = list(disk_models)
+    for m in live:
+        if m not in all_m:
+            all_m.append(m)
+    return {"models": all_m, "live": live, "disk": disk_models}
 
 
 # ── Directory Browser (for Claude mode project picker) ──
@@ -3103,11 +3303,10 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
         _ANTHROPIC_MODELS = {"sonnet", "opus", "haiku"}
         _base_model = cc_model.split("[")[0] if "[" in cc_model else cc_model
         is_anthropic = _base_model in _ANTHROPIC_MODELS
-        is_vllm = cc_model.startswith("vllm-")
-        use_ollama = conv.get("_use_ollama", False) or not (is_anthropic or cc_model.startswith("gemini") or is_vllm)
-        if is_anthropic or cc_model.startswith("gemini") or is_vllm:
-            use_ollama = False
-        use_vllm = is_vllm and not use_ollama
+        is_llama = cc_model.endswith(".gguf")
+        use_llama = conv.get("_use_llama", False) or is_llama
+        if is_anthropic or cc_model.startswith("gemini"):
+            use_llama = False
 
         await _ws_send(conv_id, {"type": "status", "text": "Compacting context..."})
 
@@ -3126,10 +3325,7 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
             effort=cc_effort,
             resume_session_id=session_id,
             fork_session=False,  # compact in place, don't fork
-            use_ollama=use_ollama,
-            use_vllm=use_vllm,
-            vllm_base_url=config.vllm_host if use_vllm else None,
-            vllm_model_alias=cc_model if use_vllm else None,
+            use_llama=use_llama,
         )
 
         # Get the current leaf — compact marker becomes its child,
@@ -3246,9 +3442,12 @@ async def _handle_claude_generation(
     websocket: WebSocket, conv_id: int, conv: dict, data: dict
 ):
     """Handle Claude Code CLI generation with session resume support."""
+    print(f"[CC-GEN] Entered: conv_id={conv_id}, action={data.get('action')}, parent_id={data.get('parent_id')}, cc_model={data.get('cc_model')}, _use_llama={conv.get('_use_llama')}")
     try:
         action = data.get("action")
         parent_id = data.get("parent_id")
+        _describe_msg_id = None
+        draft_msg_id = None
 
         if action == "generate" and parent_id is None:
             leaf = await db.get_active_leaf(conv_id)
@@ -3266,9 +3465,9 @@ async def _handle_claude_generation(
             )
             return
         # For local mode, _handle_local_generation already set cc_model and
-        # _use_ollama on the conv dict — don't let the frontend override it.
+        # _use_llama on the conv dict — don't let the frontend override it.
         # For claude mode, prefer the client's current UI state over stale DB.
-        if conv.get("_use_ollama"):
+        if conv.get("_use_llama"):
             cc_model = conv.get("cc_model") or "sonnet"
         else:
             cc_model = data.get("cc_model") or conv.get("cc_model") or "sonnet"
@@ -3288,20 +3487,16 @@ async def _handle_claude_generation(
         _base_model = cc_model.split("[")[0] if "[" in cc_model else cc_model
         is_anthropic = _base_model in _ANTHROPIC_MODELS
         is_gemini = cc_model.startswith("gemini")
-        # vllm-* models go through Claude Code with ANTHROPIC_BASE_URL pointed
-        # at the local vLLM server (which speaks /v1/messages natively). Detected
-        # purely by name prefix so it slots in next to gemini-* and anthropic
-        # without any new DB columns.
-        is_vllm = cc_model.startswith("vllm-")
-        # Only use Ollama when explicitly flagged (local mode) or when the model
-        # is not a known Anthropic/Gemini/vLLM model.  The _use_ollama flag is set
-        # by _handle_local_generation on a shallow copy — it is never in the DB.
-        use_ollama = conv.get("_use_ollama", False) or not (is_anthropic or is_gemini or is_vllm)
-        # Belt-and-suspenders: NEVER route Anthropic/Gemini/vLLM through Ollama
-        if is_anthropic or is_gemini or is_vllm:
-            use_ollama = False
-        use_vllm = is_vllm and not use_ollama
-        print(f"[CC] Model routing: cc_model={cc_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} is_vllm={is_vllm} use_ollama={use_ollama} conv._use_ollama={conv.get('_use_ollama')} conv.mode={conv.get('mode')}")
+        # .gguf models go through Claude Code with ANTHROPIC_BASE_URL pointed
+        # at the local llama-server (which speaks /v1/messages natively on :11434).
+        is_llama = cc_model.endswith(".gguf")
+        # Only use llama when explicitly flagged (local mode) or when model is a .gguf.
+        # The _use_llama flag is set by _handle_local_generation on a shallow copy.
+        use_llama = conv.get("_use_llama", False) or is_llama
+        # Belt-and-suspenders: NEVER route Anthropic/Gemini through llama
+        if is_anthropic or is_gemini:
+            use_llama = False
+        print(f"[CC] Model routing: cc_model={cc_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} is_llama={is_llama} use_llama={use_llama} conv._use_llama={conv.get('_use_llama')} conv.mode={conv.get('mode')}")
 
         # --- Compact-handoff gate ---
         # Fast check: if the target model is a 1M Anthropic, skip. Otherwise
@@ -3392,13 +3587,13 @@ async def _handle_claude_generation(
                     or any(fam in _prev_base_lower for fam in ("opus", "sonnet", "haiku"))
                 )
                 prev_is_gemini = prev_model.startswith("gemini")
-                prev_is_ollama = bool(prev_model) and not (
+                prev_is_llama = bool(prev_model) and not (
                     prev_is_anthropic or prev_is_gemini
                 )
                 if (
                     (prev_is_anthropic != is_anthropic)
                     or (prev_is_gemini != is_gemini)
-                    or (prev_is_ollama != use_ollama)
+                    or (prev_is_llama != use_llama)
                 ):
                     print(
                         f"[CC] Cross-provider turn at msg {msg['id']} ({prev_model}), will rebuild full history"
@@ -3494,11 +3689,13 @@ async def _handle_claude_generation(
                 import shutil
 
                 file_notes = []
-                desc_map: dict[str, str] = {}
+                # Track which files are images for describe
+                image_files: list[tuple[str, Path]] = []  # (original_name, attached_path)
+
+                # Step 1: Copy all files to attached_files/
                 for ip in img_paths:
                     src = Path(ip).resolve()
                     file_ext = src.suffix.lower()
-                    # Use attached_files subfolder for all attached files
                     attached_files_dir = Path(project_dir) / "attached_files"
                     attached_files_dir.mkdir(exist_ok=True)
                     dest = attached_files_dir / src.name
@@ -3506,37 +3703,57 @@ async def _handle_claude_generation(
                     try:
                         shutil.copy2(str(src), str(dest))
                         copied = True
-                        # For local mode, describe from project_dir where CC can access it
-                        if use_ollama and copied:
-                            src = dest
                     except Exception as e:
                         print(
                             f"[UPLOAD] Failed to copy file {src.name} to attached_files/: {e}"
                         )
-                    if use_ollama:
-                        # Local mode: describe image via Ollama's native multimodal API
-                        # since CC's view_image tool returns file paths that local models can't parse
-                        if file_ext in _IMAGE_EXTS:
-                            try:
-                                await _ws_send(conv_id, {"type": "status", "text": f"Describing image {src.name}..."})
-                                desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None, context=_describe_context), timeout=120)
-                                file_notes.append(f"[Image: {desc}]")
-                                desc_map[src.name] = desc
-                            except asyncio.TimeoutError:
-                                print(f"[DESCRIBE] Timed out describing {src.name} (30s)")
-                                file_notes.append("[Image shared but description timed out]")
-                            except Exception as e:
-                                print(f"[DESCRIBE] Failed to describe image {src.name}: {e}")
-                                file_notes.append("[Image shared but description unavailable]")
-                        else:
+                    if file_ext in _IMAGE_EXTS and copied:
+                        image_files.append((src.name, dest))
+                    if use_llama:
+                        if file_ext not in _IMAGE_EXTS:
                             file_notes.append(f"{src.name} (in attached_files/)")
                     else:
                         if copied:
-                            file_notes.append(
-                                f"{src.name} (in attached_files/)"
-                            )
+                            file_notes.append(f"{src.name} (in attached_files/)")
                         else:
                             file_notes.append(str(src).replace("\\", "/"))
+
+                   # Step 2: Describe images (local mode only) — runs ONCE for all images
+                desc_map: dict[str, str] = {}
+                print(f"[DESCRIBE] check — use_llama={use_llama}, image_files={len(image_files)}, cc_model={cc_model}")
+                if not use_llama or not image_files:
+                    print(f"[DESCRIBE] Skipping: use_llama={use_llama}, image_files={len(image_files)}")
+                if use_llama and image_files:
+                    print(f"[DESCRIBE] Running describe for {len(image_files)} image(s), model={config.llama_model}")
+                    _describe_model = config.vision_model or config.llama_model
+                    await _ws_send(conv_id, {
+                        "type": "describe_start",
+                        "parent_msg_id": last_user_msg["id"],
+                        "image_count": len(image_files),
+                        "model": _describe_model,
+                        "started_at": _time.time()
+                    })
+                    _describe_start = _time.time()
+                    for orig_name, attached_path in image_files:
+                        try:
+                            await _ws_send(conv_id, {"type": "status", "text": f"Describing image {orig_name}..."})
+                            desc = await asyncio.wait_for(describe_image(str(attached_path), model=config.vision_model or None, context=_describe_context), timeout=120)
+                            file_notes.append(f"[Image: {desc}]")
+                            desc_map[orig_name] = desc
+                        except asyncio.TimeoutError:
+                            print(f"[DESCRIBE] Timed out describing {orig_name} (120s)")
+                        except Exception as e:
+                            print(f"[DESCRIBE] Failed to describe image {orig_name}: {e}")
+                    _describe_elapsed = (_time.time() - _describe_start) * 1000
+                    await _ws_send(conv_id, {
+                        "type": "describe_done",
+                        "parent_msg_id": last_user_msg["id"],
+                        "descriptions": desc_map,
+                        "model": _describe_model,
+                        "elapsed_ms": _describe_elapsed
+                    })
+
+                # Step 3: Persist descriptions and create describe message
                 if desc_map:
                     try:
                         await db.update_message_image_alt(
@@ -3546,10 +3763,18 @@ async def _handle_claude_generation(
                             "type": "image_describe",
                             "message_id": last_user_msg["id"],
                             "descriptions": desc_map,
-                            "model": config.vision_model or None,
+                            "model": _describe_model,
                         })
                     except Exception as e:
                         print(f"[DESCRIBE] Failed to persist/emit descriptions: {e}")
+
+                    _describe_content = f"[Image description — {_describe_model}]\n\n" + "\n\n".join(desc_map.values())
+                    _describe_msg = await db.add_message(
+                        conv_id, "system", _describe_content,
+                        parent_id=last_user_msg["id"]
+                    )
+                    _describe_msg_id = _describe_msg["id"]
+
                 if file_notes:
                     files_str = "\n".join(f"  • {note}" for note in file_notes)
                     _has_img = any(note.startswith("[Image") for note in file_notes)
@@ -3557,9 +3782,10 @@ async def _handle_claude_generation(
                     prompt += f"\n\n{_hdr}\n{files_str}"
         # Create draft message in DB immediately so it survives navigation/restarts.
         # If parent already has an empty assistant child (stale draft), reuse it.
+        _draft_parent = _describe_msg_id or parent_id
         draft_msg = None
-        if parent_id:
-            existing_children = await db.get_children(parent_id)
+        if _draft_parent:
+            existing_children = await db.get_children(_draft_parent)
             for child in existing_children:
                 if (
                     child["role"] == "assistant"
@@ -3570,13 +3796,12 @@ async def _handle_claude_generation(
                     break
         if not draft_msg:
             draft_msg = await db.add_message(
-                conv_id, "assistant", "", parent_id=parent_id
+                conv_id, "assistant", "", parent_id=_draft_parent
             )
         draft_msg_id = draft_msg["id"]
         await db.set_active_branch(conv_id, draft_msg_id)
 
         # Initialize live snapshot for this generation (survives WS disconnects)
-        import time as _time
 
         _gen_key_local = getattr(asyncio.current_task(), "_gen_key", None)
         if _gen_key_local:
@@ -3589,14 +3814,14 @@ async def _handle_claude_generation(
                 started_at=_time.time(),
                 draft_msg_id=draft_msg_id,
                 parent_id=parent_id,
-                mode="gemini" if is_gemini else ("local" if use_ollama else "claude"),
+                mode="gemini" if is_gemini else ("local" if use_llama else "claude"),
             )
 
         # Let the client know we're launching
         if is_gemini:
             launch_label = f"Launching Gemini CLI ({cc_model})..."
-        elif use_ollama:
-            launch_label = f"Launching {cc_model} via Ollama..."
+        elif use_llama:
+            launch_label = f"Launching {cc_model} via Llama Server..."
         else:
             launch_label = f"Launching Claude Code ({cc_model})..."
         if use_resume:
@@ -3650,10 +3875,7 @@ async def _handle_claude_generation(
                     permission_mode=cc_permission_mode,
                     resume_session_id=resume_session_id if use_resume else None,
                     fork_session=fork_session,
-                    use_ollama=use_ollama,
-                    use_vllm=use_vllm,
-                    vllm_base_url=config.vllm_host if use_vllm else None,
-                    vllm_model_alias=cc_model if use_vllm else None,
+                    use_llama=use_llama,
                     backstage_parent_id=conv.get("backstage_parent_id"),
                 )
         except Exception as e:
@@ -3682,10 +3904,7 @@ async def _handle_claude_generation(
                         model=cc_model,
                         effort=cc_effort,
                         permission_mode=cc_permission_mode,
-                        use_ollama=use_ollama,
-                        use_vllm=use_vllm,
-                        vllm_base_url=config.vllm_host if use_vllm else None,
-                        vllm_model_alias=cc_model if use_vllm else None,
+                        use_llama=use_llama,
                         backstage_parent_id=conv.get("backstage_parent_id"),
                     )
                 use_resume = False
@@ -3702,7 +3921,7 @@ async def _handle_claude_generation(
                 conv_id=conv_id,
                 pid=proc.pid,
                 project_dir=project_dir,
-                mode="local" if use_ollama else ("gemini" if is_gemini else "claude"),
+                mode="local" if use_llama else ("gemini" if is_gemini else "claude"),
             )
         except Exception as e:
             print(f"[GEN] Failed to register active generation: {e}")
@@ -4017,11 +4236,13 @@ async def _handle_claude_generation(
                     import shutil
 
                     file_notes = []
-                    desc_map: dict[str, str] = {}
+                    image_files: list[tuple[str, Path]] = []
+                    _describe_msg_id = None
+
+                    # Step 1: Copy files
                     for ip in img_paths:
                         src = Path(ip).resolve()
                         file_ext = src.suffix.lower()
-                        # Use attached_files subfolder for all attached files
                         attached_files_dir = Path(project_dir) / "attached_files"
                         attached_files_dir.mkdir(exist_ok=True)
                         dest = attached_files_dir / src.name
@@ -4029,37 +4250,53 @@ async def _handle_claude_generation(
                         try:
                             shutil.copy2(str(src), str(dest))
                             copied = True
-                            # For local mode, describe from project_dir where CC can access it
-                            if use_ollama and copied:
-                                src = dest
                         except Exception as e:
                             print(
                                 f"[UPLOAD] Failed to copy file {src.name} to attached_files/: {e}"
                             )
-                        if use_ollama:
-                            # Local mode: describe image via Ollama's native multimodal API
-                            # since CC's view_image tool returns file paths that local models can't parse
-                            if file_ext in _IMAGE_EXTS:
-                                try:
-                                    await _ws_send(conv_id, {"type": "status", "text": f"Describing image {src.name}..."})
-                                    desc = await asyncio.wait_for(describe_image(str(src), model=config.vision_model or None, context=_describe_context), timeout=120)
-                                    file_notes.append(f"[Image: {desc}]")
-                                    desc_map[src.name] = desc
-                                except asyncio.TimeoutError:
-                                    print(f"[DESCRIBE] Timed out describing {src.name} (30s)")
-                                    file_notes.append("[Image shared but description timed out]")
-                                except Exception as e:
-                                    print(f"[DESCRIBE] Failed to describe image {src.name}: {e}")
-                                    file_notes.append("[Image shared but description unavailable]")
-                            else:
+                        if file_ext in _IMAGE_EXTS and copied:
+                            image_files.append((src.name, dest))
+                        if use_llama:
+                            if file_ext not in _IMAGE_EXTS:
                                 file_notes.append(f"{src.name} (in attached_files/)")
                         else:
                             if copied:
-                                file_notes.append(
-                                    f"{src.name} (in attached_files/)"
-                                )
+                                file_notes.append(f"{src.name} (in attached_files/)")
                             else:
                                 file_notes.append(str(src).replace("\\", "/"))
+
+                    # Step 2: Describe images (runs ONCE)
+                    desc_map: dict[str, str] = {}
+                    if use_llama and image_files:
+                        _describe_model = config.vision_model or config.llama_model
+                        await _ws_send(conv_id, {
+                            "type": "describe_start",
+                            "parent_msg_id": last_user_msg["id"],
+                            "image_count": len(image_files),
+                            "model": _describe_model,
+                            "started_at": _time.time()
+                        })
+                        _describe_start = _time.time()
+                        for orig_name, attached_path in image_files:
+                            try:
+                                await _ws_send(conv_id, {"type": "status", "text": f"Describing image {orig_name}..."})
+                                desc = await asyncio.wait_for(describe_image(str(attached_path), model=config.vision_model or None, context=_describe_context), timeout=120)
+                                file_notes.append(f"[Image: {desc}]")
+                                desc_map[orig_name] = desc
+                            except asyncio.TimeoutError:
+                                print(f"[DESCRIBE] Timed out describing {orig_name} (120s)")
+                            except Exception as e:
+                                print(f"[DESCRIBE] Failed to describe image {orig_name}: {e}")
+                        _describe_elapsed = (_time.time() - _describe_start) * 1000
+                        await _ws_send(conv_id, {
+                            "type": "describe_done",
+                            "parent_msg_id": last_user_msg["id"],
+                            "descriptions": desc_map,
+                            "model": _describe_model,
+                            "elapsed_ms": _describe_elapsed
+                        })
+
+                    # Step 3: Persist
                     if desc_map:
                         try:
                             await db.update_message_image_alt(
@@ -4069,10 +4306,26 @@ async def _handle_claude_generation(
                                 "type": "image_describe",
                                 "message_id": last_user_msg["id"],
                                 "descriptions": desc_map,
-                                "model": config.vision_model or None,
+                                "model": _describe_model,
                             })
                         except Exception as e:
                             print(f"[DESCRIBE] Failed to persist/emit descriptions: {e}")
+
+                        if not _describe_msg_id:
+                            _describe_content = f"[Image description — {_describe_model}]\n\n" + "\n\n".join(desc_map.values())
+                            _describe_msg = await db.add_message(
+                                conv_id, "system", _describe_content,
+                                parent_id=last_user_msg["id"]
+                            )
+                            _describe_msg_id = _describe_msg["id"]
+                            if draft_msg_id:
+                                _db = await db.get_db()
+                                await _db.execute(
+                                    "UPDATE messages SET parent_id = ? WHERE id = ?",
+                                    (_describe_msg_id, draft_msg_id),
+                                )
+                                await _db.commit()
+
                     if file_notes:
                         files_str = "\n".join(f"  • {note}" for note in file_notes)
                         _has_img = any(note.startswith("[Image") for note in file_notes)
@@ -4087,10 +4340,7 @@ async def _handle_claude_generation(
                 model=cc_model,
                 effort=cc_effort,
                 permission_mode=cc_permission_mode,
-                use_ollama=use_ollama,
-                use_vllm=use_vllm,
-                vllm_base_url=config.vllm_host if use_vllm else None,
-                vllm_model_alias=cc_model if use_vllm else None,
+                use_llama=use_llama,
                 backstage_parent_id=conv.get("backstage_parent_id"),
             )
             _active_claude_procs[conv_id] = proc
@@ -4281,13 +4531,13 @@ async def _handle_claude_generation(
             provider_name = (
                 "Gemini CLI"
                 if is_gemini
-                else ("Ollama" if use_ollama else "Claude Code")
+                else ("Llama Server" if use_llama else "Claude Code")
             )
             error_msg = (
                 result_info.get("error") or f"{provider_name} exited with no response"
             )
-            if use_ollama:
-                error_msg += f" — check that '{cc_model}' is available in Ollama"
+            if use_llama:
+                error_msg += f" — check that llama-server is running with '{cc_model}'"
             content = f"[Error: {error_msg}]"
             if rate_limit_data:
                 content += _format_rate_limit_note(rate_limit_data)
@@ -4334,8 +4584,8 @@ async def _handle_claude_generation(
         # Record what CC actually ran (from session_info), not just what we asked
         # for. If CC silently downgraded (usage cap, availability), surface it.
         resolved_model = actual_model or cc_model
-        if use_ollama:
-            model_used_field = f"{cc_model}@ollama"
+        if use_llama:
+            model_used_field = f"{cc_model}@llama-server"
         else:
             model_used_field = resolved_model
 
@@ -4588,13 +4838,14 @@ def _build_claude_history_prompt(branch: list[dict], project_dir: Path = None) -
 async def _handle_local_generation(
     websocket: WebSocket, conv_id: int, conv: dict, data: dict
 ):
-    """Handle Local mode: Claude Code launched via 'ollama launch claude'."""
-    # Local mode = Claude Code powered by a local Ollama model.
-    # Reuse the full CC handler but with use_ollama=True.
+    """Handle Local mode: Claude Code launched against llama-server."""
+    print(f"[LOCAL-GEN] Starting: conv_id={conv_id}, local_model={conv.get('local_model')}, action={data.get('action')}, parent_id={data.get('parent_id')}")
+    # Local mode = Claude Code powered by a local llama-server model.
+    # Reuse the full CC handler but with use_llama=True.
     conv = dict(conv)  # mutable copy
     # Map local_model into cc_model so _handle_claude_generation uses it
-    conv["cc_model"] = conv.get("local_model") or config.ollama_model
-    conv["_use_ollama"] = True
+    conv["cc_model"] = conv.get("local_model") or config.llama_model
+    conv["_use_llama"] = True
     await _handle_claude_generation(websocket, conv_id, conv, data)
 
 

@@ -47,6 +47,32 @@ def _reload_config():
             print(f"[ADMIN] config reload failed: {e}")
 
 
+def _get_llama_port() -> int:
+    """Get the llama-server port dynamically from config, falling back to 8000."""
+    _reload_config()
+    if _loom_config is not None and getattr(_loom_config, "llama_host", None):
+        try:
+            from urllib.parse import urlparse
+            url = _loom_config.llama_host_url()
+            parsed = urlparse(url)
+            if parsed.port:
+                return parsed.port
+        except Exception as e:
+            print(f"[ADMIN] Failed to parse llama_host port: {e}")
+    # Fallback to env or 8000
+    host = os.getenv("LLAMA_HOST", "http://localhost:8000")
+    try:
+        from urllib.parse import urlparse
+        if not host.startswith(("http://", "https://")):
+            host = f"http://{host}"
+        parsed = urlparse(host)
+        if parsed.port:
+            return parsed.port
+    except Exception:
+        pass
+    return 8000
+
+
 ADMIN_PORT = int(os.getenv("ADMIN_PORT", "3002"))
 
 # Known Loom instances to monitor
@@ -258,87 +284,67 @@ async def tool_auth_submit_code(request: Request):
 
 @app.post("/tools/clear-vram")
 async def tool_clear_vram():
-    """Unload all Ollama models from VRAM."""
+    """Stop llama-server to clear all VRAM."""
     lines = []
+    port = _get_llama_port()
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(f"http://127.0.0.1:{port}/v1/models")
+            if r.status_code == 200:
+                lines.append("Llama Server is running \u2014 stopping to free VRAM...")
+            else:
+                lines.append("Llama Server not responding (already stopped?).")
+    except Exception:
+        lines.append("Llama Server not reachable (already stopped).")
     try:
         r = subprocess.run(
-            ["ollama", "ps"],
+            ["taskkill", "/F", "/IM", "llama-server.exe", "/T"],
             capture_output=True, text=True, timeout=10,
         )
-        ps_output = r.stdout.strip()
-        lines.append(f"Before:\n{ps_output or '(no models loaded)'}")
-
-        # Parse loaded model names from 'ollama ps' output
-        models = []
-        for line in ps_output.split("\n")[1:]:  # skip header
-            parts = line.split()
-            if parts:
-                models.append(parts[0])
-
-        if not models:
-            lines.append("\nNo models loaded in VRAM.")
-        else:
-            for model in models:
-                try:
-                    # Generate with keep_alive=0 tells Ollama to unload immediately
-                    async with httpx.AsyncClient(timeout=10.0) as client:
-                        resp = await client.post(
-                            "http://127.0.0.1:11434/api/generate",
-                            json={"model": model, "keep_alive": 0},
-                        )
-                        lines.append(f"Unloaded {model}: {resp.status_code}")
-                except Exception as e:
-                    lines.append(f"Failed to unload {model}: {e}")
-
-        # Show state after
-        r2 = subprocess.run(
-            ["ollama", "ps"],
-            capture_output=True, text=True, timeout=10,
-        )
-        lines.append(f"\nAfter:\n{r2.stdout.strip() or '(no models loaded)'}")
-
-    except FileNotFoundError:
-        lines.append("ollama not found on PATH")
+        out = (r.stdout or r.stderr or "").strip()
+        lines.append(out or "llama-server.exe terminated.")
     except Exception as e:
-        lines.append(f"Error: {e}")
-
+        lines.append(f"taskkill failed: {e}")
+    _child_procs.pop("llama", None)
+    lines.append("VRAM freed.")
     return JSONResponse({"status": "ok", "output": "\n".join(lines)})
 
 
-@app.post("/tools/ollama-ps")
-async def tool_ollama_ps():
-    """Show currently loaded Ollama models."""
+@app.post("/tools/llama-status")
+async def tool_llama_status():
+    """Check if llama-server is running and show loaded model info."""
+    port = _get_llama_port()
     try:
-        r = subprocess.run(
-            ["ollama", "ps"],
-            capture_output=True, text=True, timeout=10,
-        )
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"http://127.0.0.1:{port}/v1/models")
+            if r.status_code == 200:
+                data = r.json()
+                models = [m["id"] for m in data.get("data", [])]
+                return JSONResponse({
+                    "status": "ok",
+                    "output": f"Llama Server running on :{port}\nLoaded: {', '.join(models) or '(none)'}",
+                })
+            return JSONResponse({"status": "ok", "output": f"Llama Server responded {r.status_code}"})
+    except Exception:
+        return JSONResponse({"status": "ok", "output": f"Llama Server is NOT running on :{port}"})
+
+
+@app.post("/tools/llama-models")
+async def tool_llama_models():
+    """List available .gguf model files from the models directory."""
+    from pathlib import Path
+    models_dir = Path(r"C:\LlamaServer\models")
+    try:
+        if not models_dir.exists():
+            return JSONResponse({"status": "error", "output": f"Models dir not found: {models_dir}"})
+        models = sorted(p.name for p in models_dir.glob("*.gguf"))
         return JSONResponse({
             "status": "ok",
-            "output": (r.stdout or r.stderr or "(no output)").strip(),
+            "output": "\n".join(models) if models else "(no .gguf files found)",
         })
-    except FileNotFoundError:
-        return JSONResponse({"status": "error", "output": "ollama not found on PATH"})
     except Exception as e:
         return JSONResponse({"status": "error", "output": str(e)})
 
-
-@app.post("/tools/ollama-models")
-async def tool_ollama_models():
-    """List available Ollama models."""
-    try:
-        r = subprocess.run(
-            ["ollama", "list"],
-            capture_output=True, text=True, timeout=10,
-        )
-        return JSONResponse({
-            "status": "ok",
-            "output": (r.stdout or r.stderr or "(no output)").strip(),
-        })
-    except FileNotFoundError:
-        return JSONResponse({"status": "error", "output": "ollama not found on PATH"})
-    except Exception as e:
-        return JSONResponse({"status": "error", "output": str(e)})
 
 
 COMFYUI_URL = "http://127.0.0.1:8188"
@@ -509,161 +515,142 @@ async def tool_comfyui_free():
                             lines.append(f"After:  {(vt - vf) / 1e9:.1f} / {vt / 1e9:.1f} GB VRAM used")
             except Exception:
                 pass
-
         return JSONResponse({"status": "ok", "output": "\n".join(lines)})
+
     except httpx.ConnectError:
         return JSONResponse({"status": "error", "output": "ComfyUI is not running (port 8188 not responding)"})
     except Exception as e:
         return JSONResponse({"status": "error", "output": f"Error: {e}"})
 
 
-# ── Ollama / ComfyUI process control ──────────────────────────────────────
+# ── Llama Server / ComfyUI process control ────────────────────────────────────
 # Tracked launches go in _child_procs under fixed keys so stop knows which
 # proc to kill if we started it. Stop also taskkills by image name as a
 # fallback (covers desktop-app-launched / pre-existing instances).
 
-OLLAMA_LAUNCH_CMD = os.getenv("OLLAMA_LAUNCH_CMD", "ollama serve")
+LLAMA_SERVER_EXE = os.getenv(
+    "LLAMA_SERVER_EXE",
+    r"C:\Users\exast\OneDrive\Documents\LS\bin\llama-server.exe",
+)
+LLAMA_MODELS_DIR = os.getenv("LLAMA_MODELS_DIR", r"C:\LlamaServer\models")
+LLAMA_PORT = 11434
+
 COMFYUI_LAUNCH_CMD = os.getenv(
     "COMFYUI_LAUNCH_CMD",
     r'"C:\Users\exast\Downloads\ComfyUI_windows_portable_nvidia\ComfyUI_windows_portable\run_nvidia_gpu.bat"',
 )
 
-VLLM_PORT = int(os.getenv("VLLM_PORT", "8000"))
+
+# ── Per-model configuration ────────────────────────────────────────────────
+# models_config.json lives next to admin_server.py.
+# Format: { "ModelName.gguf": { ctx_size: 150000, ngl: 999, flash_attn: true,
+#             kv_quant: "q8_0", threads: 8, batch: 2048, ubatch: 1024,
+#             mlock: false, extra_args: "--no-mmap" } }
+
+# Per-model config lives in project root (same file server.py writes).
+MODEL_CONFIG_PATH = Path(__file__).parent / "models_config.json"
 
 
-def _build_ollama_env(env: dict) -> dict:
-    """Apply operator-tuned Ollama env vars from config.json on top of inherited env.
-    Existing env entries win so users can still pin via shell."""
-    if _loom_config is None:
-        # No config import — keep historical hardcoded defaults so admin still works.
-        env.setdefault("OLLAMA_KV_CACHE_TYPE", "q8_0")
-        env.setdefault("OLLAMA_FLASH_ATTENTION", "1")
-        env.setdefault("OLLAMA_KEEP_ALIVE", "30m")
-        return env
-    cfg = _loom_config
-    env.setdefault("OLLAMA_KV_CACHE_TYPE", cfg.ollama_kv_cache_type)
-    env.setdefault("OLLAMA_FLASH_ATTENTION", "1" if cfg.ollama_flash_attention else "0")
-    env.setdefault("OLLAMA_KEEP_ALIVE", cfg.ollama_keep_alive)
-    env.setdefault("OLLAMA_NUM_PARALLEL", str(cfg.ollama_num_parallel))
-    env.setdefault("OLLAMA_MAX_LOADED_MODELS", str(cfg.ollama_max_loaded_models))
-    env.setdefault("OLLAMA_CONTEXT_LENGTH", str(cfg.ollama_context_length))
-    return env
+def _load_model_configs() -> dict:
+    if MODEL_CONFIG_PATH.exists():
+        try:
+            with open(MODEL_CONFIG_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
 
 
-def _build_vllm_cmd() -> str:
-    """Build the `vllm serve ...` command from saved config. Returns empty string
-    if no model is configured (caller must surface a friendly error)."""
-    # Operator can still hard-override the entire command via env.
-    override = os.getenv("VLLM_LAUNCH_CMD")
+def _get_model_config(model_name: str) -> dict:
+    """Get config for a model, auto-creating with defaults if missing."""
+    import re
+    cfg = _load_model_configs()
+    if model_name not in cfg:
+        m = re.search(r'(\d+)b', model_name, re.IGNORECASE)
+        if m:
+            size = int(m.group(1))
+            if size <= 3: ctx_size = 200000
+            elif size <= 8: ctx_size = 150000
+            elif size <= 14: ctx_size = 100000
+            elif size <= 27: ctx_size = 80000
+            elif size <= 70: ctx_size = 40000
+            else: ctx_size = 20000
+        else:
+            ctx_size = 150000
+        cfg[model_name] = {
+            "ctx_size": ctx_size,
+            "ngl": 999,
+            "flash_attn": True,
+            "kv_quant": "none",
+            "threads": None,
+            "batch": None,
+            "ubatch": None,
+            "mlock": False,
+            "mmproj": None,
+            "extra_args": "",
+        }
+    return cfg[model_name]
+
+
+def _build_llama_cmd(model_name: str | None = None) -> str:
+    """Build the llama-server launch command from per-model config."""
+    override = os.getenv("LLAMA_LAUNCH_CMD")
     if override:
         return override
+    _reload_config()
+    model = (model_name or
+             (os.getenv("LLAMA_MODEL") or
+              (_loom_config.llama_model if _loom_config else "Qwen3.6-27B-NVFP4.gguf"))).strip()
+    exe = (_loom_config.llama_server_exe if _loom_config else LLAMA_SERVER_EXE).strip()
+    models_dir = (_loom_config.llama_models_dir if _loom_config else LLAMA_MODELS_DIR).strip()
+    import os.path as _osp
+    model_path = model if _osp.isabs(model) else _osp.join(models_dir, model)
 
-    model = (os.getenv("VLLM_MODEL") or
-             (_loom_config.vllm_model if _loom_config else "")).strip()
-    if not model:
-        return ""
+    # Read per-model config
+    mc = _get_model_config(model)
+    port = _get_llama_port()
+    parts = [
+        f'"{exe}"',
+        f' -m "{model_path}"',
+        f' --port {port}',
+        f' --ctx-size {mc["ctx_size"]}',
+        f' --parallel 1',
+    ]
+    parts.append(f' -ngl {mc["ngl"]}')
+    parts.append(f' --flash-attn on' if mc["flash_attn"] else '')
+    if mc.get("kv_quant") and mc["kv_quant"] != "none":
+        kv_val = mc["kv_quant"].lower().replace("k", "q")
+        parts.append(f' --cache-type-k {kv_val} --cache-type-v {kv_val}')
+    if mc.get("threads"):
+        parts.append(f' --threads {mc["threads"]}')
+    if mc.get("batch"):
+        parts.append(f' --batch {mc["batch"]}')
+    if mc.get("ubatch"):
+        parts.append(f' --ubatch {mc["ubatch"]}')
+    if mc["mlock"]:
+        parts.append(' --mlock')
+    if mc.get("mmproj"):
+        mmproj_path = mc["mmproj"] if _osp.isabs(mc["mmproj"]) else _osp.join(models_dir, mc["mmproj"])
+        parts.append(f' --mmproj "{mmproj_path}"')
+    if mc.get("extra_args"):
+        parts.append(f' {mc["extra_args"]}')
+    return ''.join(parts)
 
-    # Pick which vllm binary to invoke. The config field is named "python path"
-    # for UX clarity, but vllm has no __main__ — we actually invoke vllm.exe
-    # from the same Scripts dir. If the operator pointed at python.exe, swap
-    # to the sibling vllm.exe; if they passed vllm.exe directly, use as-is;
-    # if empty, fall back to `vllm` on PATH.
-    vllm_py = (_loom_config.vllm_python_path if _loom_config else "").strip()
-    if vllm_py:
-        if vllm_py.lower().endswith("python.exe") or vllm_py.lower().endswith("python"):
-            vllm_exe = vllm_py.rsplit("/", 1)[0].rsplit("\\", 1)[0] + "/vllm.exe"
-        else:
-            vllm_exe = vllm_py
-        cmd_head = f'"{vllm_exe}" serve {model}'
-    else:
-        cmd_head = f"vllm serve {model}"
-    parts = [cmd_head, f"--port {VLLM_PORT}"]
-
-    if _loom_config is not None:
-        cfg = _loom_config
-        # vLLM accepts multiple --served-model-name values, so we register both:
-        #   1. The full HF id (so Weave/OODA dropdowns show a meaningful name)
-        #   2. The slash-free alias (so Claude Code can use it — CC chokes on "/")
-        # Both route to the same loaded model. Order matters for /v1/models —
-        # the FIRST name becomes the canonical id; we put the alias first so
-        # vllm-* prefix detection in the dispatcher stays predictable.
-        served_names = []
-        if cfg.vllm_served_name:
-            served_names.append(cfg.vllm_served_name)
-        if model and model not in served_names:
-            served_names.append(model)
-        if served_names:
-            parts.append("--served-model-name " + " ".join(served_names))
-        if cfg.vllm_quantization and cfg.vllm_quantization != "none":
-            parts.append(f"--quantization {cfg.vllm_quantization}")
-        if cfg.vllm_kv_cache_dtype and cfg.vllm_kv_cache_dtype != "auto":
-            parts.append(f"--kv-cache-dtype {cfg.vllm_kv_cache_dtype}")
-        parts.append(f"--max-model-len {cfg.vllm_max_model_len}")
-        parts.append(f"--gpu-memory-utilization {cfg.vllm_gpu_memory_utilization}")
-        parts.append(f"--max-num-seqs {cfg.vllm_max_num_seqs}")
-        if cfg.vllm_tensor_parallel_size > 1:
-            parts.append(f"--tensor-parallel-size {cfg.vllm_tensor_parallel_size}")
-        if cfg.vllm_enable_auto_tool_choice:
-            parts.append("--enable-auto-tool-choice")
-        if cfg.vllm_tool_call_parser and cfg.vllm_tool_call_parser != "none":
-            parts.append(f"--tool-call-parser {cfg.vllm_tool_call_parser}")
-        # Reasoning parser — required for Qwen3.6 thinking blocks + MTP.
-        if cfg.vllm_reasoning_parser and cfg.vllm_reasoning_parser != "none":
-            parts.append(f"--reasoning-parser {cfg.vllm_reasoning_parser}")
-        # Speculative / MTP config — passed verbatim. JSON gets quoted so the
-        # shell doesn't choke on the {} braces and embedded quotes.
-        spec = cfg.vllm_speculative_config.strip()
-        if spec:
-            spec_quoted = spec.replace('"', r'\"')
-            parts.append(f'--speculative-config "{spec_quoted}"')
-        # Override the chat template's enable_thinking default — Qwen3.6's
-        # template defaults to on, which produces multi-thousand-token reasoning
-        # prefixes before any text. Off here means CC requests get fast text;
-        # users opt in per-conv via chat_template_kwargs in their request.
-        thinking = "true" if cfg.vllm_thinking_default else "false"
-        parts.append(f'--default-chat-template-kwargs "{{\\"enable_thinking\\": {thinking}}}"')
-        if cfg.vllm_extra_args.strip():
-            parts.append(cfg.vllm_extra_args.strip())
-    else:
-        # Fallback when config isn't importable
-        extra = os.getenv("VLLM_EXTRA_ARGS",
-            "--quantization compressed-tensors --kv-cache-dtype fp8 --max-model-len 32768 "
-            "--gpu-memory-utilization 0.92 --enable-auto-tool-choice --tool-call-parser hermes")
-        parts.append(extra)
-    return " ".join(parts)
 
 
 def _spawn_detached(cmd: str, cwd: str | None = None) -> subprocess.Popen:
     """Spawn a long-running command in a detached process group on Windows.
-    Pulls Ollama tuning from config.json each time so saving the settings panel
-    takes effect on the next start without restarting admin.
-
-    Routes stdout/stderr to a per-service log file in the working tree so that
-    crashes and request errors are debuggable without a console window."""
+    Routes stdout/stderr to a per-service log file so crashes are debuggable."""
     _reload_config()
     env = os.environ.copy()
     log_name = None
-    if "ollama" in cmd.lower():
-        env = _build_ollama_env(env)
-        log_name = "ollama_admin.log"
-    if cmd.startswith("vllm ") or "vllm.exe" in cmd.lower() or "-m vllm" in cmd:
-        env.setdefault("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
-        # Force UTF-8 so vLLM's box-drawing banner doesn't crash logging on cp1252.
-        env.setdefault("PYTHONUTF8", "1")
-        # flashinfer on Windows requires an explicit CUDA root path. Auto-detect
-        # from CUDA_PATH (set by the toolkit installer) if CUDA_LIB_PATH isn't
-        # already in env. Without this, vLLM crashes during attention backend init.
-        cuda_root = env.get("CUDA_LIB_PATH") or env.get("CUDA_PATH") or env.get("CUDA_HOME")
-        if cuda_root:
-            env.setdefault("CUDA_LIB_PATH", cuda_root)
-            env.setdefault("CUDA_HOME", cuda_root)
-        log_name = "vllm_admin.log"
+    if "llama-server" in cmd.lower():
+        log_name = "llama_admin.log"
     if "comfyui" in cmd.lower() or "comfy" in cmd.lower():
         log_name = log_name or "comfyui_admin.log"
 
     log_dir = Path(__file__).parent
     if log_name:
-        # Truncate-on-spawn so we don't accrete logs from prior runs.
         log_path = log_dir / log_name
         log_handle = open(log_path, "w", encoding="utf-8", errors="replace")
         stdout_target = log_handle
@@ -672,7 +659,7 @@ def _spawn_detached(cmd: str, cwd: str | None = None) -> subprocess.Popen:
         stdout_target = subprocess.DEVNULL
         stderr_target = subprocess.DEVNULL
 
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         cmd,
         shell=True,
         cwd=cwd,
@@ -683,159 +670,95 @@ def _spawn_detached(cmd: str, cwd: str | None = None) -> subprocess.Popen:
         | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
     )
+    if log_name:
+        log_handle.close()
+    return proc
 
 
-@app.post("/tools/ollama-start")
-async def tool_ollama_start():
-    """Launch Ollama if not already running. Inherits current env."""
+@app.post("/tools/llama-start")
+async def tool_llama_start(model: str | None = None):
+    """Launch llama-server.exe with the currently configured model.
+    Pass ?model=<filename.gguf> to override the model for this run."""
+    port = _get_llama_port()
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
-            r = await client.get("http://127.0.0.1:11434/api/tags")
+            r = await client.get(f"http://127.0.0.1:{port}/v1/models")
             if r.status_code == 200:
-                return JSONResponse({"status": "ok", "output": "Ollama is already running on :11434"})
+                return JSONResponse({"status": "ok", "output": f"Llama Server is already running on :{port}"})
     except Exception:
         pass
+    _reload_config()
+    cmd = _build_llama_cmd(model)
     try:
-        proc = _spawn_detached(OLLAMA_LAUNCH_CMD)
-        _child_procs["ollama"] = proc
-        # Wait briefly for it to become reachable
-        for i in range(15):
+        proc = _spawn_detached(cmd)
+        _child_procs["llama"] = proc
+        # llama-server loads the model into VRAM before accepting requests
+        for i in range(90):
             await asyncio.sleep(1)
             try:
                 async with httpx.AsyncClient(timeout=2.0) as client:
-                    r = await client.get("http://127.0.0.1:11434/api/tags")
+                    r = await client.get(f"http://127.0.0.1:{port}/v1/models")
                     if r.status_code == 200:
                         return JSONResponse({
                             "status": "ok",
-                            "output": f"Ollama launched and ready after {i+1}s (PID {proc.pid}).",
+                            "output": f"Llama Server ready after {i+1}s (PID {proc.pid}).\nCmd: {cmd}",
                         })
             except Exception:
                 continue
         return JSONResponse({
             "status": "ok",
-            "output": f"Ollama launched (PID {proc.pid}) but not yet responding after 15s. May still be coming up.",
+            "output": f"Llama Server launched (PID {proc.pid}) but not responding after 90s. Large models may need more time.\nCmd: {cmd}",
         })
     except Exception as e:
-        return JSONResponse({"status": "error", "output": f"Failed to launch Ollama: {e}"})
+        return JSONResponse({"status": "error", "output": f"Failed to launch Llama Server: {e}\nCmd: {cmd}"})
 
 
-@app.post("/tools/ollama-stop")
-async def tool_ollama_stop():
-    """Kill all ollama.exe processes (and any tracked Ollama launch)."""
+@app.post("/tools/llama-stop")
+async def tool_llama_stop():
+    """Terminate tracked llama-server proc and kill any remaining llama-server.exe processes."""
     lines = []
-    proc = _child_procs.pop("ollama", None)
+    proc = _child_procs.pop("llama", None)
     if proc and proc.poll() is None:
         try:
             proc.terminate()
-            lines.append(f"Terminated tracked Ollama proc (PID {proc.pid}).")
+            lines.append(f"Terminated tracked Llama Server proc (PID {proc.pid}).")
         except Exception as e:
             lines.append(f"Failed to terminate tracked proc: {e}")
     try:
         r = subprocess.run(
-            ["taskkill", "/F", "/IM", "ollama.exe", "/T"],
+            ["taskkill", "/F", "/IM", "llama-server.exe", "/T"],
             capture_output=True, text=True, timeout=10,
         )
         out = (r.stdout or r.stderr or "").strip()
         lines.append(out or f"taskkill exit {r.returncode}")
     except Exception as e:
         lines.append(f"taskkill failed: {e}")
-    return JSONResponse({"status": "ok", "output": "\n".join(lines) or "No Ollama processes found."})
+    return JSONResponse({"status": "ok", "output": "\n".join(lines) or "No Llama Server processes found."})
 
 
-@app.post("/tools/vllm-start")
-async def tool_vllm_start():
-    """Launch vLLM (OpenAI-compat server) on VLLM_PORT if not already running.
-    The launch command is rebuilt from config.json each call so saved tuning
-    takes effect on the next start without restarting admin."""
-    _reload_config()
-    cmd = _build_vllm_cmd()
-    if not cmd:
-        return JSONResponse({
-            "status": "error",
-            "output": "vLLM model is not set. Either save a model in Settings → Advanced → vLLM, set VLLM_MODEL in env, or set VLLM_LAUNCH_CMD to the full command.",
-        })
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            r = await client.get(f"http://127.0.0.1:{VLLM_PORT}/v1/models")
-            if r.status_code == 200:
-                return JSONResponse({"status": "ok", "output": f"vLLM is already running on :{VLLM_PORT}"})
-    except Exception:
-        pass
-    try:
-        proc = _spawn_detached(cmd)
-        _child_procs["vllm"] = proc
-        # vLLM cold-start with model load can be 30-90s depending on size.
-        for i in range(120):
-            await asyncio.sleep(1)
-            try:
-                async with httpx.AsyncClient(timeout=2.0) as client:
-                    r = await client.get(f"http://127.0.0.1:{VLLM_PORT}/v1/models")
-                    if r.status_code == 200:
-                        return JSONResponse({
-                            "status": "ok",
-                            "output": f"vLLM launched and ready after {i+1}s (PID {proc.pid}).\nCmd: {cmd}",
-                        })
-            except Exception:
-                continue
-        return JSONResponse({
-            "status": "ok",
-            "output": f"vLLM launched (PID {proc.pid}) but not responding after 120s. Large models can need more — check again shortly.\nCmd: {cmd}",
-        })
-    except Exception as e:
-        return JSONResponse({
-            "status": "error",
-            "output": f"Failed to launch vLLM: {e}\n\nCmd: {cmd}",
-        })
-
-
-@app.post("/tools/vllm-stop")
-async def tool_vllm_stop():
-    """Terminate tracked vLLM proc; fall back to killing python on the port."""
-    lines = []
-    proc = _child_procs.pop("vllm", None)
-    if proc and proc.poll() is None:
-        try:
-            proc.terminate()
-            lines.append(f"Terminated tracked vLLM proc (PID {proc.pid}).")
-        except Exception as e:
-            lines.append(f"Failed to terminate tracked proc: {e}")
-    # Fallback: kill any python.exe whose command-line has 'vllm serve'
-    try:
-        r = subprocess.run(
-            ["wmic", "process", "where",
-             "name='python.exe' and CommandLine like '%vllm%serve%'",
-             "delete"],
-            capture_output=True, text=True, timeout=10,
-        )
-        out = (r.stdout or r.stderr or "").strip()
-        if out:
-            lines.append(out[:300])
-    except Exception as e:
-        lines.append(f"WMIC fallback failed: {e}")
-    return JSONResponse({"status": "ok", "output": "\n".join(lines) or "No vLLM processes found."})
-
-
-@app.post("/tools/vllm-restart")
-async def tool_vllm_restart():
-    """Stop the running vLLM (if any), wait for VRAM/port to free, then start
-    a fresh instance using the current saved config. Used by the Settings
-    panel's "Apply & Restart vLLM" button so changing vllm_model picks up
-    cleanly without an admin terminal."""
-    # Step 1 — tear down any existing instance
-    await tool_vllm_stop()
-    # Step 2 — give the socket and GPU a moment to release; vLLM holds onto
-    # the port for ~3-5s after the python procs exit.
-    for _ in range(10):
+@app.post("/tools/llama-restart")
+async def tool_llama_restart(model: str | None = None):
+    """Stop the running llama-server (if any), wait for port to free, then
+    start a fresh instance with the current config (or the provided model)."""
+    await tool_llama_stop()
+    await asyncio.sleep(2)  # Give Windows OS time to release the port socket
+    port = _get_llama_port()
+    for _ in range(8):
         await asyncio.sleep(1)
         try:
             async with httpx.AsyncClient(timeout=1.0) as client:
-                r = await client.get(f"http://127.0.0.1:{VLLM_PORT}/v1/models")
+                r = await client.get(f"http://127.0.0.1:{port}/v1/models")
                 if r.status_code != 200:
                     break
         except Exception:
             break
-    # Step 3 — start fresh from the latest config
-    return await tool_vllm_start()
+    return await tool_llama_start(model=model)
+
+
+
+
+
+
 
 
 @app.post("/tools/comfyui-start")
@@ -924,6 +847,244 @@ async def tool_disk_usage():
         "status": "ok",
         "output": "\n".join(lines) or "(no files found)",
     })
+
+
+def _run_powershell_cmd_sync(cmd: str) -> str:
+    """Run a PowerShell command synchronously."""
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", cmd],
+            capture_output=True, text=True, timeout=8,
+            cwd=str(Path(__file__).parent)
+        )
+        return proc.stdout or ""
+    except Exception as e:
+        return f"Error: {e}"
+
+
+async def run_powershell_cmd_async(cmd: str) -> str:
+    """Run a PowerShell command asynchronously using asyncio.to_thread."""
+    return await asyncio.to_thread(_run_powershell_cmd_sync, cmd)
+
+
+@app.post("/tools/system-specs")
+async def tool_system_specs():
+    """System specs diagnostic (CPU-Z / VRAM style)."""
+    # 1. CPU Query
+    cpu_info = {"Name": "Unknown CPU", "Cores": "?", "Threads": "?", "Speed": "?", "Load": "?"}
+    try:
+        cmd = "Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed | ConvertTo-Json"
+        out = await run_powershell_cmd_async(cmd)
+        if out.strip():
+            data = json.loads(out)
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            cpu_info["Name"] = data.get("Name", "Unknown CPU").strip()
+            cpu_info["Cores"] = data.get("NumberOfCores", "?")
+            cpu_info["Threads"] = data.get("NumberOfLogicalProcessors", "?")
+            cpu_info["Speed"] = data.get("MaxClockSpeed", "?")
+    except Exception as e:
+        cpu_info["Error"] = str(e)
+
+    # Get CPU Load
+    try:
+        cmd = "Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average"
+        out = await run_powershell_cmd_async(cmd)
+        if out.strip():
+            cpu_info["Load"] = int(out.strip())
+    except Exception:
+        pass
+
+    # 2. RAM Query
+    ram_info = {"TotalGB": 0, "FreeGB": 0, "UsedGB": 0, "PercentUsed": 0}
+    try:
+        cmd = "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory | ConvertTo-Json"
+        out = await run_powershell_cmd_async(cmd)
+        if out.strip():
+            data = json.loads(out)
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            total_kb = data.get("TotalVisibleMemorySize", 0)
+            free_kb = data.get("FreePhysicalMemory", 0)
+            if total_kb:
+                ram_info["TotalGB"] = total_kb / (1024 * 1024)
+                ram_info["FreeGB"] = free_kb / (1024 * 1024)
+                ram_info["UsedGB"] = ram_info["TotalGB"] - ram_info["FreeGB"]
+                ram_info["PercentUsed"] = (ram_info["UsedGB"] / ram_info["TotalGB"]) * 100
+    except Exception as e:
+        ram_info["Error"] = str(e)
+
+    # 3. GPU/VRAM Query
+    gpu_list = []
+    has_nvidia = False
+
+    # Try nvidia-smi first
+    try:
+        def _run_nvidia_smi():
+            return subprocess.run(
+                ["nvidia-smi", "--query-gpu=gpu_name,memory.total,memory.used,memory.free,driver_version", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+                cwd=str(Path(__file__).parent)
+            )
+        proc = await asyncio.to_thread(_run_nvidia_smi)
+        if proc.returncode == 0 and proc.stdout.strip():
+            has_nvidia = True
+            for line in proc.stdout.strip().split("\n"):
+                if not line.strip():
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 5:
+                    name = parts[0]
+                    total_mib = float(parts[1])
+                    used_mib = float(parts[2])
+                    free_mib = float(parts[3])
+                    driver = parts[4]
+                    percent_used = (used_mib / total_mib) * 100 if total_mib else 0
+                    gpu_list.append({
+                        "Source": "nvidia-smi",
+                        "Name": name,
+                        "TotalGB": total_mib / 1024,
+                        "UsedGB": used_mib / 1024,
+                        "FreeGB": free_mib / 1024,
+                        "PercentUsed": percent_used,
+                        "Driver": driver
+                    })
+    except Exception:
+        pass
+
+    # If nvidia-smi failed or returned nothing, try Win32_VideoController fallback
+    if not has_nvidia:
+        try:
+            cmd = "Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM, DriverVersion | ConvertTo-Json"
+            out = await run_powershell_cmd_async(cmd)
+            if out.strip():
+                data = json.loads(out)
+                if not isinstance(data, list):
+                    data = [data]
+                for item in data:
+                    name = item.get("Name", "Unknown GPU")
+                    raw_ram = item.get("AdapterRAM", 0)
+                    driver = item.get("DriverVersion", "Unknown")
+                    ram_gb = raw_ram / (1024 * 1024 * 1024) if raw_ram and raw_ram > 0 else 0
+                    gpu_list.append({
+                        "Source": "WMI",
+                        "Name": name,
+                        "TotalGB": ram_gb,
+                        "UsedGB": 0,
+                        "FreeGB": 0,
+                        "PercentUsed": 0,
+                        "Driver": driver
+                    })
+        except Exception:
+            pass
+
+    # Build the HTML output
+    html = []
+
+    # ── CPU CARD ──
+    cpu_speed_ghz = f"{cpu_info['Speed']}"
+    if isinstance(cpu_info['Speed'], (int, float)):
+        cpu_speed_ghz = f"{cpu_info['Speed']/1000:.2f} GHz"
+    elif isinstance(cpu_info['Speed'], str) and cpu_info['Speed'].isdigit():
+        cpu_speed_ghz = f"{int(cpu_info['Speed'])/1000:.2f} GHz"
+        
+    cpu_load_section = ""
+    if cpu_info['Load'] != "?":
+        cpu_load_section = f"""
+        <div class="spec-bar-container">
+            <div class="spec-bar-label"><span>Current Load</span><span>{cpu_info['Load']}%</span></div>
+            <div class="spec-bar-track">
+                <div class="spec-bar-fill fill-cpu" style="width: {cpu_info['Load']}%"></div>
+            </div>
+        </div>
+        """
+    html.append(f"""
+    <div class="spec-card">
+        <div class="spec-header">
+            <span class="spec-icon">&#128187;</span>
+            <span class="spec-title">CPU Check</span>
+        </div>
+        <div class="spec-body">
+            <div class="spec-row"><span class="spec-lbl">Processor:</span> <span class="spec-val">{cpu_info['Name']}</span></div>
+            <div class="spec-row"><span class="spec-lbl">Cores / Threads:</span> <span class="spec-val">{cpu_info['Cores']} Cores / {cpu_info['Threads']} Threads</span></div>
+            <div class="spec-row"><span class="spec-lbl">Base/Max Speed:</span> <span class="spec-val">{cpu_speed_ghz}</span></div>
+            {cpu_load_section}
+        </div>
+    </div>
+    """)
+
+    # ── RAM CARD ──
+    ram_section = ""
+    if ram_info["TotalGB"] > 0:
+        ram_section = f"""
+        <div class="spec-row"><span class="spec-lbl">Total Installed:</span> <span class="spec-val">{ram_info['TotalGB']:.2f} GB</span></div>
+        <div class="spec-row"><span class="spec-lbl">Memory In Use:</span> <span class="spec-val">{ram_info['UsedGB']:.2f} GB</span></div>
+        <div class="spec-row"><span class="spec-lbl">Memory Free:</span> <span class="spec-val">{ram_info['FreeGB']:.2f} GB</span></div>
+        <div class="spec-bar-container">
+            <div class="spec-bar-label"><span>Utilization</span><span>{ram_info['PercentUsed']:.1f}%</span></div>
+            <div class="spec-bar-track">
+                <div class="spec-bar-fill fill-ram" style="width: {ram_info['PercentUsed']}%"></div>
+            </div>
+        </div>
+        """
+    else:
+        ram_section = f"<div class='spec-error'>Failed to load RAM details</div>"
+    html.append(f"""
+    <div class="spec-card">
+        <div class="spec-header">
+            <span class="spec-icon">&#128190;</span>
+            <span class="spec-title">System Memory (RAM)</span>
+        </div>
+        <div class="spec-body">
+            {ram_section}
+        </div>
+    </div>
+    """)
+
+    # ── GPU / VRAM CARDS ──
+    for idx, gpu in enumerate(gpu_list):
+        gpu_details = ""
+        if gpu["Source"] == "nvidia-smi":
+            gpu_details = f"""
+            <div class="spec-row"><span class="spec-lbl">Model:</span> <span class="spec-val" style="color:#0f6; font-weight:600;">{gpu['Name']}</span></div>
+            <div class="spec-row"><span class="spec-lbl">Driver Version:</span> <span class="spec-val">{gpu['Driver']}</span></div>
+            <div class="spec-row"><span class="spec-lbl">Total VRAM:</span> <span class="spec-val">{gpu['TotalGB']:.2f} GB</span></div>
+            <div class="spec-row"><span class="spec-lbl">Used VRAM:</span> <span class="spec-val">{gpu['UsedGB']:.2f} GB</span></div>
+            <div class="spec-row"><span class="spec-lbl">Free VRAM:</span> <span class="spec-val">{gpu['FreeGB']:.2f} GB</span></div>
+            <div class="spec-bar-container">
+                <div class="spec-bar-label"><span>VRAM Utilization</span><span>{gpu['PercentUsed']:.1f}%</span></div>
+                <div class="spec-bar-track">
+                    <div class="spec-bar-fill fill-gpu" style="width: {gpu['PercentUsed']}%"></div>
+                </div>
+            </div>
+            """
+        else:
+            ram_str = f"{gpu['TotalGB']:.2f} GB" if gpu['TotalGB'] > 0 else "N/A or Dynamic"
+            gpu_details = f"""
+            <div class="spec-row"><span class="spec-lbl">Model:</span> <span class="spec-val">{gpu['Name']}</span></div>
+            <div class="spec-row"><span class="spec-lbl">Driver Version:</span> <span class="spec-val">{gpu['Driver']}</span></div>
+            <div class="spec-row"><span class="spec-lbl">Reported Video RAM:</span> <span class="spec-val">{ram_str}</span></div>
+            <div class="spec-note" style="font-size:10px; color:#666; margin-top:8px;">* Detailed VRAM metrics require an active NVIDIA driver and nvidia-smi tool.</div>
+            """
+
+        html.append(f"""
+        <div class="spec-card">
+            <div class="spec-header">
+                <span class="spec-icon">&#128451;</span>
+                <span class="spec-title">GPU {idx}: {gpu['Name'].split(' ')[0]}</span>
+            </div>
+            <div class="spec-body">
+                {gpu_details}
+            </div>
+        </div>
+        """)
+
+    wrapped_html = f"""
+    <div class="specs-grid">
+        {"".join(html)}
+    </div>
+    """
+    return JSONResponse({"status": "ok_html", "output": wrapped_html})
 
 
 @app.websocket("/ws/terminal")
@@ -1066,6 +1227,27 @@ async def dashboard():
     .quick-links {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }}
     .quick-link {{ padding: 8px 14px; border: 1px solid #0ff; border-radius: 6px; color: #0ff; text-decoration: none; font-size: 13px; background: rgba(0,255,255,0.05); transition: 0.2s; }}
     .quick-link:hover {{ background: rgba(0,255,255,0.18); }}
+    
+    /* System Specs Styles */
+    .specs-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 10px; font-family: 'Segoe UI', sans-serif; }}
+    .spec-card {{ background: rgba(255,255,255,0.02); border: 1px solid rgba(0,255,255,0.1); border-radius: 8px; padding: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); transition: transform 0.2s, border-color 0.2s; }}
+    .spec-card:hover {{ transform: translateY(-2px); border-color: rgba(0,255,255,0.3); background: rgba(255,255,255,0.04); }}
+    .spec-header {{ display: flex; align-items: center; gap: 8px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 8px; margin-bottom: 12px; }}
+    .spec-icon {{ font-size: 20px; }}
+    .spec-title {{ font-size: 14px; font-weight: bold; color: #0ff; text-transform: uppercase; letter-spacing: 0.5px; }}
+    .spec-body {{ display: flex; flex-direction: column; gap: 6px; }}
+    .spec-row {{ display: flex; justify-content: space-between; font-size: 12px; }}
+    .spec-lbl {{ color: #888; }}
+    .spec-val {{ color: #fff; font-weight: 500; text-align: right; }}
+    .spec-bar-container {{ margin-top: 12px; }}
+    .spec-bar-label {{ font-size: 11px; color: #aaa; margin-bottom: 4px; display: flex; justify-content: space-between; }}
+    .spec-bar-track {{ background: rgba(255,255,255,0.08); height: 8px; border-radius: 4px; overflow: hidden; border: 1px solid rgba(255,255,255,0.05); }}
+    .spec-bar-fill {{ height: 100%; border-radius: 4px; transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1); }}
+    .fill-cpu {{ background: linear-gradient(90deg, #00c6ff, #0072ff); box-shadow: 0 0 8px rgba(0, 198, 255, 0.5); }}
+    .fill-ram {{ background: linear-gradient(90deg, #00f2fe, #4facfe); box-shadow: 0 0 8px rgba(0, 242, 254, 0.5); }}
+    .fill-gpu {{ background: linear-gradient(90deg, #f9d423, #ff4e50); box-shadow: 0 0 8px rgba(255, 78, 80, 0.5); }}
+    .spec-error {{ font-size: 12px; color: #f66; padding: 10px; background: rgba(255,102,102,0.1); border-radius: 4px; text-align: center; }}
+    #tool-output.html-mode {{ font-family: inherit; color: inherit; white-space: normal; background: #0d0d21; border-color: rgba(0,255,255,0.15); max-height: none; }}
 </style>
 </head>
 <body>
@@ -1074,7 +1256,7 @@ async def dashboard():
 <div class="quick-links">
     <a href="https://localhost:3000" target="_blank" class="quick-link">&#127760; Main Loom (:3000)</a>
     <a href="http://localhost:3001" target="_blank" class="quick-link">&#129514; Test Server (:3001)</a>
-    <a href="http://localhost:11434" target="_blank" class="quick-link">&#129303; Ollama (:11434)</a>
+    <a href="http://localhost:{_get_llama_port()}" target="_blank" class="quick-link">&#129303; Llama Server (:{_get_llama_port()})</a>
     <a href="http://localhost:8188" target="_blank" class="quick-link">&#127912; ComfyUI (:8188)</a>
 </div>
 
@@ -1107,29 +1289,25 @@ async def dashboard():
         <span class="icon">&#128165;</span> Clear VRAM
         <span class="label">Unload all models</span>
     </button>
-    <button class="tool-btn" onclick="runTool('ollama-ps')">
-        <span class="icon">&#128202;</span> Ollama PS
-        <span class="label">Loaded models</span>
+    <button class="tool-btn" onclick="runTool('llama-status')">
+        <span class="icon">&#128202;</span> Llama Status
+        <span class="label">Running server info</span>
     </button>
-    <button class="tool-btn" onclick="runTool('ollama-models')">
+    <button class="tool-btn" onclick="runTool('llama-models')">
         <span class="icon">&#128451;</span> Model List
-        <span class="label">Available models</span>
+        <span class="label">Available .gguf files</span>
     </button>
-    <button class="tool-btn" onclick="runTool('ollama-start')">
-        <span class="icon">&#9658;</span> Start Ollama
-        <span class="label">Launch ollama serve</span>
+    <button class="tool-btn" onclick="runTool('llama-start')">
+        <span class="icon">&#9658;</span> Start Llama
+        <span class="label">Launch llama-server</span>
     </button>
-    <button class="tool-btn" onclick="confirmTool('ollama-stop', 'Kill all ollama.exe processes?')">
-        <span class="icon">&#9209;</span> Stop Ollama
-        <span class="label">Kill all ollama.exe</span>
+    <button class="tool-btn" onclick="confirmTool('llama-stop', 'Stop Llama Server?')">
+        <span class="icon">&#9209;</span> Stop Llama
+        <span class="label">Terminate llama-server</span>
     </button>
-    <button class="tool-btn" onclick="runTool('vllm-start')">
-        <span class="icon">&#9658;</span> Start vLLM
-        <span class="label">vllm serve (NVFP4)</span>
-    </button>
-    <button class="tool-btn" onclick="confirmTool('vllm-stop', 'Stop vLLM server?')">
-        <span class="icon">&#9209;</span> Stop vLLM
-        <span class="label">Terminate vLLM process</span>
+    <button class="tool-btn" onclick="runTool('llama-restart')">
+        <span class="icon">&#128260;</span> Restart Llama
+        <span class="label">Stop + start llama-server</span>
     </button>
     <button class="tool-btn" onclick="runTool('comfyui-status')">
         <span class="icon">&#127912;</span> ComfyUI Status
@@ -1150,6 +1328,10 @@ async def dashboard():
     <button class="tool-btn" onclick="runTool('disk-usage')">
         <span class="icon">&#128190;</span> Disk Usage
         <span class="label">DB &amp; log sizes</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('system-specs')">
+        <span class="icon">&#128187;</span> System Specs
+        <span class="label">CPU-Z / VRAM check</span>
     </button>
 </div>
 <div id="tool-output"></div>
@@ -1332,8 +1514,13 @@ async def dashboard():
                 }}
                 return;
             }}
-            out.textContent = d.output || '(no output)';
-            out.className = d.status === 'error' ? 'visible error' : 'visible';
+            if (d.status === 'ok_html') {{
+                out.innerHTML = d.output;
+                out.className = 'visible html-mode';
+            }} else {{
+                out.textContent = d.output || '(no output)';
+                out.className = d.status === 'error' ? 'visible error' : 'visible';
+            }}
         }} catch (e) {{
             out.textContent = 'Request failed: ' + e;
             out.className = 'visible error';
