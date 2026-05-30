@@ -537,6 +537,11 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             "Bash", "Glob", "Grep", "Agent",
             "WebSearch", "WebFetch",
         ]
+    # Llama/local models: block built-in WebSearch/WebFetch (require Anthropic API).
+    # The MCP web-tools server (registered below) provides keyless web_search/web_fetch
+    # via DuckDuckGo + trafilatura as the replacement.
+    if use_llama:
+        disallowed_list += ["WebSearch", "WebFetch"]
     cc_args = ["-p", prompt,
                "--output-format", "stream-json",
                "--include-partial-messages",
@@ -574,6 +579,22 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         backstage_md = Path(__file__).parent / "backstage.md"
         if backstage_md.exists():
             cc_args.extend(["--append-system-prompt", backstage_md.read_text(encoding="utf-8")])
+
+    # Llama/local models: register MCP web-tools so they get web_search/web_fetch
+    # via DuckDuckGo + trafilatura (keyless, no Anthropic API needed).
+    if use_llama:
+        web_tools_script = Path(__file__).parent / "mcp_web_tools.py"
+        if web_tools_script.is_file():
+            mcp_web_config = {
+                "mcpServers": {
+                    "web-tools": {
+                        "type": "stdio",
+                        "command": sys.executable,
+                        "args": [str(web_tools_script)],
+                    }
+                }
+            }
+            cc_args.extend(["--mcp-config", json.dumps(mcp_web_config)])
 
     # Always launch plain claude — use_llama overrides via env vars below.
     cc_args.extend(["--model", model, "--effort", effort])

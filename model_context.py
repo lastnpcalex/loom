@@ -30,6 +30,20 @@ def is_1m_anthropic(model_id: str) -> bool:
     return "[1m]" in m
 
 
+def is_anthropic(model_id: str) -> bool:
+    """True for any Anthropic value Loom surfaces in the dropdown — either the
+    sonnet/opus/haiku alias or a full `claude-<family>-...` ID, with optional
+    `[1m]` suffix. Used by routing to decide between cloud Anthropic, Gemini,
+    and local-llama paths."""
+    if not model_id:
+        return False
+    base = model_id.split("[")[0] if "[" in model_id else model_id
+    bl = base.lower()
+    if bl in ("sonnet", "opus", "haiku"):
+        return True
+    return bl.startswith(("claude-opus-", "claude-sonnet-", "claude-haiku-"))
+
+
 def is_gemini(model_id: str) -> bool:
     if not model_id:
         return False
@@ -60,11 +74,7 @@ def is_local_ollama(model_id: str) -> bool:
     come through CC in Braid mode with `use_ollama=True`."""
     if not model_id:
         return False
-    if is_gemini(model_id) or is_vllm(model_id):
-        return False
-    m = model_id.lower()
-    # Anthropic shortcodes Loom uses: sonnet, haiku, opus (with optional [1m])
-    if m.startswith(("sonnet", "haiku", "opus")):
+    if is_gemini(model_id) or is_vllm(model_id) or is_anthropic(model_id):
         return False
     return True
 

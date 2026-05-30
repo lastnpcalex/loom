@@ -6,7 +6,7 @@
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
-A self-hosted web interface for branching AI conversations across Claude Code, Gemini CLI, and local Ollama models — and for handing off between them mid-conversation. Every conversation is a tree — branch, fork, regenerate, and full-text search across every path without losing anything.
+A self-hosted web interface for branching AI conversations across Claude Code, Antigravity (agy), and local Ollama models — and for handing off between them mid-conversation. Every conversation is a tree — branch, fork, regenerate, and full-text search across every path without losing anything.
 
 ## What is a loom?
 
@@ -14,7 +14,7 @@ An LLM loom treats every conversation as a **tree, not a thread**. Each message 
 
 This matters because LLM output is non-deterministic. The same prompt can produce a brilliant answer on one roll and a mediocre one on the next. A linear chat hides that variance — you see one path and lose the rest. A loom preserves them all. Regenerate five times, keep the best, branch from the second-best later. Edit a message from ten turns ago and watch the conversation diverge. The tree is the conversation's real shape; a single thread is just one path through it.
 
-A Shadow Loom applies this to four backends — Claude Code, Gemini CLI, local Ollama models, and Ollama-powered Claude Code (Braid) — with a shared branching infrastructure, persistent storage, and full-text search across everything.
+A Shadow Loom applies this to four backends — Claude Code, Antigravity (agy), local Ollama models, and Ollama-powered Claude Code (Braid) — with a shared branching infrastructure, persistent storage, and full-text search across everything.
 
 ## Search
 
@@ -92,13 +92,13 @@ Connects to the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code
 - Per-turn and cumulative cost tracking
 - Image attachments via the Read tool or clipboard paste (Ctrl+V)
 
-### Gemini — Gemini CLI in the browser
+### Gemini — Antigravity (agy) in the browser
 
-Connects to the [Gemini CLI](https://github.com/google-gemini/gemini-cli) as a subprocess, using the same loom infrastructure as Claude Code. Supports Gemini 2.5 and 3.x model families.
+Connects to the [Antigravity CLI](https://github.com/google-gemini/gemini-cli) as a subprocess, using the same loom infrastructure as Claude Code. Supports Gemini 2.5, 3.x, and Claude/GPT-OSS model families.
 
 - Same tool call rendering, streaming, and permission proxying as Loom mode
-- Model selection: Gemini 2.5 Pro/Flash/Flash Lite, Gemini 3 Flash Preview, Gemini 3.1 Pro/Flash Lite Preview
-- Permission hook handles both Claude (`PreToolUse`) and Gemini (`BeforeTool`) formats
+- Model selection: Gemini 3.5 Flash, Gemini 3.1 Pro, Claude Sonnet/Opus (Thinking), GPT-OSS 120B
+- Permission hook handles both Claude (`PreToolUse`) and agy (`PreToolUse`) formats
 
 #### Cross-provider switching
 
@@ -210,7 +210,7 @@ Open `https://localhost:3000` in your browser.
 
 For Loom mode, ensure the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) is installed and on PATH with an active subscription or API key.
 
-For Gemini mode, ensure the [Gemini CLI](https://github.com/google-gemini/gemini-cli) is installed and on PATH with authentication configured.
+For Gemini mode, ensure [Antigravity (agy)](https://github.com/google-gemini/gemini-cli) is installed and on PATH with authentication configured.
 
 For Braid/Weave modes, ensure [Ollama](https://ollama.com) is installed with a model pulled (e.g. `ollama pull qwen3.5:9b`).
 
@@ -240,7 +240,7 @@ ooda_harness.py        -- OODA loop: XML parser, state executors, prompt builder
 character_loader.py    -- Parse/save character, persona, and lore .md files
 ollama_client.py       -- Ollama API client (chat streaming, image description)
 claude_client.py       -- Claude Code CLI subprocess wrapper, NDJSON stream parser
-gemini_client.py       -- Gemini CLI subprocess wrapper, NDJSON stream parser
+gemini_client.py       -- Antigravity (agy) subprocess wrapper, plain text collector
 cc_permission_hook.py  -- PreToolUse/BeforeTool hook script for browser-based permission prompts
 mcp_web_tools.py       -- MCP stdio server: web_search (DuckDuckGo) + web_fetch (trafilatura) for local models
 admin_server.py        -- Admin dashboard for managing Loom instances

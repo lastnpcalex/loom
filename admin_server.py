@@ -21,6 +21,23 @@ import sys
 import time
 from pathlib import Path
 
+# Monkey-patch asyncio ProactorEventLoop to suppress Windows-specific ConnectionResetError
+if sys.platform == "win32":
+    try:
+        from asyncio.proactor_events import _ProactorBasePipeTransport
+        _orig_call_connection_lost = _ProactorBasePipeTransport._call_connection_lost
+
+        def _patched_call_connection_lost(self, exc):
+            try:
+                _orig_call_connection_lost(self, exc)
+            except (ConnectionResetError, OSError, ConnectionAbortedError):
+                pass
+
+        _ProactorBasePipeTransport._call_connection_lost = _patched_call_connection_lost
+    except Exception:
+        pass
+
+
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
@@ -537,7 +554,11 @@ LLAMA_PORT = 11434
 
 COMFYUI_LAUNCH_CMD = os.getenv(
     "COMFYUI_LAUNCH_CMD",
-    "run_nvidia_gpu.bat",
+    "py -3.12 main.py --listen --use-pytorch-cross-attention",
+)
+COMFYUI_LAUNCH_CWD = os.getenv(
+    "COMFYUI_LAUNCH_CWD",
+    r"C:\ComfyUI2\ComfyUI",
 )
 
 
@@ -772,7 +793,7 @@ async def tool_comfyui_start():
     except Exception:
         pass
     try:
-        proc = _spawn_detached(COMFYUI_LAUNCH_CMD)
+        proc = _spawn_detached(COMFYUI_LAUNCH_CMD, cwd=COMFYUI_LAUNCH_CWD)
         _child_procs["comfyui"] = proc
         # Wait briefly for it to become reachable (ComfyUI cold-starts can be slow)
         for i in range(30):
@@ -794,7 +815,7 @@ async def tool_comfyui_start():
     except Exception as e:
         return JSONResponse({
             "status": "error",
-            "output": f"Failed to launch ComfyUI: {e}\n\nCommand: {COMFYUI_LAUNCH_CMD}\nSet env COMFYUI_LAUNCH_CMD to override.",
+            "output": f"Failed to launch ComfyUI: {e}\n\nCommand: {COMFYUI_LAUNCH_CMD}\nCWD: {COMFYUI_LAUNCH_CWD}\nSet env COMFYUI_LAUNCH_CMD or COMFYUI_LAUNCH_CWD to override.",
         })
 
 

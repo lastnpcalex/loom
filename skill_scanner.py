@@ -63,10 +63,14 @@ BUILTIN_COMMANDS = [
      "prompt_template": "Show what files and context are currently included in this conversation. {args}"},
     {"name": "memory",          "command": "/memory",          "description": "View or edit CLAUDE.md project memory", "mode": "headless",
      "prompt_template": "Show or update the project memory (CLAUDE.md). {args}"},
-    {"name": "plan",            "command": "/plan",            "description": "Create or review an implementation plan for a task", "mode": "headless",
-     "prompt_template": "Create a detailed implementation plan for: {args}. Break it down into steps, identify files to change, and note any risks."},
-    {"name": "tasks",           "command": "/tasks",           "description": "View or manage the current task list / todo items", "mode": "headless",
-     "prompt_template": "Show the current task list and their status. {args}"},
+    {"name": "plan",            "command": "/plan",            "description": "Create or review an implementation plan for a task", "mode": "meta",
+     "prompt_template": None},
+    {"name": "tasks",           "command": "/tasks",           "description": "View or manage the current task list / todo items", "mode": "meta",
+     "prompt_template": None},
+    {"name": "artifacts",       "command": "/artifacts",       "description": "List all standard project plans and artifacts", "mode": "meta",
+     "prompt_template": None},
+    {"name": "artifact",        "command": "/artifact",        "description": "Preview a specific project plan or artifact", "mode": "meta",
+     "prompt_template": None},
 
     # ── API & SDK ──
     {"name": "claude-api",      "command": "/claude-api",      "description": "Help building apps with the Claude API or Anthropic SDK", "mode": "headless",

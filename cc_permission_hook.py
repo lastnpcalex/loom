@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """PreToolUse / BeforeTool hook -> Loom HTTP bridge.
 
-Works with both Claude Code (PreToolUse) and Gemini CLI (BeforeTool).
+Works with both Claude Code (PreToolUse) and Antigravity/agy (PreToolUse).
 Routes tool permission decisions through Loom's HTTP API so the user
 can approve/deny in the browser UI.
 
 Claude Code output format:
   {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow/deny", ...}}
 
-Gemini CLI output format:
+Antigravity (agy) output format:
   {"decision": "allow/deny", "reason": "..."}
 
-Environment variables (set by Loom when launching CC/Gemini):
+Environment variables (set by Loom when launching CC/agy):
   LOOM_PORT: Port of the Loom server (default: 3000)
   LOOM_CONV_ID: Conversation ID in Loom
 """
@@ -35,11 +35,13 @@ READ_ONLY = {
     "TaskOutput", "TodoWrite", "Skill",
     "EnterPlanMode", "EnterWorktree", "ExitWorktree",
     "Explore", "CronList", "ToolSearch", "Agent",
-    # Gemini CLI tools (snake_case)
+    # Antigravity (agy) tools (snake_case)
     "read_file", "read_many_files", "glob", "grep_search",
     "list_directory", "google_web_search", "web_fetch",
     "write_todos", "enter_plan_mode",
     "cli_help", "codebase_investigator", "get_internal_docs",
+    # MCP web-tools (keyless DuckDuckGo search for local models)
+    "web_search",
 }
 
 
@@ -47,13 +49,11 @@ def allow(reason="Auto-approved", event_name="PreToolUse"):
     """Output allow JSON and exit 0."""
     sys.stderr.write(f"[Hook] Allowing: {reason}\n")
     if event_name == "BeforeTool":
-        # Gemini expects a flat object
         output = {
             "decision": "allow",
             "reason": reason
         }
     else:
-        # Claude Code expects a wrapper
         output = {
             "hookSpecificOutput": {
                 "hookEventName": event_name,
@@ -67,16 +67,14 @@ def allow(reason="Auto-approved", event_name="PreToolUse"):
 
 
 def deny(reason="Blocked", event_name="PreToolUse"):
-    """Output deny JSON and exit 0."""
+    """Output deny JSON and exit."""
     sys.stderr.write(f"[Hook] Denying: {reason}\n")
     if event_name == "BeforeTool":
-        # Gemini expects a flat object
         output = {
             "decision": "deny",
             "reason": reason
         }
     else:
-        # Claude Code expects a wrapper
         output = {
             "hookSpecificOutput": {
                 "hookEventName": event_name,
@@ -90,7 +88,18 @@ def deny(reason="Blocked", event_name="PreToolUse"):
 
 
 def main():
-    sys.stderr.write("[PERM-HOOK] Hook started\n")
+    event_name = "PreToolUse"
+    if "--event" in sys.argv:
+        try:
+            idx = sys.argv.index("--event")
+            if idx + 1 < len(sys.argv):
+                event_name = sys.argv[idx + 1]
+        except ValueError:
+            pass
+    elif len(sys.argv) > 1 and sys.argv[1] in ("PreToolUse", "PostToolUse", "BeforeTool"):
+        event_name = sys.argv[1]
+
+    sys.stderr.write(f"[PERM-HOOK] Hook started for event {event_name}\n")
     port = os.environ.get("LOOM_PORT", "3000")
     conv_id = os.environ.get("LOOM_CONV_ID", "")
     backstage_parent = os.environ.get("LOOM_BACKSTAGE_PARENT_ID", "")
@@ -107,9 +116,87 @@ def main():
     except (json.JSONDecodeError, IOError):
         sys.exit(0)
 
-    # Detect provider from hook_event_name (both Claude and Gemini include this)
-    event_name = request.get("hook_event_name", "PreToolUse")
+    # Detect provider from hook_event_name if event_name argument is not passed (legacy)
+    if "hook_event_name" in request:
+        event_name = request["hook_event_name"]
+
     tool_name = request.get("tool_name", "")
+
+    # PostToolUse Hook Flow
+    if event_name == "PostToolUse":
+        # Extract content
+        output_content = ""
+        for k in ["output", "result", "response", "content"]:
+            if k in request:
+                output_content = str(request[k])
+                break
+        
+        is_error = False
+        if "error" in request and request["error"]:
+            output_content = str(request["error"])
+            is_error = True
+            
+        tool_id = request.get("tool_id", str(request.get("stepIdx", "0")))
+        
+        # POST to /api/cc-tool-result
+        protocols = ["http", "https"]
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        payload = {
+            "loom_conv_id": conv_id,
+            "tool_name": tool_name,
+            "tool_id": tool_id,
+            "content": output_content,
+            "is_error": is_error
+        }
+        
+        for proto in protocols:
+            url = f"{proto}://127.0.0.1:{port}/api/cc-tool-result"
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=data,
+                headers={"Content-Type": "application/json"}
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+                    pass
+                break
+            except Exception as e:
+                sys.stderr.write(f"[Hook] PostToolUse result send failed via {proto}: {e}\n")
+        sys.exit(0)
+
+    # PreToolUse Hook Flow
+    # Notify Loom that tool execution has started (useful for read-only tools or tracking)
+    tool_id = request.get("tool_id", str(request.get("stepIdx", "0")))
+    tool_input = request.get("tool_input", {})
+    
+    protocols = ["http", "https"]
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    
+    start_payload = {
+        "loom_conv_id": conv_id,
+        "tool_name": tool_name,
+        "tool_id": tool_id,
+        "tool_input": tool_input
+    }
+    
+    for proto in protocols:
+        url = f"{proto}://127.0.0.1:{port}/api/cc-tool-start"
+        data = json.dumps(start_payload).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=3, context=ctx) as resp:
+                pass
+            break
+        except Exception as e:
+            sys.stderr.write(f"[Hook] PreToolUse start send failed via {proto}: {e}\n")
 
     # BACKSTAGE LOCKDOWN:
     # If this is a backstage session, we strictly deny file-writing and shell tools.
@@ -129,13 +216,6 @@ def main():
     request["tool_name"] = tool_name # Normalize for Loom API
 
     # Try HTTP first, then HTTPS as a fallback
-    protocols = ["http", "https"]
-    
-    # Skip cert verification for localhost (self-signed)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
     errors = []
     for proto in protocols:
         url = f"{proto}://127.0.0.1:{port}/api/cc-permission"

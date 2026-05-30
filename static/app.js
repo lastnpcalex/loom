@@ -478,12 +478,40 @@ async function checkHealth(retries = 2) {
     try {
         const health = await API.get('/api/health');
         if (health.status === 'mock') {
-            // Mock mode — Llama Server not available, not an error
+            State.loadedModel = null;
             return;
         } else if (health.status === 'error') {
+            State.loadedModel = null;
             showToast(`Llama Server not reachable: ${health.error}`, 'error');
         } else if (!health.model_available && health.models) {
+            State.loadedModel = null;
             showToast(`Model "${health.target_model}" not found. Available: ${health.models.join(', ')}`, 'error');
+        } else {
+            let loadedGguf = null;
+            if (health.models && health.models.length > 0) {
+                const activeId = health.models[0];
+                const map = health.model_name_map || {};
+                for (const [gguf, srvId] of Object.entries(map)) {
+                    if (srvId === activeId) {
+                        loadedGguf = gguf;
+                        break;
+                    }
+                }
+                if (!loadedGguf) {
+                    loadedGguf = health.target_model || null;
+                }
+            }
+            State.loadedModel = loadedGguf;
+            if (typeof renderConversationList === 'function') renderConversationList();
+            if (typeof renderMessages === 'function') renderMessages();
+            if (State.currentConv) {
+                if (State.currentConv.mode === 'hermes' || State.currentConv.mode === 'weave') {
+                    const weaveSel = document.getElementById('weave-model-inline');
+                    if (weaveSel) _populateWeaveModelDropdown(weaveSel, State.currentConv.local_model || '');
+                } else if (State.currentConv.mode === 'claude' || State.currentConv.mode === 'local') {
+                    updateInlineCCControls(State.currentConv);
+                }
+            }
         }
     } catch {
         if (retries > 0) {
@@ -728,12 +756,12 @@ function buildConvItem(conv) {
     const isHermes = conv.mode === 'hermes';
     const charName = isGemini ? (conv.cc_model || 'Gemini')
         : isCC ? (conv.cc_model || 'Claude')
-        : isLocal ? (conv.local_model || 'Llama')
-        : isHermes ? (conv.local_model || 'Hermes')
+        : isLocal ? (conv.local_model || State.loadedModel || 'Llama')
+        : isHermes ? (conv.local_model || State.loadedModel || 'Hermes')
         : conv.character_id
         ? (State.characters.find(c => c.id === conv.character_id)?.name || conv.character_id)
         : 'Freeform';
-    const modeBadge = isGemini ? '<span class="mode-badge" title="Gemini CLI in the browser">Loom {Gemini}</span>'
+    const modeBadge = isGemini ? '<span class="mode-badge" title="Antigravity (agy) in the browser">Loom {agy}</span>'
         : isCC ? '<span class="mode-badge" title="Claude Code in the browser">Loom {Claude}</span>'
         : isLocal ? '<span class="mode-badge" title="Claude Code powered by a local Llama model">Braid {Local}</span>'
         : isHermes ? '<span class="mode-badge" title="Hermes Agent (ACP) powered by a local Llama model">Hermes {Agent}</span>'
@@ -1021,7 +1049,7 @@ async function loadConversation(convId) {
     connectWebSocket(convId);
     renderTree();
     renderMessages();
-    updateInlineCCControls(conv);
+    await updateInlineCCControls(conv);
 
     // If only a linear conversation (no forks), go straight to chat
     const hasForks = treeData.some(n => {
@@ -1158,7 +1186,7 @@ async function createConversation() {
 }
 
 // ── Open New Conversation Modal ──
-function openNewConvModal() {
+async function openNewConvModal() {
     renderCharacterGrid();
     renderPersonaSelect();
     renderLoreChecklist();
@@ -1172,7 +1200,12 @@ function openNewConvModal() {
     document.getElementById('project-dir').value = '';
     document.getElementById('cc-model-group').classList.remove('hidden');
     document.getElementById('cc-effort-group').classList.remove('hidden');
-    document.getElementById('cc-model').value = 'sonnet';
+    
+    await Promise.all([
+        populateCCModelDropdowns('sonnet'),
+        fetchLocalModels()
+    ]);
+    
     document.getElementById('cc-effort').value = 'high';
     document.getElementById('local-model-group').classList.add('hidden');
     showWeaveFields(false);
@@ -1238,7 +1271,7 @@ async function loadDirBrowser(path) {
 
 // ── Inline CC Model/Effort Controls ──
 
-function updateInlineCCControls(conv) {
+async function updateInlineCCControls(conv) {
     const controls = document.getElementById('cc-inline-controls');
     const weaveControls = document.getElementById('weave-inline-controls');
     const statePanelChat = document.getElementById('btn-state-panel-chat');
@@ -1264,11 +1297,18 @@ function updateInlineCCControls(conv) {
         const effortSel = document.getElementById('cc-effort-inline');
         const permSel = document.getElementById('cc-permission-mode-inline');
         const ccModel = conv.cc_model || 'sonnet';
-        modelSel.value = ccModel;
+        await populateCCModelDropdowns(ccModel);
+        
         effortSel.value = conv.cc_effort || 'high';
         if (permSel) permSel.value = conv.cc_permission_mode || 'default';
-        const _baseModel = ccModel.includes('[') ? ccModel.split('[')[0] : ccModel;
-        const isAnthropicModel = ['sonnet', 'opus', 'haiku'].includes(_baseModel);
+        
+        const resolvedModel = modelSel.value;
+        if (resolvedModel && resolvedModel !== ccModel) {
+            conv.cc_model = resolvedModel;
+            API.put(`/api/conversations/${conv.id}`, { cc_model: resolvedModel }).catch(console.error);
+        }
+        
+        const isAnthropicModel = _isAnthropicValue(resolvedModel);
         // Braid picks its model in Settings (cfg-braid-model); the cc-model/effort
         // selects don't apply, so hide them.
         modelSel.style.display = isBraid ? 'none' : '';
@@ -1321,26 +1361,60 @@ function updateInlineCCControls(conv) {
     if (typeof updateCanvasVisibility === 'function') updateCanvasVisibility();
 }
 
+// Treat both alias (opus/sonnet/haiku) and full IDs (claude-opus-4-6) as
+// Anthropic for UI gating. Mirrors model_context.is_anthropic() server-side.
+const _ANTHROPIC_ALIASES = new Set(['sonnet', 'opus', 'haiku']);
+function _isAnthropicValue(v) {
+    if (!v) return false;
+    const base = (v.includes('[') ? v.split('[')[0] : v).toLowerCase();
+    return _ANTHROPIC_ALIASES.has(base)
+        || /^claude-(opus|sonnet|haiku)-/.test(base);
+}
+function _isOpusValue(v) {
+    if (!v) return false;
+    const base = (v.includes('[') ? v.split('[')[0] : v).toLowerCase();
+    return base === 'opus' || base.startsWith('claude-opus-');
+}
+
+function _modelsMatch(a, b) {
+    if (!a || !b) return false;
+    const norm = (s) => s.toLowerCase()
+        .replace(/\.gguf$/i, '')
+        .replace(/[:\-_.]/g, '');
+    const na = norm(a);
+    const nb = norm(b);
+    return na === nb || na.includes(nb) || nb.includes(na);
+}
+
 // Inline Weave/Braid model dropdown — populated from Llama Server
 async function _populateWeaveModelDropdown(select, currentModel) {
-    let models = [];
+    if (!select) return;
+    let loadedModel = null;
     try {
         const data = await API.get('/api/local/all-models');
-        models = (data.models || []).map(m => m.name);
+        const found = (data.models || []).find(m => m.loaded);
+        if (found) {
+            loadedModel = found.name;
+        }
     } catch {}
     const prev = select.value;
-    select.innerHTML = '<option value="">Default</option>';
+    select.innerHTML = '<option value="">Local Model</option>';
 
-    for (const name of models) {
+    if (loadedModel) {
         const opt = document.createElement('option');
-        opt.value = name;
-        opt.textContent = name;
+        opt.value = loadedModel;
+        opt.textContent = loadedModel;
         select.appendChild(opt);
     }
 
     let target = currentModel || prev || '';
-    if (target && !models.includes(target)) target = '';
-    if (!target && models.length === 1) target = models[0];
+    if (target) {
+        if (loadedModel && _modelsMatch(target, loadedModel)) {
+            target = loadedModel;
+        } else if (target !== loadedModel) {
+            target = '';
+        }
+    }
     select.value = target;
     select.title = 'Local model';
 }
@@ -1381,11 +1455,8 @@ function initInlineCCControls() {
         } catch { showToast('Failed to update', 'error'); }
     }
 
-    const _ANTHROPIC_MODELS = new Set(['sonnet', 'opus', 'haiku']);
-
     function _syncEffortVisibility(model) {
-        const base = model.includes('[') ? model.split('[')[0] : model;
-        effortSel.style.display = _ANTHROPIC_MODELS.has(base) ? '' : 'none';
+        effortSel.style.display = _isAnthropicValue(model) ? '' : 'none';
     }
 
     modelSel.addEventListener('change', () => {
@@ -1410,7 +1481,7 @@ function initInlineCCControls() {
             try {
                 await API.put(`/api/conversations/${State.currentConvId}`, { ooda_enabled: enabled });
                 State.currentConv.ooda_enabled = enabled;
-                updateInlineCCControls(State.currentConv);
+                await updateInlineCCControls(State.currentConv);
                 if (enabled) {
                     // Auto-seed state cards on first enable
                     const existing = await API.get(`/api/conversations/${State.currentConvId}/state`);
@@ -1925,22 +1996,19 @@ function showWeaveFields(show) {
 
 async function fetchLocalModels() {
     const select = document.getElementById('local-model');
-    select.innerHTML = '<option value="">Loading models...</option>';
+    if (!select) return;
+    select.innerHTML = '<option value="">Local Model</option>';
     try {
-        const data = await API.get('/api/local/models');
-        select.innerHTML = '';
-        if (data.models && data.models.length > 0) {
-            for (const model of data.models) {
-                const opt = document.createElement('option');
-                opt.value = model;
-                opt.textContent = model;
-                select.appendChild(opt);
-            }
-        } else {
-            select.innerHTML = '<option value="">No models found</option>';
+        const data = await API.get('/api/local/all-models');
+        const found = (data.models || []).find(m => m.loaded);
+        if (found) {
+            const opt = document.createElement('option');
+            opt.value = found.name;
+            opt.textContent = found.name;
+            select.appendChild(opt);
         }
     } catch {
-        select.innerHTML = '<option value="">Failed to load models</option>';
+        // Fall back to just Local Model option
     }
 }
 
@@ -1952,15 +2020,20 @@ async function populateCCModelDropdowns(selectedValue) {
     }
     // Fetch Llama Server models for local CC.
     let llamaModels = [];
+    let loadedModel = null;
     try {
-        const data = await API.get('/api/local/models');
-        llamaModels = (data.models || []).map(m => m.name || m);
+        const data = await API.get('/api/local/all-models');
+        const found = (data.models || []).find(m => m.loaded);
+        if (found) {
+            loadedModel = found.name;
+            llamaModels = [loadedModel];
+        }
     } catch {}
     const selects = ['cc-model-inline', 'cc-model', 'cfg-cc-model'];
     for (const id of selects) {
         const sel = document.getElementById(id);
         if (!sel) continue;
-        const prev = selectedValue || sel.value;
+        let prev = selectedValue || sel.value;
         sel.innerHTML = '';
         for (const group of _ccModelsCache) {
             const og = document.createElement('optgroup');
@@ -1973,7 +2046,7 @@ async function populateCCModelDropdowns(selectedValue) {
             }
             sel.appendChild(og);
         }
-        // Append local Llama Server models
+        // Append local Llama Server models (only show the active loaded model)
         if (llamaModels.length > 0) {
             const og = document.createElement('optgroup');
             og.label = 'Llama Server';
@@ -1985,7 +2058,19 @@ async function populateCCModelDropdowns(selectedValue) {
             }
             sel.appendChild(og);
         }
-        if (prev) sel.value = prev;
+        if (prev) {
+            // Check if the previous model value is one of the Anthropic/Gemini API models
+            const isApi = _ccModelsCache.some(group => group.models.some(m => m.value === prev));
+            if (!isApi) {
+                if (loadedModel && _modelsMatch(prev, loadedModel)) {
+                    prev = loadedModel;
+                } else {
+                    // Fallback to sonnet if no matching local model is loaded
+                    prev = 'sonnet';
+                }
+            }
+            sel.value = prev;
+        }
     }
 }
 
@@ -2176,19 +2261,18 @@ function setupEventListeners() {
         });
     });
 
-    // Model selection — disable "max" effort when not opus, hide effort for local models
-    const _MODAL_ANTHROPIC = new Set(['sonnet', 'opus', 'haiku']);
+    // Model selection — disable "max"/"xhigh" effort when not Opus family,
+    // hide effort entirely for non-Anthropic models.
     document.getElementById('cc-model').addEventListener('change', () => {
         const model = document.getElementById('cc-model').value;
-        const baseModel = model.includes('[') ? model.split('[')[0] : model;
         const effortGroup = document.getElementById('cc-effort-group');
-        if (!_MODAL_ANTHROPIC.has(baseModel)) {
+        if (!_isAnthropicValue(model)) {
             effortGroup.classList.add('hidden');
         } else {
             effortGroup.classList.remove('hidden');
             const maxOpt = document.querySelector('#cc-effort option[value="max"]');
             const xhighOpt = document.querySelector('#cc-effort option[value="xhigh"]');
-            if (baseModel !== 'opus') {
+            if (!_isOpusValue(model)) {
                 if (maxOpt) maxOpt.disabled = true;
                 if (xhighOpt) xhighOpt.disabled = true;
                 const curEffort = document.getElementById('cc-effort').value;
@@ -2352,23 +2436,19 @@ function setupEventListeners() {
         document.getElementById('cfg-cc-effort').value = (conv && conv.cc_effort) || 'high';
         document.getElementById('cfg-cc-permission').value = (conv && conv.cc_permission_mode) || 'default';
 
-        // Load model configs in parallel with dropdowns
-        const localModel = (conv && conv.local_model) || cfg.llama_model;
+        const localModel = (conv && conv.local_model) || '';
         await Promise.all([
             _loadModelConfigs(),
             _populateModelDropdown(),
             _populateLocalSelect('cfg-model', cfg.llama_model || ''),
             _populateLocalVisionSelect('cfg-vision-model', cfg.vision_model || ''),
-            _populateLocalSelect('cfg-braid-model', localModel),
-            _populateLocalSelect('cfg-hermes-model', localModel),
-            _populateLocalSelect('cfg-weave-model', localModel),
-            populateCCModelDropdowns(),
+            _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), localModel),
+            _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), localModel),
+            _populateWeaveModelDropdown(document.getElementById('cfg-weave-model'), localModel),
+            populateCCModelDropdowns(conv && conv.cc_model || 'sonnet'),
             _populateKvQuantDropdown(),
             _populateMmprojDropdown(),
         ]);
-
-        // Set cc-model value after populateCCModelDropdowns
-        document.getElementById('cfg-cc-model').value = (conv && conv.cc_model) || 'sonnet';
 
         // Show tuning for the selected model
         const selModel = document.getElementById('cfg-llama-model-select').value;
@@ -2417,6 +2497,7 @@ function setupEventListeners() {
                 showToast('Llama Server restarted: ' + (data.output || '').split('\n')[0]);
                 try { await API.post('/api/local/refresh-models', {}); } catch {}
                 _invalidateModelCaches();
+                checkHealth();
             } else {
                 showToast('Llama Server restart failed: ' + (data.output || 'unknown error'), 'error');
             }
@@ -2439,11 +2520,14 @@ function setupEventListeners() {
         try {
             await API.post('/api/local/refresh-models', {});
             _invalidateModelCaches();
+            checkHealth();
             await Promise.all([
                 _populateLocalSelect('cfg-model', document.getElementById('cfg-model').value),
                 _populateLocalVisionSelect('cfg-vision-model', document.getElementById('cfg-vision-model').value),
-                _populateLocalSelect('cfg-braid-model', document.getElementById('cfg-braid-model').value),
-                _populateLocalSelect('cfg-weave-model', document.getElementById('cfg-weave-model').value),
+                _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), document.getElementById('cfg-braid-model') ? document.getElementById('cfg-braid-model').value : ''),
+                _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), document.getElementById('cfg-hermes-model') ? document.getElementById('cfg-hermes-model').value : ''),
+                _populateWeaveModelDropdown(document.getElementById('cfg-weave-model'), document.getElementById('cfg-weave-model') ? document.getElementById('cfg-weave-model').value : ''),
+                populateCCModelDropdowns(document.getElementById('cfg-cc-model') ? document.getElementById('cfg-cc-model').value : ''),
             ]);
             showToast('Models refreshed');
         } catch (e) {
@@ -2451,6 +2535,30 @@ function setupEventListeners() {
         } finally {
             btn.disabled = false;
             btn.textContent = orig;
+        }
+    });
+
+    // Manual refresh — queries Anthropic's /v1/models with the local Claude Code
+    // subscription token (free, instant, no generation) and rebuilds the
+    // Anthropic group's labels with the live version numbers (e.g. "Opus" → "Opus 4.8").
+    const btnRefreshCC = document.getElementById('btn-refresh-cc-models');
+    if (btnRefreshCC) btnRefreshCC.addEventListener('click', async () => {
+        const orig = btnRefreshCC.textContent;
+        btnRefreshCC.disabled = true;
+        btnRefreshCC.textContent = '↻ Checking...';
+        try {
+            const data = await API.post('/api/cc-models/refresh', {});
+            _ccModelsCache = data.models || null;
+            const selected = document.getElementById('cfg-cc-model')
+                ? document.getElementById('cfg-cc-model').value
+                : '';
+            await populateCCModelDropdowns(selected);
+            showToast('Anthropic models refreshed');
+        } catch (e) {
+            showToast('Refresh failed: ' + (e.message || e), 'error');
+        } finally {
+            btnRefreshCC.disabled = false;
+            btnRefreshCC.textContent = orig;
         }
     });
 
@@ -2468,9 +2576,8 @@ function setupEventListeners() {
 
     // Settings model change — toggle effort visibility
     document.getElementById('cfg-cc-model').addEventListener('change', () => {
-        const _base = (document.getElementById('cfg-cc-model').value || '').split('[')[0];
-        const isAnthropicCfg = ['sonnet', 'opus', 'haiku'].includes(_base);
-        document.getElementById('cfg-cc-effort-group').classList.toggle('hidden', !isAnthropicCfg);
+        const v = document.getElementById('cfg-cc-model').value || '';
+        document.getElementById('cfg-cc-effort-group').classList.toggle('hidden', !_isAnthropicValue(v));
     });
 
     document.getElementById('btn-save-settings').addEventListener('click', async () => {
@@ -2926,9 +3033,9 @@ function renderHomeCharacters() {
             </div>
         `;
         // Click main area → start new conversation with this character
-        card.querySelector('.char-card-main').addEventListener('click', () => {
+        card.querySelector('.char-card-main').addEventListener('click', async () => {
             State.selectedCharacterId = char.id;
-            openNewConvModal();
+            await openNewConvModal();
         });
         // Edit button
         card.querySelector('.char-edit-btn').addEventListener('click', (e) => {

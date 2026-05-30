@@ -193,7 +193,7 @@
                 <div id="tree-state-cards-list"></div>
             </div>
             <div id="canvas-fullview" class="hidden">
-                <iframe id="canvas-fullview-iframe" sandbox="allow-scripts allow-same-origin"></iframe>
+                <iframe id="canvas-fullview-iframe"></iframe>
             </div>
             <div id="tree-canvas">
                 <div id="tree-nodes"></div>
@@ -407,6 +407,9 @@
                 <div class="settings-overrides" id="cfg-overrides-loom">
                     <div class="form-group">
                         <label for="cfg-cc-model">Loom Model</label>
+                        <div class="label-with-action">
+                            <button type="button" class="btn-mini" id="btn-refresh-cc-models" title="Query Anthropic API to refresh model version labels">↻ Refresh</button>
+                        </div>
                         <select id="cfg-cc-model" class="form-select"></select>
                     </div>
                     <div class="form-group" id="cfg-cc-effort-group">

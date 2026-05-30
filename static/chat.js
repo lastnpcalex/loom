@@ -1236,6 +1236,26 @@ const _HERMES_SLASH_COMMANDS = [
     { name: 'version', description: 'Show Hermes version' },
 ];
 
+function _getModeLabel(conv) {
+    if (!conv) return 'system';
+    const mode = conv.mode || 'weave';
+    if (mode === 'claude') {
+        const model = (conv.cc_model || '').toLowerCase();
+        if (model.startsWith('gemini') || model.startsWith('claude sonnet') || model.startsWith('claude opus') || model.startsWith('gpt-oss')) {
+            return 'gemini'; // runs via agy
+        }
+        return 'claude';
+    }
+    if (mode === 'local') {
+        return 'local';
+    }
+    if (mode === 'hermes') {
+        return 'hermes';
+    }
+    return mode;
+}
+
+
 /** Candidates for the "/" autocomplete — Hermes commands for Hermes convs, else Loom skills. */
 async function _slashCandidates() {
     if (State.currentConv && State.currentConv.mode === 'hermes') {
@@ -1292,7 +1312,113 @@ function _translateSlashCommand(content, skills) {
  * Handle meta commands that Loom processes natively (not sent to CC).
  */
 function _handleMetaCommand(name, args) {
+    function addSystemMessage(html, extraClass = '') {
+        const container = document.getElementById('messages-container');
+        if (!container) return;
+        const el = document.createElement('div');
+        el.className = 'system-message ' + extraClass;
+        el.innerHTML = html;
+        container.appendChild(el);
+        el.scrollIntoView({ behavior: 'smooth' });
+    }
+
     switch (name) {
+        case 'plan':
+            if (!State.currentConvId) {
+                showToast('No conversation selected', 'error');
+                break;
+            }
+            API.get(`/api/conversations/${State.currentConvId}/artifacts`).then(res => {
+                const artifacts = res.artifacts || [];
+                const planFile = artifacts.find(a => a.name.toLowerCase() === 'implementation_plan.md');
+                if (!planFile) {
+                    addSystemMessage('No active implementation plan (`implementation_plan.md`) found. Run a slash command or ask the assistant to create a plan first.');
+                    return;
+                }
+                fetch(`/api/conversations/${State.currentConvId}/file?path=${encodeURIComponent(planFile.path)}`)
+                    .then(r => {
+                        if (!r.ok) throw new Error(r.statusText);
+                        return r.text();
+                    })
+                    .then(content => {
+                        previewArtifact(planFile.name, content);
+                    })
+                    .catch(err => showToast('Failed to load plan: ' + err, 'error'));
+            }).catch(err => showToast('Failed to check workspace artifacts: ' + err, 'error'));
+            break;
+        case 'tasks':
+        case 'task':
+            if (!State.currentConvId) {
+                showToast('No conversation selected', 'error');
+                break;
+            }
+            API.get(`/api/conversations/${State.currentConvId}/artifacts`).then(res => {
+                const artifacts = res.artifacts || [];
+                const taskFile = artifacts.find(a => a.name.toLowerCase() === 'task.md' || a.name.toLowerCase() === 'tasks.md');
+                if (!taskFile) {
+                    addSystemMessage('No active task list found. Create a `task.md` file in the workspace to get started.');
+                    return;
+                }
+                fetch(`/api/conversations/${State.currentConvId}/file?path=${encodeURIComponent(taskFile.path)}`)
+                    .then(r => {
+                        if (!r.ok) throw new Error(r.statusText);
+                        return r.text();
+                    })
+                    .then(content => {
+                        const cleanHtml = DOMPurify.sanitize(marked.parse(content));
+                        addSystemMessage(`<div class="markdown-body" style="font-size:0.9em;color:var(--text-secondary)">${cleanHtml}</div>`, 'task-list-system');
+                    })
+                    .catch(err => showToast('Failed to load task file: ' + err, 'error'));
+            }).catch(err => showToast('Failed to check workspace artifacts: ' + err, 'error'));
+            break;
+        case 'artifacts':
+        case 'artifact':
+            if (!State.currentConvId) {
+                showToast('No conversation selected', 'error');
+                break;
+            }
+            if (name === 'artifact' && args) {
+                const targetName = args.trim().toLowerCase();
+                API.get(`/api/conversations/${State.currentConvId}/artifacts`).then(res => {
+                    const artifacts = res.artifacts || [];
+                    const match = artifacts.find(a => a.name.toLowerCase() === targetName || a.name.toLowerCase().replace('.md', '') === targetName);
+                    if (!match) {
+                        showToast(`Artifact "${args}" not found`, 'error');
+                        return;
+                    }
+                    fetch(`/api/conversations/${State.currentConvId}/file?path=${encodeURIComponent(match.path)}`)
+                        .then(r => {
+                            if (!r.ok) throw new Error(r.statusText);
+                            return r.text();
+                        })
+                        .then(content => {
+                            previewArtifact(match.name, content);
+                        })
+                        .catch(err => showToast('Failed to load artifact: ' + err, 'error'));
+                }).catch(err => showToast('Failed to list artifacts: ' + err, 'error'));
+                break;
+            }
+            API.get(`/api/conversations/${State.currentConvId}/artifacts`).then(res => {
+                const artifacts = res.artifacts || [];
+                if (artifacts.length === 0) {
+                    addSystemMessage('No planning or artifact files found in this workspace.');
+                    return;
+                }
+                let html = `<div style="font-size:0.9em;color:var(--text-secondary)">`;
+                html += `<strong style="color:var(--cyan)">Project Artifacts:</strong><ul style="margin:8px 0;padding-left:20px;list-style-type:square">`;
+                artifacts.forEach(a => {
+                    const sizeKB = Math.round(a.size / 102) / 10;
+                    html += `<li style="margin-bottom:4px">`
+                        + `<a href="#" class="artifact-link" data-path="${escapeHtml(a.path)}" data-name="${escapeHtml(a.name)}" style="color:var(--cyan);text-decoration:underline">${escapeHtml(a.name)}</a> `
+                        + `<span style="font-size:0.8em;color:var(--text-dim)">(${sizeKB} KB)</span>`
+                        + `</li>`;
+                });
+                html += `</ul></div>`;
+                addSystemMessage(html);
+            }).catch(err => {
+                showToast('Failed to fetch artifacts: ' + err, 'error');
+            });
+            break;
         case 'help':
             // Alias for /skills — show all available commands
             _handleMetaCommand('skills', args);
@@ -1480,10 +1606,23 @@ function _initSlashAutocomplete() {
         matches.forEach((skill, i) => {
             const item = document.createElement('div');
             item.className = 'slash-item';
-            const sourceClass = skill.source === 'user' ? 'user' : 'system';
+            let sourceClass = 'system';
+            let sourceLabel = 'system';
+            if (skill.source === 'user') {
+                sourceClass = 'user';
+                sourceLabel = 'user';
+            } else if (skill.mode === 'meta') {
+                sourceClass = 'meta';
+                sourceLabel = 'loom';
+            } else if (skill.mode === 'hermes') {
+                sourceClass = 'hermes';
+                sourceLabel = 'hermes';
+            } else if (State.currentConv) {
+                const label = _getModeLabel(State.currentConv);
+                sourceClass = label;
+                sourceLabel = label;
+            }
             const modeClass = skill.mode === 'meta' ? 'meta' : '';
-            const sourceLabel = skill.source === 'user' ? 'user'
-                : skill.mode === 'meta' ? 'loom' : 'system';
             const sourceTag = `<span class="slash-source ${sourceClass} ${modeClass}">${sourceLabel}</span>`;
             item.innerHTML =
                 `<span class="slash-cmd">${escapeHtml(skill.command || '/' + skill.name)}</span>` +
@@ -2229,7 +2368,14 @@ function loadOlderMessages(renderMsgs, container, scrollParent) {
             if (anchorEl && anchorTopBefore != null) {
                 const anchorTopAfter = anchorEl.getBoundingClientRect().top;
                 const shift = anchorTopAfter - anchorTopBefore;
-                if (shift) scrollParent.scrollTop += shift;
+                if (shift) {
+                    const prevBehavior = scrollParent.style.scrollBehavior;
+                    scrollParent.style.scrollBehavior = 'auto';
+                    scrollParent.scrollTop += shift;
+                    // Force a reflow to apply the scroll change before restoring scrollBehavior
+                    void scrollParent.offsetHeight;
+                    scrollParent.style.scrollBehavior = prevBehavior;
+                }
             }
             VIRTUAL_SCROLL.isLoadingOlder = false;
         };
@@ -2346,6 +2492,16 @@ function showGenerateBar() {
     scrollToBottom();
 }
 
+function _modelsMatch(a, b) {
+    if (!a || !b) return false;
+    const norm = (s) => s.toLowerCase()
+        .replace(/\.gguf$/i, '')
+        .replace(/[:\-_.]/g, '');
+    const na = norm(a);
+    const nb = norm(b);
+    return na === nb || na.includes(nb) || nb.includes(na);
+}
+
 function createMessageElement(msg, cost, elapsed) {
     // Fall back to the persisted generation duration when the caller didn't
     // supply a live timer value — so the M:SS badge survives a page refresh.
@@ -2368,14 +2524,18 @@ function createMessageElement(msg, cost, elapsed) {
         : msg.role === 'user' ? 'You'
         : isGemini ? 'Gemini'
         : isClaudeMode ? 'Claude'
-        : isLocalMode ? (State.currentConv.local_model || 'Local')
-        : isHermesMode ? (State.currentConv.local_model || 'Hermes')
+        : isLocalMode ? 'Braid'
+        : isHermesMode ? 'Hermes'
         : getCharacterName();
     // Local model tag to show alongside the Braid/Hermes label
     const _lmName = State.currentConv && State.currentConv.local_model;
+    let activeModelName = _lmName || State.loadedModel || '';
+    if (_lmName && State.loadedModel && _modelsMatch(_lmName, State.loadedModel)) {
+        activeModelName = State.loadedModel;
+    }
     const localModelTag = (isLocalMode || isHermesMode)
-        ? (_lmName
-            ? `<span class="local-model-tag">({${escapeHtml(_lmName)} model})</span>`
+        ? (activeModelName
+            ? `<span class="local-model-tag">(${escapeHtml(activeModelName)})</span>`
             : `<span class="local-model-tag">(${isHermesMode ? 'Hermes' : 'local model'})</span>`)
         : '';
     const branchLabelFull = State.branchNames?.[msg.id] || '';
@@ -4089,6 +4249,17 @@ function openPreviewModal(wrapper) {
     }
     doc.close();
 }
+function previewArtifact(filename, content) {
+    const modal = document.getElementById('modal-preview');
+    const title = modal.querySelector('h2');
+    if (title) title.textContent = filename;
+    const body = document.getElementById('preview-modal-body');
+    modal.classList.remove('hidden');
+    body.innerHTML = `<div class="markdown-body" style="padding:20px;overflow-y:auto;max-height:75vh;color:var(--text-primary)">`
+        + DOMPurify.sanitize(marked.parse(content))
+        + `</div>`;
+}
+
 
 // ── Event Delegation for Tool Blocks + Thinking + Code Actions ──
 document.addEventListener('click', (e) => {
@@ -4126,6 +4297,26 @@ document.addEventListener('click', (e) => {
     if (e.target.closest('[data-close-modal-preview]')) {
         document.getElementById('modal-preview').classList.add('hidden');
         document.getElementById('preview-modal-body').innerHTML = '';
+        return;
+    }
+    // Click delegation for .artifact-link
+    const artifactLink = e.target.closest('.artifact-link');
+    if (artifactLink) {
+        e.preventDefault();
+        e.stopPropagation();
+        const path = artifactLink.getAttribute('data-path');
+        const name = artifactLink.getAttribute('data-name');
+        if (State.currentConvId && path) {
+            fetch(`/api/conversations/${State.currentConvId}/file?path=${encodeURIComponent(path)}`)
+                .then(r => {
+                    if (!r.ok) throw new Error(r.statusText);
+                    return r.text();
+                })
+                .then(content => {
+                    previewArtifact(name, content);
+                })
+                .catch(err => showToast('Failed to load artifact: ' + err, 'error'));
+        }
         return;
     }
     // Tool block expand/collapse

@@ -52,8 +52,22 @@ branches_of_the_loom.md
 # SSL certificates
 certs/
 
-# Startup script (machine-specific paths)
+# Startup scripts (machine-specific paths)
 start_loom.bat
+start_prod_servers.bat
+
+# Agent hook/MCP config (machine-specific absolute paths + PII)
+.agents/
+
+# Native binaries (CUDA / ggml / llama DLLs — large, machine-specific)
+bin/
+
+# Attached / test images
+test_image.png
+attached_*.png
+attached_*.jpg
+attached_*.jpeg
+attached_*.webp
 
 # Photoshop files
 *.psd

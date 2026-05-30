@@ -1,9 +1,14 @@
-"""Gemini Code CLI subprocess wrapper with NDJSON stream parser."""
+"""Antigravity (agy) CLI subprocess wrapper.
+
+Runs agy in plain text mode (-p flag) and collects the raw output.
+Model is set via ~/.gemini/antigravity-cli/settings.json (not a CLI flag).
+"""
 
 import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -12,133 +17,125 @@ log = logging.getLogger(__name__)
 # Use the standard Loom blocking hook
 _HOOK_SCRIPT = str(Path(__file__).parent / "cc_permission_hook.py")
 
+_active_queues: dict[int, asyncio.Queue] = {}
 
-def _process_event(raw: dict) -> list[dict]:
-    """Process a raw Gemini stream-json event and return simplified event dicts."""
-    events = []
-    etype = raw.get("type", "")
 
-    if "error" in raw:
-        err = raw["error"]
-        msg = err.get("message") if isinstance(err, dict) else str(err)
-        events.append({"type": "result", "is_error": True, "error": msg})
-        return events
+def _find_agy_exe() -> str:
+    """Find the agy executable on PATH or in known install locations."""
+    agy_name = "agy.exe" if sys.platform == "win32" else "agy"
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        known = os.path.join(local_app_data, "agy", "bin", "agy.exe")
+        if os.path.exists(known):
+            return known
+    return agy_name
 
-    if etype == "init":
-        events.append({
-            "type": "session_info",
-            "session_id": raw.get("session_id", ""),
-            "model": raw.get("model", ""),
-        })
-    elif etype == "message":
-        role = raw.get("role", "")
-        content = raw.get("content", "")
-        if role == "assistant" and content:
-            events.append({"type": "text_delta", "text": content})
-    elif etype == "tool_use":
-        events.append({
-            "type": "tool_start",
-            "name": raw.get("tool_name", ""),
-            "tool_id": raw.get("tool_id", ""),
-        })
-        params = raw.get("parameters", {})
-        if params:
-            events.append({
-                "type": "tool_input_delta",
-                "json": json.dumps(params, indent=2),
-                "tool_id": raw.get("tool_id", ""),
-            })
-    elif etype == "tool_result":
-        events.append({
-            "type": "tool_result",
-            "content": str(raw.get("output", "")),
-            "tool_id": raw.get("tool_id", ""),
-            "is_error": raw.get("status") != "success",
-        })
-    elif etype == "result":
-        stats = raw.get("stats", {})
-        events.append({"type": "usage", "input_tokens": stats.get("input_tokens", 0), "output_tokens": stats.get("output_tokens", 0)})
-        events.append({
-            "type": "result",
-            "duration_ms": stats.get("duration_ms", 0),
-            "result_text": raw.get("result", ""),
-            "session_id": raw.get("session_id", ""),
-            "is_error": raw.get("status") != "success",
-        })
-    return events
+
+def _loom_model_to_agy(model: str, effort: str) -> str:
+    """Map Loom's model selection to agy 2.0 model identifiers."""
+    ml = model.lower()
+    if "gemini 3.5 flash" in ml:
+        return {
+            "low": "gemini-3.5-flash-low",
+            "medium": "gemini-3.5-flash-medium",
+        }.get(effort, "gemini-3.5-flash")
+    if "gemini 3.1 pro" in ml:
+        return {
+            "low": "gemini-3.1-pro-low",
+            "medium": "gemini-3.1-pro-medium",
+        }.get(effort, "gemini-3.1-pro")
+    if "sonnet" in ml:
+        return "claude-sonnet"
+    if "opus" in ml:
+        return "claude-opus"
+    if "gpt-oss" in ml:
+        return "gpt-oss-120b"
+    return model
+
+
+def _set_agy_model(agy_model_id: str):
+    """Update agy's settings.json with the desired model."""
+    if sys.platform == "win32":
+        home = Path(os.environ.get("USERPROFILE", Path.home()))
+    else:
+        home = Path.home()
+    settings_path = home / ".gemini" / "antigravity-cli" / "settings.json"
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            settings["model"] = agy_model_id
+            settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+            log.info(f"[AGY] Model updated in settings.json: {agy_model_id}")
+        except Exception as e:
+            log.error(f"[AGY] Failed to write model to settings.json: {e}")
 
 
 def _configure_permission_hook(cwd: str, backstage_parent_id: int | None = None, server_port: int = 8000):
-    """Configure BeforeTool hook + trust entry so Gemini CLI calls our permission hook."""
-    gemini_dir = Path(cwd) / ".gemini"
-    gemini_dir.mkdir(parents=True, exist_ok=True)
+    """Configure hooks.json + trust entry so Antigravity CLI calls our permission hook."""
+    agents_dir = Path(cwd) / ".agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
 
     python_exe = sys.executable
     hook_path = _HOOK_SCRIPT
-    # Gemini CLI runs hooks via PowerShell on Windows — "exe" "arg" syntax fails.
-    # Use & (call operator) to handle quoted paths correctly in PowerShell.
     if sys.platform == "win32":
-        hook_command = f'& "{python_exe}" "{hook_path}"'
+        pre_hook_command = f'& "{python_exe}" "{hook_path}" --event PreToolUse'
+        post_hook_command = f'& "{python_exe}" "{hook_path}" --event PostToolUse'
     else:
-        hook_command = f'"{python_exe}" "{hook_path}"'
+        pre_hook_command = f'"{python_exe}" "{hook_path}" --event PreToolUse'
+        post_hook_command = f'"{python_exe}" "{hook_path}" --event PostToolUse'
 
-    hook_def = [
-        {
-            "matcher": "*",
-            "hooks": [{
-                "type": "command",
-                "command": hook_command,
-                "timeout": 900000,  # 15 min — user needs time to approve in Loom UI
-            }]
-        }
-    ]
+    hooks_def = {
+        "PreToolUse": [
+            {
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": pre_hook_command,
+                    "timeout": 900000,
+                }]
+            }
+        ],
+        "PostToolUse": [
+            {
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": post_hook_command,
+                    "timeout": 90000,
+                }]
+            }
+        ]
+    }
 
-    # Detect protocol (HTTPS if certs exist). Resolve relative to this script
-    # — the server's cwd may differ from the project root (e.g. worktree),
-    # which silently flips this to http:// and breaks the backstage MCP.
-    _certs_dir = Path(__file__).parent / "certs"
-    protocol = "https" if (_certs_dir / "cert.pem").exists() and (_certs_dir / "key.pem").exists() else "http"
+    hooks_path = agents_dir / "hooks.json"
+    hooks_path.write_text(json.dumps(hooks_def, indent=2), encoding="utf-8")
+    log.info(f"[AGY] Hooks configured: {hooks_path}")
 
-    # Write project-level settings.json (the one Gemini actually reads)
-    settings_path = gemini_dir / "settings.json"
-    existing = {}
-    if settings_path.exists():
-        try: existing = json.loads(settings_path.read_text(encoding="utf-8"))
-        except: existing = {}
-
-    existing["hooks"] = {"BeforeTool": hook_def}
-    
-    # Backstage: Inject MCP server for state cards
     if backstage_parent_id:
-        existing["mcpServers"] = existing.get("mcpServers", {})
-        existing["mcpServers"]["loom-state-cards"] = {
-            "command": python_exe,
-            "args": [str(Path(__file__).parent / "mcp_state_cards.py")],
-            "env": {
-                "LOOM_API_URL": f"{protocol}://127.0.0.1:{server_port}",
-                "LOOM_BACKSTAGE_PARENT_ID": str(backstage_parent_id)
+        _certs_dir = Path(__file__).parent / "certs"
+        protocol = "https" if (_certs_dir / "cert.pem").exists() and (_certs_dir / "key.pem").exists() else "http"
+        mcp_config = {
+            "mcpServers": {
+                "loom-state-cards": {
+                    "command": python_exe,
+                    "args": [str(Path(__file__).parent / "mcp_state_cards.py")],
+                    "env": {
+                        "LOOM_API_URL": f"{protocol}://127.0.0.1:{server_port}",
+                        "LOOM_BACKSTAGE_PARENT_ID": str(backstage_parent_id)
+                    }
+                }
             }
         }
-    
-    settings_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-    log.info(f"[GEMINI] Hook configured: {settings_path}")
+        mcp_path = agents_dir / "mcp_config.json"
+        mcp_path.write_text(json.dumps(mcp_config, indent=2), encoding="utf-8")
+        log.info(f"[AGY] MCP server configured: {mcp_path}")
 
-    # Remove settings.local.json if it has stale Claude-style PreToolUse hooks
-    local_path = gemini_dir / "settings.local.json"
-    if local_path.exists():
-        try:
-            local = json.loads(local_path.read_text(encoding="utf-8"))
-            if "PreToolUse" in local.get("hooks", {}):
-                del local["hooks"]["PreToolUse"]
-                local_path.write_text(json.dumps(local, indent=2), encoding="utf-8")
-        except: pass
-
-    # Add hook command to ~/.gemini/trusted_hooks.json so Gemini doesn't skip it
-    _ensure_hook_trusted(cwd, hook_command)
+    _ensure_hook_trusted(cwd, pre_hook_command)
+    _ensure_hook_trusted(cwd, post_hook_command)
 
 
 def _ensure_hook_trusted(cwd: str, hook_command: str):
-    """Add our hook command to Gemini's trusted_hooks.json for this project path."""
+    """Add our hook command to agy's trusted_hooks.json for this project path."""
     if sys.platform == "win32":
         home = Path(os.environ.get("USERPROFILE", Path.home()))
     else:
@@ -150,9 +147,7 @@ def _ensure_hook_trusted(cwd: str, hook_command: str):
         try: trusted = json.loads(trusted_path.read_text(encoding="utf-8"))
         except: trusted = {}
 
-    # Gemini stores trust entries with a colon prefix on the command string
     trust_key = f":{hook_command}"
-    # Normalize the cwd to match Gemini's path format
     norm_cwd = str(Path(cwd).resolve())
 
     project_hooks = trusted.get(norm_cwd, [])
@@ -161,125 +156,159 @@ def _ensure_hook_trusted(cwd: str, hook_command: str):
         trusted[norm_cwd] = project_hooks
         trusted_path.parent.mkdir(parents=True, exist_ok=True)
         trusted_path.write_text(json.dumps(trusted, indent=2), encoding="utf-8")
-        log.info(f"[GEMINI] Hook trusted for {norm_cwd}")
+        log.info(f"[AGY] Hook trusted for {norm_cwd}")
 
 
 async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
-                     model: str = "sonnet", effort: str = "high",
+                     model: str = "Gemini 3.5 Flash (High)", effort: str = "high",
                      permission_mode: str = "default",
                      resume_session_id: str = None, fork_session: bool = False,
                      backstage_parent_id: int | None = None):
+    """Launch agy in headless mode and yield events.
+
+    Uses plain -p mode (no --output-format). agy runs to completion and outputs
+    raw text to stdout. We collect it all, strip ANSI codes, and forward as
+    text_delta events followed by a result event.
+    """
     _configure_permission_hook(cwd, backstage_parent_id, server_port)
 
-    # Use YOLO mode to ensure tools are visible in headless mode.
-    # Security is enforced by our hook script which fires even in YOLO mode.
+    agy_model = _loom_model_to_agy(model, effort)
+    _set_agy_model(agy_model)
+
+    queue = asyncio.Queue()
+    _active_queues[conv_id] = queue
+
+    # agy 1.0.2 does not support --output-format. Run in plain -p mode
+    # and collect the raw text output.
+    agy_exe = _find_agy_exe()
     cc_args = [
-        "--model", model,
-        "--output-format", "stream-json",
-        "--approval-mode", "yolo",
-        # Gemini CLI's "trusted folders" check otherwise overrides yolo back to
-        # default and aborts headless runs from arbitrary cwds.
-        "--skip-trust",
+        "--conversation", resume_session_id or str(conv_id),
+        "-p", prompt,
+        "--dangerously-skip-permissions",
+        "--print-timeout", "5m",
     ]
-    if resume_session_id:
-        cc_args.extend(["--resume", resume_session_id])
-
-    # Backstage Lockdown: Use temporary policy to block file/shell tools
-    if backstage_parent_id:
-        policy_path = Path(cwd) / ".gemini" / "backstage_policy.toml"
-        policy_content = """
-[[rule]]
-toolName = "*"
-decision = "deny"
-priority = 0
-
-[[rule]]
-mcpServerName = "loom-state-cards"
-decision = "allow"
-priority = 1000
-
-[[rule]]
-toolName = "list_directory"
-decision = "allow"
-priority = 1000
-
-[[rule]]
-toolName = "read_file"
-decision = "allow"
-priority = 1000
-"""
-        policy_path.write_text(policy_content.strip(), encoding="utf-8")
-        cc_args.extend(["--policy", str(policy_path)])
-        cc_args.extend(["--allowed-mcp-server-names", "loom-state-cards"])
-    
-    gemini_exe = "gemini.cmd" if sys.platform == "win32" else "gemini"
 
     env = {
         **os.environ,
         "LOOM_CONV_ID": str(conv_id),
         "LOOM_PORT": str(server_port),
-        # Belt-and-suspenders for older Gemini CLI builds that ignore --skip-trust.
-        "GEMINI_CLI_TRUST_WORKSPACE": "true",
     }
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
 
-    # Always pipe prompt via stdin on Windows — newlines in command-line args
-    # get mangled by CreateProcess, causing Gemini to see only the first line.
-    use_stdin = sys.platform == "win32" or len(prompt) > 20000
-    if use_stdin:
-        cc_args.extend(["-p", "-"])  # read prompt from stdin
-    else:
-        cc_args.extend(["-p", prompt])
-
-    cmd = [gemini_exe] + cc_args
-
-    print(f"[GEMINI] Prompt length: {len(prompt)} chars (stdin={use_stdin})")
-    print(f"[GEMINI] Prompt preview: {repr(prompt[:200])}")
+    cmd = [agy_exe] + cc_args
+    print(f"[AGY] CMD: {' '.join(cmd[:6])}{'...' if len(cmd) > 6 else ''}")
+    print(f"[AGY] agy_model={agy_model}, prompt_len={len(prompt)}")
 
     kwargs = {}
     if sys.platform == "win32":
-        import subprocess
-        # Use CREATE_NO_WINDOW (0x08000000) and CREATE_NEW_PROCESS_GROUP (0x00000200)
         kwargs["creationflags"] = 0x08000000 | 0x00000200
 
     proc = await asyncio.create_subprocess_exec(
         *cmd, cwd=cwd, env=env,
-        stdin=asyncio.subprocess.PIPE if use_stdin else asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         limit=16 * 1024 * 1024,
         **kwargs
     )
 
-    # Feed prompt via stdin if needed in a background task to prevent pipe deadlocks
-    if use_stdin and proc.stdin:
-        async def _feed_stdin():
-            try:
-                proc.stdin.write(prompt.encode("utf-8"))
-                await proc.stdin.drain()
-                proc.stdin.close()
-            except Exception as e:
-                log.error(f"[GEMINI] Error feeding stdin: {e}")
-        asyncio.create_task(_feed_stdin())
+    # Collect stdout, strip ANSI, and look for a JSON block at the end.
+    async def _read_stdout_to_queue(stdout, queue):
+        buf = b""
+        try:
+            while True:
+                chunk = await stdout.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+        except Exception as e:
+            log.error(f"[AGY] Error reading stdout: {e}")
+        finally:
+            raw_text = buf.decode("utf-8", errors="replace")
+            # Strip ANSI escape codes
+            raw_text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', raw_text)
+            raw_text = raw_text.strip()
+            if raw_text:
+                try:
+                    parsed = json.loads(raw_text)
+                    # {"response": "...", "stats": {...}, "error": null}
+                    response_text = parsed.get("response", "") or ""
+                    stats = parsed.get("stats", {})
+                    err = parsed.get("error")
+                    if response_text:
+                        queue.put_nowait({"type": "text_delta", "text": response_text})
+                    if stats:
+                        queue.put_nowait({
+                            "type": "usage",
+                            "input_tokens": stats.get("inputTokens", stats.get("input_tokens", 0)),
+                            "output_tokens": stats.get("outputTokens", stats.get("output_tokens", 0)),
+                        })
+                        queue.put_nowait({
+                            "type": "result",
+                            "duration_ms": stats.get("latencyMs", stats.get("duration_ms", 0)),
+                            "result_text": response_text,
+                            "is_error": err is not None,
+                        })
+                    elif err:
+                        queue.put_nowait({
+                            "type": "result",
+                            "is_error": True,
+                            "error": str(err),
+                        })
+                    else:
+                        # Empty response — no error, no text
+                        queue.put_nowait({"type": "result", "is_error": False})
+                except json.JSONDecodeError:
+                    # Not JSON — treat as plain text
+                    lines = [l for l in raw_text.split("\n") if l.strip()]
+                    for line in lines:
+                        queue.put_nowait({"type": "text_delta", "text": line + "\n"})
+                    queue.put_nowait({"type": "result", "is_error": False})
+            queue.put_nowait(None)
+
+    asyncio.create_task(_read_stdout_to_queue(proc.stdout, queue))
 
     async def _read_stderr():
         async for line in proc.stderr:
             text = line.decode("utf-8", errors="replace").strip()
-            if text: print(f"[GEMINI-stderr] {text}")
+            if text: print(f"[AGY-stderr] {text}")
     asyncio.create_task(_read_stderr())
 
     async def _event_stream():
-        async for line in proc.stdout:
-            line = line.strip()
-            if not line: continue
+        yield {
+            "type": "session_info",
+            "session_id": resume_session_id or str(conv_id),
+            "model": agy_model,
+        }
+
+        stdout_done = False
+        got_result = False
+        while not (stdout_done and queue.empty()):
             try:
-                raw = json.loads(line.decode("utf-8", errors="replace"))
-                for evt in _process_event(raw): yield evt
-                if raw.get("type") == "result": break
-            except: continue
+                evt = await queue.get()
+                if evt is None:
+                    stdout_done = True
+                    continue
+                if evt.get("type") == "result":
+                    got_result = True
+                yield evt
+            except asyncio.CancelledError:
+                break
+
+        _active_queues.pop(conv_id, None)
         await proc.wait()
 
+        # Only emit a synthetic result if the JSON block didn't produce one.
+        if not got_result:
+            yield {
+                "type": "result",
+                "is_error": proc.returncode != 0,
+                "result_text": "",
+                "session_id": resume_session_id or str(conv_id),
+            }
+
     return proc, _event_stream()
+
 
 async def cancel_gemini(proc):
     if proc.returncode is None:

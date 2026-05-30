@@ -832,20 +832,13 @@ _VISION_MODELS_CACHE: dict | None = None
 
 async def _refresh_local_models_cache() -> dict:
     global _LOCAL_MODELS_CACHE
-    # Prefer live server models; fall back to directory scan
     status = await health_check()
-    live_models = status.get("models", [])
     import llama_client as _lc
     disk_models = _lc.list_local_models()
-    # Combine: live first, then any disk models not yet loaded
-    all_models = list(live_models)
-    for m in disk_models:
-        if m not in all_models:
-            all_models.append(m)
     _LOCAL_MODELS_CACHE = {
         "backend": "llama",
         "host": config.llama_host,
-        "models": all_models,
+        "models": disk_models,
         "disk_models": disk_models,
         "target_model": config.llama_model,
         "available": status.get("model_available", False),
@@ -919,9 +912,15 @@ async def _refresh_all_engines_cache() -> dict:
     disk_models = _lc.list_local_models()
     status = await _lc.health_check()
     live_models = status.get("models", [])
+    model_name_map = status.get("model_name_map", {})
     out: list[dict] = []
     for m in disk_models:
-        out.append({"name": m, "backend": "llama", "loaded": m in live_models})
+        is_loaded = False
+        if m in model_name_map and model_name_map[m] in live_models:
+            is_loaded = True
+        elif live_models and m == status.get("target_model"):
+            is_loaded = True
+        out.append({"name": m, "backend": "llama", "loaded": is_loaded})
     _ALL_ENGINES_CACHE = {
         "models": out,
         "active_backend": "llama",
@@ -1436,6 +1435,24 @@ async def api_get_conversation(conv_id: int):
     conv = await db.get_conversation(conv_id)
     if not conv:
         raise HTTPException(404, "Conversation not found")
+    # Lazy-migrate legacy local model names to loaded model filenames if they match
+    if conv.get("local_model") and config.llama_model:
+        local_model = conv["local_model"]
+        if models_match(local_model, config.llama_model):
+            if local_model != config.llama_model:
+                conv["local_model"] = config.llama_model
+                await db.update_conversation_fields(conv_id, local_model=config.llama_model)
+    # Lazy-migrate legacy local model names in cc_model to loaded model filenames if they match
+    if conv.get("cc_model") and config.llama_model:
+        cc_model = conv["cc_model"]
+        is_api = any(
+            cc_model.startswith(prefix)
+            for prefix in ("sonnet", "haiku", "opus", "gemini", "Gemini", "gpt", "GPT")
+        )
+        if not is_api and models_match(cc_model, config.llama_model):
+            if cc_model != config.llama_model:
+                conv["cc_model"] = config.llama_model
+                await db.update_conversation_fields(conv_id, cc_model=config.llama_model)
     # Lazy-mint a slug for conversations that had canvas enabled before
     # the canvas_slug column existed.
     if conv.get("canvas_enabled") and not conv.get("canvas_slug"):
@@ -2247,13 +2264,15 @@ CC_MODELS = [
         {"value": "opus[1m]", "label": "Opus (1M)"},
         {"value": "haiku", "label": "Haiku"},
     ]},
-    {"group": "Gemini", "models": [
-        {"value": "gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro Preview"},
-        {"value": "gemini-3-flash-preview", "label": "Gemini 3 Flash Preview"},
-        {"value": "gemini-3.1-flash-lite-preview", "label": "Gemini 3.1 Flash Lite Preview"},
-        {"value": "gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
-        {"value": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
-        {"value": "gemini-2.5-flash-lite", "label": "Gemini 2.5 Flash Lite"},
+    {"group": "Antigravity (agy)", "models": [
+        {"value": "Gemini 3.5 Flash (Low)", "label": "Gemini 3.5 Flash (Low)"},
+        {"value": "Gemini 3.5 Flash (High)", "label": "Gemini 3.5 Flash (High)"},
+        {"value": "Gemini 3.5 Flash (Medium)", "label": "Gemini 3.5 Flash (Medium)"},
+        {"value": "Gemini 3.1 Pro (High)", "label": "Gemini 3.1 Pro (High)"},
+        {"value": "Gemini 3.1 Pro (Low)", "label": "Gemini 3.1 Pro (Low)"},
+        {"value": "Claude Sonnet 4.6 (Thinking)", "label": "Claude Sonnet 4.6 (Thinking)"},
+        {"value": "Claude Opus 4.6 (Thinking)", "label": "Claude Opus 4.6 (Thinking)"},
+        {"value": "GPT-OSS 120B (Medium)", "label": "GPT-OSS 120B (Medium)"},
     ]},
 ]
 
@@ -2261,6 +2280,155 @@ CC_MODELS = [
 @app.get("/api/cc-models")
 async def api_cc_models():
     return CC_MODELS
+
+
+# Families that support the 1M-context beta — surfaced as `<value>[1m]` entries.
+# Subscription users can only enable 1M via the CLI's `[1m]` model suffix
+# (`--betas` is API-key-only), and the CLI's suffix parser is independent of
+# alias-vs-full-ID resolution, so `opus[1m]` and `claude-opus-4-7[1m]` both work.
+_CC_ONEM_FAMILIES = {"opus", "sonnet"}
+# Family display order, applied to both the Auto group and within Pinned.
+_CC_FAMILY_ORDER = ["opus", "sonnet", "haiku"]
+
+import re as _re
+# claude-<family>-<major>[-<minor>][-<yyyymmdd>] — minor is 1-2 digits and
+# optional (e.g. `claude-opus-4-20250514` is version 4.0 with a date, NOT
+# minor=20250514). The optional 8-digit date tail is anchored so it can't be
+# mistaken for the minor.
+_CC_MODEL_ID_RE = _re.compile(
+    r"^claude-(opus|sonnet|haiku)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$",
+    _re.IGNORECASE,
+)
+
+
+def _read_oauth_token() -> str | None:
+    """Read the Claude Code subscription OAuth access token from the standard
+    credentials file. Returns None if missing/unreadable. The expiresAt timestamp
+    is intentionally not checked — the API returns 401 if it's actually expired,
+    and reading the file each call means the user can refresh their session via
+    the desktop app without restarting Loom."""
+    cred_path = Path.home() / ".claude" / ".credentials.json"
+    try:
+        data = json.loads(cred_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return (data.get("claudeAiOauth") or {}).get("accessToken")
+
+
+@app.post("/api/cc-models/refresh")
+async def api_cc_models_refresh():
+    """Rebuild the Anthropic dropdown from the live `/v1/models` API, using the
+    local Claude Code subscription OAuth token (no API key, no generation —
+    one free metadata request). Produces two groups in place of the old single
+    "Anthropic" group:
+
+      • "Anthropic — Auto"   alias values (`opus`, `opus[1m]`, …) labeled
+                              "(latest)" without a specific version, since the
+                              CLI's own bundled alias→ID map decides which
+                              concrete model actually runs.
+      • "Anthropic — Pinned" every full claude-* ID the API returns, so the
+                              user can pin an exact version. Each version is
+                              followed by its `[1m]` sibling for opus/sonnet.
+
+    Mutates CC_MODELS in place so existing references stay valid."""
+    token = _read_oauth_token()
+    if not token:
+        raise HTTPException(
+            502,
+            "No Claude Code login found (~/.claude/.credentials.json). "
+            "Run `claude` once to sign in, then retry.",
+        )
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "oauth-2025-04-20",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                "https://api.anthropic.com/v1/models",
+                params={"limit": 100},
+                headers=headers,
+            )
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Failed to reach Anthropic /v1/models: {e}")
+
+    if resp.status_code == 401:
+        raise HTTPException(
+            502,
+            "Anthropic rejected the login token (expired?). "
+            "Open the Claude Code desktop app and sign in again, then retry.",
+        )
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Anthropic /v1/models returned {resp.status_code}: {resp.text[:200]}")
+
+    # Group every returned claude-* model by family. display_name comes
+    # pre-formatted ("Claude Opus 4.8"); strip the "Claude " prefix so labels
+    # read "Opus 4.8" to match the compact dropdown style.
+    by_family: dict[str, list[tuple[tuple[int, int], str, str]]] = {
+        f: [] for f in _CC_FAMILY_ORDER
+    }
+    for m in resp.json().get("data", []):
+        model_id = m.get("id", "")
+        match = _CC_MODEL_ID_RE.match(model_id)
+        if not match:
+            continue
+        family = match.group(1).lower()
+        if family not in by_family:
+            continue
+        version = (int(match.group(2)), int(match.group(3) or 0))
+        label = (m.get("display_name") or "").removeprefix("Claude ").strip()
+        if not label:
+            label = f"{family.capitalize()} {version[0]}.{version[1]}"
+        by_family[family].append((version, model_id, label))
+
+    if not any(by_family.values()):
+        raise HTTPException(502, "Anthropic /v1/models returned no recognizable claude-* models.")
+
+    for family in by_family:
+        by_family[family].sort(key=lambda t: t[0], reverse=True)
+
+    # Auto group — one alias entry per family that has any pinned model. The
+    # CLI's bundled alias map (frozen at the CLI's build time) decides which
+    # concrete ID runs, so the label can't honestly name a version.
+    auto_models: list[dict] = []
+    for family in _CC_FAMILY_ORDER:
+        if not by_family[family]:
+            continue
+        cap = family.capitalize()
+        auto_models.append({"value": family, "label": f"{cap} (latest)"})
+        if family in _CC_ONEM_FAMILIES:
+            auto_models.append({"value": f"{family}[1m]", "label": f"{cap} (latest, 1M)"})
+
+    # Pinned group — every concrete claude-* ID, with [1m] siblings interleaved
+    # per version so each release block stays together.
+    pinned_models: list[dict] = []
+    for family in _CC_FAMILY_ORDER:
+        for _ver, model_id, label in by_family[family]:
+            pinned_models.append({"value": model_id, "label": label})
+            if family in _CC_ONEM_FAMILIES:
+                pinned_models.append({"value": f"{model_id}[1m]", "label": f"{label} (1M)"})
+
+    # Splice the two new groups in where the old Anthropic group(s) were, keep
+    # everything else in original order. Handles both the initial hardcoded
+    # "Anthropic" group and any prior refresh's "Anthropic — Auto/Pinned" pair.
+    new_cc_models: list[dict] = []
+    inserted = False
+    for group in CC_MODELS:
+        if group["group"].startswith("Anthropic"):
+            if not inserted:
+                new_cc_models.append({"group": "Anthropic — Auto", "models": auto_models})
+                new_cc_models.append({"group": "Anthropic — Pinned", "models": pinned_models})
+                inserted = True
+        else:
+            new_cc_models.append(group)
+    if not inserted:
+        new_cc_models.insert(0, {"group": "Anthropic — Pinned", "models": pinned_models})
+        new_cc_models.insert(0, {"group": "Anthropic — Auto", "models": auto_models})
+
+    CC_MODELS[:] = new_cc_models
+    return {"models": CC_MODELS, "families": sorted(f for f, v in by_family.items() if v)}
 
 
 _VISION_MODEL_CACHE: dict[tuple[str, str], bool] = {}
@@ -2367,6 +2535,56 @@ async def serve_project_file(conv_id: int, path: str = ""):
         filename=target.name,
         content_disposition_type="inline",
     )
+
+
+@app.get("/api/conversations/{conv_id}/artifacts")
+async def serve_project_artifacts(conv_id: int):
+    """Scan conversation's project directory for planning and artifact files."""
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    project_dir = conv.get("project_dir")
+    if not project_dir:
+        raise HTTPException(400, "No project directory set")
+
+    base = Path(project_dir).resolve()
+    if not base.exists() or not base.is_dir():
+        return {"artifacts": []}
+
+    # Files we want to check for in the workspace
+    standard_files = ["CLAUDE.md", "task.md", "tasks.md", "walkthrough.md", "implementation_plan.md"]
+    artifacts = []
+
+    # 1. Check standard root files
+    for filename in standard_files:
+        target = base / filename
+        if target.exists() and target.is_file():
+            artifacts.append({
+                "name": filename,
+                "path": filename,
+                "size": target.stat().st_size,
+                "modified": target.stat().st_mtime
+            })
+
+    # 2. Check files inside .claude/plans/
+    plans_dir = base / ".claude" / "plans"
+    if plans_dir.is_dir():
+        try:
+            for p in plans_dir.glob("*.md"):
+                if p.is_file():
+                    rel_path = f".claude/plans/{p.name}"
+                    artifacts.append({
+                        "name": p.name,
+                        "path": rel_path,
+                        "size": p.stat().st_size,
+                        "modified": p.stat().st_mtime
+                    })
+        except Exception:
+            pass
+
+    # Sort by name
+    artifacts.sort(key=lambda x: x["name"].lower())
+    return {"artifacts": artifacts}
 
 
 # ── Claude Code Permission Hook Endpoint ──
@@ -2530,6 +2748,52 @@ async def handle_cc_permission(data: dict):
         return {"allow": True}
     else:
         return {"allow": False, "message": "Denied by user in Loom UI"}
+
+
+@app.post("/api/cc-tool-start")
+async def handle_cc_tool_start(data: dict):
+    """Receive tool start event from CC hook script, forward to event stream."""
+    conv_id = int(data.get("loom_conv_id", 0))
+    tool_name = data.get("tool_name", "")
+    tool_id = data.get("tool_id", "")
+    tool_input = data.get("tool_input", {})
+    
+    print(f"[PERM] Hook tool-start: conv={conv_id} tool={tool_name} id={tool_id}")
+    
+    if conv_id in gemini_client._active_queues:
+        gemini_client._active_queues[conv_id].put_nowait({
+            "type": "tool_start",
+            "name": tool_name,
+            "tool_id": tool_id,
+        })
+        if tool_input:
+            gemini_client._active_queues[conv_id].put_nowait({
+                "type": "tool_input_delta",
+                "json": json.dumps(tool_input, indent=2),
+                "tool_id": tool_id,
+            })
+    return {"status": "ok"}
+
+
+@app.post("/api/cc-tool-result")
+async def handle_cc_tool_result(data: dict):
+    """Receive tool result event from CC hook script, forward to event stream."""
+    conv_id = int(data.get("loom_conv_id", 0))
+    tool_name = data.get("tool_name", "")
+    tool_id = data.get("tool_id", "")
+    content = data.get("content", "")
+    is_error = data.get("is_error", False)
+    
+    print(f"[PERM] Hook tool-result: conv={conv_id} tool={tool_name} id={tool_id} error={is_error}")
+    
+    if conv_id in gemini_client._active_queues:
+        gemini_client._active_queues[conv_id].put_nowait({
+            "type": "tool_result",
+            "content": content,
+            "tool_id": tool_id,
+            "is_error": is_error,
+        })
+    return {"status": "ok"}
 
 
 # ── Skills & Modules ──
@@ -3299,13 +3563,13 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
         cc_model = data.get("cc_model") or conv.get("cc_model") or "sonnet"
         cc_effort = conv.get("cc_effort") or "high"
 
-        # Determine provider (same logic as _handle_claude_generation)
-        _ANTHROPIC_MODELS = {"sonnet", "opus", "haiku"}
-        _base_model = cc_model.split("[")[0] if "[" in cc_model else cc_model
-        is_anthropic = _base_model in _ANTHROPIC_MODELS
+        # Determine provider (same logic as _handle_claude_generation).
+        # Pinned full IDs (e.g. `claude-opus-4-6`) count as Anthropic too —
+        # routed through model_context.is_anthropic to keep the shape in sync.
+        is_anthropic = model_context.is_anthropic(cc_model)
         is_llama = cc_model.endswith(".gguf")
         use_llama = conv.get("_use_llama", False) or is_llama
-        if is_anthropic or cc_model.startswith("gemini"):
+        if is_anthropic or is_gemini_model(cc_model):
             use_llama = False
 
         await _ws_send(conv_id, {"type": "status", "text": "Compacting context..."})
@@ -3406,9 +3670,52 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
         await _ws_send(conv_id, {"type": "error", "error": f"Compaction failed: {e}"})
 
 
+def is_gemini_model(model: str) -> bool:
+    if not model:
+        return False
+    ml = model.lower()
+    return ml.startswith("gemini") or model in (
+        "Claude Sonnet 4.6 (Thinking)",
+        "Claude Opus 4.6 (Thinking)",
+        "GPT-OSS 120B (Medium)"
+    )
+
+
+def models_match(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    def norm(s: str) -> str:
+        s = s.lower()
+        if s.endswith(".gguf"):
+            s = s[:-5]
+        return "".join(c for c in s if c.isalnum())
+    na = norm(a)
+    nb = norm(b)
+    return na == nb or na in nb or nb in na
+
+
 async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
     """Handle a generation request over WebSocket — routes by conversation mode."""
     conv = await db.get_conversation(conv_id)
+    if conv and conv.get("local_model") and config.llama_model:
+        local_model = conv["local_model"]
+        if models_match(local_model, config.llama_model):
+            if local_model != config.llama_model:
+                await db.update_conversation_fields(conv_id, local_model=config.llama_model)
+                conv = dict(conv)
+                conv["local_model"] = config.llama_model
+    if conv and conv.get("cc_model") and config.llama_model:
+        cc_model = conv["cc_model"]
+        is_api = any(
+            cc_model.startswith(prefix)
+            for prefix in ("sonnet", "haiku", "opus", "gemini", "Gemini", "gpt", "GPT")
+        )
+        if not is_api and models_match(cc_model, config.llama_model):
+            if cc_model != config.llama_model:
+                await db.update_conversation_fields(conv_id, cc_model=config.llama_model)
+                conv = dict(conv)
+                conv["cc_model"] = config.llama_model
+
     mode = conv.get("mode", "weave") if conv else "weave"
 
     if mode == "claude":
@@ -3481,12 +3788,10 @@ async def _handle_claude_generation(
         if data.get("cc_model") and data["cc_model"] != conv.get("cc_model"):
             await db.update_conversation_fields(conv_id, cc_model=cc_model)
 
-        # Identify provider based on model name
-        # Strip [1m] suffix for provider detection (e.g. "sonnet[1m]" → "sonnet")
-        _ANTHROPIC_MODELS = {"sonnet", "opus", "haiku"}
-        _base_model = cc_model.split("[")[0] if "[" in cc_model else cc_model
-        is_anthropic = _base_model in _ANTHROPIC_MODELS
-        is_gemini = cc_model.startswith("gemini")
+        # Identify provider based on model name. Accepts aliases (sonnet/opus/
+        # haiku), pinned full IDs (claude-opus-4-6), and `[1m]` suffix variants.
+        is_anthropic = model_context.is_anthropic(cc_model)
+        is_gemini = is_gemini_model(cc_model)
         # .gguf models go through Claude Code with ANTHROPIC_BASE_URL pointed
         # at the local llama-server (which speaks /v1/messages natively on :11434).
         is_llama = cc_model.endswith(".gguf")
@@ -3577,16 +3882,11 @@ async def _handle_claude_generation(
                     continue
                 # Check if the session was created by a different provider.
                 # cc_model_used can hold either a shortcode alias ("opus[1m]")
-                # or the full Anthropic model id ("claude-opus-4-7[1m]") — accept both.
+                # or a full Anthropic model id ("claude-opus-4-7[1m]") — the
+                # helper accepts both.
                 prev_model = msg.get("cc_model_used") or ""
-                _prev_base = prev_model.split("[")[0] if "[" in prev_model else prev_model
-                _prev_base_lower = _prev_base.lower()
-                prev_is_anthropic = (
-                    _prev_base in _ANTHROPIC_MODELS
-                    or _prev_base_lower.startswith("claude-")
-                    or any(fam in _prev_base_lower for fam in ("opus", "sonnet", "haiku"))
-                )
-                prev_is_gemini = prev_model.startswith("gemini")
+                prev_is_anthropic = model_context.is_anthropic(prev_model)
+                prev_is_gemini = is_gemini_model(prev_model)
                 prev_is_llama = bool(prev_model) and not (
                     prev_is_anthropic or prev_is_gemini
                 )
@@ -3600,8 +3900,8 @@ async def _handle_claude_generation(
                     )
                     crossed_provider = True
                     break
-                # Gemini CLI doesn't support --fork-session, so resuming
-                # mutates the session in place. Skip resume for Gemini.
+                # agy doesn't support --fork-session, so resuming
+                # mutates the session in place. Skip resume for agy.
                 if is_gemini:
                     print(f"[CC] Gemini has no --fork-session, skipping resume for branch safety")
                     break
@@ -3819,7 +4119,7 @@ async def _handle_claude_generation(
 
         # Let the client know we're launching
         if is_gemini:
-            launch_label = f"Launching Gemini CLI ({cc_model})..."
+            launch_label = f"Launching agy ({cc_model})..."
         elif use_llama:
             launch_label = f"Launching {cc_model} via Llama Server..."
         else:
@@ -4529,7 +4829,7 @@ async def _handle_claude_generation(
         # If CC produced no output at all, mark draft as error (don't delete)
         if not full_text and not any(b["type"] == "tool_use" for b in content_blocks):
             provider_name = (
-                "Gemini CLI"
+                "Antigravity (agy)"
                 if is_gemini
                 else ("Llama Server" if use_llama else "Claude Code")
             )
