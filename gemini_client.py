@@ -159,17 +159,65 @@ def _ensure_hook_trusted(cwd: str, hook_command: str):
         log.info(f"[AGY] Hook trusted for {norm_cwd}")
 
 
+def normalize_tool_name(name: str) -> str:
+    mapping = {
+        "view_file": "Read",
+        "read_file": "Read",
+        "read_many_files": "Read",
+        "write_to_file": "Write",
+        "write_file": "Write",
+        "replace_file_content": "Edit",
+        "multi_replace_file_content": "Edit",
+        "run_command": "Bash",
+        "execute_command": "Bash",
+        "run_shell_command": "Bash",
+        "grep_search": "Grep",
+        "list_dir": "Glob",
+        "list_directory": "Glob",
+        "glob": "Glob",
+        "search_web": "WebSearch",
+        "google_web_search": "WebSearch",
+        "read_url_content": "WebFetch",
+        "web_fetch": "WebFetch",
+    }
+    return mapping.get(name, name)
+
+
+def clean_arg_val(val):
+    if isinstance(val, str):
+        if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+            return val[1:-1]
+    return val
+
+
+def normalize_tool_args(name: str, args: dict) -> dict:
+    cleaned = {k: clean_arg_val(v) for k, v in args.items()}
+    mapped = {}
+    if name in ("view_file", "read_file", "read_many_files"):
+        mapped["file_path"] = cleaned.get("AbsolutePath", cleaned.get("TargetFile", cleaned.get("file_path", "")))
+    elif name in ("write_to_file", "write_file"):
+        mapped["file_path"] = cleaned.get("TargetFile", cleaned.get("file_path", ""))
+        mapped["content"] = cleaned.get("CodeContent", cleaned.get("content", ""))
+    elif name in ("replace_file_content", "multi_replace_file_content", "edit"):
+        mapped["file_path"] = cleaned.get("TargetFile", cleaned.get("file_path", ""))
+        mapped["old_string"] = cleaned.get("TargetContent", cleaned.get("old_string", ""))
+        mapped["new_string"] = cleaned.get("ReplacementContent", cleaned.get("new_string", ""))
+    elif name in ("run_command", "execute_command", "run_shell_command"):
+        mapped["command"] = cleaned.get("CommandLine", cleaned.get("command", ""))
+    elif name in ("grep_search", "grep"):
+        mapped["query"] = cleaned.get("Query", cleaned.get("query", ""))
+        mapped["dir"] = cleaned.get("SearchPath", cleaned.get("dir", ""))
+    else:
+        mapped = cleaned
+    return mapped
+
+
 async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
                      model: str = "Gemini 3.5 Flash (High)", effort: str = "high",
                      permission_mode: str = "default",
                      resume_session_id: str = None, fork_session: bool = False,
                      backstage_parent_id: int | None = None):
-    """Launch agy in headless mode and yield events.
-
-    Uses plain -p mode (no --output-format). agy runs to completion and outputs
-    raw text to stdout. We collect it all, strip ANSI codes, and forward as
-    text_delta events followed by a result event.
-    """
+    """Launch agy in headless mode, watch its transcript, and yield events in real time."""
     _configure_permission_hook(cwd, backstage_parent_id, server_port)
 
     agy_model = _loom_model_to_agy(model, effort)
@@ -178,8 +226,40 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     queue = asyncio.Queue()
     _active_queues[conv_id] = queue
 
-    # agy 1.0.2 does not support --output-format. Run in plain -p mode
-    # and collect the raw text output.
+    # Setup transcript watching paths
+    if sys.platform == "win32":
+        home = Path(os.environ.get("USERPROFILE", Path.home()))
+    else:
+        home = Path.home()
+    brain_path = home / ".gemini" / "antigravity-cli" / "brain"
+
+    def find_latest_transcript(path: Path) -> tuple[Path | None, float]:
+        latest_file = None
+        latest_time = 0.0
+        if path.exists():
+            for root, dirs, files in os.walk(path):
+                for f in files:
+                    if f == "transcript.jsonl":
+                        fp = Path(root) / f
+                        try:
+                            mtime = fp.stat().st_mtime
+                            if mtime > latest_time:
+                                latest_time = mtime
+                                latest_file = fp
+                        except OSError:
+                            pass
+        return latest_file, latest_time
+
+    # Determine baseline before launching process to avoid race conditions
+    use_resume = bool(resume_session_id)
+    baseline_file, baseline_time = find_latest_transcript(brain_path)
+    initial_size = 0
+    if use_resume and baseline_file:
+        try:
+            initial_size = baseline_file.stat().st_size
+        except OSError:
+            pass
+
     agy_exe = _find_agy_exe()
     cc_args = [
         "--conversation", resume_session_id or str(conv_id),
@@ -212,83 +292,306 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         **kwargs
     )
 
-    # Collect stdout, strip ANSI, and look for a JSON block at the end.
-    async def _read_stdout_to_queue(stdout, queue):
-        buf = b""
-        try:
-            while True:
-                chunk = await stdout.read(4096)
-                if not chunk:
-                    break
-                buf += chunk
-        except Exception as e:
-            log.error(f"[AGY] Error reading stdout: {e}")
-        finally:
-            raw_text = buf.decode("utf-8", errors="replace")
-            # Strip ANSI escape codes
-            raw_text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', raw_text)
-            raw_text = raw_text.strip()
-            if raw_text:
-                try:
-                    parsed = json.loads(raw_text)
-                    # {"response": "...", "stats": {...}, "error": null}
-                    response_text = parsed.get("response", "") or ""
-                    stats = parsed.get("stats", {})
-                    err = parsed.get("error")
-                    if response_text:
-                        queue.put_nowait({"type": "text_delta", "text": response_text})
-                    if stats:
-                        queue.put_nowait({
-                            "type": "usage",
-                            "input_tokens": stats.get("inputTokens", stats.get("input_tokens", 0)),
-                            "output_tokens": stats.get("outputTokens", stats.get("output_tokens", 0)),
-                        })
-                        queue.put_nowait({
-                            "type": "result",
-                            "duration_ms": stats.get("latencyMs", stats.get("duration_ms", 0)),
-                            "result_text": response_text,
-                            "is_error": err is not None,
-                        })
-                    elif err:
-                        queue.put_nowait({
-                            "type": "result",
-                            "is_error": True,
-                            "error": str(err),
-                        })
-                    else:
-                        # Empty response — no error, no text
-                        queue.put_nowait({"type": "result", "is_error": False})
-                except json.JSONDecodeError:
-                    # Not JSON — treat as plain text
-                    lines = [l for l in raw_text.split("\n") if l.strip()]
-                    for line in lines:
-                        queue.put_nowait({"type": "text_delta", "text": line + "\n"})
-                    queue.put_nowait({"type": "result", "is_error": False})
-            queue.put_nowait(None)
-
-    asyncio.create_task(_read_stdout_to_queue(proc.stdout, queue))
-
+    # We read stderr in the background
     async def _read_stderr():
-        async for line in proc.stderr:
-            text = line.decode("utf-8", errors="replace").strip()
-            if text: print(f"[AGY-stderr] {text}")
+        try:
+            async for line in proc.stderr:
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    print(f"[AGY-stderr] {text}")
+        except Exception as e:
+            log.error(f"[AGY] Error reading stderr: {e}")
     asyncio.create_task(_read_stderr())
 
-    async def _event_stream():
-        yield {
-            "type": "session_info",
-            "session_id": resume_session_id or str(conv_id),
-            "model": agy_model,
-        }
+    # We also drain stdout to avoid blocking
+    async def _drain_stdout():
+        try:
+            while True:
+                chunk = await proc.stdout.read(4096)
+                if not chunk:
+                    break
+        except Exception as e:
+            log.error(f"[AGY] Error draining stdout: {e}")
+    asyncio.create_task(_drain_stdout())
 
-        stdout_done = False
+    # Asynchronous task to monitor and tail the transcript.jsonl file
+    async def _tail_transcript_to_queue():
+        active_file = None
+        # Poll for the active transcript file being created or modified (10s timeout)
+        for _ in range(200):
+            latest_file, latest_time = find_latest_transcript(brain_path)
+            if latest_file and (latest_file != baseline_file or latest_time > baseline_time + 0.1):
+                active_file = latest_file
+                break
+            await asyncio.sleep(0.05)
+
+        if not active_file:
+            log.error("[AGY] Timeout waiting for active transcript file. Waiting for process completion.")
+            await proc.wait()
+            queue.put_nowait({
+                "type": "result",
+                "is_error": proc.returncode != 0,
+                "result_text": "",
+                "session_id": resume_session_id or str(conv_id),
+            })
+            queue.put_nowait(None)
+            return
+
+        session_id = ""
+        try:
+            rel = active_file.relative_to(brain_path)
+            session_id = rel.parts[0]
+        except ValueError:
+            session_id = active_file.parent.parent.parent.parent.name
+
+        # Put session info event into queue
+        queue.put_nowait({
+            "type": "session_info",
+            "session_id": session_id,
+            "model": agy_model,
+        })
+
+        # Wait a moment for file updates to begin
+        await asyncio.sleep(0.1)
+        
+        try:
+            with open(active_file, "r", encoding="utf-8", errors="replace") as f:
+                if active_file == baseline_file and initial_size > 0:
+                    f.seek(initial_size)
+                    f.readline()  # consume any trailing fragment of the previous line
+                
+                full_text = ""
+                processed_steps = set()
+                active_tool_calls = []
+
+                while True:
+                    line = f.readline()
+                    if line:
+                        if not line.strip():
+                            continue
+                        try:
+                            event = json.loads(line)
+                            step_index = event.get("step_index")
+                            if step_index in processed_steps:
+                                continue
+                            processed_steps.add(step_index)
+
+                            etype = event.get("type")
+                            source = event.get("source")
+                            content = event.get("content")
+                            tool_calls = event.get("tool_calls")
+
+                            if etype == "PLANNER_RESPONSE":
+                                thinking = event.get("thinking")
+                                content = event.get("content")
+
+                                # Stream thinking process if present
+                                if thinking:
+                                    chunk_size = 128
+                                    for i in range(0, len(thinking), chunk_size):
+                                        chunk = thinking[i:i+chunk_size]
+                                        queue.put_nowait({"type": "thinking_delta", "text": chunk})
+                                        await asyncio.sleep(0.005)
+
+                                # Process tool calls with Claude-compatible mappings
+                                if tool_calls:
+                                    for idx, tool in enumerate(tool_calls):
+                                        tool_id = str(step_index)
+                                        tool_name = tool.get("name")
+                                        tool_args = tool.get("args", {})
+                                        
+                                        mapped_name = normalize_tool_name(tool_name)
+                                        mapped_args = normalize_tool_args(tool_name, tool_args)
+                                        
+                                        active_tool_calls.append(tool_id)
+                                        
+                                        queue.put_nowait({
+                                            "type": "tool_start",
+                                            "name": mapped_name,
+                                            "tool_id": tool_id,
+                                        })
+                                        queue.put_nowait({
+                                            "type": "tool_input_delta",
+                                            "json": json.dumps(mapped_args, indent=2),
+                                            "tool_id": tool_id,
+                                        })
+                                        if tool_name in ("ask_question", "AskUserQuestion"):
+                                            queue.put_nowait({
+                                                "type": "ask_user_question",
+                                                "questions": tool_args.get("questions", []),
+                                                "tool_id": tool_id,
+                                            })
+                                        elif tool_name in ("ExitPlanMode", "exit_plan_mode"):
+                                            queue.put_nowait({
+                                                "type": "plan_ready",
+                                                "plan": tool_args.get("plan", ""),
+                                                "plan_file": tool_args.get("planFilePath", tool_args.get("plan_file", "")),
+                                                "tool_id": tool_id,
+                                            })
+
+                                # Stream content (commentary or final response) as text_delta
+                                if content:
+                                    chunk_size = 64
+                                    for i in range(0, len(content), chunk_size):
+                                        chunk = content[i:i+chunk_size]
+                                        queue.put_nowait({"type": "text_delta", "text": chunk})
+                                        await asyncio.sleep(0.01)
+                                    full_text += content
+
+                            elif etype not in ("USER_INPUT", "CONVERSATION_HISTORY"):
+                                if active_tool_calls:
+                                    tool_id = active_tool_calls.pop(0)
+                                    queue.put_nowait({
+                                        "type": "tool_result",
+                                        "content": content or "",
+                                        "tool_id": tool_id,
+                                        "is_error": False,
+                                    })
+                                else:
+                                    if content:
+                                        queue.put_nowait({
+                                            "type": "text_delta",
+                                            "text": f"\n[Tool Output]: {content}\n",
+                                        })
+                        except Exception as e:
+                            log.error(f"[AGY] Error parsing transcript line: {e}")
+                    else:
+                        # EOF. Check if process is finished
+                        if proc.returncode is not None:
+                            # Read any remaining lines
+                            for line in f:
+                                if not line.strip():
+                                    continue
+                                try:
+                                    event = json.loads(line)
+                                    step_index = event.get("step_index")
+                                    if step_index in processed_steps:
+                                        continue
+                                    processed_steps.add(step_index)
+
+                                    etype = event.get("type")
+                                    content = event.get("content")
+                                    thinking = event.get("thinking")
+                                    tool_calls = event.get("tool_calls")
+
+                                    if etype == "PLANNER_RESPONSE":
+                                        if thinking:
+                                            queue.put_nowait({"type": "thinking_delta", "text": thinking})
+
+                                        if tool_calls:
+                                            for idx, tool in enumerate(tool_calls):
+                                                tool_id = str(step_index)
+                                                tool_name = tool.get("name")
+                                                tool_args = tool.get("args", {})
+                                                
+                                                mapped_name = normalize_tool_name(tool_name)
+                                                mapped_args = normalize_tool_args(tool_name, tool_args)
+                                                
+                                                active_tool_calls.append(tool_id)
+                                                queue.put_nowait({
+                                                    "type": "tool_start",
+                                                    "name": mapped_name,
+                                                    "tool_id": tool_id,
+                                                })
+                                                queue.put_nowait({
+                                                    "type": "tool_input_delta",
+                                                    "json": json.dumps(mapped_args, indent=2),
+                                                    "tool_id": tool_id,
+                                                })
+                                                if tool_name in ("ask_question", "AskUserQuestion"):
+                                                    queue.put_nowait({
+                                                        "type": "ask_user_question",
+                                                        "questions": tool_args.get("questions", []),
+                                                        "tool_id": tool_id,
+                                                    })
+                                                elif tool_name in ("ExitPlanMode", "exit_plan_mode"):
+                                                    queue.put_nowait({
+                                                        "type": "plan_ready",
+                                                        "plan": tool_args.get("plan", ""),
+                                                        "plan_file": tool_args.get("planFilePath", tool_args.get("plan_file", "")),
+                                                        "tool_id": tool_id,
+                                                    })
+                                        if content:
+                                            queue.put_nowait({"type": "text_delta", "text": content})
+                                            full_text += content
+                                    elif etype not in ("USER_INPUT", "CONVERSATION_HISTORY"):
+                                        if active_tool_calls:
+                                            tool_id = active_tool_calls.pop(0)
+                                            queue.put_nowait({
+                                                "type": "tool_result",
+                                                "content": content or "",
+                                                "tool_id": tool_id,
+                                                "is_error": False,
+                                            })
+                                        else:
+                                            if content:
+                                                queue.put_nowait({
+                                                    "type": "text_delta",
+                                                    "text": f"\n[Tool Output]: {content}\n",
+                                                })
+                                except Exception as e:
+                                    log.error(f"[AGY] Error parsing final transcript line: {e}")
+                            break
+                        await asyncio.sleep(0.05)
+
+                queue.put_nowait({
+                    "type": "result",
+                    "is_error": proc.returncode != 0,
+                    "result_text": full_text,
+                    "session_id": session_id,
+                })
+        except Exception as e:
+            log.error(f"[AGY] Error tailing transcript: {e}")
+            queue.put_nowait({
+                "type": "result",
+                "is_error": True,
+                "error": str(e),
+                "session_id": session_id,
+            })
+        finally:
+            queue.put_nowait(None)
+
+    asyncio.create_task(_tail_transcript_to_queue())
+
+    async def _event_stream():
         got_result = False
-        while not (stdout_done and queue.empty()):
+        queue_done = False
+        
+        yielded_starts = set()
+        yielded_results = set()
+        yielded_questions = set()
+        yielded_plans = set()
+        
+        while not (queue_done and queue.empty()):
             try:
                 evt = await queue.get()
                 if evt is None:
-                    stdout_done = True
+                    queue_done = True
                     continue
+                
+                etype = evt.get("type")
+                tool_id = evt.get("tool_id")
+                
+                if etype == "tool_start":
+                    if tool_id in yielded_starts:
+                        continue
+                    yielded_starts.add(tool_id)
+                    
+                elif etype == "tool_result":
+                    if tool_id in yielded_results:
+                        continue
+                    yielded_results.add(tool_id)
+                    
+                elif etype == "ask_user_question":
+                    if tool_id in yielded_questions:
+                        continue
+                    yielded_questions.add(tool_id)
+                    
+                elif etype == "plan_ready":
+                    if tool_id in yielded_plans:
+                        continue
+                    yielded_plans.add(tool_id)
+                    
                 if evt.get("type") == "result":
                     got_result = True
                 yield evt
@@ -298,7 +601,7 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         _active_queues.pop(conv_id, None)
         await proc.wait()
 
-        # Only emit a synthetic result if the JSON block didn't produce one.
+        # Emit default result if not already yielded
         if not got_result:
             yield {
                 "type": "result",

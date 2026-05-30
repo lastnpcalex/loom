@@ -2516,13 +2516,15 @@ function createMessageElement(msg, cost, elapsed) {
     div.dataset.msgId = msg.id;
 
     const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
-    const msgModel = msg.cc_model_used || State.currentConv?.cc_model || '';
-    const isGemini = isClaudeMode && msgModel.startsWith('gemini');
+    const msgModel = (msg.cc_model_used || State.currentConv?.cc_model || '').toLowerCase();
+    const isGemini = msgModel.includes('gemini');
+    const isCodex = msgModel.startsWith('codex');
     const isLocalMode = State.currentConv && State.currentConv.mode === 'local';
     const isHermesMode = State.currentConv && State.currentConv.mode === 'hermes';
     const roleLabel = msg.role === 'system' ? 'System'
         : msg.role === 'user' ? 'You'
         : isGemini ? 'Gemini'
+        : isCodex ? 'Codex'
         : isClaudeMode ? 'Claude'
         : isLocalMode ? 'Braid'
         : isHermesMode ? 'Hermes'
@@ -2656,7 +2658,7 @@ function createMessageElement(msg, cost, elapsed) {
 
     // Detect project-relative image paths in assistant CC/local messages
     let projectImgHtml = '';
-    if (msg.role === 'assistant' && (isClaudeMode || isLocalMode || isHermesMode) && State.currentConv) {
+    if (msg.role === 'assistant' && (isClaudeMode || isLocalMode || isHermesMode || isCodex) && State.currentConv) {
         const allText = (msg.content || '') + ' ' + (typeof msg.content_blocks === 'string' ? msg.content_blocks : JSON.stringify(msg.content_blocks || ''));
         const imgRegex = /[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)/gi;
         const matches = allText.match(imgRegex) || [];
@@ -2956,8 +2958,12 @@ function getCharacterName() {
     if (!State.currentConvId) return 'Assistant';
     const conv = State.conversations.find(c => c.id === State.currentConvId);
     if (!conv) return 'Assistant';
+    const ccModel = (conv.cc_model || '').toLowerCase();
+    if (ccModel.startsWith('codex')) return 'Codex';
+    if (ccModel.includes('gemini')) return 'Gemini';
     if (conv.mode === 'local') return conv.local_model || 'Local';
     if (conv.mode === 'hermes') return conv.local_model || 'Hermes';
+    if (conv.mode === 'claude') return 'Claude';
     if (!conv.character_id) {
         // Weave/OODA without a character attached: show the model name (mirrors
         // Braid's behavior). Falls through to "Assistant" if nothing's set.
@@ -3197,10 +3203,13 @@ function appendStreamingMessage() {
     streamingDiv = document.createElement('div');
     streamingDiv.className = 'message assistant streaming';
     const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
-    const isGemini = isClaudeMode && State.currentConv.cc_model && State.currentConv.cc_model.startsWith('gemini');
+    const msgModel = (State.currentConv?.cc_model || '').toLowerCase();
+    const isGemini = msgModel.includes('gemini');
+    const isCodex = msgModel.startsWith('codex');
     const isLocalMode = State.currentConv && State.currentConv.mode === 'local';
     const isHermesMode = State.currentConv && State.currentConv.mode === 'hermes';
     const label = isGemini ? 'Gemini'
+        : isCodex ? 'Codex'
         : isClaudeMode ? 'Claude'
         : isLocalMode ? (State.currentConv.local_model || 'Local')
         : isHermesMode ? (State.currentConv.local_model || 'Hermes')

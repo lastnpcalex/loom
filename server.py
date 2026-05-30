@@ -70,7 +70,9 @@ from context_manager import get_context_for_generation
 import claude_client
 import gemini_client
 import hermes_client
+import codex_client
 import model_context
+import local_summary
 from skill_scanner import get_all_skills, BUILTIN_COMMANDS
 
 from contextlib import asynccontextmanager
@@ -178,6 +180,29 @@ async def lifespan(app):
     asyncio.create_task(_warm_model_caches())
     # Sync model IDs from the running Llama Server into config
     asyncio.create_task(_update_model_ids_on_startup())
+
+    async def _refresh_remote_models_on_startup():
+        await asyncio.sleep(3)
+        try:
+            print("[STARTUP] Refreshing Anthropic models...")
+            await api_cc_models_refresh()
+            print("[STARTUP] Anthropic models refreshed successfully")
+        except Exception as e:
+            print(f"[STARTUP] Anthropic model refresh skipped/failed: {e}")
+
+        try:
+            print("[STARTUP] Refreshing Codex models from cache...")
+            local_models = load_local_codex_models()
+            if local_models:
+                for group in CC_MODELS:
+                    if group["group"].startswith("ChatGPT Codex"):
+                        group["models"] = local_models
+                        print(f"[STARTUP] Codex models updated from cache: {len(local_models)} models loaded")
+                        break
+        except Exception as e:
+            print(f"[STARTUP] Codex model refresh failed: {e}")
+
+    asyncio.create_task(_refresh_remote_models_on_startup())
     yield
     await db.close_db()
 
@@ -1487,6 +1512,10 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["nsfw"] = int(data["nsfw"])
     if "cc_model" in data:
         fields["cc_model"] = data["cc_model"]
+        cc_model = data["cc_model"]
+        is_gemini = is_gemini_model(cc_model)
+        is_codex = is_codex_model(cc_model)
+        fields["mode"] = "gemini" if is_gemini else ("codex" if is_codex else "claude")
     if "cc_effort" in data:
         fields["cc_effort"] = data["cc_effort"]
     if "cc_permission_mode" in data:
@@ -2252,6 +2281,44 @@ async def api_update_config(data: dict):
     return config.to_dict()
 
 
+def load_local_codex_models() -> list[dict]:
+    """Load Codex models from the local ~/.codex/models_cache.json file if it exists."""
+    import os
+    from pathlib import Path
+    home = Path(os.environ.get("USERPROFILE") or Path.home())
+    cache_path = home / ".codex" / "models_cache.json"
+    if not cache_path.exists():
+        return []
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        models = []
+        for m in data.get("models", []):
+            slug = m.get("slug")
+            display_name = m.get("display_name")
+            if slug and display_name:
+                models.append({
+                    "value": f"codex-{slug}",
+                    "label": f"Codex ({display_name})"
+                })
+        return models
+    except Exception as e:
+        print(f"[CODEX] Failed to load local models cache: {e}")
+        return []
+
+
+def get_initial_codex_models() -> list[dict]:
+    local_models = load_local_codex_models()
+    if local_models:
+        return local_models
+    return [
+        {"value": "codex-gpt-5.5", "label": "Codex (GPT-5.5)"},
+        {"value": "codex-gpt-5.4", "label": "Codex (GPT-5.4)"},
+        {"value": "codex-gpt-5.4-mini", "label": "Codex (GPT-5.4-mini)"},
+        {"value": "codex-gpt-5.3-codex", "label": "Codex (GPT-5.3-codex)"},
+        {"value": "codex-gpt-4o", "label": "Codex (GPT-4o)"},
+    ]
+
+
 # ── CC Model List ──
 # Single source of truth for Anthropic + Gemini models available in Loom/Braid.
 # Update this list when new models ship — all dropdowns pull from here.
@@ -2274,6 +2341,7 @@ CC_MODELS = [
         {"value": "Claude Opus 4.6 (Thinking)", "label": "Claude Opus 4.6 (Thinking)"},
         {"value": "GPT-OSS 120B (Medium)", "label": "GPT-OSS 120B (Medium)"},
     ]},
+    {"group": "ChatGPT Codex (codex)", "models": get_initial_codex_models()},
 ]
 
 
@@ -2378,6 +2446,8 @@ async def api_cc_models_refresh():
         if family not in by_family:
             continue
         version = (int(match.group(2)), int(match.group(3) or 0))
+        if version < (4, 5):
+            continue
         label = (m.get("display_name") or "").removeprefix("Claude ").strip()
         if not label:
             label = f"{family.capitalize()} {version[0]}.{version[1]}"
@@ -2426,6 +2496,17 @@ async def api_cc_models_refresh():
     if not inserted:
         new_cc_models.insert(0, {"group": "Anthropic — Pinned", "models": pinned_models})
         new_cc_models.insert(0, {"group": "Anthropic — Auto", "models": auto_models})
+
+    # Also reload and update Codex models cache in CC_MODELS
+    try:
+        local_models = load_local_codex_models()
+        if local_models:
+            for group in new_cc_models:
+                if group["group"].startswith("ChatGPT Codex"):
+                    group["models"] = local_models
+                    break
+    except Exception as e:
+        print(f"[REFRESH] Failed to update Codex models: {e}")
 
     CC_MODELS[:] = new_cc_models
     return {"models": CC_MODELS, "families": sorted(f for f, v in by_family.items() if v)}
@@ -3307,18 +3388,49 @@ def _format_rate_limit_note(data: dict) -> str:
     """
     if not data:
         return ""
+    
+    # Flatten rate_limit_info keys if present
+    info = data.get("rate_limit_info") or {}
+    if not isinstance(info, dict):
+        info = {}
+        
     parts = []
-    for k in ("reset", "reset_at", "resets_at", "retry_after", "retry_after_seconds"):
-        if k in data:
-            parts.append(f"{k}={data[k]}")
-    for k in ("window", "bucket", "tier", "limit_type", "scope"):
-        if k in data:
-            parts.append(f"{k}={data[k]}")
-    snapshot = data.get("snapshot") or data.get("status")
-    if isinstance(snapshot, dict):
-        parts.append("status=" + json.dumps(snapshot, default=str)[:200])
+    
+    # Check limit type/window
+    limit_type = info.get("rateLimitType") or data.get("limit_type") or data.get("window") or data.get("scope")
+    if limit_type:
+        parts.append(f"limit_type={limit_type}")
+        
+    # Check status
+    status = info.get("status") or data.get("status")
+    if status:
+        parts.append(f"status={status}")
+
+    # Check reset time/delay
+    resets_at = info.get("resetsAt") or data.get("resets_at") or data.get("reset_at") or data.get("reset")
+    if resets_at:
+        try:
+            import time
+            resets_str = time.ctime(float(resets_at))
+            parts.append(f"resets_at={resets_str}")
+        except Exception:
+            parts.append(f"resets_at={resets_at}")
+            
+    retry_after = data.get("retry_after") or data.get("retry_after_seconds") or data.get("retry_delay_ms")
+    if retry_after:
+        parts.append(f"retry_after={retry_after}")
+
+    # Overage information
+    overage_status = info.get("overageStatus")
+    if overage_status:
+        parts.append(f"overage_status={overage_status}")
+    overage_reason = info.get("overageDisabledReason")
+    if overage_reason:
+        parts.append(f"overage_reason={overage_reason}")
+
     if not parts:
         parts.append("raw=" + json.dumps(data, default=str)[:300])
+        
     return "\n\n[Loom note: rate-limit details from CC — " + "; ".join(parts) + "]"
 
 
@@ -3569,7 +3681,7 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
         is_anthropic = model_context.is_anthropic(cc_model)
         is_llama = cc_model.endswith(".gguf")
         use_llama = conv.get("_use_llama", False) or is_llama
-        if is_anthropic or is_gemini_model(cc_model):
+        if is_anthropic or is_gemini_model(cc_model) or is_codex_model(cc_model):
             use_llama = False
 
         await _ws_send(conv_id, {"type": "status", "text": "Compacting context..."})
@@ -3668,6 +3780,13 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
         await asyncio.sleep(2)
         await _ws_send(conv_id, {"type": "compact_done"})
         await _ws_send(conv_id, {"type": "error", "error": f"Compaction failed: {e}"})
+
+
+def is_codex_model(model: str) -> bool:
+    if not model:
+        return False
+    ml = model.lower()
+    return ml.startswith("codex")
 
 
 def is_gemini_model(model: str) -> bool:
@@ -3792,16 +3911,23 @@ async def _handle_claude_generation(
         # haiku), pinned full IDs (claude-opus-4-6), and `[1m]` suffix variants.
         is_anthropic = model_context.is_anthropic(cc_model)
         is_gemini = is_gemini_model(cc_model)
+        is_codex = is_codex_model(cc_model)
         # .gguf models go through Claude Code with ANTHROPIC_BASE_URL pointed
         # at the local llama-server (which speaks /v1/messages natively on :11434).
         is_llama = cc_model.endswith(".gguf")
         # Only use llama when explicitly flagged (local mode) or when model is a .gguf.
         # The _use_llama flag is set by _handle_local_generation on a shallow copy.
         use_llama = conv.get("_use_llama", False) or is_llama
-        # Belt-and-suspenders: NEVER route Anthropic/Gemini through llama
-        if is_anthropic or is_gemini:
+        # Belt-and-suspenders: NEVER route Anthropic/Gemini/Codex through llama
+        if is_anthropic or is_gemini or is_codex:
             use_llama = False
-        print(f"[CC] Model routing: cc_model={cc_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} is_llama={is_llama} use_llama={use_llama} conv._use_llama={conv.get('_use_llama')} conv.mode={conv.get('mode')}")
+        print(f"[CC] Model routing: cc_model={cc_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} is_codex={is_codex} is_llama={is_llama} use_llama={use_llama} conv._use_llama={conv.get('_use_llama')} conv.mode={conv.get('mode')}")
+
+        target_mode = "gemini" if is_gemini else ("codex" if is_codex else ("local" if use_llama else "claude"))
+        if conv.get("mode") != target_mode:
+            print(f"[CC] Updating conversation {conv_id} mode from {conv.get('mode')} to {target_mode}")
+            await db.update_conversation_fields(conv_id, mode=target_mode)
+            conv["mode"] = target_mode
 
         # --- Compact-handoff gate ---
         # Fast check: if the target model is a 1M Anthropic, skip. Otherwise
@@ -3887,12 +4013,14 @@ async def _handle_claude_generation(
                 prev_model = msg.get("cc_model_used") or ""
                 prev_is_anthropic = model_context.is_anthropic(prev_model)
                 prev_is_gemini = is_gemini_model(prev_model)
+                prev_is_codex = is_codex_model(prev_model)
                 prev_is_llama = bool(prev_model) and not (
-                    prev_is_anthropic or prev_is_gemini
+                    prev_is_anthropic or prev_is_gemini or prev_is_codex
                 )
                 if (
                     (prev_is_anthropic != is_anthropic)
                     or (prev_is_gemini != is_gemini)
+                    or (prev_is_codex != is_codex)
                     or (prev_is_llama != use_llama)
                 ):
                     print(
@@ -3900,10 +4028,10 @@ async def _handle_claude_generation(
                     )
                     crossed_provider = True
                     break
-                # agy doesn't support --fork-session, so resuming
-                # mutates the session in place. Skip resume for agy.
-                if is_gemini:
-                    print(f"[CC] Gemini has no --fork-session, skipping resume for branch safety")
+                # agy and codex don't support --fork-session in the same way,
+                # so resuming mutates the session in place. Skip resume.
+                if is_gemini or is_codex:
+                    print(f"[CC] Gemini/Codex has no stable --fork-session, skipping resume for branch safety")
                     break
                 resume_session_id = msg["cc_session_id"]
                 break
@@ -3930,8 +4058,8 @@ async def _handle_claude_generation(
                 print(f"[CC] Retrieved branch with {len(branch)} messages")
                 prompt = _build_claude_history_prompt(branch, project_dir)
                 if not prompt:
-                    if is_gemini:
-                        print(f"[CC] WARNING: Empty prompt from branch for Gemini!")
+                    if is_gemini or is_codex:
+                        print(f"[CC] WARNING: Empty prompt from branch for Gemini/Codex!")
                         prompt = "(continue)"
                     else:
                         await _ws_send(
@@ -4114,12 +4242,14 @@ async def _handle_claude_generation(
                 started_at=_time.time(),
                 draft_msg_id=draft_msg_id,
                 parent_id=parent_id,
-                mode="gemini" if is_gemini else ("local" if use_llama else "claude"),
+                mode="gemini" if is_gemini else ("codex" if is_codex else ("local" if use_llama else "claude")),
             )
 
         # Let the client know we're launching
         if is_gemini:
             launch_label = f"Launching agy ({cc_model})..."
+        elif is_codex:
+            launch_label = f"Launching Codex ({cc_model})..."
         elif use_llama:
             launch_label = f"Launching {cc_model} via Llama Server..."
         else:
@@ -4164,6 +4294,19 @@ async def _handle_claude_generation(
                     fork_session=fork_session,
                     backstage_parent_id=conv.get("backstage_parent_id"),
                 )
+            elif is_codex:
+                proc, event_stream = await codex_client.run_codex(
+                    prompt,
+                    project_dir,
+                    conv_id=conv_id,
+                    server_port=config.port,
+                    model=cc_model,
+                    effort=cc_effort,
+                    permission_mode=cc_permission_mode,
+                    resume_session_id=resume_session_id if use_resume else None,
+                    fork_session=fork_session,
+                    backstage_parent_id=conv.get("backstage_parent_id"),
+                )
             else:
                 proc, event_stream = await claude_client.run_claude(
                     prompt,
@@ -4187,6 +4330,16 @@ async def _handle_claude_generation(
                 prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
                 if is_gemini:
                     proc, event_stream = await gemini_client.run_gemini(
+                        prompt,
+                        project_dir,
+                        conv_id=conv_id,
+                        server_port=config.port,
+                        model=cc_model,
+                        effort=cc_effort,
+                        permission_mode=cc_permission_mode,
+                    )
+                elif is_codex:
+                    proc, event_stream = await codex_client.run_codex(
                         prompt,
                         project_dir,
                         conv_id=conv_id,
@@ -4221,7 +4374,7 @@ async def _handle_claude_generation(
                 conv_id=conv_id,
                 pid=proc.pid,
                 project_dir=project_dir,
-                mode="local" if use_llama else ("gemini" if is_gemini else "claude"),
+                mode="local" if use_llama else ("gemini" if is_gemini else ("codex" if is_codex else "claude")),
             )
         except Exception as e:
             print(f"[GEN] Failed to register active generation: {e}")
@@ -4831,12 +4984,27 @@ async def _handle_claude_generation(
             provider_name = (
                 "Antigravity (agy)"
                 if is_gemini
-                else ("Llama Server" if use_llama else "Claude Code")
+                else ("ChatGPT Codex" if is_codex else ("Llama Server" if use_llama else "Claude Code"))
             )
-            error_msg = (
-                result_info.get("error") or f"{provider_name} exited with no response"
-            )
-            if use_llama:
+            error_msg = result_info.get("error")
+            if not error_msg:
+                if rate_limit_data:
+                    info = rate_limit_data.get("rate_limit_info", {})
+                    limit_type = info.get("rateLimitType") or rate_limit_data.get("rateLimitType") or "rate cap"
+                    resets_at = info.get("resetsAt") or rate_limit_data.get("resetsAt")
+                    if resets_at:
+                        try:
+                            import time
+                            reset_time_str = time.ctime(float(resets_at))
+                            error_msg = f"{provider_name} rate limit reached ({limit_type} limit) — resets at {reset_time_str}"
+                        except Exception:
+                            error_msg = f"{provider_name} rate limit reached ({limit_type} limit)"
+                    else:
+                        error_msg = f"{provider_name} rate limit reached ({limit_type} limit)"
+                else:
+                    error_msg = f"{provider_name} exited with no response"
+
+            if use_llama and not rate_limit_data:
                 error_msg += f" — check that llama-server is running with '{cc_model}'"
             content = f"[Error: {error_msg}]"
             if rate_limit_data:

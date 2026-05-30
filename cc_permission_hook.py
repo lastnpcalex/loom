@@ -22,6 +22,59 @@ import ssl
 import urllib.request
 import urllib.error
 
+
+def normalize_tool_name(name: str) -> str:
+    mapping = {
+        "view_file": "Read",
+        "read_file": "Read",
+        "read_many_files": "Read",
+        "write_to_file": "Write",
+        "write_file": "Write",
+        "replace_file_content": "Edit",
+        "multi_replace_file_content": "Edit",
+        "run_command": "Bash",
+        "execute_command": "Bash",
+        "run_shell_command": "Bash",
+        "grep_search": "Grep",
+        "list_dir": "Glob",
+        "list_directory": "Glob",
+        "glob": "Glob",
+        "search_web": "WebSearch",
+        "google_web_search": "WebSearch",
+        "read_url_content": "WebFetch",
+        "web_fetch": "WebFetch",
+    }
+    return mapping.get(name, name)
+
+
+def clean_arg_val(val):
+    if isinstance(val, str):
+        if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+            return val[1:-1]
+    return val
+
+
+def normalize_tool_args(name: str, args: dict) -> dict:
+    cleaned = {k: clean_arg_val(v) for k, v in args.items()}
+    mapped = {}
+    if name in ("view_file", "read_file", "read_many_files"):
+        mapped["file_path"] = cleaned.get("AbsolutePath", cleaned.get("TargetFile", cleaned.get("file_path", "")))
+    elif name in ("write_to_file", "write_file"):
+        mapped["file_path"] = cleaned.get("TargetFile", cleaned.get("file_path", ""))
+        mapped["content"] = cleaned.get("CodeContent", cleaned.get("content", ""))
+    elif name in ("replace_file_content", "multi_replace_file_content", "edit"):
+        mapped["file_path"] = cleaned.get("TargetFile", cleaned.get("file_path", ""))
+        mapped["old_string"] = cleaned.get("TargetContent", cleaned.get("old_string", ""))
+        mapped["new_string"] = cleaned.get("ReplacementContent", cleaned.get("new_string", ""))
+    elif name in ("run_command", "execute_command", "run_shell_command"):
+        mapped["command"] = cleaned.get("CommandLine", cleaned.get("command", ""))
+    elif name in ("grep_search", "grep"):
+        mapped["query"] = cleaned.get("Query", cleaned.get("query", ""))
+        mapped["dir"] = cleaned.get("SearchPath", cleaned.get("dir", ""))
+    else:
+        mapped = cleaned
+    return mapped
+
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -42,6 +95,16 @@ READ_ONLY = {
     "cli_help", "codebase_investigator", "get_internal_docs",
     # MCP web-tools (keyless DuckDuckGo search for local models)
     "web_search",
+}
+
+AGY_TOOLS = {
+    "view_file", "read_file", "read_many_files",
+    "write_to_file", "write_file",
+    "replace_file_content", "multi_replace_file_content",
+    "run_command", "execute_command", "run_shell_command",
+    "grep_search", "list_dir", "list_directory", "glob",
+    "search_web", "google_web_search",
+    "read_url_content", "web_fetch"
 }
 
 
@@ -121,6 +184,7 @@ def main():
         event_name = request["hook_event_name"]
 
     tool_name = request.get("tool_name", "")
+    is_agy = tool_name in AGY_TOOLS
 
     # PostToolUse Hook Flow
     if event_name == "PostToolUse":
@@ -146,7 +210,7 @@ def main():
         
         payload = {
             "loom_conv_id": conv_id,
-            "tool_name": tool_name,
+            "tool_name": normalize_tool_name(tool_name) if is_agy else tool_name,
             "tool_id": tool_id,
             "content": output_content,
             "is_error": is_error
@@ -172,6 +236,9 @@ def main():
     tool_id = request.get("tool_id", str(request.get("stepIdx", "0")))
     tool_input = request.get("tool_input", {})
     
+    mapped_name = normalize_tool_name(tool_name) if is_agy else tool_name
+    mapped_input = normalize_tool_args(tool_name, tool_input) if is_agy else tool_input
+    
     protocols = ["http", "https"]
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -179,9 +246,9 @@ def main():
     
     start_payload = {
         "loom_conv_id": conv_id,
-        "tool_name": tool_name,
+        "tool_name": mapped_name,
         "tool_id": tool_id,
-        "tool_input": tool_input
+        "tool_input": mapped_input
     }
     
     for proto in protocols:
@@ -203,17 +270,18 @@ def main():
     # This forces the agent to use the 'loom-state-cards' MCP server instead.
     if backstage_parent:
         deny_list = {
-            "Write", "Edit", "NotebookEdit", "Bash", "Replace", "write_file", "run_shell_command", "replace"
+            "Write", "Edit", "NotebookEdit", "Bash", "Replace"
         }
-        if tool_name in deny_list:
-            deny(f"Tool {tool_name} is disabled in Backstage mode. Use the 'loom-state-cards' MCP tools to manage character and scene data.", event_name=event_name)
+        if mapped_name in deny_list:
+            deny(f"Tool {mapped_name} is disabled in Backstage mode. Use the 'loom-state-cards' MCP tools to manage character and scene data.", event_name=event_name)
 
     # Auto-approve read-only tools
-    if tool_name in READ_ONLY:
-        allow(f"Read-only tool: {tool_name}", event_name=event_name)
+    if mapped_name in READ_ONLY:
+        allow(f"Read-only tool: {mapped_name}", event_name=event_name)
 
     request["loom_conv_id"] = conv_id
-    request["tool_name"] = tool_name # Normalize for Loom API
+    request["tool_name"] = mapped_name # Normalize for Loom API
+    request["tool_input"] = mapped_input
 
     # Try HTTP first, then HTTPS as a fallback
     errors = []

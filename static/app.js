@@ -508,7 +508,7 @@ async function checkHealth(retries = 2) {
                 if (State.currentConv.mode === 'hermes' || State.currentConv.mode === 'weave') {
                     const weaveSel = document.getElementById('weave-model-inline');
                     if (weaveSel) _populateWeaveModelDropdown(weaveSel, State.currentConv.local_model || '');
-                } else if (State.currentConv.mode === 'claude' || State.currentConv.mode === 'local') {
+                } else if (State.currentConv.mode === 'claude' || State.currentConv.mode === 'local' || State.currentConv.mode === 'codex') {
                     updateInlineCCControls(State.currentConv);
                 }
             }
@@ -537,7 +537,7 @@ function renderConversationList() {
     } else if (State.convFilter === 'hermes') {
         convs = convs.filter(c => c.mode === 'hermes');
     } else if (State.convFilter === 'claude') {
-        convs = convs.filter(c => c.mode === 'claude');
+        convs = convs.filter(c => c.mode === 'claude' || c.mode === 'codex');
     }
 
     if (convs.length === 0) {
@@ -750,19 +750,24 @@ function buildConvItem(conv) {
     const div = document.createElement('div');
     div.className = 'conv-item';
 
-    const isCC = conv.mode === 'claude';
-    const isGemini = isCC && conv.cc_model && conv.cc_model.startsWith('gemini');
+    const isCCMode = conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini';
+    const ccModel = (conv.cc_model || '').toLowerCase();
+    const isGemini = isCCMode && ccModel.includes('gemini');
+    const isCodex = isCCMode && ccModel.startsWith('codex');
+    const isClaude = isCCMode && !isGemini && !isCodex;
     const isLocal = conv.mode === 'local';
     const isHermes = conv.mode === 'hermes';
     const charName = isGemini ? (conv.cc_model || 'Gemini')
-        : isCC ? (conv.cc_model || 'Claude')
+        : isCodex ? (conv.cc_model || 'Codex')
+        : isClaude ? (conv.cc_model || 'Claude')
         : isLocal ? (conv.local_model || State.loadedModel || 'Llama')
         : isHermes ? (conv.local_model || State.loadedModel || 'Hermes')
         : conv.character_id
         ? (State.characters.find(c => c.id === conv.character_id)?.name || conv.character_id)
         : 'Freeform';
     const modeBadge = isGemini ? '<span class="mode-badge" title="Antigravity (agy) in the browser">Loom {agy}</span>'
-        : isCC ? '<span class="mode-badge" title="Claude Code in the browser">Loom {Claude}</span>'
+        : isCodex ? '<span class="mode-badge" title="ChatGPT Codex in the browser">Loom {Codex}</span>'
+        : isClaude ? '<span class="mode-badge" title="Claude Code in the browser">Loom {Claude}</span>'
         : isLocal ? '<span class="mode-badge" title="Claude Code powered by a local Llama model">Braid {Local}</span>'
         : isHermes ? '<span class="mode-badge" title="Hermes Agent (ACP) powered by a local Llama model">Hermes {Agent}</span>'
         : '<span class="mode-badge" title="Structured roleplay with local models">Weave</span>';
@@ -1288,15 +1293,16 @@ async function updateInlineCCControls(conv) {
         _branchCountCtl?.classList.toggle('hidden', !show);
     };
 
-    if (conv && (conv.mode === 'claude' || conv.mode === 'local')) {
+    if (conv && (conv.mode === 'claude' || conv.mode === 'local' || conv.mode === 'codex')) {
         const isBraid = conv.mode === 'local';
+        const isCodex = conv.mode === 'codex';
         controls.classList.remove('hidden');
         weaveControls?.classList.add('hidden');
-        setBranchCount(1);  // CC / Braid: always single branch
+        setBranchCount(1);  // CC / Braid / Codex: always single branch
         const modelSel = document.getElementById('cc-model-inline');
         const effortSel = document.getElementById('cc-effort-inline');
         const permSel = document.getElementById('cc-permission-mode-inline');
-        const ccModel = conv.cc_model || 'sonnet';
+        const ccModel = conv.cc_model || (isCodex ? 'codex-gpt-5.5' : 'sonnet');
         await populateCCModelDropdowns(ccModel);
         
         effortSel.value = conv.cc_effort || 'high';
@@ -1463,7 +1469,11 @@ function initInlineCCControls() {
         saveCC('cc_model', modelSel.value);
         _syncEffortVisibility(modelSel.value);
         // Update local state immediately so generate messages include the new model
-        if (State.currentConv) State.currentConv.cc_model = modelSel.value;
+        if (State.currentConv) {
+            State.currentConv.cc_model = modelSel.value;
+            if (typeof renderConversationList === 'function') renderConversationList();
+            if (typeof renderMessages === 'function') renderMessages();
+        }
     });
     effortSel.addEventListener('change', () => saveCC('cc_effort', effortSel.value));
 
@@ -2609,7 +2619,7 @@ function setupEventListeners() {
         // Loom/Braid per-conversation settings (if in a conversation)
         if (conv && State.currentConvId) {
             const updates = {};
-            if (conv.mode === 'claude') {
+            if (conv.mode === 'claude' || conv.mode === 'codex') {
                 updates.cc_model = document.getElementById('cfg-cc-model').value;
                 updates.cc_effort = document.getElementById('cfg-cc-effort').value;
                 updates.cc_permission_mode = document.getElementById('cfg-cc-permission').value;
@@ -2628,6 +2638,8 @@ function setupEventListeners() {
                 if (updates.cc_effort) { const s = document.getElementById('cc-effort-inline'); if (s) s.value = updates.cc_effort; }
                 if (updates.cc_permission_mode) { const s = document.getElementById('cc-permission-mode-inline'); if (s) s.value = updates.cc_permission_mode; }
                 if (updates.local_model) { const s = document.getElementById('weave-model-inline'); if (s) s.value = updates.local_model; }
+                if (typeof renderConversationList === 'function') renderConversationList();
+                if (typeof renderMessages === 'function') renderMessages();
             }
         }
         closeModal('modal-settings');
@@ -3575,7 +3587,7 @@ function renderSearchResults(results, query) {
         item.className = 'search-result-item';
 
         const modeClass = r.mode || 'weave';
-        const modeLabel = r.mode === 'claude' ? 'Loom' : r.mode === 'local' ? 'Braid' : r.mode === 'hermes' ? 'Hermes' : 'Weave';
+        const modeLabel = r.mode === 'claude' ? 'Loom' : r.mode === 'local' ? 'Braid' : r.mode === 'hermes' ? 'Hermes' : r.mode === 'codex' ? 'Codex' : 'Weave';
         const titleHtml = escapeHtml(r.title || 'Untitled').replace(re, '<mark>$1</mark>');
 
         let snippetHtml = '';
