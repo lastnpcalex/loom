@@ -261,9 +261,32 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             pass
 
     agy_exe = _find_agy_exe()
+
+    # Windows has a ~32K char limit on command lines (CreateProcess).  For
+    # prompts that approach this, write the full text to a temp file and pass a
+    # short redirect instruction via -p instead.
+    _MAX_CLI_PROMPT = 28_000  # leave headroom for the rest of the args
+    prompt_file: Path | None = None
+
+    if len(prompt) > _MAX_CLI_PROMPT:
+        agents_dir = Path(cwd) / ".agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        prompt_file = agents_dir / f"loom_prompt_{conv_id}.md"
+        prompt_file.write_text(prompt, encoding="utf-8")
+        cli_prompt = (
+            f"Read the full conversation context from the file at "
+            f"{prompt_file.name} in the .agents directory and respond "
+            f"to the latest user message. Do NOT summarize the file — "
+            f"treat its contents as the conversation history and reply naturally."
+        )
+        print(f"[AGY] Prompt too large for CLI ({len(prompt)} chars), "
+              f"wrote to {prompt_file}")
+    else:
+        cli_prompt = prompt
+
     cc_args = [
         "--conversation", resume_session_id or str(conv_id),
-        "-p", prompt,
+        "-p", cli_prompt,
         "--dangerously-skip-permissions",
         "--print-timeout", "5m",
     ]
@@ -278,7 +301,7 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
 
     cmd = [agy_exe] + cc_args
     print(f"[AGY] CMD: {' '.join(cmd[:6])}{'...' if len(cmd) > 6 else ''}")
-    print(f"[AGY] agy_model={agy_model}, prompt_len={len(prompt)}")
+    print(f"[AGY] agy_model={agy_model}, prompt_len={len(prompt)}, cli_len={len(cli_prompt)}")
 
     kwargs = {}
     if sys.platform == "win32":
@@ -302,6 +325,17 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         except Exception as e:
             log.error(f"[AGY] Error reading stderr: {e}")
     asyncio.create_task(_read_stderr())
+
+    # Clean up the temp prompt file when the process finishes
+    if prompt_file:
+        async def _cleanup_prompt_file():
+            await proc.wait()
+            try:
+                prompt_file.unlink(missing_ok=True)
+                print(f"[AGY] Cleaned up prompt file: {prompt_file}")
+            except Exception as e:
+                log.warning(f"[AGY] Failed to clean up prompt file: {e}")
+        asyncio.create_task(_cleanup_prompt_file())
 
     # We also drain stdout to avoid blocking
     async def _drain_stdout():
