@@ -13,6 +13,7 @@ env/
 *.db
 *.db-wal
 *.db-shm
+loom_cron.db*
 
 # Uploaded files
 uploads/
@@ -31,6 +32,7 @@ desktop.ini
 
 # Claude Code local settings
 .claude/
+.codex/
 
 # User-created characters (keep defaults)
 characters/*
@@ -115,6 +117,7 @@ scratch/
 # Test / debug / probe scripts (not part of the product)
 test_*.py
 test_*.txt
+probe_*.txt
 debug_*.py
 check_*.py
 smoke_*.py
@@ -123,6 +126,8 @@ smoke_*.py
 *_test.py
 *_test_*.py
 _test_*.py
+# ...but the real test suite in tests/ is product code, not scratch
+!tests/test_*.py
 
 # Temporary / backup files
 temp_*
@@ -165,3 +170,7 @@ haikus.md
 
 # pytest cache
 .pytest_cache/
+.pytest_tmp/
+
+# Generated workspaces
+workspaces/
