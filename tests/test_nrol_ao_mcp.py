@@ -142,6 +142,7 @@ def nrol_repo(tmp_path_factory):
         shutil.copytree(SOURCE_REPO / "sources", root / "sources")
     (root / "topics").mkdir()
     (root / "loom" / "topics").mkdir(parents=True)
+    (root / "briefs").mkdir()
     return root
 
 
@@ -383,6 +384,25 @@ def test_observe_applies_mechanical_partial_lr(nrol, topic_path):
     # 55 is beyond the higher_strengthens threshold (50): H1 (highest
     # likelihood) must not lose mass.
     assert after["H1"] > before["H1"]
+
+
+def test_legacy_posterior_path_rejected_on_active_topic(nrol, topic_path, monkeypatch):
+    """The legacy run_update(posteriors=...) freeform path must refuse ACTIVE
+    topics — the migration spec's 'biggest authority leak'. Admin override
+    requires a signed NROL_AO_ADMIN_POSTERIORS_REASON."""
+    import importlib
+
+    monkeypatch.delenv("NROL_AO_ADMIN_POSTERIORS_REASON", raising=False)
+    update_mod = importlib.import_module("framework.update")
+    before = _disk_posteriors(topic_path)
+    with pytest.raises(Exception) as exc_info:
+        update_mod.run_update(
+            SLUG,
+            posteriors={"H1": 0.9, "H2": 0.05, "H3": 0.05},
+            posterior_reason="operator says so",
+        )
+    assert "ACTIVE" in str(exc_info.value)
+    assert _disk_posteriors(topic_path) == before
 
 
 # ---------------------------------------------------------------------------
