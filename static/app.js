@@ -1127,6 +1127,25 @@ async function createConversation() {
         return;
     }
 
+    if (mode === 'nrol') {
+        const ccModel = document.getElementById('cc-model').value;
+        const ccEffort = document.getElementById('cc-effort').value;
+        const conv = await API.post('/api/conversations', {
+            title,
+            mode: 'claude',
+            nrol_operator: true,
+            cc_model: ccModel,
+            cc_effort: ccEffort,
+        });
+        State.conversations.unshift(conv);
+        closeModal('modal-new-conv');
+        document.getElementById('new-conv-title').value = '';
+        renderConversationList();
+        await loadConversation(conv.id);
+        switchView('chat');
+        return;
+    }
+
     if (mode === 'local' || mode === 'hermes') {
         const localModel = document.getElementById('local-model').value;
         if (!localModel) {
@@ -2282,6 +2301,12 @@ function setupEventListeners() {
             document.getElementById('local-model-group').classList.add('hidden');
             if (mode === 'claude') {
                 document.getElementById('project-dir-group').classList.remove('hidden');
+                document.getElementById('cc-model-group').classList.remove('hidden');
+                document.getElementById('cc-effort-group').classList.remove('hidden');
+                showWeaveFields(false);
+            } else if (mode === 'nrol') {
+                // Operator mode: model/effort selectable; workspace is fixed
+                // server-side to a neutral directory, so no project dir field.
                 document.getElementById('cc-model-group').classList.remove('hidden');
                 document.getElementById('cc-effort-group').classList.remove('hidden');
                 showWeaveFields(false);

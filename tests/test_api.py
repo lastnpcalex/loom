@@ -44,13 +44,14 @@ async def test_health_endpoint(client, mock_ollama):
     assert "models" in data
 
 
-async def test_ollama_models_endpoint(client, mock_ollama):
-    """GET /api/ollama/models returns model list."""
-    resp = await client.get("/api/ollama/models")
+async def test_local_models_endpoint(client, mock_ollama):
+    """GET /api/local/models returns the backend-aware model cache.
+
+    (Replaced /api/ollama/models when model listing became cache-based.)"""
+    resp = await client.get("/api/local/models")
     assert resp.status_code == 200
     data = resp.json()
     assert "models" in data
-    assert "llama3:8b" in data["models"]
 
 
 async def test_create_weave_conversation(client, mock_ollama):
@@ -90,6 +91,24 @@ async def test_create_claude_conversation(client, mock_ollama):
     data = resp.json()
     assert data["mode"] == "claude"
     assert data["cc_model"] == "opus"
+
+
+async def test_create_nrol_operator_conversation(client, mock_ollama):
+    """POST /api/conversations with nrol_operator launches a locked CC profile.
+
+    Mode is forced to claude, the flag persists, and project_dir defaults to
+    the neutral operator workspace (never the Loom or engine repo)."""
+    resp = await client.post("/api/conversations", json={
+        "title": "NROL Operator Test",
+        "mode": "claude",
+        "nrol_operator": True,
+        "cc_model": "opus",
+    })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["mode"] == "claude"
+    assert data["nrol_operator"] == 1
+    assert data["project_dir"].replace("\\", "/").endswith("workspaces/nrol_operator")
 
 
 async def test_get_conversation(client, mock_ollama):

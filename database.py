@@ -352,6 +352,9 @@ async def _run_migrations(db):
         "ALTER TABLE conversations ADD COLUMN canvas_slug TEXT",
         # Bluesky access token for canvas proxy auth
         "ALTER TABLE conversations ADD COLUMN bsky_token TEXT",
+        # NROL-AO operator mode: CC launch profile with file/shell tools
+        # stripped; only the nrol-ao MCP surface (plus web reads) available
+        "ALTER TABLE conversations ADD COLUMN nrol_operator INTEGER DEFAULT 0",
     ]
     for sql in migrations:
         try:
@@ -724,6 +727,7 @@ async def update_conversation_fields(conv_id: int, **fields):
         "project_dir",
         "backstage_parent_id",
         "bsky_token",
+        "nrol_operator",
     }
     updates = []
     params = []

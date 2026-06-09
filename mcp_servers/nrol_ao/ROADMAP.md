@@ -40,7 +40,14 @@ boundary, proposal lifecycle, validation rules, red-team failure modes).
 
 ## Stages
 
-### Stage 0 — Define "correct" executably (tasks #1–#7)
+### Stage 0 — Define "correct" executably (tasks #1–#7) — ✅ DONE 2026-06-09
+
+All items complete. Capability suite green (16 tests). Found+fixed: dead
+FIRE path (suggested_likelihoods key mismatch), missing lr_decay on the
+process_evidence path. Verified live: headless tool-stripping holds
+(subagent delegation inherits restrictions); LOOM_CONV_ID reaches the MCP
+server via --mcp-config env per spawn. Math audit report:
+`MATH_AUDIT_2026-06-09.md`.
 
 - Capability test suite (`tests/test_nrol_ao_mcp.py`): FIRE without
   indicator rejected; OBSERVE without observable/value rejected; evidence
@@ -61,9 +68,17 @@ boundary, proposal lifecycle, validation rules, red-team failure modes).
 
 ### Stage 1 — Make the boundary real (tasks #8–#12)
 
-- NROL-AO operator mode in Loom (see decision above).
-- Fail-closed permission default in the MCP server (today: no LOOM_CONV_ID
-  + flag unset → commit proceeds ungated).
+- ✅ NROL-AO operator mode in Loom (2026-06-09): "NROL-AO" entry in the
+  new-conversation modal → mode=claude + nrol_operator flag (DB column).
+  Launch profile strips Write/Edit/NotebookEdit/Bash/Agent/Task/KillShell/
+  SlashCommand, adds --strict-mcp-config, neutral cwd
+  (workspaces/nrol_operator), OPERATOR.md system prompt. The permission
+  hook auto-allows the mcp__nrol-ao__ surface (reads are free; commits are
+  gated by the MCP server's own fail-closed browser request — single
+  prompt per commit) and denies file/shell tools as defense in depth.
+- ✅ Fail-closed permission default (2026-06-09): commit=true without
+  LOOM_CONV_ID is denied; NROL_AO_ALLOW_UNGATED_COMMITS=1 is the explicit
+  headless opt-out.
 - State/code split: `NROL_AO_STATE_DIR` owned by the MCP server; repo
   becomes code, state becomes data with one writer.
 - Proposal lifecycle: `submit_article` → `propose_match` →

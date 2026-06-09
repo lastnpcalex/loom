@@ -1798,6 +1798,16 @@ async def api_create_conversation(data: dict = None):
     style_nudge = data.get("style_nudge", "Natural")
     mode = data.get("mode", "weave")
     project_dir = data.get("project_dir")
+    nrol_operator = 1 if data.get("nrol_operator") else 0
+    if nrol_operator:
+        # Operator conversations are CC sessions launched from a neutral
+        # workspace — never the Loom repo or the NROL engine repo — so any
+        # file path the session touches is outside its project boundary.
+        mode = "claude"
+        if not project_dir:
+            operator_dir = Path(__file__).parent / "workspaces" / "nrol_operator"
+            operator_dir.mkdir(parents=True, exist_ok=True)
+            project_dir = str(operator_dir)
 
     first_turn = data.get("first_turn", "character")  # "character" or "user"
     custom_scene = data.get("custom_scene")
@@ -1822,6 +1832,8 @@ async def api_create_conversation(data: dict = None):
         cc_effort=cc_effort,
         ooda_enabled=1 if mode == "weave" else 0,
     )
+    if nrol_operator:
+        fields["nrol_operator"] = 1
     if mode in ("local", "hermes") and local_model:
         fields["local_model"] = local_model
     await db.update_conversation_fields(conv["id"], **fields)
@@ -4936,6 +4948,7 @@ async def _handle_claude_generation(
                     fork_session=fork_session,
                     use_llama=use_llama,
                     backstage_parent_id=conv.get("backstage_parent_id"),
+                    nrol_operator=bool(conv.get("nrol_operator")),
                 )
         except Exception as e:
             if use_resume:
@@ -4976,6 +4989,7 @@ async def _handle_claude_generation(
                         permission_mode=cc_permission_mode,
                         use_llama=use_llama,
                         backstage_parent_id=conv.get("backstage_parent_id"),
+                        nrol_operator=bool(conv.get("nrol_operator")),
                     )
                 use_resume = False
             else:
@@ -5440,6 +5454,7 @@ async def _handle_claude_generation(
                 permission_mode=cc_permission_mode,
                 use_llama=use_llama,
                 backstage_parent_id=conv.get("backstage_parent_id"),
+                nrol_operator=bool(conv.get("nrol_operator")),
             )
             _active_claude_procs[conv_id] = proc
 

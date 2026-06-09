@@ -511,6 +511,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                      resume_session_id: str = None, fork_session: bool = False,
                      use_llama: bool = False,
                      backstage_parent_id: int | None = None,
+                     nrol_operator: bool = False,
                      extra_mcp_servers: dict | None = None,
                      extra_disallowed_tools: list[str] | None = None,
                      append_system_prompt: str | None = None,
@@ -540,6 +541,16 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             "Read", "Write", "Edit", "NotebookEdit",
             "Bash", "Glob", "Grep", "Agent",
             "WebSearch", "WebFetch",
+        ]
+    # NROL operator role: perception and typed proposals only. File/shell/
+    # subagent tools are stripped so the only mutation surface is the nrol-ao
+    # MCP server (whose commits are fail-closed behind Loom approval).
+    # Read/Glob/Grep/Web* stay — the operator reads sources, it just can't
+    # write anything except through typed transitions.
+    if nrol_operator:
+        disallowed_list += [
+            "Write", "Edit", "NotebookEdit", "Bash",
+            "Agent", "Task", "KillShell", "SlashCommand",
         ]
     # Llama/local models: block built-in WebSearch/WebFetch (require Anthropic API).
     # The MCP web-tools server (registered below) provides keyless web_search/web_fetch
@@ -597,7 +608,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # sessions, not just the admin scan worker. User-scope `claude mcp add`
     # still works for external Claude Code sessions; this inline config keeps
     # Loom self-contained.
-    if os.environ.get("NROL_AO_AUTO_MCP", "1") not in {"0", "false", "False"}:
+    if nrol_operator or os.environ.get("NROL_AO_AUTO_MCP", "1") not in {"0", "false", "False"}:
         nrol_repo = Path(os.environ.get("NROL_AO_REPO", r"C:\Claude-Code\NROL-AO\temp-repo"))
         nrol_server = Path(__file__).parent / "mcp_servers" / "nrol_ao" / "server.py"
         if nrol_repo.exists() and nrol_server.is_file() and "nrol-ao" not in mcp_servers:
@@ -630,6 +641,14 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
 
     if extra_mcp_servers:
         mcp_servers.update(extra_mcp_servers)
+    if nrol_operator:
+        # Only the inline-configured servers (nrol-ao, web-tools for llama)
+        # load — user/project-scope MCP servers are ignored so the operator
+        # can't reach unrelated tool surfaces.
+        cc_args.append("--strict-mcp-config")
+        operator_md = Path(__file__).parent / "mcp_servers" / "nrol_ao" / "OPERATOR.md"
+        if operator_md.exists():
+            cc_args.extend(["--append-system-prompt", operator_md.read_text(encoding="utf-8")])
     if mcp_servers:
         cc_args.extend(["--mcp-config", json.dumps({"mcpServers": mcp_servers})])
     if append_system_prompt:
@@ -651,6 +670,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # Pass Loom connection info to the hook script via env vars
     env = {**os.environ}
     env["LOOM_CONV_ID"] = str(conv_id)
+    if nrol_operator:
+        env["LOOM_NROL_OPERATOR"] = "1"
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
     env["LOOM_PORT"] = str(server_port)

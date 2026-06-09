@@ -191,7 +191,8 @@ def main():
     port = os.environ.get("LOOM_PORT", "3000")
     conv_id = os.environ.get("LOOM_CONV_ID", "")
     backstage_parent = os.environ.get("LOOM_BACKSTAGE_PARENT_ID", "")
-    sys.stderr.write(f"[PERM-HOOK] port={port} conv={conv_id} backstage={backstage_parent}\n")
+    nrol_operator = os.environ.get("LOOM_NROL_OPERATOR", "")
+    sys.stderr.write(f"[PERM-HOOK] port={port} conv={conv_id} backstage={backstage_parent} nrol={nrol_operator}\n")
 
     if not conv_id:
         # Not running under Loom — pass through
@@ -345,9 +346,29 @@ def main():
         if mapped_name in deny_list:
             deny(f"Tool {mapped_name} is disabled in Backstage mode. Use the 'loom-state-cards' MCP tools to manage character and scene data.", event_name=event_name)
 
+    # NROL OPERATOR LOCKDOWN:
+    # Same deny set as backstage — the CLI already strips these via
+    # --disallowedTools; this is defense in depth if launch args drift.
+    if nrol_operator:
+        deny_list = {"Write", "Edit", "NotebookEdit", "Bash", "Replace"}
+        if mapped_name in deny_list:
+            deny(
+                f"Tool {mapped_name} is disabled in NROL operator mode. "
+                "Use the nrol-ao MCP tools (typed transitions) instead.",
+                event_name=event_name,
+            )
+
     # Auto-approve read-only tools
     if event_name != "PermissionRequest" and mapped_name in READ_ONLY:
         allow(f"Read-only tool: {mapped_name}", event_name=event_name)
+
+    # Auto-approve the nrol-ao MCP surface entirely. Its read tools are
+    # side-effect-free, and its mutating tools (commit=true) raise their own
+    # Loom permission request from inside the MCP server — with transition,
+    # indicator, and evidence context. Prompting here too would double-prompt
+    # every commit with a less informative dialog.
+    if event_name != "PermissionRequest" and mapped_name.startswith("mcp__nrol-ao__"):
+        allow(f"nrol-ao MCP tool (commits gated server-side): {mapped_name}", event_name=event_name)
 
     request["loom_conv_id"] = conv_id
     request["tool_name"] = mapped_name # Normalize for Loom API
