@@ -510,7 +510,11 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                      permission_mode: str = "default",
                      resume_session_id: str = None, fork_session: bool = False,
                      use_llama: bool = False,
-                     backstage_parent_id: int | None = None):
+                     backstage_parent_id: int | None = None,
+                     extra_mcp_servers: dict | None = None,
+                     extra_disallowed_tools: list[str] | None = None,
+                     append_system_prompt: str | None = None,
+                     extra_env: dict | None = None):
     """Run Claude Code CLI and yield parsed events as an async generator.
 
     Returns (process, generator) so the caller can cancel via process.terminate().
@@ -542,6 +546,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # via DuckDuckGo + trafilatura as the replacement.
     if use_llama:
         disallowed_list += ["WebSearch", "WebFetch"]
+    if extra_disallowed_tools:
+        disallowed_list += [tool for tool in extra_disallowed_tools if tool not in disallowed_list]
     cc_args = ["-p", prompt,
                "--output-format", "stream-json",
                "--include-partial-messages",
@@ -557,22 +563,18 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # Backstage: inject the state-cards MCP server scoped to the parent conv.
     # Inline JSON config — no temp file needed. The subprocess receives
     # LOOM_API_URL / LOOM_BACKSTAGE_PARENT_ID via the server entry's env.
+    mcp_servers: dict = {}
     if backstage_parent_id:
         mcp_script = str(Path(__file__).parent / "mcp_state_cards.py")
-        mcp_config = {
-            "mcpServers": {
-                "loom-state-cards": {
-                    "type": "stdio",
-                    "command": sys.executable,
-                    "args": [mcp_script],
-                    "env": {
-                        "LOOM_API_URL": f"{protocol}://127.0.0.1:{server_port}",
-                        "LOOM_BACKSTAGE_PARENT_ID": str(backstage_parent_id),
-                    },
-                }
-            }
+        mcp_servers["loom-state-cards"] = {
+            "type": "stdio",
+            "command": sys.executable,
+            "args": [mcp_script],
+            "env": {
+                "LOOM_API_URL": f"{protocol}://127.0.0.1:{server_port}",
+                "LOOM_BACKSTAGE_PARENT_ID": str(backstage_parent_id),
+            },
         }
-        cc_args.extend(["--mcp-config", json.dumps(mcp_config)])
 
         # Append a backstage-specific system prompt so the agent knows it's
         # editing state cards for a parent RP conv, not assisting with code.
@@ -585,16 +587,53 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     if use_llama:
         web_tools_script = Path(__file__).parent / "mcp_web_tools.py"
         if web_tools_script.is_file():
-            mcp_web_config = {
-                "mcpServers": {
-                    "web-tools": {
-                        "type": "stdio",
-                        "command": sys.executable,
-                        "args": [str(web_tools_script)],
-                    }
-                }
+            mcp_servers["web-tools"] = {
+                "type": "stdio",
+                "command": sys.executable,
+                "args": [str(web_tools_script)],
             }
-            cc_args.extend(["--mcp-config", json.dumps(mcp_web_config)])
+
+    # NROL-AO: make the engine MCP available to ordinary Loom-launched CC
+    # sessions, not just the admin scan worker. User-scope `claude mcp add`
+    # still works for external Claude Code sessions; this inline config keeps
+    # Loom self-contained.
+    if os.environ.get("NROL_AO_AUTO_MCP", "1") not in {"0", "false", "False"}:
+        nrol_repo = Path(os.environ.get("NROL_AO_REPO", r"C:\Claude-Code\NROL-AO\temp-repo"))
+        nrol_server = Path(__file__).parent / "mcp_servers" / "nrol_ao" / "server.py"
+        if nrol_repo.exists() and nrol_server.is_file() and "nrol-ao" not in mcp_servers:
+            nrol_env = {
+                "NROL_AO_REPO": str(nrol_repo),
+                "NROL_AO_ACTIVITY_DIR": os.environ.get(
+                    "NROL_AO_ACTIVITY_DIR",
+                    str(nrol_repo / "loom" / "mcp_activity"),
+                ),
+                "ALPHA_OMEGA_PORT": os.environ.get("ALPHA_OMEGA_PORT", "8098"),
+                "LOOM_PORT": str(server_port),
+                "LOOM_CONV_ID": str(conv_id),
+                "PYTHONPATH": str(Path(__file__).parent)
+                + os.pathsep
+                + os.environ.get("PYTHONPATH", ""),
+            }
+            try:
+                from config import config as _loom_config
+                nrol_env.setdefault("NROL_AO_LLAMA_HOST", _loom_config.llama_host_url())
+                if getattr(_loom_config, "llama_model", ""):
+                    nrol_env.setdefault("NROL_AO_LLAMA_MODEL", _loom_config.llama_model)
+            except Exception:
+                pass
+            mcp_servers["nrol-ao"] = {
+                "type": "stdio",
+                "command": sys.executable,
+                "args": ["-m", "mcp_servers.nrol_ao.server"],
+                "env": nrol_env,
+            }
+
+    if extra_mcp_servers:
+        mcp_servers.update(extra_mcp_servers)
+    if mcp_servers:
+        cc_args.extend(["--mcp-config", json.dumps({"mcpServers": mcp_servers})])
+    if append_system_prompt:
+        cc_args.extend(["--append-system-prompt", append_system_prompt])
 
     # Always launch plain claude — use_llama overrides via env vars below.
     cc_args.extend(["--model", model, "--effort", effort])
@@ -615,6 +654,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
     env["LOOM_PORT"] = str(server_port)
+    if extra_env:
+        env.update({str(k): str(v) for k, v in extra_env.items() if v is not None})
     # Always clear ollama-style entrypoint flags — we never use ollama launch anymore.
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)

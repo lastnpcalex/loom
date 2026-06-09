@@ -3,10 +3,32 @@
  * State management, API client, view switching, initialization
  */
 
+async function apiError(res, method, url) {
+    let detail = '';
+    try {
+        const data = await res.clone().json();
+        if (typeof data.detail === 'string') {
+            detail = data.detail;
+        } else if (data.detail) {
+            detail = JSON.stringify(data.detail);
+        } else if (typeof data.error === 'string') {
+            detail = data.error;
+        }
+    } catch {
+        try {
+            detail = (await res.text()).trim();
+        } catch {}
+    }
+    const err = new Error(`${method} ${url}: ${res.status}${detail ? ` - ${detail}` : ''}`);
+    err.status = res.status;
+    err.detail = detail;
+    return err;
+}
+
 const API = {
     async get(url) {
         const res = await fetch(url);
-        if (!res.ok) throw new Error(`GET ${url}: ${res.status}`);
+        if (!res.ok) throw await apiError(res, 'GET', url);
         return res.json();
     },
     async post(url, data = {}) {
@@ -15,12 +37,12 @@ const API = {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(data),
         });
-        if (!res.ok) throw new Error(`POST ${url}: ${res.status}`);
+        if (!res.ok) throw await apiError(res, 'POST', url);
         return res.json();
     },
     async del(url) {
         const res = await fetch(url, { method: 'DELETE' });
-        if (!res.ok) throw new Error(`DELETE ${url}: ${res.status}`);
+        if (!res.ok) throw await apiError(res, 'DELETE', url);
         return res.json();
     },
     async put(url, data) {
@@ -29,7 +51,7 @@ const API = {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(data),
         });
-        if (!res.ok) throw new Error(`PUT ${url}: ${res.status}`);
+        if (!res.ok) throw await apiError(res, 'PUT', url);
         return res.json();
     },
     async upload(file) {
@@ -1012,6 +1034,7 @@ async function loadConversation(convId) {
     State.currentConv = conv;
     State.treeData = treeData;
     State.bookmarks = bookmarks || [];
+    if (typeof _invalidateSkillsCache === 'function') _invalidateSkillsCache();
 
     // Backstage UI: banner when viewing a backstage child, hide the entry
     // button so you don't recurse into another backstage.
@@ -1367,14 +1390,15 @@ async function updateInlineCCControls(conv) {
     if (typeof updateCanvasVisibility === 'function') updateCanvasVisibility();
 }
 
-// Treat both alias (opus/sonnet/haiku) and full IDs (claude-opus-4-6) as
+// Treat both alias (opus/sonnet/haiku) and full IDs (claude-fable-5,
+// claude-opus-4-6, etc.) as
 // Anthropic for UI gating. Mirrors model_context.is_anthropic() server-side.
 const _ANTHROPIC_ALIASES = new Set(['sonnet', 'opus', 'haiku']);
 function _isAnthropicValue(v) {
     if (!v) return false;
     const base = (v.includes('[') ? v.split('[')[0] : v).toLowerCase();
     return _ANTHROPIC_ALIASES.has(base)
-        || /^claude-(opus|sonnet|haiku)-/.test(base);
+        || /^claude-(fable|opus|sonnet|haiku)-/.test(base);
 }
 function _isOpusValue(v) {
     if (!v) return false;
@@ -1468,6 +1492,7 @@ function initInlineCCControls() {
     modelSel.addEventListener('change', () => {
         saveCC('cc_model', modelSel.value);
         _syncEffortVisibility(modelSel.value);
+        if (typeof _invalidateSkillsCache === 'function') _invalidateSkillsCache();
         // Update local state immediately so generate messages include the new model
         if (State.currentConv) {
             State.currentConv.cc_model = modelSel.value;
@@ -2359,6 +2384,7 @@ function setupEventListeners() {
     }
 
     function _renderLocalSelect(sel, models, selectedModel, backendLabel) {
+        if (!sel) return;
         if (models.length > 0) {
             sel.innerHTML = models.map(m =>
                 `<option value="${m}"${m === selectedModel ? ' selected' : ''}>${m}</option>`
@@ -2370,6 +2396,7 @@ function setupEventListeners() {
 
     async function _populateLocalSelect(selectId, selectedModel) {
         const sel = document.getElementById(selectId);
+        if (!sel) return;
         try {
             const data = await _fetchModels();
             const models = (data.models || []).map(m => m.name || m);
@@ -2381,6 +2408,7 @@ function setupEventListeners() {
 
     async function _populateLocalVisionSelect(selectId, selectedModel) {
         const sel = document.getElementById(selectId);
+        if (!sel) return;
         try {
             const data = await _fetchVisionModels();
             const models = (data.models || []).map(m => m.name || m);
@@ -2450,8 +2478,6 @@ function setupEventListeners() {
         await Promise.all([
             _loadModelConfigs(),
             _populateModelDropdown(),
-            _populateLocalSelect('cfg-model', cfg.llama_model || ''),
-            _populateLocalVisionSelect('cfg-vision-model', cfg.vision_model || ''),
             _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), localModel),
             _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), localModel),
             _populateWeaveModelDropdown(document.getElementById('cfg-weave-model'), localModel),
@@ -2461,7 +2487,8 @@ function setupEventListeners() {
         ]);
 
         // Show tuning for the selected model
-        const selModel = document.getElementById('cfg-llama-model-select').value;
+        const llamaModelSelect = document.getElementById('cfg-llama-model-select');
+        const selModel = llamaModelSelect ? llamaModelSelect.value : '';
         _showModelTuning(selModel);
 
         // Override visibility
@@ -2532,8 +2559,6 @@ function setupEventListeners() {
             _invalidateModelCaches();
             checkHealth();
             await Promise.all([
-                _populateLocalSelect('cfg-model', document.getElementById('cfg-model').value),
-                _populateLocalVisionSelect('cfg-vision-model', document.getElementById('cfg-vision-model').value),
                 _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), document.getElementById('cfg-braid-model') ? document.getElementById('cfg-braid-model').value : ''),
                 _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), document.getElementById('cfg-hermes-model') ? document.getElementById('cfg-hermes-model').value : ''),
                 _populateWeaveModelDropdown(document.getElementById('cfg-weave-model'), document.getElementById('cfg-weave-model') ? document.getElementById('cfg-weave-model').value : ''),
@@ -2565,7 +2590,7 @@ function setupEventListeners() {
             await populateCCModelDropdowns(selected);
             showToast('Anthropic models refreshed');
         } catch (e) {
-            showToast('Refresh failed: ' + (e.message || e), 'error');
+            showToast('Refresh failed: ' + (e.detail || e.message || e), 'error');
         } finally {
             btnRefreshCC.disabled = false;
             btnRefreshCC.textContent = orig;
@@ -2593,7 +2618,11 @@ function setupEventListeners() {
     document.getElementById('btn-save-settings').addEventListener('click', async () => {
         // Save all sections at once
         const conv = State.currentConv;
-        const selectedModel = document.getElementById('cfg-llama-model-select').value;
+        const valueOf = (id, fallback = '') => {
+            const el = document.getElementById(id);
+            return el ? el.value : fallback;
+        };
+        const selectedModel = valueOf('cfg-llama-model-select', State.config.llama_model || '') || State.config.llama_model || '';
 
         // Save tuning for the selected model
         if (selectedModel) {
@@ -2601,18 +2630,21 @@ function setupEventListeners() {
             await _saveModelConfigs();
         }
 
+        // The from-folder picker is the single source of truth for both the
+        // default local model and the vision model — llama-server only loads
+        // one model at a time, so the two cannot diverge in practice.
         const globalCfg = {
             ...State.config,
-            llama_host: document.getElementById('cfg-host').value,
-            llama_model: selectedModel || document.getElementById('cfg-model').value,
-            vision_model: document.getElementById('cfg-vision-model').value,
-            llama_server_exe: document.getElementById('cfg-llama-server-exe').value,
-            temperature: parseFloat(document.getElementById('cfg-temp').value),
-            top_p: parseFloat(document.getElementById('cfg-top-p').value),
-            max_tokens: parseInt(document.getElementById('cfg-max-tokens').value),
-            repeat_penalty: parseFloat(document.getElementById('cfg-repeat-penalty').value),
-            max_context_tokens: parseInt(document.getElementById('cfg-context').value),
-            verbatim_window: parseInt(document.getElementById('cfg-verbatim').value),
+            llama_host: valueOf('cfg-host', State.config.llama_host || ''),
+            llama_model: selectedModel,
+            vision_model: selectedModel,
+            llama_server_exe: valueOf('cfg-llama-server-exe', State.config.llama_server_exe || ''),
+            temperature: parseFloat(valueOf('cfg-temp', State.config.temperature ?? 0.85)),
+            top_p: parseFloat(valueOf('cfg-top-p', State.config.top_p ?? 0.92)),
+            max_tokens: parseInt(valueOf('cfg-max-tokens', State.config.max_tokens ?? 1024)),
+            repeat_penalty: parseFloat(valueOf('cfg-repeat-penalty', State.config.repeat_penalty ?? 1.12)),
+            max_context_tokens: parseInt(valueOf('cfg-context', State.config.max_context_tokens ?? 28000)),
+            verbatim_window: parseInt(valueOf('cfg-verbatim', State.config.verbatim_window ?? 8)),
         };
         await API.put('/api/config', globalCfg);
         State.config = globalCfg;
@@ -2620,15 +2652,15 @@ function setupEventListeners() {
         if (conv && State.currentConvId) {
             const updates = {};
             if (conv.mode === 'claude' || conv.mode === 'codex') {
-                updates.cc_model = document.getElementById('cfg-cc-model').value;
-                updates.cc_effort = document.getElementById('cfg-cc-effort').value;
-                updates.cc_permission_mode = document.getElementById('cfg-cc-permission').value;
+                updates.cc_model = valueOf('cfg-cc-model', conv.cc_model || 'sonnet');
+                updates.cc_effort = valueOf('cfg-cc-effort', conv.cc_effort || 'high');
+                updates.cc_permission_mode = valueOf('cfg-cc-permission', conv.cc_permission_mode || 'default');
             } else if (conv.mode === 'local') {
-                updates.local_model = document.getElementById('cfg-braid-model').value;
+                updates.local_model = valueOf('cfg-braid-model', conv.local_model || '');
             } else if (conv.mode === 'hermes') {
-                updates.local_model = document.getElementById('cfg-hermes-model').value;
+                updates.local_model = valueOf('cfg-hermes-model', conv.local_model || '');
             } else if (conv.mode === 'weave') {
-                updates.local_model = document.getElementById('cfg-weave-model').value;
+                updates.local_model = valueOf('cfg-weave-model', conv.local_model || '');
             }
             if (Object.keys(updates).length) {
                 await API.put(`/api/conversations/${State.currentConvId}`, updates);
@@ -2667,6 +2699,7 @@ function setupEventListeners() {
 
     async function _populateModelDropdown() {
         const sel = document.getElementById('cfg-llama-model-select');
+        if (!sel) return;
         try {
             const data = await API.get('/api/disk-models');
             const models = data.models || [];
@@ -2689,6 +2722,7 @@ function setupEventListeners() {
 
       function _populateKvQuantDropdown() {
         const sel = document.getElementById('cfg-mc-kv-quant');
+        if (!sel) return;
         sel.innerHTML = '';
         for (const q of _kvQuantOptions) {
             const opt = document.createElement('option');
@@ -2700,6 +2734,7 @@ function setupEventListeners() {
 
     async function _populateMmprojDropdown() {
         const sel = document.getElementById('cfg-mc-mmproj');
+        if (!sel) return;
         sel.innerHTML = '';
         const noneOpt = document.createElement('option');
         noneOpt.value = 'none';
@@ -2721,43 +2756,60 @@ function setupEventListeners() {
     }
 
     function _showModelTuning(name) {
+        const fields = document.getElementById('model-tuning-fields');
+        if (!fields) return;
         if (!name || !_modelConfigs[name]) {
-            document.getElementById('model-tuning-fields').classList.add('hidden');
+            fields.classList.add('hidden');
             return;
         }
         const mc = _modelConfigs[name];
-        document.getElementById('model-tuning-model-name').textContent = `for ${name}`;
-        document.getElementById('cfg-mc-ctx-size').value = mc.ctx_size ?? 150000;
-        document.getElementById('cfg-mc-ngl').value = mc.ngl ?? 999;
-        document.getElementById('cfg-mc-kv-quant').value = mc.kv_quant ?? 'none';
-        document.getElementById('cfg-mc-threads').value = mc.threads ?? '';
-        document.getElementById('cfg-mc-batch').value = mc.batch ?? '';
-        document.getElementById('cfg-mc-ubatch').value = mc.ubatch ?? '';
-        document.getElementById('cfg-mc-flash-attn').checked = mc.flash_attn !== false;
-        document.getElementById('cfg-mc-mlock').checked = !!mc.mlock;
-        document.getElementById('cfg-mc-mmproj').value = mc.mmproj || 'none';
-        document.getElementById('cfg-mc-extra').value = mc.extra_args ?? '';
-        document.getElementById('model-tuning-fields').classList.remove('hidden');
+        const setText = (id, value) => { const el = document.getElementById(id); if (el) el.textContent = value; };
+        const setValue = (id, value) => { const el = document.getElementById(id); if (el) el.value = value; };
+        const setChecked = (id, value) => { const el = document.getElementById(id); if (el) el.checked = value; };
+        setText('model-tuning-model-name', `for ${name}`);
+        setValue('cfg-mc-ctx-size', mc.ctx_size ?? 150000);
+        setValue('cfg-mc-ngl', mc.ngl ?? 999);
+        setValue('cfg-mc-kv-quant', mc.kv_quant ?? 'none');
+        setValue('cfg-mc-threads', mc.threads ?? '');
+        setValue('cfg-mc-batch', mc.batch ?? '');
+        setValue('cfg-mc-ubatch', mc.ubatch ?? '');
+        setChecked('cfg-mc-flash-attn', mc.flash_attn !== false);
+        setChecked('cfg-mc-mlock', !!mc.mlock);
+        setValue('cfg-mc-mmproj', mc.mmproj || 'none');
+        setValue('cfg-mc-extra', mc.extra_args ?? '');
+        fields.classList.remove('hidden');
     }
 
     function _readModelTuning() {
+        const valueOf = (id, fallback = '') => {
+            const el = document.getElementById(id);
+            return el ? el.value : fallback;
+        };
+        const checkedOf = (id, fallback = false) => {
+            const el = document.getElementById(id);
+            return el ? el.checked : fallback;
+        };
+        const mmproj = valueOf('cfg-mc-mmproj', 'none');
         return {
-            ctx_size: parseInt(document.getElementById('cfg-mc-ctx-size').value) || 150000,
-            ngl: parseInt(document.getElementById('cfg-mc-ngl').value) || 999,
-            kv_quant: document.getElementById('cfg-mc-kv-quant').value,
-            threads: document.getElementById('cfg-mc-threads').value || null,
-            batch: document.getElementById('cfg-mc-batch').value || null,
-            ubatch: document.getElementById('cfg-mc-ubatch').value || null,
-            flash_attn: document.getElementById('cfg-mc-flash-attn').checked,
-            mlock: document.getElementById('cfg-mc-mlock').checked,
-            mmproj: document.getElementById('cfg-mc-mmproj').value === 'none' ? null : document.getElementById('cfg-mc-mmproj').value,
-            extra_args: document.getElementById('cfg-mc-extra').value,
+            ctx_size: parseInt(valueOf('cfg-mc-ctx-size', 150000)) || 150000,
+            ngl: parseInt(valueOf('cfg-mc-ngl', 999)) || 999,
+            kv_quant: valueOf('cfg-mc-kv-quant', 'none'),
+            threads: valueOf('cfg-mc-threads') || null,
+            batch: valueOf('cfg-mc-batch') || null,
+            ubatch: valueOf('cfg-mc-ubatch') || null,
+            flash_attn: checkedOf('cfg-mc-flash-attn', true),
+            mlock: checkedOf('cfg-mc-mlock'),
+            mmproj: mmproj === 'none' ? null : mmproj,
+            extra_args: valueOf('cfg-mc-extra'),
         };
     }
 
-    document.getElementById('cfg-llama-model-select').addEventListener('change', function () {
-        _showModelTuning(this.value);
-    });
+    const llamaModelSettingsSelect = document.getElementById('cfg-llama-model-select');
+    if (llamaModelSettingsSelect) {
+        llamaModelSettingsSelect.addEventListener('change', function () {
+            _showModelTuning(this.value);
+        });
+    }
 
     // Close modals
     document.querySelectorAll('[data-close-modal]').forEach(btn => {

@@ -638,7 +638,7 @@ function handleWSMessage(data) {
                 _streamFlushTimer = null;
                 hideRetryBar();
                 hidePlanBar();
-                appendStreamingMessage();
+                appendStreamingMessage(data.cc_model);
             } else if (isOnOurBranch) {
                 // Parallel sibling — count it but don't render
                 State._parallelCount = (State._parallelCount || 0) + 1;
@@ -750,7 +750,7 @@ function handleWSMessage(data) {
             // If a snapshot reconstruction is in flight, queue the prompt —
             // rendering it now would attach it to a streamingDiv that's about
             // to be destroyed by _reconstructFromSnapshot's remove+re-append.
-            if (!data.conv_id || data.conv_id === State.currentConvId) {
+            if ((!data.conv_id || _sameConvId(data.conv_id, State.currentConvId)) && _isOurBranch(data)) {
                 if (State._reconstructing) {
                     (State._pendingPermPrompts = State._pendingPermPrompts || []).push(data);
                 } else {
@@ -780,7 +780,7 @@ function handleWSMessage(data) {
 
         case 'branch_landed': {
             // Global notification — a generation completed somewhere (maybe another conversation)
-            const isCurrentConv = data.conv_id === State.currentConvId;
+            const isCurrentConv = _sameConvId(data.conv_id, State.currentConvId);
             const isWatching = isCurrentConv && State.currentView === 'chat' && !document.hidden;
             if (!isWatching) {
                 _notifications.push({
@@ -805,7 +805,7 @@ function handleWSMessage(data) {
         }
 
         case 'plan_landed': {
-            const isCurrentConv = data.conv_id === State.currentConvId;
+            const isCurrentConv = _sameConvId(data.conv_id, State.currentConvId);
             const isWatching = isCurrentConv && State.currentView === 'chat' && !document.hidden;
             if (!isWatching) {
                 _notifications.push({
@@ -1112,7 +1112,7 @@ function updateContextInfo(data) {
  */
 function _reconstructFromSnapshot(snap) {
     removeStreamingMessage();
-    appendStreamingMessage();
+    appendStreamingMessage(snap.cc_model);
     if (!streamingDiv) return;
 
     const contentEl = streamingDiv.querySelector('.message-content');
@@ -1192,11 +1192,12 @@ function _reconstructFromSnapshot(snap) {
     // prompts from other loom conversations into this branch's stream.
     for (const n of _notifications) {
         if (n.type !== 'permission' || n.resolved) continue;
-        if (n.convId && n.convId !== State.currentConvId) continue;
+        if (n.convId && !_sameConvId(n.convId, State.currentConvId)) continue;
         showPermissionPrompt({
             request_id: n.requestId,
             conv_id: n.convId,
             tool_name: n.toolName,
+            approval_method: n.approvalMethod,
             input_summary: n.inputSummary,
         });
     }
@@ -1209,14 +1210,19 @@ function _reconstructFromSnapshot(snap) {
 // ── Skills / Slash Commands ──
 
 let _cachedSkills = null;  // cached from /api/skills
+let _cachedSkillsKey = null;
 
 async function _loadSkills() {
-    if (_cachedSkills) return _cachedSkills;
+    const modelKey = State.currentConv?.cc_model || State.currentConv?.local_model || '';
+    const cacheKey = `${State.currentConvId || ''}:${State.currentConv?.mode || ''}:${modelKey}`;
+    if (_cachedSkills && _cachedSkillsKey === cacheKey) return _cachedSkills;
     try {
         const convParam = State.currentConvId ? `?conv_id=${State.currentConvId}` : '';
         _cachedSkills = await API.get(`/api/skills${convParam}`);
+        _cachedSkillsKey = cacheKey;
     } catch {
         _cachedSkills = [];
+        _cachedSkillsKey = cacheKey;
     }
     return _cachedSkills;
 }
@@ -1239,19 +1245,8 @@ const _HERMES_SLASH_COMMANDS = [
 function _getModeLabel(conv) {
     if (!conv) return 'system';
     const mode = conv.mode || 'weave';
-    if (mode === 'claude') {
-        const model = (conv.cc_model || '').toLowerCase();
-        if (model.startsWith('gemini') || model.startsWith('claude sonnet') || model.startsWith('claude opus') || model.startsWith('gpt-oss')) {
-            return 'gemini'; // runs via agy
-        }
-        return 'claude';
-    }
-    if (mode === 'local') {
-        return 'local';
-    }
-    if (mode === 'hermes') {
-        return 'hermes';
-    }
+    const agentKind = _agentKindForModel(conv.cc_model || conv.local_model || '', conv);
+    if (agentKind) return agentKind;
     return mode;
 }
 
@@ -1272,7 +1267,10 @@ async function _slashCandidates() {
     return _loadSkills();
 }
 
-function _invalidateSkillsCache() { _cachedSkills = null; }
+function _invalidateSkillsCache() {
+    _cachedSkills = null;
+    _cachedSkillsKey = null;
+}
 
 /**
  * Translate a /slash command into a natural language prompt for CC.
@@ -1365,7 +1363,7 @@ function _handleMetaCommand(name, args) {
                         return r.text();
                     })
                     .then(content => {
-                        const cleanHtml = DOMPurify.sanitize(marked.parse(content));
+                        const cleanHtml = formatContent(content);
                         addSystemMessage(`<div class="markdown-body" style="font-size:0.9em;color:var(--text-secondary)">${cleanHtml}</div>`, 'task-list-system');
                     })
                     .catch(err => showToast('Failed to load task file: ' + err, 'error'));
@@ -1972,6 +1970,11 @@ function cancelGeneration() {
 
 const _notifications = [];
 
+function _sameConvId(a, b) {
+    if (a === undefined || a === null || b === undefined || b === null) return false;
+    return String(a) === String(b);
+}
+
 function addNotification(message) {
     const preview = (message.content || '').replace(/[#*_`>\[\]]/g, '').trim();
     _notifications.push({
@@ -1986,6 +1989,11 @@ function addNotification(message) {
     _renderNotifBell();
 }
 
+function permissionSupportsAllowAll(toolName) {
+    const name = String(toolName || '');
+    return name !== 'ExitPlanMode' && name !== 'exit_plan_mode';
+}
+
 function addPermissionNotification(data) {
     // Don't duplicate — check if we already have this request_id
     if (_notifications.some(n => n.type === 'permission' && n.requestId === data.request_id)) return;
@@ -1994,7 +2002,9 @@ function addPermissionNotification(data) {
         requestId: data.request_id,
         convId: data.conv_id || State.currentConvId,
         toolName: data.tool_name || 'Unknown',
+        approvalMethod: data.approval_method || '',
         inputSummary: (data.input_summary || '').substring(0, 200),
+        supportsAllowAll: permissionSupportsAllowAll(data.tool_name),
         resolved: false,
         time: new Date(),
     });
@@ -2079,7 +2089,7 @@ function _renderBranchNotifItem(n) {
         const idx = _notifications.indexOf(n);
         if (idx !== -1) _notifications.splice(idx, 1);
         _renderNotifBell();
-        if (State.currentConvId !== n.convId) {
+        if (!_sameConvId(State.currentConvId, n.convId)) {
             State._skipLoadOnChat = true;
             await loadConversation(n.convId);
         }
@@ -2115,16 +2125,20 @@ function _renderPermissionNotifItem(n) {
             `<button class="notif-perm-btn plan-revise" data-action="deny">Revise</button>` +
             `</div>`;
     } else {
+        const allowAllButton = n.supportsAllowAll === false
+            ? ''
+            : `<button class="notif-perm-btn allow-all" data-action="allow-all">Allow for Branch</button>`;
         item.innerHTML =
             `<div class="notif-perm-header">` +
             `<span class="notif-time">${timeStr}</span>` +
             `<span class="notif-perm-tool">${escapeHtml(n.toolName)}</span>` +
             `</div>` +
+            (n.approvalMethod ? `<div class="notif-perm-summary">${escapeHtml(n.approvalMethod)}</div>` : '') +
             `<div class="notif-perm-summary">${escapeHtml(n.inputSummary)}</div>` +
             `<div class="notif-perm-actions">` +
             `<button class="notif-perm-btn allow" data-action="allow">Allow</button>` +
             `<button class="notif-perm-btn deny" data-action="deny">Deny</button>` +
-            `<button class="notif-perm-btn allow-all" data-action="allow-all">Allow All</button>` +
+            allowAllButton +
             `</div>`;
     }
 
@@ -2164,7 +2178,7 @@ function _renderPermissionNotifItem(n) {
     // Click on the item body (not buttons) navigates to the conversation
     item.addEventListener('click', async (e) => {
         if (e.target.closest('.notif-perm-btn')) return;
-        if (State.currentConvId !== n.convId) {
+        if (!_sameConvId(State.currentConvId, n.convId)) {
             State._skipLoadOnChat = true;
             await loadConversation(n.convId);
             switchView('chat');
@@ -2287,7 +2301,7 @@ function renderMessages() {
     if (lastMsg && lastMsg.role === 'assistant' && State.isStreaming) {
         const lastEl = container.querySelector(`.message[data-msg-id="${lastMsg.id}"]`);
         if (lastEl) lastEl.remove();
-        appendStreamingMessage();
+        appendStreamingMessage(lastMsg.cc_model_used);
         // Render accumulated content_blocks from the draft
         if (lastMsg.content_blocks && streamingDiv) {
             try {
@@ -2502,6 +2516,47 @@ function _modelsMatch(a, b) {
     return na === nb || na.includes(nb) || nb.includes(na);
 }
 
+function _agentKindForModel(model, conv) {
+    const msgModel = (model || '').toLowerCase();
+    const mode = (conv?.mode || '').toLowerCase();
+    if (
+        msgModel.startsWith('codex') ||
+        msgModel.startsWith('gpt-5') ||
+        msgModel === 'gpt-4o' ||
+        msgModel.startsWith('o3') ||
+        msgModel.startsWith('o4')
+    ) return 'codex';
+    if (
+        msgModel.includes('gemini') ||
+        msgModel.startsWith('claude sonnet') ||
+        msgModel.startsWith('claude opus') ||
+        msgModel.startsWith('gpt-oss')
+    ) return 'gemini';
+    if (
+        msgModel === 'sonnet' ||
+        msgModel === 'opus' ||
+        msgModel === 'haiku' ||
+        msgModel.startsWith('sonnet[') ||
+        msgModel.startsWith('opus[') ||
+        msgModel.startsWith('haiku[') ||
+        msgModel.startsWith('claude-')
+    ) return 'claude';
+    if (msgModel.endsWith('.gguf') || msgModel.includes('@llama-server')) return 'local';
+    if (msgModel.startsWith('hermes:')) return 'hermes';
+    if (['claude', 'gemini', 'codex', 'local', 'hermes'].includes(mode)) return mode;
+    return '';
+}
+
+function _assistantRoleLabelForModel(model, conv) {
+    const agentKind = _agentKindForModel(model, conv);
+    if (agentKind === 'gemini') return 'Gemini';
+    if (agentKind === 'codex') return 'Codex';
+    if (agentKind === 'local') return 'Braid';
+    if (agentKind === 'hermes') return 'Hermes';
+    if (agentKind === 'claude') return 'Claude';
+    return getCharacterName();
+}
+
 function createMessageElement(msg, cost, elapsed) {
     // Fall back to the persisted generation duration when the caller didn't
     // supply a live timer value — so the M:SS badge survives a page refresh.
@@ -2515,20 +2570,15 @@ function createMessageElement(msg, cost, elapsed) {
     div.className = `message ${msg.role}${isErrorMsg ? ' message-error' : ''}${isDraft ? ' message-generating' : ''}${isDescribeMsg ? ' message-describing' : ''}`;
     div.dataset.msgId = msg.id;
 
-    const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
     const msgModel = (msg.cc_model_used || State.currentConv?.cc_model || '').toLowerCase();
-    const isGemini = msgModel.includes('gemini');
-    const isCodex = msgModel.startsWith('codex');
-    const isLocalMode = State.currentConv && State.currentConv.mode === 'local';
-    const isHermesMode = State.currentConv && State.currentConv.mode === 'hermes';
+    const agentKind = _agentKindForModel(msgModel, State.currentConv);
+    const isClaudeMode = agentKind === 'claude';
+    const isLocalMode = agentKind === 'local';
+    const isHermesMode = agentKind === 'hermes';
+    const isCliAgentMode = ['claude', 'gemini', 'codex', 'local', 'hermes'].includes(agentKind);
     const roleLabel = msg.role === 'system' ? 'System'
         : msg.role === 'user' ? 'You'
-        : isGemini ? 'Gemini'
-        : isCodex ? 'Codex'
-        : isClaudeMode ? 'Claude'
-        : isLocalMode ? 'Braid'
-        : isHermesMode ? 'Hermes'
-        : getCharacterName();
+        : _assistantRoleLabelForModel(msgModel, State.currentConv);
     // Local model tag to show alongside the Braid/Hermes label
     const _lmName = State.currentConv && State.currentConv.local_model;
     let activeModelName = _lmName || State.loadedModel || '';
@@ -2658,7 +2708,7 @@ function createMessageElement(msg, cost, elapsed) {
 
     // Detect project-relative image paths in assistant CC/local messages
     let projectImgHtml = '';
-    if (msg.role === 'assistant' && (isClaudeMode || isLocalMode || isHermesMode || isCodex) && State.currentConv) {
+    if (msg.role === 'assistant' && isCliAgentMode && State.currentConv) {
         const allText = (msg.content || '') + ' ' + (typeof msg.content_blocks === 'string' ? msg.content_blocks : JSON.stringify(msg.content_blocks || ''));
         const imgRegex = /[\w/\\._-]+\.(?:png|jpg|jpeg|gif|webp)/gi;
         const matches = allText.match(imgRegex) || [];
@@ -2730,12 +2780,58 @@ function createMessageElement(msg, cost, elapsed) {
     return div;
 }
 
-function renderEditDiff(inputJson) {
+function _parseMaybeJson(value) {
+    if (!value) return null;
+    if (typeof value !== 'string') return value;
+    try { return JSON.parse(value); } catch { return null; }
+}
+
+function renderUnifiedDiff(diffText, fallbackTitle) {
+    if (!diffText) return null;
+    const lines = String(diffText).split('\n');
+    let diffHtml = '<div class="diff-header">' + escapeHtml(fallbackTitle || 'Codex diff') + '</div>';
+    diffHtml += '<div class="diff-body">';
+    for (const line of lines) {
+        const cls = line.startsWith('+') && !line.startsWith('+++') ? 'diff-add'
+            : line.startsWith('-') && !line.startsWith('---') ? 'diff-remove'
+            : line.startsWith('@@') ? 'diff-hunk'
+            : 'diff-context';
+        diffHtml += '<div class="' + cls + '">' + escapeHtml(line || ' ') + '</div>';
+    }
+    diffHtml += '</div>';
+    return diffHtml;
+}
+
+function renderFileChangeSummary(changes) {
+    if (!Array.isArray(changes) || !changes.length) return null;
+    let diffHtml = '<div class="diff-header">Codex file changes</div>';
+    diffHtml += '<div class="diff-body">';
+    for (const change of changes) {
+        const path = change.path || change.file || change.filePath || 'unknown file';
+        const kind = change.kind || change.type || change.status || 'change';
+        diffHtml += '<div class="diff-context">' + escapeHtml(kind + ': ' + path) + '</div>';
+    }
+    diffHtml += '</div>';
+    return diffHtml;
+}
+
+function renderEditDiff(inputJson, resultJson) {
     try {
-        const data = typeof inputJson === 'string' ? JSON.parse(inputJson) : inputJson;
+        const inputData = _parseMaybeJson(inputJson) || {};
+        const resultData = _parseMaybeJson(resultJson) || {};
+        const data = resultData.kind === 'codex_diff' ? resultData : inputData;
+        if (data.kind === 'codex_diff') {
+            return renderUnifiedDiff(data.diff, data.turnId || data.threadId || 'Codex diff')
+                || renderFileChangeSummary(data.files)
+                || '<div class="tool-block-input">' + escapeHtml(JSON.stringify(data, null, 2)) + '</div>';
+        }
+        if (Array.isArray(data.changes) || Array.isArray(data.fileChanges)) {
+            return renderFileChangeSummary(data.changes || data.fileChanges);
+        }
         const filePath = data.file_path || 'unknown file';
         const oldStr = data.old_string || '';
         const newStr = data.new_string || '';
+        if (!oldStr && !newStr) return null;
         const oldLines = oldStr.split('\n');
         const newLines = newStr.split('\n');
         let diffHtml = '<div class="diff-header">' + escapeHtml(filePath) + '</div>';
@@ -2825,7 +2921,7 @@ function renderContentBlocks(blocks) {
         const result = (block.result || '').trim();
         const resultDisplay = result.length > 2000 ? result.substring(0, 2000) + '\n... (truncated)' : result;
         const isEdit = (name === 'Edit');
-        const diffHtml = isEdit ? renderEditDiff(input) : null;
+        const diffHtml = isEdit ? renderEditDiff(input, result) : null;
         const bodyHtml = diffHtml || renderToolBody(name, input, resultDisplay);
         return '<div class="tool-block">' +
             '<div class="tool-block-header" data-tool-toggle>' +
@@ -2958,12 +3054,13 @@ function getCharacterName() {
     if (!State.currentConvId) return 'Assistant';
     const conv = State.conversations.find(c => c.id === State.currentConvId);
     if (!conv) return 'Assistant';
-    const ccModel = (conv.cc_model || '').toLowerCase();
-    if (ccModel.startsWith('codex')) return 'Codex';
-    if (ccModel.includes('gemini')) return 'Gemini';
-    if (conv.mode === 'local') return conv.local_model || 'Local';
-    if (conv.mode === 'hermes') return conv.local_model || 'Hermes';
-    if (conv.mode === 'claude') return 'Claude';
+    const ccModel = conv.cc_model || '';
+    const agentKind = _agentKindForModel(ccModel || conv.local_model || '', conv);
+    if (agentKind === 'codex') return 'Codex';
+    if (agentKind === 'gemini') return 'Gemini';
+    if (agentKind === 'local') return conv.local_model || 'Local';
+    if (agentKind === 'hermes') return conv.local_model || 'Hermes';
+    if (agentKind === 'claude') return 'Claude';
     if (!conv.character_id) {
         // Weave/OODA without a character attached: show the model name (mirrors
         // Braid's behavior). Falls through to "Assistant" if nothing's set.
@@ -3052,13 +3149,76 @@ function _formatElapsed(seconds) {
     return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
 }
 
+const MARKDOWN_SANITIZE_CONFIG = {
+    ADD_TAGS: ['button'],
+    ADD_ATTR: ['data-code-action', 'aria-hidden'],
+};
+
+function sanitizeMarkdownHtml(raw) {
+    return typeof DOMPurify !== 'undefined'
+        ? DOMPurify.sanitize(raw, MARKDOWN_SANITIZE_CONFIG)
+        : raw;
+}
+
+function renderLatexExpression(source, latex, displayMode) {
+    if (typeof katex === 'undefined') return escapeHtml(source);
+    try {
+        return katex.renderToString(latex.trim(), {
+            displayMode,
+            throwOnError: false,
+            strict: 'ignore',
+            output: 'html',
+        });
+    } catch {
+        return escapeHtml(source);
+    }
+}
+
+function replaceLatexInTextSegment(segment, renderedMath) {
+    const mathPattern = /(\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\\\(([\s\S]+?)\\\)|(^|[^\w\\])\$((?:\\.|[^\n$\\])+?)\$(?![\w]))/g;
+    return segment.replace(mathPattern, (match, _all, dollarDisplay, bracketDisplay, parenInline, dollarPrefix, dollarInline) => {
+        const displayLatex = dollarDisplay !== undefined ? dollarDisplay : bracketDisplay;
+        const inlineLatex = parenInline !== undefined ? parenInline : dollarInline;
+        const displayMode = displayLatex !== undefined;
+        const latex = displayMode ? displayLatex : inlineLatex;
+        if (!latex || !latex.trim()) return match;
+
+        const prefix = dollarInline !== undefined ? dollarPrefix : '';
+        const source = dollarInline !== undefined ? '$' + dollarInline + '$' : match;
+        const token = 'LOOMMATHPLACEHOLDER' + renderedMath.length + 'END';
+        renderedMath.push(renderLatexExpression(source, latex, displayMode));
+        return prefix + token;
+    });
+}
+
+function prepareMarkdownLatex(text, renderedMath) {
+    const codePattern = /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*(?:`|$))/g;
+    let out = '';
+    let last = 0;
+    text.replace(codePattern, (match, _unused, offset) => {
+        out += replaceLatexInTextSegment(text.slice(last, offset), renderedMath);
+        out += match;
+        last = offset + match.length;
+        return match;
+    });
+    out += replaceLatexInTextSegment(text.slice(last), renderedMath);
+    return out;
+}
+
+function parseMarkdownWithLatex(text) {
+    const renderedMath = [];
+    const prepared = prepareMarkdownLatex(text, renderedMath);
+    let raw = marked.parse(prepared);
+    renderedMath.forEach((html, i) => {
+        raw = raw.replaceAll('LOOMMATHPLACEHOLDER' + i + 'END', html);
+    });
+    return sanitizeMarkdownHtml(raw);
+}
+
 function formatContent(text) {
     if (!text) return '';
     if (typeof marked !== 'undefined') {
-        const raw = marked.parse(text);
-        return typeof DOMPurify !== 'undefined'
-            ? DOMPurify.sanitize(raw, { ADD_TAGS: ['button'], ADD_ATTR: ['data-code-action'] })
-            : raw;
+        return parseMarkdownWithLatex(text);
     }
     // Fallback if marked not loaded
     let html = escapeHtml(text);
@@ -3198,22 +3358,11 @@ function _stopGenTimer() {
     if (_loomAnimInterval) { clearInterval(_loomAnimInterval); _loomAnimInterval = null; }
 }
 
-function appendStreamingMessage() {
+function appendStreamingMessage(ccModel) {
     const container = document.getElementById('messages');
     streamingDiv = document.createElement('div');
     streamingDiv.className = 'message assistant streaming';
-    const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
-    const msgModel = (State.currentConv?.cc_model || '').toLowerCase();
-    const isGemini = msgModel.includes('gemini');
-    const isCodex = msgModel.startsWith('codex');
-    const isLocalMode = State.currentConv && State.currentConv.mode === 'local';
-    const isHermesMode = State.currentConv && State.currentConv.mode === 'hermes';
-    const label = isGemini ? 'Gemini'
-        : isCodex ? 'Codex'
-        : isClaudeMode ? 'Claude'
-        : isLocalMode ? (State.currentConv.local_model || 'Local')
-        : isHermesMode ? (State.currentConv.local_model || 'Hermes')
-        : getCharacterName();
+    const label = _assistantRoleLabelForModel(ccModel || State.currentConv?.cc_model, State.currentConv);
     streamingDiv.innerHTML = '<div class="message-header">' +
         '<span class="message-role">' + escapeHtml(label) + '</span>' +
         '</div>' +
@@ -3445,11 +3594,20 @@ function finalizeToolBlock(result, toolId, imageUrl, isError) {
     const resultEl = block.querySelector('.tool-block-result');
     // Truncate long results for display
     const display = result.length > 2000 ? result.substring(0, 2000) + '\n... (truncated)' : result;
-    resultEl.textContent = display;
+    const toolName = block.querySelector('.tool-name')?.textContent || '';
+    const inputText = block.querySelector('.tool-block-input')?.textContent || '';
+    const diffHtml = toolName === 'Edit' ? renderEditDiff(inputText, result) : null;
+    if (diffHtml) {
+        const inputEl = block.querySelector('.tool-block-input');
+        if (inputEl) inputEl.textContent = '';
+        resultEl.innerHTML = diffHtml;
+    } else {
+        resultEl.textContent = display;
+    }
 
     // Show success/error indicator on the header
     const header = block.querySelector('.tool-block-header');
-    if (header) {
+    if (header && !header.querySelector('.tool-status')) {
         const indicator = document.createElement('span');
         indicator.className = isError ? 'tool-status tool-error' : 'tool-status tool-success';
         indicator.textContent = isError ? '✗' : '✓';
@@ -3901,7 +4059,7 @@ function showPermissionPrompt(data) {
         const planFileName = planInput.planFilePath ? planInput.planFilePath.split(/[/\\]/).pop() : '';
         // Render plan as markdown if marked is available, otherwise fall back to escaped pre
         const planHtml = (typeof marked !== 'undefined' && planRaw.length > 10)
-            ? DOMPurify.sanitize(marked.parse(planRaw))
+            ? formatContent(planRaw)
             : '<pre>' + escapeHtml(planRaw) + '</pre>';
         prompt.innerHTML = '<div class="permission-header">' +
             '<span class="permission-icon">&#x1F9F5;</span>' +
@@ -3916,18 +4074,23 @@ function showPermissionPrompt(data) {
     } else {
         prompt.className = 'permission-prompt';
         const inputSummary = escapeHtml(data.input_summary || JSON.stringify(data.tool_input || {}).substring(0, 300));
+        const approvalMethod = escapeHtml(data.approval_method || '');
+        const allowAllButton = permissionSupportsAllowAll(data.tool_name)
+            ? '<button class="btn-permission allow-all" data-perm-action="allow-all" data-request-id="' + data.request_id + '">Allow for Branch</button>'
+            : '';
         prompt.innerHTML = '<div class="permission-header">' +
             '<span class="permission-icon">&#x1f512;</span>' +
             '<span class="permission-title">Permission Request</span>' +
             '</div>' +
             '<div class="permission-body">' +
             '<div class="permission-tool">Tool: <strong>' + toolName + '</strong></div>' +
+            (approvalMethod ? '<div class="permission-tool">Permission: <strong>' + approvalMethod + '</strong></div>' : '') +
             (inputSummary ? '<div class="permission-input"><pre>' + inputSummary + '</pre></div>' : '') +
             '</div>' +
             '<div class="permission-actions">' +
             '<button class="btn-permission allow" data-perm-action="allow" data-request-id="' + data.request_id + '">Allow</button>' +
             '<button class="btn-permission deny" data-perm-action="deny" data-request-id="' + data.request_id + '">Deny</button>' +
-            '<button class="btn-permission allow-all" data-perm-action="allow-all" data-request-id="' + data.request_id + '">Allow All</button>' +
+            allowAllButton +
             '</div>';
     }
 
@@ -3951,7 +4114,7 @@ function showPermissionPrompt(data) {
             // Disable buttons while waiting
             prompt.querySelectorAll('.btn-permission').forEach(b => b.disabled = true);
             prompt.querySelector('.permission-title').textContent =
-                allow ? 'Allowed' + (always ? ' (all future)' : '') : 'Denied';
+                allow ? 'Allowed' + (always ? ' (branch)' : '') : 'Denied';
             prompt.classList.add(allow ? 'resolved-allow' : 'resolved-deny');
 
             // Also clear the notification bell
@@ -4265,7 +4428,7 @@ function previewArtifact(filename, content) {
     const body = document.getElementById('preview-modal-body');
     modal.classList.remove('hidden');
     body.innerHTML = `<div class="markdown-body" style="padding:20px;overflow-y:auto;max-height:75vh;color:var(--text-primary)">`
-        + DOMPurify.sanitize(marked.parse(content))
+        + formatContent(content)
         + `</div>`;
 }
 

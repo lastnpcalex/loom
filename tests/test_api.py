@@ -3,6 +3,38 @@
 import pytest
 
 
+class _FakeAnthropicResponse:
+    def __init__(self, status_code, data=None, text=""):
+        self.status_code = status_code
+        self._data = data or {}
+        self.text = text
+
+    def json(self):
+        return self._data
+
+
+class _FakeAnthropicClient:
+    response = _FakeAnthropicResponse(200)
+    last_request = None
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def get(self, url, params=None, headers=None):
+        type(self).last_request = {
+            "url": url,
+            "params": params,
+            "headers": headers,
+        }
+        return type(self).response
+
+
 async def test_health_endpoint(client, mock_ollama):
     """GET /api/health returns status info."""
     resp = await client.get("/api/health")
@@ -96,3 +128,75 @@ async def test_delete_conversation(client, mock_ollama):
 
     get_resp = await client.get(f"/api/conversations/{conv_id}")
     assert get_resp.status_code == 404
+
+
+async def test_refresh_cc_models_requires_claude_code_token(client, monkeypatch):
+    import server
+
+    monkeypatch.setattr(server, "_read_oauth_token", lambda: None)
+    monkeypatch.setattr(server.httpx, "AsyncClient", _FakeAnthropicClient)
+    _FakeAnthropicClient.last_request = None
+
+    resp = await client.post("/api/cc-models/refresh")
+
+    assert resp.status_code == 401
+    assert "No Claude Code login found" in resp.json()["detail"]
+    assert "Run `claude` once" in resp.json()["detail"]
+    assert _FakeAnthropicClient.last_request is None
+
+
+async def test_refresh_cc_models_reports_rejected_claude_code_token(client, monkeypatch):
+    import server
+
+    monkeypatch.setattr(server, "_read_oauth_token", lambda: "expired-token")
+    monkeypatch.setattr(server.httpx, "AsyncClient", _FakeAnthropicClient)
+    _FakeAnthropicClient.response = _FakeAnthropicResponse(401, text="unauthorized")
+    _FakeAnthropicClient.last_request = None
+
+    resp = await client.post("/api/cc-models/refresh")
+
+    assert resp.status_code == 401
+    assert "Anthropic rejected the login token" in resp.json()["detail"]
+    assert "Run `claude`" in resp.json()["detail"]
+    assert _FakeAnthropicClient.last_request["headers"]["Authorization"] == "Bearer expired-token"
+    assert _FakeAnthropicClient.last_request["headers"]["anthropic-beta"] == "oauth-2025-04-20"
+
+
+async def test_refresh_cc_models_accepts_valid_claude_code_token(client, monkeypatch):
+    import server
+
+    monkeypatch.setattr(server, "_read_oauth_token", lambda: "valid-token")
+    monkeypatch.setattr(server.httpx, "AsyncClient", _FakeAnthropicClient)
+    monkeypatch.setattr(server, "load_local_codex_models", lambda: [])
+    monkeypatch.setattr(server, "CC_MODELS", [
+        {"group": "Anthropic", "models": []},
+        {"group": "Other", "models": [{"value": "other", "label": "Other"}]},
+    ])
+    _FakeAnthropicClient.response = _FakeAnthropicResponse(200, {
+        "data": [
+            {"id": "claude-opus-4-7-20260101", "display_name": "Claude Opus 4.7"},
+            {"id": "claude-sonnet-4-5-20260101", "display_name": "Claude Sonnet 4.5"},
+            {"id": "claude-haiku-4-5-20260101", "display_name": "Claude Haiku 4.5"},
+        ]
+    })
+    _FakeAnthropicClient.last_request = None
+
+    resp = await client.post("/api/cc-models/refresh")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["families"] == ["haiku", "opus", "sonnet"]
+    groups = {group["group"]: group["models"] for group in data["models"]}
+    auto_models = next(models for name, models in groups.items() if "Auto" in name)
+    pinned_models = next(models for name, models in groups.items() if "Pinned" in name)
+    assert [model["value"] for model in auto_models] == [
+        "opus",
+        "opus[1m]",
+        "sonnet",
+        "sonnet[1m]",
+        "haiku",
+    ]
+    pinned_values = [model["value"] for model in pinned_models]
+    assert "claude-opus-4-7-20260101[1m]" in pinned_values
+    assert "claude-sonnet-4-5-20260101[1m]" in pinned_values
+    assert "claude-haiku-4-5-20260101[1m]" not in pinned_values

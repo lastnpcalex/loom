@@ -2240,6 +2240,16 @@ body::after {
 .message-content h2 { font-size: 15px; font-weight: 600; margin: 8px 0 4px; }
 .message-content h3 { font-size: 14px; font-weight: 600; margin: 6px 0 3px; }
 .message-content h4, .message-content h5, .message-content h6 { font-size: 13px; font-weight: 600; margin: 4px 0 2px; }
+.message-content .katex { color: var(--text-primary); }
+.message-content .katex-display {
+    margin: 8px 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 2px 0 4px;
+}
+.message-content .katex-display > .katex {
+    white-space: nowrap;
+}
 /* ── Code Block Wrapper + Toolbar ── */
 .code-block-wrapper {
     position: relative;
@@ -3239,6 +3249,22 @@ body::after {
 .slash-source.meta {
     color: rgba(255, 180, 50, 0.8);
     border: 1px solid rgba(255, 180, 50, 0.25);
+}
+.slash-source.claude {
+    color: rgba(190, 135, 255, 0.82);
+    border: 1px solid rgba(190, 135, 255, 0.24);
+}
+.slash-source.codex {
+    color: rgba(105, 220, 255, 0.82);
+    border: 1px solid rgba(105, 220, 255, 0.24);
+}
+.slash-source.gemini {
+    color: rgba(0, 220, 160, 0.82);
+    border: 1px solid rgba(0, 220, 160, 0.24);
+}
+.slash-source.hermes {
+    color: rgba(255, 120, 95, 0.82);
+    border: 1px solid rgba(255, 120, 95, 0.24);
 }
 .slash-desc {
     font-size: 0.75em;

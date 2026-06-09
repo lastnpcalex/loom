@@ -20,6 +20,48 @@ _HOOK_SCRIPT = str(Path(__file__).parent / "cc_permission_hook.py")
 _active_queues: dict[int, asyncio.Queue] = {}
 
 
+def _agy_home() -> Path:
+    if sys.platform == "win32":
+        return Path(os.environ.get("USERPROFILE", Path.home())) / ".gemini" / "antigravity-cli"
+    return Path.home() / ".gemini" / "antigravity-cli"
+
+
+_RE_RESETS_IN = re.compile(r"Resets in ([0-9hms]+)")
+
+
+def _scan_agy_log_for_error(since_ts: float) -> str | None:
+    """Look at the newest agy cli-*.log for a fatal signal (429/auth) since `since_ts`.
+
+    agy writes its real error to its own log file rather than stderr, so when
+    the transcript never materializes we have to read this to surface a useful
+    message instead of "exited with no response".
+    """
+    log_dir = _agy_home() / "log"
+    if not log_dir.exists():
+        return None
+    try:
+        candidates = [p for p in log_dir.glob("cli-*.log") if p.stat().st_mtime >= since_ts - 1.0]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda p: p.stat().st_mtime)
+    try:
+        text = latest.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    if "RESOURCE_EXHAUSTED" in text or "Individual quota reached" in text:
+        m = _RE_RESETS_IN.search(text)
+        resets = f" — resets in {m.group(1)}" if m else ""
+        return f"Antigravity quota reached (429){resets}"
+    if "You are not logged into Antigravity" in text and "silent auth succeeded" not in text:
+        return "Antigravity is not logged in — run `agy` interactively to sign in"
+    if "PERMISSION_DENIED" in text:
+        return "Antigravity permission denied — check account access"
+    return None
+
+
 def _find_agy_exe() -> str:
     """Find the agy executable on PATH or in known install locations."""
     agy_name = "agy.exe" if sys.platform == "win32" else "agy"
@@ -299,6 +341,9 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
 
+    import time as _time
+    launch_ts = _time.time()
+
     cmd = [agy_exe] + cc_args
     print(f"[AGY] CMD: {' '.join(cmd[:6])}{'...' if len(cmd) > 6 else ''}")
     print(f"[AGY] agy_model={agy_model}, prompt_len={len(prompt)}, cli_len={len(cli_prompt)}")
@@ -362,10 +407,14 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         if not active_file:
             log.error("[AGY] Timeout waiting for active transcript file. Waiting for process completion.")
             await proc.wait()
+            err = _scan_agy_log_for_error(launch_ts)
+            if err:
+                print(f"[AGY] CLI log diagnosis: {err}")
             queue.put_nowait({
                 "type": "result",
-                "is_error": proc.returncode != 0,
+                "is_error": True if err else (proc.returncode != 0),
                 "result_text": "",
+                "error": err,
                 "session_id": resume_session_id or str(conv_id),
             })
             queue.put_nowait(None)
@@ -568,10 +617,16 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                             break
                         await asyncio.sleep(0.05)
 
+                post_err = None
+                if not full_text:
+                    post_err = _scan_agy_log_for_error(launch_ts)
+                    if post_err:
+                        print(f"[AGY] CLI log diagnosis (post-transcript): {post_err}")
                 queue.put_nowait({
                     "type": "result",
-                    "is_error": proc.returncode != 0,
+                    "is_error": bool(post_err) or proc.returncode != 0,
                     "result_text": full_text,
+                    "error": post_err,
                     "session_id": session_id,
                 })
         except Exception as e:

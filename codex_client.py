@@ -1,6 +1,7 @@
-"""ChatGPT Codex CLI subprocess wrapper.
+"""ChatGPT Codex app-server subprocess wrapper.
 
-Runs codex in headless mode (exec) with --json flag and streams the events.
+Runs Codex through the app-server JSONL protocol so Loom can broker live
+approval requests instead of using non-interactive `codex exec`.
 """
 
 import asyncio
@@ -8,12 +9,300 @@ import json
 import logging
 import os
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# Use the standard Loom blocking hook
-_HOOK_SCRIPT = str(Path(__file__).parent / "cc_permission_hook.py")
+_IGNORED_APP_SERVER_EVENTS = {
+    "account/rateLimits/updated",
+    "remoteControl/status/changed",
+    "serverRequest/resolved",
+    "thread/status/changed",
+    "thread/tokenUsage/updated",
+    "turn/started",
+}
+
+_IGNORED_APP_SERVER_ITEM_TYPES = {
+    "agentMessage",
+    "reasoning",
+    "userMessage",
+}
+
+
+def _toml_literal(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _toml_array(values: list[str]) -> str:
+    return "[" + ", ".join(_toml_literal(v) for v in values) + "]"
+
+
+def _codex_config_args(key: str, value: str) -> list[str]:
+    return ["-c", f"{key}={value}"]
+
+
+def _nrol_mcp_config(conv_id: int, server_port: int) -> dict:
+    if os.environ.get("NROL_AO_AUTO_MCP", "1") in {"0", "false", "False"}:
+        return {}
+    root = Path(__file__).parent
+    nrol_repo = Path(os.environ.get("NROL_AO_REPO", r"C:\Claude-Code\NROL-AO\temp-repo"))
+    nrol_server = root / "mcp_servers" / "nrol_ao" / "server.py"
+    if not nrol_repo.exists() or not nrol_server.is_file():
+        return {}
+
+    env = {
+        "NROL_AO_REPO": str(nrol_repo),
+        "NROL_AO_ACTIVITY_DIR": os.environ.get(
+            "NROL_AO_ACTIVITY_DIR",
+            str(nrol_repo / "loom" / "mcp_activity"),
+        ),
+        "ALPHA_OMEGA_PORT": os.environ.get("ALPHA_OMEGA_PORT", "8098"),
+        "LOOM_PORT": str(server_port),
+        "LOOM_CONV_ID": str(conv_id),
+        "PYTHONPATH": str(root) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+    }
+    try:
+        from config import config as _loom_config
+
+        env.setdefault("NROL_AO_LLAMA_HOST", _loom_config.llama_host_url())
+        if getattr(_loom_config, "llama_model", ""):
+            env.setdefault("NROL_AO_LLAMA_MODEL", _loom_config.llama_model)
+    except Exception:
+        pass
+
+    return {
+        "command": sys.executable,
+        "args": ["-m", "mcp_servers.nrol_ao.server"],
+        "env": env,
+        "required": True,
+        "startup_timeout_sec": 20.0,
+        "tool_timeout_sec": 1200.0,
+        "default_tools_approval_mode": "approve",
+    }
+
+
+def _nrol_mcp_config_args(conv_id: int, server_port: int) -> list[str]:
+    config = _nrol_mcp_config(conv_id, server_port)
+    if not config:
+        return []
+    args: list[str] = []
+    server_key = 'mcp_servers."nrol-ao"'
+    args += _codex_config_args(f"{server_key}.command", _toml_literal(config["command"]))
+    args += _codex_config_args(f"{server_key}.args", _toml_array(config["args"]))
+    args += _codex_config_args(f"{server_key}.required", "true")
+    args += _codex_config_args(f"{server_key}.startup_timeout_sec", "20.0")
+    args += _codex_config_args(f"{server_key}.tool_timeout_sec", "1200.0")
+    args += _codex_config_args(f"{server_key}.default_tools_approval_mode", _toml_literal("approve"))
+    for key, value in config["env"].items():
+        args += _codex_config_args(f"{server_key}.env.{key}", _toml_literal(value))
+    return args
+
+
+def _codex_tool_name(item: dict) -> str:
+    """Return a stable Loom-facing name for Codex tool items."""
+    item_type = item.get("type")
+    if item_type in ("command_execution", "commandExecution", "local_shell_call", "localShellCall"):
+        return "Bash"
+    if item_type in ("file_change", "fileChange"):
+        return "Edit"
+    if item_type in ("mcp_tool_call", "mcpToolCall"):
+        server = item.get("server") or "mcp"
+        tool = item.get("tool") or item.get("toolName") or "tool"
+        return f"{server}.{tool}"
+    if item_type in ("dynamic_tool_call", "dynamicToolCall"):
+        namespace = item.get("namespace")
+        tool = item.get("tool") or item.get("toolName") or "tool"
+        return f"{namespace}.{tool}" if namespace else tool
+    return (
+        item.get("name")
+        or item.get("tool_name")
+        or item.get("function_name")
+        or item.get("call_name")
+        or item_type
+        or "tool"
+    )
+
+
+def _is_codex_tool_item(item: dict) -> bool:
+    """True for Codex item types that should render as Loom tool blocks."""
+    item_type = item.get("type")
+    return item_type in {
+        "mcp_tool_call",
+        "mcpToolCall",
+        "dynamic_tool_call",
+        "dynamicToolCall",
+        "command_execution",
+        "commandExecution",
+        "local_shell_call",
+        "localShellCall",
+        "function_call",
+        "tool_call",
+        "custom_tool_call",
+        "file_change",
+        "fileChange",
+    } or any(key in item for key in ("tool_name", "function_name", "call_id"))
+
+
+def _codex_item_id(item: dict, raw: dict) -> str:
+    """Pick the most stable id available for matching start/result events."""
+    return str(
+        item.get("id")
+        or item.get("call_id")
+        or item.get("tool_call_id")
+        or item.get("item_id")
+        or raw.get("item_id")
+        or raw.get("timestamp")
+        or ""
+    )
+
+
+def _text_from_value(value) -> str:
+    """Extract readable text from common Codex scalar/list/dict content shapes."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        return "".join(_text_from_value(part) for part in value)
+    if isinstance(value, dict):
+        for key in ("text", "content", "output_text", "message", "summary"):
+            text = _text_from_value(value.get(key))
+            if text:
+                return text
+        if "error" in value:
+            return _text_from_value(value["error"])
+        try:
+            return json.dumps(value, indent=2)
+        except TypeError:
+            return str(value)
+    return str(value)
+
+
+def _codex_item_text(item: dict) -> str:
+    """Extract assistant/reasoning text from current and likely Codex item shapes."""
+    for key in ("text", "content", "output_text", "message", "summary"):
+        text = _text_from_value(item.get(key))
+        if text:
+            return text
+    return ""
+
+
+def _codex_tool_input(item: dict) -> str:
+    """Format Codex tool input for Loom's tool detail panel."""
+    item_type = item.get("type")
+    if item_type in ("command_execution", "commandExecution", "local_shell_call", "localShellCall"):
+        command = item.get("command") or item.get("cmd") or item.get("script") or ""
+        return json.dumps({"command": command}, indent=2) if command else ""
+    if item_type in ("file_change", "fileChange"):
+        changes = item.get("changes") or item.get("fileChanges") or []
+        return json.dumps({"changes": changes}, indent=2)
+    args = None
+    for key in ("arguments", "input", "tool_input", "params", "parameters", "args"):
+        if key in item:
+            args = item.get(key)
+            break
+    if args is not None:
+        if isinstance(args, str):
+            return args
+        try:
+            return json.dumps(args, indent=2)
+        except TypeError:
+            return str(args)
+    return ""
+
+
+def _codex_tool_output(item: dict) -> str:
+    """Extract Codex tool output regardless of item type."""
+    if item.get("type") in ("file_change", "fileChange"):
+        changes = item.get("changes") or item.get("fileChanges") or []
+        try:
+            return json.dumps(changes, indent=2)
+        except TypeError:
+            return str(changes)
+    for key in ("aggregated_output", "formatted_output", "output", "result", "text", "content", "error"):
+        value = item.get(key)
+        if value is not None:
+            return _text_from_value(value)
+    return ""
+
+
+def _codex_diff_payload(raw: dict) -> dict:
+    params = raw.get("params") or {}
+    diff = (
+        params.get("diff")
+        or params.get("unifiedDiff")
+        or params.get("unified_diff")
+        or params.get("patch")
+        or raw.get("diff")
+        or raw.get("patch")
+        or ""
+    )
+    files = (
+        params.get("files")
+        or params.get("fileChanges")
+        or params.get("changes")
+        or raw.get("files")
+        or raw.get("fileChanges")
+        or raw.get("changes")
+        or []
+    )
+    return {
+        "kind": "codex_diff",
+        "threadId": params.get("threadId") or raw.get("threadId"),
+        "turnId": params.get("turnId") or raw.get("turnId"),
+        "diff": diff,
+        "files": files,
+    }
+
+
+def _codex_diff_tool_id(raw: dict) -> str:
+    params = raw.get("params") or {}
+    ident = (
+        params.get("turnId")
+        or params.get("threadId")
+        or raw.get("turnId")
+        or raw.get("threadId")
+        or "thread"
+    )
+    return f"codex-diff:{ident}"
+
+
+def _codex_runner_error(item: dict) -> str:
+    output = _codex_tool_output(item)
+    if "windows sandbox: timed out" in output or "runner pipe-in" in output:
+        return "Codex Windows sandbox runner failed before the command started."
+    return ""
+
+
+def _codex_usage(raw: dict) -> dict | None:
+    """Normalize token usage from turn/item payloads when Codex includes it."""
+    usage = raw.get("usage") or raw.get("token_usage") or raw.get("metrics", {}).get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    input_tokens = (
+        usage.get("input_tokens")
+        or usage.get("prompt_tokens")
+        or usage.get("total_input_tokens")
+        or 0
+    )
+    output_tokens = (
+        usage.get("output_tokens")
+        or usage.get("completion_tokens")
+        or usage.get("total_output_tokens")
+        or 0
+    )
+    if not input_tokens and not output_tokens:
+        return None
+    return {
+        "type": "usage",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
 
 
 def _find_codex_exe() -> str:
@@ -71,87 +360,182 @@ def _loom_model_to_codex(model: str) -> str:
     return "gpt-5.5"
 
 
+def _codex_approval_policy(permission_mode: str | None) -> str:
+    """Map Loom's compact Act/Plan selector to Codex's approval policy.
 
-def _configure_permission_hook(cwd: str):
-    """Configure hooks.json so Codex CLI calls our permission hook."""
-    codex_dir = Path(cwd) / ".codex"
-    codex_dir.mkdir(parents=True, exist_ok=True)
+    Loom's Act mode should behave like an interactive CLI session: actions
+    that need approval stop and ask through the browser.
+    """
+    mode = (permission_mode or "default").lower()
+    if mode in ("never", "none"):
+        return "never"
+    if mode in ("on-request", "request"):
+        return "on-request"
+    return "on-request"
 
-    python_exe = sys.executable
-    hook_path = _HOOK_SCRIPT
-    if sys.platform == "win32":
-        pre_hook_command = f'& "{python_exe}" "{hook_path}" --event PreToolUse'
-        post_hook_command = f'& "{python_exe}" "{hook_path}" --event PostToolUse'
-    else:
-        pre_hook_command = f'"{python_exe}" "{hook_path}" --event PreToolUse'
-        post_hook_command = f'"{python_exe}" "{hook_path}" --event PostToolUse'
 
-    hooks_def = {
-        "hooks": {
-            "PreToolUse": [
-                {
-                    "matcher": ".*",
-                    "hooks": [{
-                        "type": "command",
-                        "command": pre_hook_command,
-                        "timeout": 900000,
-                    }]
-                }
-            ],
-            "PostToolUse": [
-                {
-                    "matcher": ".*",
-                    "hooks": [{
-                        "type": "command",
-                        "command": post_hook_command,
-                        "timeout": 90000,
-                    }]
-                }
-            ]
-        }
+def _json_dumps_line(payload: dict) -> bytes:
+    return (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _compact_json(value, limit: int = 4000) -> str:
+    try:
+        text = json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
+    except Exception:
+        text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"...[truncated {len(text) - limit} chars]"
+
+
+def _app_user_input(prompt: str) -> list[dict]:
+    return [{"type": "text", "text": prompt}]
+
+
+def _app_sandbox_policy(cwd: str) -> dict:
+    return {
+        "type": "workspaceWrite",
+        "writableRoots": [cwd],
+        "networkAccess": False,
     }
 
-    hooks_path = codex_dir / "hooks.json"
-    hooks_path.write_text(json.dumps(hooks_def, indent=2), encoding="utf-8")
-    log.info(f"[CODEX] Hooks configured: {hooks_path}")
+
+def _app_permission_payload(method: str, params: dict) -> tuple[str, dict]:
+    if method == "item/commandExecution/requestApproval":
+        command = params.get("command") or params.get("cmd") or params.get("argv") or params.get("execCommand")
+        if isinstance(command, list):
+            command = " ".join(str(part) for part in command)
+        return "Bash", {"command": command or "", **params}
+    if method == "item/fileChange/requestApproval":
+        return "Edit", params
+    if method == "item/permissions/requestApproval":
+        return "PermissionRequest", params
+    if method == "item/tool/requestUserInput":
+        return params.get("toolName") or params.get("tool") or "ToolInput", params
+    return method, params
+
+
+def _requested_permissions(params: dict) -> dict:
+    for key in ("permissions", "requestedPermissions", "requested_permissions"):
+        value = params.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _app_approval_response(method: str, allow: bool, always: bool, params: dict | None = None) -> dict:
+    params = params or {}
+    decision = "acceptForSession" if allow and always else ("accept" if allow else "decline")
+    if method == "item/permissions/requestApproval":
+        if allow:
+            return {
+                "permissions": _requested_permissions(params),
+                "scope": "session" if always else "turn",
+            }
+        return {
+            "permissions": {
+                "filesystem": {"entries": []},
+                "network": {"enabled": False},
+            },
+            "scope": "turn",
+            "strictAutoReview": True,
+        }
+    if method == "item/tool/requestUserInput":
+        return {"decision": decision}
+    return {"decision": decision}
+
+
+async def _post_loom_permission(
+    server_port: int,
+    conv_id: int,
+    method: str,
+    params: dict,
+    permission_scope: str = "",
+    permission_request_handler=None,
+) -> dict:
+    tool_name, tool_input = _app_permission_payload(method, params)
+    payload = {
+        "loom_conv_id": conv_id,
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "source": "codex_app_server",
+        "approval_method": method,
+        "permission_scope": permission_scope,
+    }
+    if permission_request_handler is not None:
+        try:
+            return await permission_request_handler(payload)
+        except Exception as exc:
+            log.exception("[CODEX] Direct Loom permission handler failed")
+            return {"allow": False, "message": f"Loom permission handler failed: {exc}"}
+
+    def _post() -> dict:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{server_port}/api/cc-permission",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=86400) as resp:
+                return json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+        except urllib.error.URLError as exc:
+            return {"allow": False, "message": f"Loom permission bridge failed: {exc}"}
+
+    return await asyncio.to_thread(_post)
 
 
 async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
                     model: str = "Codex (GPT-4o)", effort: str = "high",
                     permission_mode: str = "default",
                     resume_session_id: str = None, fork_session: bool = False,
-                    backstage_parent_id: int | None = None):
-    """Launch codex in headless mode, parse its JSONL stream, and yield events in real time."""
-    _configure_permission_hook(cwd)
+                    backstage_parent_id: int | None = None,
+                    permission_request_handler=None):
+    """Launch Codex app-server and yield Loom-compatible stream events."""
+    workspace_root = Path(cwd).resolve()
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    cwd = str(workspace_root)
 
     codex_model = _loom_model_to_codex(model)
     codex_exe = _find_codex_exe()
-
-    # Build the codex exec arguments
-    # Use - to read prompt from stdin (handles very large prompts perfectly)
-    cc_args = []
-    if resume_session_id:
-        cc_args.extend(["resume", resume_session_id, "-"])
-    else:
-        cc_args.extend(["-"])
-
-    cc_args.extend(["--json", "--dangerously-bypass-hook-trust"])
-
-    # Model and configuration overrides
-    cc_args.extend(["-m", codex_model])
-
-    # If it's a reasoning model (o3-mini/o1), configure the effort
-    if codex_model in ("o3-mini", "o1") and effort:
-        cc_args.extend(["-c", f"model_reasoning_effort={effort}"])
-
-    cmd = [codex_exe, "exec"] + cc_args
-    print(f"[CODEX] CMD: {' '.join(cmd[:6])}{'...' if len(cmd) > 6 else ''}")
-    print(f"[CODEX] codex_model={codex_model}, prompt_len={len(prompt)}")
+    approval_policy = _codex_approval_policy(permission_mode)
+    gen_key = getattr(asyncio.current_task(), "_gen_key", None)
+    permission_scope = f"gen:{gen_key[2]}" if gen_key else ""
+    nrol_mcp_config = _nrol_mcp_config(conv_id, server_port)
+    nrol_mcp_args = _nrol_mcp_config_args(conv_id, server_port)
+    cmd = [codex_exe, "app-server", *nrol_mcp_args, "--stdio", "--disable", "hooks"]
+    print(f"[CODEX] CMD: {' '.join(cmd)}")
+    print(
+        f"[CODEX] app-server model={codex_model}, approval={approval_policy}, "
+        f"sandbox=workspace-write, cwd={cwd}, prompt_len={len(prompt)}"
+    )
+    launch_info = {
+        "type": "codex_launch_info",
+        "surface": "app-server",
+        "model": codex_model,
+        "approval_policy": approval_policy,
+        "approvals_reviewer": "user",
+        "sandbox": "workspace-write",
+        "cwd": cwd,
+        "writable_roots": [cwd],
+        "hook_path": None,
+        "hook_scope": "disabled",
+        "mcp_servers": [
+            name
+            for name, enabled in (
+                ("nrol-ao", bool(nrol_mcp_config)),
+            )
+            if enabled
+        ],
+    }
 
     env = {
         **os.environ,
         "LOOM_CONV_ID": str(conv_id),
         "LOOM_PORT": str(server_port),
+        "LOOM_API_URL": f"http://127.0.0.1:{server_port}",
+        "LOOM_WORKSPACE_ROOT": cwd,
     }
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
@@ -169,32 +553,24 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
         **kwargs
     )
 
-    # Feed the prompt to stdin in the background
-    async def _feed_stdin():
-        try:
-            proc.stdin.write(prompt.encode("utf-8"))
-            await proc.stdin.drain()
-            proc.stdin.close()
-        except Exception as e:
-            log.error(f"[CODEX] Error feeding stdin: {e}")
-    asyncio.create_task(_feed_stdin())
+    stderr_lines: list[str] = []
 
-    # We read stderr in the background
     async def _read_stderr():
         try:
             async for line in proc.stderr:
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
+                    stderr_lines.append(text)
                     print(f"[CODEX-stderr] {text}")
         except Exception as e:
             log.error(f"[CODEX] Error reading stderr: {e}")
-    asyncio.create_task(_read_stderr())
+    stderr_task = asyncio.create_task(_read_stderr())
 
-    async def _event_stream():
-        session_id = resume_session_id or str(conv_id)
-        full_text = ""
-        got_result = False
+    pending_responses: dict[str | int, asyncio.Future] = {}
+    app_messages: asyncio.Queue[dict] = asyncio.Queue()
+    request_id = 0
 
+    async def _read_stdout():
         try:
             async for line in proc.stdout:
                 line = line.strip()
@@ -205,56 +581,372 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                 except json.JSONDecodeError:
                     print(f"[CODEX] Non-JSON line on stdout: {line[:200]}")
                     continue
+                if "id" in raw and ("result" in raw or "error" in raw) and "method" not in raw:
+                    fut = pending_responses.pop(raw.get("id"), None)
+                    if fut and not fut.done():
+                        fut.set_result(raw)
+                    else:
+                        await app_messages.put(raw)
+                else:
+                    await app_messages.put(raw)
+        except Exception as e:
+            await app_messages.put({"type": "error", "message": f"Codex app-server stdout failed: {e}"})
 
-                etype = raw.get("type")
-                if etype == "thread.started":
-                    session_id = raw.get("thread_id", session_id)
+    stdout_task = asyncio.create_task(_read_stdout())
+
+    async def _send(payload: dict):
+        if not proc.stdin or proc.stdin.is_closing():
+            raise RuntimeError("Codex app-server stdin is closed")
+        proc.stdin.write(_json_dumps_line(payload))
+        await proc.stdin.drain()
+
+    async def _request(method: str, params: dict | None = None) -> dict:
+        nonlocal request_id
+        request_id += 1
+        rid = request_id
+        fut = asyncio.get_running_loop().create_future()
+        pending_responses[rid] = fut
+        payload = {"id": rid, "method": method}
+        if params is not None:
+            payload["params"] = params
+        await _send(payload)
+        return await fut
+
+    async def _answer_server_request(raw: dict):
+        method = raw.get("method") or ""
+        rid = raw.get("id")
+        params = raw.get("params") or {}
+        if method in {
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+            "item/tool/requestUserInput",
+        }:
+            tool_name, _ = _app_permission_payload(method, params)
+            print(f"[CODEX] Waiting for Loom permission: method={method} tool={tool_name} request_id={rid}")
+            print(f"[CODEX] Approval request params: {_compact_json(params)}")
+            result = await _post_loom_permission(
+                server_port,
+                conv_id,
+                method,
+                params,
+                permission_scope=permission_scope,
+                permission_request_handler=permission_request_handler,
+            )
+            allow = bool(result.get("allow"))
+            always = bool(result.get("always"))
+            print(f"[CODEX] Loom permission resolved: method={method} allow={allow} always={always} request_id={rid}")
+            response = _app_approval_response(method, allow, always, params)
+            print(f"[CODEX] Approval response payload: {_compact_json(response)}")
+            await _send({"id": rid, "result": response})
+            return
+        await _send({"id": rid, "error": {"code": -32601, "message": f"Loom does not handle {method}"}})
+
+    cleaned_up = False
+
+    async def _cleanup():
+        nonlocal cleaned_up
+        if cleaned_up:
+            return
+        cleaned_up = True
+        try:
+            if proc.stdin and not proc.stdin.is_closing():
+                proc.stdin.close()
+        except Exception:
+            pass
+        if proc.returncode is None:
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+        if not stdout_task.done():
+            stdout_task.cancel()
+        try:
+            await stdout_task
+        except asyncio.CancelledError:
+            pass
+        await stderr_task
+
+    async def _event_stream():
+        session_id = resume_session_id or str(conv_id)
+        full_text = ""
+        got_result = False
+        started_tool_ids: set[str] = set()
+        diff_tool_ids: set[str] = set()
+        unknown_event_types: set[str] = set()
+        unknown_item_types: set[str] = set()
+        yield launch_info
+
+        try:
+            try:
+                init = await _request(
+                    "initialize",
+                    {
+                        "clientInfo": {"name": "Loom", "version": "1"},
+                        "capabilities": {"experimental": True},
+                    },
+                )
+                if init.get("error"):
+                    await _cleanup()
+                    yield {"type": "error", "message": json.dumps(init["error"])}
+                    return
+                await _send({"method": "initialized"})
+
+                mcp_servers = {}
+                if nrol_mcp_config:
+                    mcp_servers["nrol-ao"] = nrol_mcp_config
+                thread_config = {"mcp_servers": mcp_servers} if mcp_servers else None
+                thread_params = {
+                    "cwd": cwd,
+                    "model": codex_model,
+                    "approvalPolicy": approval_policy,
+                    "approvalsReviewer": "user",
+                    "sandbox": "workspace-write",
+                    "sessionStartSource": "startup",
+                    "threadSource": "user",
+                }
+                if thread_config:
+                    thread_params["config"] = thread_config
+
+                thread_start = await _request(
+                    "thread/start",
+                    thread_params,
+                )
+                if thread_start.get("error"):
+                    await _cleanup()
+                    yield {"type": "error", "message": json.dumps(thread_start["error"])}
+                    return
+
+                thread_result = thread_start.get("result") or {}
+                thread = thread_result.get("thread") or {}
+                session_id = thread.get("id") or thread.get("threadId") or session_id
+                yield {
+                    "type": "session_info",
+                    "session_id": session_id,
+                    "model": thread_result.get("model") or codex_model,
+                }
+                if nrol_mcp_config:
+                    yield {
+                        "type": "status",
+                        "text": "NROL MCP configured for this Codex thread; waiting for startup status",
+                    }
+
+                turn_start = await _request(
+                    "turn/start",
+                    {
+                        "threadId": session_id,
+                        "input": _app_user_input(prompt),
+                        "cwd": cwd,
+                        "model": codex_model,
+                        "approvalPolicy": approval_policy,
+                        "approvalsReviewer": "user",
+                        "sandboxPolicy": _app_sandbox_policy(cwd),
+                        "effort": effort if effort in ("minimal", "low", "medium", "high", "xhigh") else None,
+                    },
+                )
+                if turn_start.get("error"):
+                    await _cleanup()
+                    yield {"type": "error", "message": json.dumps(turn_start["error"])}
+                    return
+            except Exception as e:
+                await _cleanup()
+                yield {"type": "error", "message": f"Codex app-server launch failed: {e}"}
+                return
+
+            while True:
+                raw = await app_messages.get()
+                method = raw.get("method")
+                if method and "id" in raw:
+                    if method in {
+                        "item/commandExecution/requestApproval",
+                        "item/fileChange/requestApproval",
+                        "item/permissions/requestApproval",
+                        "item/tool/requestUserInput",
+                    }:
+                        tool_name, _ = _app_permission_payload(method, raw.get("params") or {})
+                        yield {
+                            "type": "status",
+                            "text": f"Codex is waiting for Loom permission: {tool_name}",
+                        }
+                    asyncio.create_task(_answer_server_request(raw))
+                    continue
+
+                params = raw.get("params") or {}
+                etype = raw.get("type") or method
+                usage_evt = _codex_usage(raw)
+                if usage_evt:
+                    yield usage_evt
+
+                if etype in ("thread.started", "thread/started"):
+                    thread = params.get("thread") or raw.get("thread") or {}
+                    session_id = raw.get("thread_id") or params.get("threadId") or thread.get("id") or session_id
                     yield {
                         "type": "session_info",
                         "session_id": session_id,
                         "model": codex_model,
                     }
 
-                elif etype == "item.started":
-                    item = raw.get("item") or {}
-                    item_type = item.get("type")
-                    item_id = item.get("id") or str(raw.get("timestamp", ""))
-                    if item_type in ("mcp_tool_call", "command_execution"):
+                elif etype in ("thread/diff/updated", "thread.diff.updated", "turn/diff/updated", "turn.diff.updated"):
+                    tool_id = _codex_diff_tool_id(raw)
+                    payload = _codex_diff_payload(raw)
+                    if tool_id not in diff_tool_ids:
+                        diff_tool_ids.add(tool_id)
+                        started_tool_ids.add(tool_id)
                         yield {
                             "type": "tool_start",
-                            "name": item.get("name", item_type),
+                            "name": "Edit",
+                            "tool_id": tool_id,
+                        }
+                        yield {
+                            "type": "tool_input_delta",
+                            "json": json.dumps(payload, indent=2),
+                            "tool_id": tool_id,
+                        }
+                    yield {
+                        "type": "tool_result",
+                        "content": json.dumps(payload, indent=2),
+                        "tool_id": tool_id,
+                        "is_error": False,
+                    }
+
+                elif etype in ("mcpServer/startupStatus/updated", "mcpServer.startupStatus.updated"):
+                    name = params.get("name") or raw.get("name") or "mcp"
+                    status = params.get("status") or raw.get("status") or "unknown"
+                    error = params.get("error") or raw.get("error")
+                    text = f"MCP startup: {name} {status}"
+                    if error:
+                        text += f" ({error})"
+                    yield {"type": "status", "text": text}
+
+                elif etype in ("item.started", "item/started"):
+                    item = raw.get("item") or params.get("item") or params
+                    item_type = item.get("type")
+                    item_id = _codex_item_id(item, raw)
+                    if _is_codex_tool_item(item):
+                        tool_input = _codex_tool_input(item)
+                        started_tool_ids.add(item_id)
+                        yield {
+                            "type": "tool_start",
+                            "name": _codex_tool_name(item),
                             "tool_id": item_id,
                         }
+                        if tool_input:
+                            yield {
+                                "type": "tool_input_delta",
+                                "json": tool_input,
+                                "tool_id": item_id,
+                            }
+                    elif item_type in _IGNORED_APP_SERVER_ITEM_TYPES:
+                        pass
+                    elif item_type and item_type not in unknown_item_types:
+                        unknown_item_types.add(item_type)
+                        print(f"[CODEX] Ignoring item.started type={item_type}: {json.dumps(item, default=str)[:500]}")
 
-                elif etype == "item.completed":
-                    item = raw.get("item") or {}
+                elif etype in ("item.completed", "item/completed"):
+                    item = raw.get("item") or params.get("item") or params
                     item_type = item.get("type")
-                    item_id = item.get("id") or str(raw.get("timestamp", ""))
-                    content = item.get("text", "")
+                    item_id = _codex_item_id(item, raw)
+                    content = _codex_item_text(item)
 
-                    if item_type == "reasoning" and content:
+                    if item_type in ("reasoning", "reasoningSummary", "reasoning_summary", "summary") and content:
                         chunk_size = 128
                         for i in range(0, len(content), chunk_size):
                             yield {"type": "thinking_delta", "text": content[i:i+chunk_size]}
                             await asyncio.sleep(0.005)
 
-                    elif item_type == "agent_message" and content:
-                        chunk_size = 64
-                        for i in range(0, len(content), chunk_size):
-                            yield {"type": "text_delta", "text": content[i:i+chunk_size]}
-                            await asyncio.sleep(0.01)
-                        full_text += content
+                    elif (
+                        item_type in ("agent_message", "agentMessage", "message", "assistant_message", "assistantMessage", "output_text")
+                        or item.get("role") == "assistant"
+                    ) and content:
+                        if not full_text:
+                            chunk_size = 64
+                            for i in range(0, len(content), chunk_size):
+                                yield {"type": "text_delta", "text": content[i:i+chunk_size]}
+                                await asyncio.sleep(0.01)
+                            full_text += content
 
-                    elif item_type in ("mcp_tool_call", "command_execution"):
+                    elif _is_codex_tool_item(item):
+                        if item_id not in started_tool_ids:
+                            started_tool_ids.add(item_id)
+                            tool_input = _codex_tool_input(item)
+                            yield {
+                                "type": "tool_start",
+                                "name": _codex_tool_name(item),
+                                "tool_id": item_id,
+                            }
+                            if tool_input:
+                                yield {
+                                    "type": "tool_input_delta",
+                                    "json": tool_input,
+                                    "tool_id": item_id,
+                                }
                         yield {
                             "type": "tool_result",
-                            "content": item.get("output", ""),
+                            "content": _codex_tool_output(item),
                             "tool_id": item_id,
-                            "is_error": item.get("status") == "failed",
+                            "is_error": item.get("status") == "failed" or item.get("exit_code") not in (None, 0),
                         }
+                        runner_error = _codex_runner_error(item)
+                        if runner_error:
+                            yield {"type": "error", "message": runner_error}
+                    elif item_type in _IGNORED_APP_SERVER_ITEM_TYPES:
+                        pass
+                    elif item_type and item_type not in unknown_item_types:
+                        unknown_item_types.add(item_type)
+                        print(f"[CODEX] Ignoring item.completed type={item_type}: {json.dumps(item, default=str)[:500]}")
 
-                elif etype == "turn.completed":
+                elif etype in ("item.updated", "item.delta", "item/agentMessage/delta", "item/reasoning/delta"):
+                    item = raw.get("item") or params.get("item") or {}
+                    delta = (
+                        raw.get("delta")
+                        or params.get("delta")
+                        or item.get("delta")
+                        or raw.get("text")
+                        or params.get("text")
+                        or raw.get("content")
+                    )
+                    item_type = item.get("type") or raw.get("item_type") or (
+                        "reasoning" if etype == "item/reasoning/delta" else "agentMessage"
+                    )
+                    text = _text_from_value(delta)
+                    if item_type in ("reasoning", "reasoningSummary", "reasoning_summary", "summary") and text:
+                        yield {"type": "thinking_delta", "text": text}
+                    elif item_type in ("agent_message", "agentMessage", "message", "assistant_message", "assistantMessage", "output_text") and text:
+                        full_text += text
+                        yield {"type": "text_delta", "text": text}
+
+                elif etype in ("turn.completed", "turn/completed"):
+                    turn = params.get("turn") or raw.get("turn") or {}
+                    for item in turn.get("items") or []:
+                        item_id = _codex_item_id(item, raw)
+                        content = _codex_item_text(item)
+                        if _is_codex_tool_item(item):
+                            if item_id not in started_tool_ids:
+                                started_tool_ids.add(item_id)
+                                yield {
+                                    "type": "tool_start",
+                                    "name": _codex_tool_name(item),
+                                    "tool_id": item_id,
+                                }
+                            yield {
+                                "type": "tool_result",
+                                "content": _codex_tool_output(item),
+                                "tool_id": item_id,
+                                "is_error": item.get("status") == "failed" or item.get("exit_code") not in (None, 0),
+                            }
+                            runner_error = _codex_runner_error(item)
+                            if runner_error:
+                                yield {"type": "error", "message": runner_error}
+                        elif (
+                            item.get("type") in ("agent_message", "agentMessage", "message", "assistant_message", "assistantMessage", "output_text")
+                            or item.get("role") == "assistant"
+                        ) and content and not full_text:
+                            full_text += content
+                            yield {"type": "text_delta", "text": content}
                     got_result = True
+                    await _cleanup()
                     yield {
                         "type": "result",
                         "is_error": False,
@@ -263,9 +955,12 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     }
                     break
 
-                elif etype in ("turn.failed", "error"):
+                elif etype in ("turn.failed", "turn/failed", "error", "warning"):
                     got_result = True
-                    err_msg = raw.get("error", {}).get("message", raw.get("message", "Unknown error"))
+                    error = raw.get("error") or params.get("error") or {}
+                    err_msg = error.get("message") if isinstance(error, dict) else error
+                    err_msg = err_msg or raw.get("message") or params.get("message") or "Unknown error"
+                    await _cleanup()
                     yield {
                         "type": "result",
                         "is_error": True,
@@ -275,8 +970,15 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     }
                     break
 
+                elif etype in _IGNORED_APP_SERVER_EVENTS:
+                    pass
+                elif etype not in unknown_event_types:
+                    unknown_event_types.add(str(etype))
+                    print(f"[CODEX] Ignoring event type={etype}: {json.dumps(raw, default=str)[:500]}")
+
         except Exception as e:
             log.error(f"[CODEX] Error processing event stream: {e}")
+            await _cleanup()
             yield {
                 "type": "result",
                 "is_error": True,
@@ -285,15 +987,35 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                 "error": str(e),
             }
 
-        await proc.wait()
+        try:
+            if proc.stdin and not proc.stdin.is_closing():
+                proc.stdin.close()
+        except Exception:
+            pass
+        if proc.returncode is None:
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+        if not stdout_task.done():
+            stdout_task.cancel()
+        try:
+            await stdout_task
+        except asyncio.CancelledError:
+            pass
+        await stderr_task
 
         # Emit default result if not already yielded
         if not got_result:
+            err_text = "\n".join(stderr_lines[-20:])
             yield {
                 "type": "result",
                 "is_error": proc.returncode != 0,
-                "result_text": full_text,
+                "result_text": full_text or err_text,
                 "session_id": session_id,
+                "error": err_text if proc.returncode != 0 else "",
             }
 
     return proc, _event_stream()

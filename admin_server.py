@@ -14,6 +14,7 @@ Usage:
 import asyncio
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -38,7 +39,7 @@ if sys.platform == "win32":
         pass
 
 
-from fastapi import FastAPI, Request, WebSocket
+from fastapi import Body, FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 import httpx
@@ -101,6 +102,14 @@ INSTANCES = {
 _server_ref: list = []
 # Track child processes we've launched (for restart)
 _child_procs: dict[str, subprocess.Popen] = {}
+NROL_AO_REPO = Path(os.environ.get("NROL_AO_REPO", r"C:\Claude-Code\NROL-AO\temp-repo"))
+NROL_AO_PORT = int(os.environ.get("ALPHA_OMEGA_PORT", "8098"))
+NROL_SCAN_WORKSPACE = Path(
+    os.environ.get(
+        "NROL_SCAN_WORKSPACE",
+        str(Path(__file__).parent / "workspaces" / "nrol_ao"),
+    )
+)
 
 app = FastAPI(title="Loom Admin")
 
@@ -659,16 +668,16 @@ def _build_llama_cmd(model_name: str | None = None) -> str:
 
 
 
-def _spawn_detached(cmd: str, cwd: str | None = None) -> subprocess.Popen:
+def _spawn_detached(cmd: str, cwd: str | None = None, log_name: str | None = None) -> subprocess.Popen:
     """Spawn a long-running command in a detached process group on Windows.
     Routes stdout/stderr to a per-service log file so crashes are debuggable."""
     _reload_config()
     env = os.environ.copy()
-    log_name = None
-    if "llama-server" in cmd.lower():
-        log_name = "llama_admin.log"
-    if "comfyui" in cmd.lower() or "comfy" in cmd.lower():
-        log_name = log_name or "comfyui_admin.log"
+    if log_name is None:
+        if "llama-server" in cmd.lower():
+            log_name = "llama_admin.log"
+        elif "comfyui" in cmd.lower() or "comfy" in cmd.lower():
+            log_name = "comfyui_admin.log"
 
     log_dir = Path(__file__).parent
     if log_name:
@@ -680,6 +689,13 @@ def _spawn_detached(cmd: str, cwd: str | None = None) -> subprocess.Popen:
         stdout_target = subprocess.DEVNULL
         stderr_target = subprocess.DEVNULL
 
+    # DETACHED_PROCESS breaks stdout/stderr handle inheritance on Windows —
+    # skip it when we have a log file so crash output actually lands there.
+    flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    if not log_name:
+        flags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+    flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
     proc = subprocess.Popen(
         cmd,
         shell=True,
@@ -687,9 +703,7 @@ def _spawn_detached(cmd: str, cwd: str | None = None) -> subprocess.Popen:
         stdout=stdout_target,
         stderr=stderr_target,
         env=env,
-        creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
-        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        creationflags=flags,
     )
     if log_name:
         log_handle.close()
@@ -776,6 +790,346 @@ async def tool_llama_restart(model: str | None = None):
     return await tool_llama_start(model=model)
 
 
+async def _probe_nrol_dashboard() -> tuple[bool, str]:
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"http://127.0.0.1:{NROL_AO_PORT}/topics")
+        if r.status_code == 200:
+            topics = r.json()
+            return True, f"NROL-AO dashboard running on :{NROL_AO_PORT} ({len(topics)} topics)"
+        return False, f"NROL-AO dashboard responded HTTP {r.status_code} on :{NROL_AO_PORT}"
+    except Exception as e:
+        return False, f"NROL-AO dashboard is NOT running on :{NROL_AO_PORT}: {e}"
+
+
+def _nrol_activity_path() -> Path:
+    return Path(os.environ.get("NROL_AO_ACTIVITY_DIR", str(NROL_AO_REPO / "loom" / "mcp_activity")))
+
+
+def _ensure_nrol_scan_workspace() -> Path:
+    NROL_SCAN_WORKSPACE.mkdir(parents=True, exist_ok=True)
+    (NROL_SCAN_WORKSPACE / "canvas").mkdir(parents=True, exist_ok=True)
+    (NROL_SCAN_WORKSPACE / "canvas" / "triggers").mkdir(parents=True, exist_ok=True)
+    return NROL_SCAN_WORKSPACE
+
+
+def _nrol_env() -> dict:
+    env = os.environ.copy()
+    env["NROL_AO_REPO"] = str(NROL_AO_REPO)
+    env["ALPHA_OMEGA_PORT"] = str(NROL_AO_PORT)
+    env["NROL_AO_ACTIVITY_DIR"] = str(_nrol_activity_path())
+    if _loom_config is not None:
+        try:
+            env.setdefault("NROL_AO_LLAMA_HOST", _loom_config.llama_host_url())
+            if getattr(_loom_config, "llama_model", ""):
+                env.setdefault("NROL_AO_LLAMA_MODEL", _loom_config.llama_model)
+        except Exception:
+            pass
+    return env
+
+
+def _nrol_mcp_server_config() -> dict:
+    env = _nrol_env()
+    env["PYTHONPATH"] = str(Path(__file__).parent) + os.pathsep + env.get("PYTHONPATH", "")
+    return {
+        "nrol-ao": {
+            "type": "stdio",
+            "command": sys.executable,
+            "args": ["-m", "mcp_servers.nrol_ao.server"],
+            "env": {
+                key: value
+                for key, value in env.items()
+                if key.startswith("NROL_AO_")
+                or key in {"ALPHA_OMEGA_PORT", "LOOM_PORT", "LOOM_CONV_ID", "PYTHONPATH"}
+            },
+        }
+    }
+
+
+def _call_nrol_mcp_tool(name: str, *args, **kwargs) -> dict:
+    env = _nrol_env()
+    keys = ("NROL_AO_REPO", "ALPHA_OMEGA_PORT", "NROL_AO_ACTIVITY_DIR", "NROL_AO_LLAMA_HOST", "NROL_AO_LLAMA_MODEL")
+    previous = {key: os.environ.get(key) for key in keys}
+    try:
+        for key in keys:
+            if key in env:
+                os.environ[key] = env[key]
+        from mcp_servers.nrol_ao import server as nrol_mcp
+        raw = getattr(nrol_mcp, name)(*args, **kwargs)
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {"raw": raw}
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@app.post("/tools/nrol-status")
+async def tool_nrol_status():
+    """Check NROL-AO repo, dashboard, MCP bridge, activity, and llama reachability."""
+    lines = [f"NROL-AO repo: {NROL_AO_REPO}"]
+    lines.append(f"  exists: {NROL_AO_REPO.exists()}")
+    lines.append(f"  engine.py: {(NROL_AO_REPO / 'engine.py').exists()}")
+    lines.append(f"  server.py: {(NROL_AO_REPO / 'server.py').exists()}")
+    workspace = _ensure_nrol_scan_workspace()
+    lines.append(f"\nScan workspace: {workspace}")
+    lines.append(f"  CLAUDE.md: {(workspace / 'CLAUDE.md').exists()}")
+    lines.append(f"  canvas/index.html: {(workspace / 'canvas' / 'index.html').exists()}")
+
+    mcp_server = Path(__file__).parent / "mcp_servers" / "nrol_ao" / "server.py"
+    lines.append(f"\nMCP bridge: {mcp_server}")
+    lines.append(f"  exists: {mcp_server.exists()}")
+    lines.append("  transport: stdio, on-demand per Claude Code session")
+    lines.append(f"  command: {sys.executable} {Path(__file__).parent / 'nrol_ao_mcp_server.py'}")
+
+    up, dash_msg = await _probe_nrol_dashboard()
+    lines.append(f"\nDashboard: {dash_msg}")
+    lines.append(f"  URL: http://localhost:{NROL_AO_PORT}")
+    proc = _child_procs.get("nrol_dashboard")
+    if proc:
+        lines.append(f"  tracked PID: {proc.pid}, poll={proc.poll()}")
+
+    act_dir = _nrol_activity_path()
+    snap = act_dir / "snapshot.json"
+    lines.append(f"\nActivity snapshot: {snap}")
+    lines.append(f"  exists: {snap.exists()}")
+    if snap.exists():
+        try:
+            data = json.loads(snap.read_text(encoding="utf-8"))
+            lines.append(f"  active jobs: {data.get('active', 0)}")
+            lines.append(f"  jobs recorded: {len(data.get('jobs', []) or [])}")
+            lines.append(f"  updated_at: {data.get('updated_at')}")
+        except Exception as e:
+            lines.append(f"  read error: {e}")
+
+    llama_port = _get_llama_port()
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            r = await client.get(f"http://127.0.0.1:{llama_port}/v1/models")
+        if r.status_code == 200:
+            models = [m.get("id") for m in r.json().get("data", []) if m.get("id")]
+            lines.append(f"\nLlama Server: online on :{llama_port}")
+            lines.append(f"  loaded: {', '.join(models) or '(none)'}")
+        else:
+            lines.append(f"\nLlama Server: HTTP {r.status_code} on :{llama_port}")
+    except Exception as e:
+        lines.append(f"\nLlama Server: not reachable on :{llama_port}: {e}")
+
+    try:
+        proc = subprocess.run(
+            ["claude", "mcp", "list"],
+            cwd=str(Path(__file__).parent),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        has_nrol = "nrol-ao" in output
+        lines.append(f"\nClaude MCP registration: {'nrol-ao present' if has_nrol else 'nrol-ao not found'}")
+        if output:
+            lines.append(output[-2000:])
+    except Exception as e:
+        lines.append(f"\nClaude MCP registration check failed: {e}")
+
+    return JSONResponse({"status": "ok" if up else "error", "output": "\n".join(lines)})
+
+
+@app.post("/tools/nrol-topic-status")
+async def tool_nrol_topic_status():
+    """Show active NROL-AO topic freshness and governance queues."""
+    try:
+        data = _call_nrol_mcp_tool("topic_status")
+        if data.get("error"):
+            return JSONResponse({"status": "error", "output": data["error"]})
+        topics = data.get("topics", []) or []
+        lines = [f"Active topics: {len(topics)}", ""]
+        for topic in topics:
+            stale = "STALE" if topic.get("scanStale") else "fresh"
+            age = topic.get("scanAgeHours")
+            age_text = "never scanned" if age is None else f"{age}h old"
+            queues = (
+                f"queues: review={topic.get('flaggedForIndicatorReview', 0)}, "
+                f"schema_gaps={topic.get('flaggedSchemaGaps', 0)}, "
+                f"extensions={topic.get('proposedSchemaExtensions', 0)}"
+            )
+            lines.append(
+                f"[{stale}] {topic.get('slug')} | {topic.get('classification')} | "
+                f"{topic.get('governanceHealth') or 'unknown'} | {age_text}"
+            )
+            lines.append(f"  {topic.get('title')}")
+            lines.append(f"  updated: {topic.get('lastUpdated') or '(unknown)'} | {queues}")
+        return JSONResponse({"status": "ok", "output": "\n".join(lines).rstrip()})
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": f"NROL topic status failed: {e}"})
+
+
+@app.post("/tools/nrol-mcp-activity")
+async def tool_nrol_mcp_activity():
+    """Show recent NROL-AO MCP activity without launching operational work."""
+    try:
+        data = _call_nrol_mcp_tool("list_activity", limit=8)
+        if data.get("error"):
+            return JSONResponse({"status": "error", "output": data["error"]})
+        jobs = data.get("jobs", []) or []
+        lines = [
+            "NROL MCP activity",
+            f"updated: {data.get('updated_at') or '(unknown)'} | active: {data.get('active', 0)}",
+            "",
+        ]
+        if not jobs:
+            lines.append("No MCP jobs recorded.")
+        for job in jobs:
+            title = " | ".join(str(x) for x in [job.get("task"), job.get("slug")] if x)
+            lines.append(f"{job.get('status', 'unknown')}: {title or job.get('job_id', 'job')}")
+            if job.get("model"):
+                lines.append(f"  model: {job['model']}")
+            if job.get("summary"):
+                lines.append(f"  summary: {json.dumps(job['summary'], ensure_ascii=False)[:500]}")
+            if job.get("error"):
+                lines.append(f"  error: {job['error']}")
+        return JSONResponse({"status": "ok", "output": "\n".join(lines).rstrip()})
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": f"NROL MCP activity failed: {e}"})
+
+
+@app.post("/tools/nrol-dashboard-start")
+async def tool_nrol_dashboard_start():
+    """Launch the NROL-AO dashboard HTTP server."""
+    up, msg = await _probe_nrol_dashboard()
+    if up:
+        return JSONResponse({"status": "ok", "output": msg})
+    if not (NROL_AO_REPO / "server.py").exists():
+        return JSONResponse({
+            "status": "error",
+            "output": f"NROL-AO server.py not found at {NROL_AO_REPO / 'server.py'}",
+        })
+
+    log_path = Path(__file__).parent / "nrol_ao_admin.log"
+    env = _nrol_env()
+    try:
+        log_handle = open(log_path, "w", encoding="utf-8", errors="replace")
+        proc = subprocess.Popen(
+            [sys.executable, "server.py"],
+            cwd=str(NROL_AO_REPO),
+            env=env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        log_handle.close()
+        _child_procs["nrol_dashboard"] = proc
+        for i in range(15):
+            await asyncio.sleep(1)
+            up, msg = await _probe_nrol_dashboard()
+            if up:
+                return JSONResponse({
+                    "status": "ok",
+                    "output": f"{msg}\nPID: {proc.pid}\nLog: {log_path}",
+                })
+            if proc.poll() is not None:
+                return JSONResponse({
+                    "status": "error",
+                    "output": f"NROL-AO dashboard exited with {proc.returncode}. Check {log_path}",
+                })
+        return JSONResponse({
+            "status": "ok",
+            "output": f"NROL-AO dashboard launched (PID {proc.pid}) but did not answer within 15s.\nLog: {log_path}",
+        })
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": f"Failed to launch NROL-AO dashboard: {e}"})
+
+
+@app.post("/tools/nrol-dashboard-stop")
+async def tool_nrol_dashboard_stop():
+    """Stop the NROL-AO dashboard if this admin server launched it."""
+    proc = _child_procs.pop("nrol_dashboard", None)
+    if not proc:
+        up, msg = await _probe_nrol_dashboard()
+        return JSONResponse({
+            "status": "error" if up else "ok",
+            "output": (
+                "No tracked NROL-AO dashboard process. "
+                "If it is running, it was launched outside Loom admin and was not killed.\n"
+                + msg
+            ),
+        })
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+            return JSONResponse({"status": "ok", "output": f"Terminated NROL-AO dashboard PID {proc.pid}"})
+        except Exception as e:
+            return JSONResponse({"status": "error", "output": f"Failed to terminate PID {proc.pid}: {e}"})
+    return JSONResponse({"status": "ok", "output": f"NROL-AO dashboard PID {proc.pid} already exited ({proc.returncode})"})
+
+
+@app.post("/tools/nrol-mcp-smoke")
+async def tool_nrol_mcp_smoke():
+    """Run a short import/status smoke test for the stdio MCP bridge."""
+    cmd = [
+        sys.executable,
+        "-c",
+        "from mcp_servers.nrol_ao import server; print(server.nrol_status())",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(Path(__file__).parent),
+            env=_nrol_env(),
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        output = ((proc.stdout or "") + (proc.stderr or "")).strip() or "(no output)"
+        return JSONResponse({
+            "status": "ok" if proc.returncode == 0 else "error",
+            "output": f"exit_code: {proc.returncode}\n{output}",
+        })
+    except subprocess.TimeoutExpired:
+        return JSONResponse({"status": "error", "output": "MCP smoke test timed out after 45s"})
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": f"MCP smoke test failed: {e}"})
+
+
+@app.post("/tools/nrol-mcp-register")
+async def tool_nrol_mcp_register():
+    """Register the NROL-AO stdio MCP bridge with Claude Code user config."""
+    cmd = [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        "user",
+        "--transport",
+        "stdio",
+        "nrol-ao",
+        "--",
+        sys.executable,
+        str(Path(__file__).parent / "nrol_ao_mcp_server.py"),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(Path(__file__).parent),
+            env=_nrol_env(),
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        output = ((proc.stdout or "") + (proc.stderr or "")).strip() or "(no output)"
+        return JSONResponse({
+            "status": "ok" if proc.returncode == 0 else "error",
+            "output": " ".join(cmd) + f"\n\nexit_code: {proc.returncode}\n{output}",
+        })
+    except subprocess.TimeoutExpired:
+        return JSONResponse({"status": "error", "output": "Claude MCP registration timed out after 45s"})
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": f"Claude MCP registration failed: {e}"})
+
+
 
 
 
@@ -793,7 +1147,7 @@ async def tool_comfyui_start():
     except Exception:
         pass
     try:
-        proc = _spawn_detached(COMFYUI_LAUNCH_CMD, cwd=COMFYUI_LAUNCH_CWD)
+        proc = _spawn_detached(COMFYUI_LAUNCH_CMD, cwd=COMFYUI_LAUNCH_CWD, log_name="comfyui_admin.log")
         _child_procs["comfyui"] = proc
         # Wait briefly for it to become reachable (ComfyUI cold-starts can be slow)
         for i in range(30):
@@ -832,22 +1186,72 @@ async def tool_comfyui_stop():
             lines.append(f"Terminated tracked ComfyUI proc (PID {proc.pid}).")
         except Exception as e:
             lines.append(f"Failed to terminate tracked proc: {e}")
-    # Best-effort: kill main.py-launched python.exe (covers portable .bat)
+    # Best-effort: kill main.py-launched python.exe (covers portable .bat).
+    # wmic.exe was removed in modern Windows 11 — use PowerShell instead.
     try:
+        ps_script = (
+            "$procs = Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | "
+            "Where-Object { $_.CommandLine -like '*main.py*--listen*' }; "
+            "if ($procs) { foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force; "
+            "Write-Output (\"Killed PID \" + $p.ProcessId) } } "
+            "else { Write-Output 'no-match' }"
+        )
         r = subprocess.run(
-            ["wmic", "process", "where",
-             "name='python.exe' and CommandLine like '%ComfyUI%main.py%'",
-             "delete"],
-            capture_output=True, text=True, timeout=10,
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, text=True, timeout=15,
         )
         out = (r.stdout or r.stderr or "").strip()
-        if "deleted successfully" in out.lower() or "instances of" in out.lower():
-            lines.append("Killed ComfyUI python.exe via WMIC.")
-        elif out:
-            lines.append(out[:300])
+        if out and out != "no-match":
+            lines.append(out[:500])
+        elif out == "no-match":
+            lines.append("No untracked ComfyUI python.exe found.")
     except Exception as e:
-        lines.append(f"WMIC fallback failed: {e}")
+        lines.append(f"PowerShell fallback failed: {e}")
     return JSONResponse({"status": "ok", "output": "\n".join(lines) or "No ComfyUI processes found."})
+
+
+@app.get("/tools/comfyui-log")
+async def tool_comfyui_log(lines: int = 80):
+    """Return the last N lines of comfyui_admin.log, plus diagnostics."""
+    log_dir = Path(__file__).parent
+    log_path = log_dir / "comfyui_admin.log"
+    out = [
+        f"Log path:    {log_path}",
+        f"Log exists:  {log_path.exists()}",
+        f"Launch cmd:  {COMFYUI_LAUNCH_CMD}",
+        f"Launch cwd:  {COMFYUI_LAUNCH_CWD}",
+        f"CWD exists:  {Path(COMFYUI_LAUNCH_CWD).exists()}",
+        f"Tracked proc: {_child_procs.get('comfyui')}",
+        "",
+    ]
+    proc = _child_procs.get("comfyui")
+    if proc:
+        out.append(f"Process poll: {proc.poll()} (None = still running)")
+    if log_path.exists():
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+            tail = "\n".join(text.splitlines()[-lines:])
+            out.append(f"=== last {lines} lines ===")
+            out.append(tail)
+        except Exception as e:
+            out.append(f"Failed to read log: {e}")
+    return JSONResponse({"status": "ok", "output": "\n".join(out)})
+
+
+@app.post("/tools/comfyui-fix-deps")
+async def tool_comfyui_fix_deps():
+    """Run pip upgrade for huggingface-hub and transformers in the ComfyUI Python env."""
+    try:
+        r = await asyncio.to_thread(
+            subprocess.run,
+            ["py", "-3.12", "-m", "pip", "install", "huggingface-hub>=0.34.0", "transformers", "-U"],
+            capture_output=True, text=True, timeout=180, cwd=COMFYUI_LAUNCH_CWD,
+        )
+        out = (r.stdout or "") + (r.stderr or "")
+        status = "ok" if r.returncode == 0 else "error"
+        return JSONResponse({"status": status, "output": out.strip() or f"exit {r.returncode}"})
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": str(e)})
 
 
 @app.post("/tools/disk-usage")
@@ -1248,6 +1652,11 @@ async def dashboard():
     .quick-links {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }}
     .quick-link {{ padding: 8px 14px; border: 1px solid #0ff; border-radius: 6px; color: #0ff; text-decoration: none; font-size: 13px; background: rgba(0,255,255,0.05); transition: 0.2s; }}
     .quick-link:hover {{ background: rgba(0,255,255,0.18); }}
+    .tabs {{ display: flex; gap: 8px; margin: 4px 0 10px; }}
+    .tab-btn {{ padding: 5px 10px; border: 1px solid #444; background: rgba(255,255,255,0.03); color: #aaa; border-radius: 4px; cursor: pointer; }}
+    .tab-btn.active {{ border-color: #0ff; color: #0ff; background: rgba(0,255,255,0.08); }}
+    details.cron-detail summary {{ cursor: pointer; color: #0ff; }}
+    details.cron-detail pre {{ white-space: pre-wrap; color: #aaa; background: #070711; border: 1px solid #222; padding: 8px; border-radius: 4px; max-height: 180px; overflow: auto; }}
     
     /* System Specs Styles */
     .specs-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 10px; font-family: 'Segoe UI', sans-serif; }}
@@ -1278,6 +1687,7 @@ async def dashboard():
     <a href="https://localhost:3000" target="_blank" class="quick-link">&#127760; Main Loom (:3000)</a>
     <a href="http://localhost:3001" target="_blank" class="quick-link">&#129514; Test Server (:3001)</a>
     <a href="http://localhost:{_get_llama_port()}" target="_blank" class="quick-link">&#129303; Llama Server (:{_get_llama_port()})</a>
+    <a href="http://localhost:{NROL_AO_PORT}" target="_blank" class="quick-link">&#128200; NROL-AO (:{NROL_AO_PORT})</a>
     <a href="http://localhost:8188" target="_blank" class="quick-link">&#127912; ComfyUI (:8188)</a>
 </div>
 
@@ -1294,6 +1704,18 @@ async def dashboard():
         <tbody id="generations-body"></tbody>
     </table>
 </div>
+
+<h2>Cron Jobs <span id="cron-count" style="color:#888; font-size:12px; font-weight:normal;"></span></h2>
+<div class="tabs">
+    <button id="cron-active-tab" class="tab-btn active" onclick="setCronTab(false)">Active</button>
+    <button id="cron-archive-tab" class="tab-btn" onclick="setCronTab(true)">Archive</button>
+    <a href="/api/cron-help-proxy" target="_blank" class="quick-link" style="padding:5px 10px;">Help</a>
+</div>
+<div id="cron-empty" style="color:#666; font-size:12px; padding:8px 0;">None tracked.</div>
+<table id="cron-table" style="display:none;">
+    <tr><th>ID</th><th>Conv</th><th>Script</th><th>Repeat</th><th>Last</th><th>Next</th><th>Status</th><th>Details</th><th>Actions</th></tr>
+    <tbody id="cron-body"></tbody>
+</table>
 
 {terminal_html}
 <h2>Tools</h2>
@@ -1330,6 +1752,34 @@ async def dashboard():
         <span class="icon">&#128260;</span> Restart Llama
         <span class="label">Stop + start llama-server</span>
     </button>
+    <button class="tool-btn" onclick="runTool('nrol-status')">
+        <span class="icon">&#128200;</span> NROL Status
+        <span class="label">Repo, MCP, dashboard, llama</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('nrol-topic-status')">
+        <span class="icon">&#128202;</span> NROL Topics
+        <span class="label">Freshness and queues</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('nrol-mcp-activity')">
+        <span class="icon">&#128221;</span> MCP Activity
+        <span class="label">Recent tool jobs</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('nrol-dashboard-start')">
+        <span class="icon">&#9658;</span> Start NROL
+        <span class="label">Launch NROL dashboard</span>
+    </button>
+    <button class="tool-btn" onclick="confirmTool('nrol-dashboard-stop', 'Stop NROL-AO dashboard if Loom admin launched it?')">
+        <span class="icon">&#9209;</span> Stop NROL
+        <span class="label">Terminate tracked dashboard</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('nrol-mcp-smoke')">
+        <span class="icon">&#129514;</span> NROL MCP Test
+        <span class="label">Import/status smoke test</span>
+    </button>
+    <button class="tool-btn" onclick="confirmTool('nrol-mcp-register', 'Register nrol-ao MCP in Claude Code user config?')">
+        <span class="icon">&#128279;</span> Register NROL MCP
+        <span class="label">claude mcp add nrol-ao</span>
+    </button>
     <button class="tool-btn" onclick="runTool('comfyui-status')">
         <span class="icon">&#127912;</span> ComfyUI Status
         <span class="label">Is it running?</span>
@@ -1340,11 +1790,19 @@ async def dashboard():
     </button>
     <button class="tool-btn" onclick="runTool('comfyui-start')">
         <span class="icon">&#9658;</span> Start ComfyUI
-        <span class="label">Launch run_nvidia_gpu.bat</span>
+        <span class="label">py -3.12 main.py --listen</span>
     </button>
     <button class="tool-btn" onclick="confirmTool('comfyui-stop', 'Kill ComfyUI?')">
         <span class="icon">&#9209;</span> Stop ComfyUI
         <span class="label">Terminate ComfyUI process</span>
+    </button>
+    <button class="tool-btn" onclick="runToolGet('comfyui-log')">
+        <span class="icon">&#128221;</span> ComfyUI Log
+        <span class="label">Last 80 lines of startup log</span>
+    </button>
+    <button class="tool-btn" onclick="runTool('comfyui-fix-deps')">
+        <span class="icon">&#128295;</span> Fix ComfyUI Deps
+        <span class="label">pip upgrade huggingface-hub + transformers</span>
     </button>
     <button class="tool-btn" onclick="runTool('disk-usage')">
         <span class="icon">&#128190;</span> Disk Usage
@@ -1425,7 +1883,7 @@ async def dashboard():
 
     async function refreshAll() {{
         try {{
-            await Promise.all([refreshInstances(), refreshGenerations()]);
+            await Promise.all([refreshInstances(), refreshGenerations(), refreshCronJobs()]);
         }} catch (e) {{ /* keep ticking */ }}
         scheduleRefresh();
     }}
@@ -1490,6 +1948,81 @@ async def dashboard():
         }}).join('');
     }}
 
+    let cronArchiveTab = false;
+
+    function setCronTab(archive) {{
+        cronArchiveTab = archive;
+        document.getElementById('cron-active-tab').classList.toggle('active', !archive);
+        document.getElementById('cron-archive-tab').classList.toggle('active', archive);
+        refreshCronJobs();
+    }}
+
+    function esc(s) {{
+        return String(s ?? '').replace(/[&<>"']/g, ch => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[ch]));
+    }}
+
+    async function refreshCronJobs() {{
+        let jobs = [];
+        try {{
+            const r = await fetch('/api/cron-proxy?include_archived=' + (cronArchiveTab ? 'true' : 'false'), {{cache: 'no-store'}});
+            if (r.ok) jobs = await r.json();
+        }} catch (e) {{ /* ignore */ }}
+        jobs = jobs.filter(j => cronArchiveTab ? j.archived : !j.archived);
+        const empty = document.getElementById('cron-empty');
+        const table = document.getElementById('cron-table');
+        const body = document.getElementById('cron-body');
+        const count = document.getElementById('cron-count');
+        count.textContent = jobs.length ? '(' + jobs.length + ')' : '';
+        if (!jobs.length) {{
+            empty.style.display = 'block';
+            table.style.display = 'none';
+            body.innerHTML = '';
+            return;
+        }}
+        empty.style.display = 'none';
+        table.style.display = 'table';
+        body.innerHTML = jobs.map(j => {{
+            const desc = esc(j.description || 'No description');
+            const output = esc([j.last_output, j.last_error].filter(Boolean).join('\\n'));
+            const status = j.archived ? 'archived' : (j.enabled ? (j.last_status || 'enabled') : 'disabled');
+            const actions = j.archived ? '' : `
+                <button class="btn btn-cyan" onclick="toggleCron(${{j.id}}, ${{j.enabled ? 'false' : 'true'}})">${{j.enabled ? 'Disable' : 'Enable'}}</button>
+                <button class="btn btn-warn" onclick="archiveCron(${{j.id}})">Archive</button>`;
+            return `<tr>
+                <td>#${{j.id}}</td>
+                <td>${{j.conv_id}}</td>
+                <td><code>${{esc(j.script)}}</code></td>
+                <td>${{Math.round((j.every_seconds || 0) / 60)}} min</td>
+                <td>${{esc(j.last_run_at_display || 'never')}}</td>
+                <td>${{esc(j.next_run_at_display || '-')}}</td>
+                <td>${{esc(status)}}${{j.last_exit_code !== null && j.last_exit_code !== undefined ? ' (' + j.last_exit_code + ')' : ''}}</td>
+                <td><details class="cron-detail"><summary>Description</summary><pre>${{desc}}</pre>${{output ? '<pre>' + output + '</pre>' : ''}}</details></td>
+                <td>${{actions}}</td>
+            </tr>`;
+        }}).join('');
+    }}
+
+    async function toggleCron(id, enabled) {{
+        try {{
+            const r = await fetch('/api/cron-proxy/' + id, {{
+                method: 'PUT',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{enabled}})
+            }});
+            showToast(r.ok ? 'cron updated' : 'cron update failed');
+        }} catch (e) {{ showToast('cron update failed: ' + e); }}
+        setTimeout(refreshCronJobs, 300);
+    }}
+
+    async function archiveCron(id) {{
+        if (!confirm('Archive cron job #' + id + '?')) return;
+        try {{
+            const r = await fetch('/api/cron-proxy/' + id, {{method: 'DELETE'}});
+            showToast(r.ok ? 'cron archived' : 'cron archive failed');
+        }} catch (e) {{ showToast('cron archive failed: ' + e); }}
+        setTimeout(refreshCronJobs, 300);
+    }}
+
     async function killGen(draftId) {{
         if (!confirm('Kill generation #' + draftId + '?')) return;
         showToast('killing #' + draftId);
@@ -1542,6 +2075,23 @@ async def dashboard():
                 out.textContent = d.output || '(no output)';
                 out.className = d.status === 'error' ? 'visible error' : 'visible';
             }}
+        }} catch (e) {{
+            out.textContent = 'Request failed: ' + e;
+            out.className = 'visible error';
+        }}
+        scheduleRefresh(30000);
+    }}
+
+    async function runToolGet(name) {{
+        clearTimeout(refreshTimer);
+        const out = document.getElementById('tool-output');
+        out.className = 'visible';
+        out.innerHTML = '<span class="spinner"></span> Loading ' + name + '...';
+        try {{
+            const r = await fetch('/tools/' + name, {{method: 'GET'}});
+            const d = await r.json();
+            out.textContent = d.output || '(no output)';
+            out.className = d.status === 'error' ? 'visible error' : 'visible';
         }} catch (e) {{
             out.textContent = 'Request failed: ' + e;
             out.className = 'visible error';
@@ -1662,6 +2212,55 @@ async def api_generations_kill_proxy(draft_msg_id: int):
     return JSONResponse({"error": "no instance reachable"}, status_code=502)
 
 
+@app.get("/api/cron-help-proxy")
+async def api_cron_help_proxy():
+    for name, info in INSTANCES.items():
+        try:
+            r = await _get_instance(info["port"], "/api/cron/help")
+            if r.status_code == 200:
+                return JSONResponse(r.json())
+        except Exception:
+            continue
+    return JSONResponse({"error": "no instance reachable"}, status_code=502)
+
+
+@app.get("/api/cron-proxy")
+async def api_cron_proxy(include_archived: bool = False):
+    suffix = "true" if include_archived else "false"
+    for name, info in INSTANCES.items():
+        try:
+            r = await _get_instance(info["port"], f"/api/cron/jobs?include_archived={suffix}")
+            if r.status_code == 200:
+                return JSONResponse(r.json())
+        except Exception:
+            continue
+    return JSONResponse([])
+
+
+@app.put("/api/cron-proxy/{job_id}")
+async def api_cron_update_proxy(job_id: int, payload: dict = Body(...)):
+    for name, info in INSTANCES.items():
+        try:
+            r = await _put_instance(info["port"], f"/api/cron/jobs/{job_id}", payload)
+            if r.status_code in (200, 201):
+                return JSONResponse(r.json())
+        except Exception:
+            continue
+    return JSONResponse({"error": "no instance reachable"}, status_code=502)
+
+
+@app.delete("/api/cron-proxy/{job_id}")
+async def api_cron_archive_proxy(job_id: int):
+    for name, info in INSTANCES.items():
+        try:
+            r = await _delete_instance(info["port"], f"/api/cron/jobs/{job_id}")
+            if r.status_code == 200:
+                return JSONResponse(r.json())
+        except Exception:
+            continue
+    return JSONResponse({"error": "no instance reachable"}, status_code=502)
+
+
 async def _post_instance(port: int, path: str) -> httpx.Response:
     """POST to an instance, trying HTTPS then HTTP."""
     for scheme in ("https", "http"):
@@ -1679,6 +2278,28 @@ async def _get_instance(port: int, path: str) -> httpx.Response:
         try:
             async with httpx.AsyncClient(timeout=2.0, verify=False) as client:
                 return await client.get(f"{scheme}://localhost:{port}{path}")
+        except Exception:
+            continue
+    raise ConnectionError(f"Cannot reach localhost:{port}")
+
+
+async def _put_instance(port: int, path: str, payload: dict) -> httpx.Response:
+    """PUT JSON to an instance, trying HTTPS then HTTP."""
+    for scheme in ("https", "http"):
+        try:
+            async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
+                return await client.put(f"{scheme}://localhost:{port}{path}", json=payload)
+        except Exception:
+            continue
+    raise ConnectionError(f"Cannot reach localhost:{port}")
+
+
+async def _delete_instance(port: int, path: str) -> httpx.Response:
+    """DELETE from an instance, trying HTTPS then HTTP."""
+    for scheme in ("https", "http"):
+        try:
+            async with httpx.AsyncClient(timeout=5.0, verify=False) as client:
+                return await client.delete(f"{scheme}://localhost:{port}{path}")
         except Exception:
             continue
     raise ConnectionError(f"Cannot reach localhost:{port}")

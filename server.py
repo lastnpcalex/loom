@@ -12,6 +12,8 @@ if sys.platform == "win32":
 import asyncio
 import json
 import os
+import sqlite3
+import subprocess
 import time
 import time as _time  # alias used by generation_ms timing in CC/OODA/Weave handlers
 import uuid
@@ -76,6 +78,26 @@ import local_summary
 from skill_scanner import get_all_skills, BUILTIN_COMMANDS
 
 from contextlib import asynccontextmanager
+
+CRON_DB_PATH = Path("loom_cron.db")
+CRON_ALLOWED_SUFFIXES = {".py", ".ps1", ".js"}
+CRON_MIN_INTERVAL_SECONDS = 60
+CRON_DENY_PATTERNS = (
+    "rm -rf",
+    "remove-item -recurse",
+    "remove-item -force -recurse",
+    "del /s",
+    "erase /s",
+    "rmdir /s",
+    "rd /s",
+    "format ",
+    "shutdown ",
+    "reboot",
+    "mkfs",
+    "diskpart",
+)
+_cron_scheduler_task: asyncio.Task | None = None
+_cron_running: set[int] = set()
 
 # ── Canvas CLAUDE.md template ──
 CANVAS_CLAUDE_MD = """\
@@ -156,7 +178,9 @@ document.getElementById('run-btn').addEventListener('click', () => {
 
 @asynccontextmanager
 async def lifespan(app):
+    global _cron_scheduler_task
     await db.init_db()
+    await _cron_init_db()
     # Clean up stale draft messages (empty assistant msgs older than 30 min)
     await _cleanup_stale_drafts()
     # Reap orphan CC/ollama subprocesses from prior server instances.
@@ -203,7 +227,14 @@ async def lifespan(app):
             print(f"[STARTUP] Codex model refresh failed: {e}")
 
     asyncio.create_task(_refresh_remote_models_on_startup())
+    _cron_scheduler_task = asyncio.create_task(_cron_scheduler_loop())
     yield
+    if _cron_scheduler_task:
+        _cron_scheduler_task.cancel()
+        try:
+            await _cron_scheduler_task
+        except asyncio.CancelledError:
+            pass
     await db.close_db()
 
 
@@ -411,6 +442,298 @@ async def _ensure_ollama():
 
 
 
+def _cron_now() -> float:
+    return time.time()
+
+
+def _cron_iso(ts: float | None) -> str | None:
+    if not ts:
+        return None
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def _cron_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(CRON_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _cron_init_db_sync() -> None:
+    with _cron_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cron_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conv_id INTEGER NOT NULL,
+                workspace TEXT NOT NULL,
+                script TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                every_seconds INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                archived INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                archived_at REAL,
+                last_run_at REAL,
+                last_finished_at REAL,
+                next_run_at REAL NOT NULL,
+                last_status TEXT,
+                last_exit_code INTEGER,
+                last_output TEXT,
+                last_error TEXT,
+                run_count INTEGER NOT NULL DEFAULT 0,
+                skip_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cron_active_due ON cron_jobs(archived, enabled, next_run_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cron_conv ON cron_jobs(conv_id, archived)")
+        conn.commit()
+
+
+async def _cron_init_db() -> None:
+    await asyncio.to_thread(_cron_init_db_sync)
+
+
+def _cron_row_to_dict(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    for key in ("created_at", "updated_at", "archived_at", "last_run_at", "last_finished_at", "next_run_at"):
+        d[f"{key}_display"] = _cron_iso(d.get(key))
+    return d
+
+
+def _cron_list_jobs_sync(include_archived: bool = False, conv_id: int | None = None) -> list[dict]:
+    where = []
+    args: list = []
+    if not include_archived:
+        where.append("archived = 0")
+    if conv_id is not None:
+        where.append("conv_id = ?")
+        args.append(conv_id)
+    sql = "SELECT * FROM cron_jobs"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY archived ASC, enabled DESC, next_run_at ASC, id DESC"
+    with _cron_connect() as conn:
+        return [_cron_row_to_dict(r) for r in conn.execute(sql, args).fetchall()]
+
+
+async def _cron_list_jobs(include_archived: bool = False, conv_id: int | None = None) -> list[dict]:
+    return await asyncio.to_thread(_cron_list_jobs_sync, include_archived, conv_id)
+
+
+def _cron_validate_script(script: str, workspace: str) -> tuple[Path, str]:
+    if not isinstance(script, str) or not script.strip():
+        raise HTTPException(status_code=400, detail="script is required")
+    if "\x00" in script or script.startswith(("~", "/", "\\")) or ":" in Path(script).parts[0]:
+        raise HTTPException(status_code=400, detail="script must be a relative path inside the conversation workspace")
+    rel = Path(script)
+    if any(part in ("", ".", "..") for part in rel.parts):
+        raise HTTPException(status_code=400, detail="script path may not contain traversal segments")
+    workspace_path = Path(workspace).resolve()
+    target = (workspace_path / rel).resolve()
+    try:
+        target.relative_to(workspace_path)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="script must stay inside the conversation workspace")
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail="script file does not exist")
+    if target.suffix.lower() not in CRON_ALLOWED_SUFFIXES:
+        raise HTTPException(status_code=400, detail=f"script suffix must be one of {sorted(CRON_ALLOWED_SUFFIXES)}")
+    try:
+        text = target.read_text(encoding="utf-8", errors="ignore").lower()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"could not read script for safety scan: {e}")
+    for pattern in CRON_DENY_PATTERNS:
+        if pattern in text:
+            raise HTTPException(status_code=400, detail=f"script contains rejected command pattern: {pattern}")
+    return target, str(rel).replace("\\", "/")
+
+
+def _cron_interval_from_payload(data: dict) -> int:
+    seconds = data.get("every_seconds")
+    if seconds is None and data.get("every_minutes") is not None:
+        seconds = int(data["every_minutes"]) * 60
+    if seconds is None and data.get("every_hours") is not None:
+        seconds = int(data["every_hours"]) * 3600
+    try:
+        seconds = int(seconds)
+    except Exception:
+        raise HTTPException(status_code=400, detail="provide every_seconds, every_minutes, or every_hours")
+    if seconds < CRON_MIN_INTERVAL_SECONDS:
+        raise HTTPException(status_code=400, detail=f"interval must be at least {CRON_MIN_INTERVAL_SECONDS} seconds")
+    return seconds
+
+
+def _cron_create_job_sync(conv_id: int, workspace: str, script: str, description: str, every_seconds: int, enabled: bool) -> dict:
+    now = _cron_now()
+    next_run = now + every_seconds
+    with _cron_connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO cron_jobs
+                (conv_id, workspace, script, description, every_seconds, enabled, created_at, updated_at, next_run_at, last_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (conv_id, workspace, script, description, every_seconds, 1 if enabled else 0, now, now, next_run, "created"),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM cron_jobs WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return _cron_row_to_dict(row)
+
+
+async def _cron_create_job(conv_id: int, workspace: str, script: str, description: str, every_seconds: int, enabled: bool) -> dict:
+    return await asyncio.to_thread(_cron_create_job_sync, conv_id, workspace, script, description, every_seconds, enabled)
+
+
+def _cron_archive_job_sync(job_id: int) -> bool:
+    now = _cron_now()
+    with _cron_connect() as conn:
+        cur = conn.execute(
+            "UPDATE cron_jobs SET enabled = 0, archived = 1, archived_at = ?, updated_at = ?, last_status = ? WHERE id = ? AND archived = 0",
+            (now, now, "archived", job_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+async def _cron_archive_job(job_id: int) -> bool:
+    return await asyncio.to_thread(_cron_archive_job_sync, job_id)
+
+
+def _cron_set_enabled_sync(job_id: int, enabled: bool) -> bool:
+    now = _cron_now()
+    with _cron_connect() as conn:
+        cur = conn.execute(
+            "UPDATE cron_jobs SET enabled = ?, updated_at = ?, last_status = ? WHERE id = ? AND archived = 0",
+            (1 if enabled else 0, now, "enabled" if enabled else "disabled", job_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+async def _cron_set_enabled(job_id: int, enabled: bool) -> bool:
+    return await asyncio.to_thread(_cron_set_enabled_sync, job_id, enabled)
+
+
+def _cron_due_jobs_sync(now: float) -> list[dict]:
+    with _cron_connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM cron_jobs WHERE archived = 0 AND enabled = 1 AND next_run_at <= ? ORDER BY next_run_at ASC",
+            (now,),
+        ).fetchall()
+        return [_cron_row_to_dict(r) for r in rows]
+
+
+def _cron_update_after_run_sync(job_id: int, started: float, exit_code: int | None, output: str, error: str, every_seconds: int) -> None:
+    now = _cron_now()
+    status = "ok" if exit_code == 0 else "error"
+    with _cron_connect() as conn:
+        conn.execute(
+            """
+            UPDATE cron_jobs
+            SET last_run_at = ?, last_finished_at = ?, next_run_at = ?, last_status = ?,
+                last_exit_code = ?, last_output = ?, last_error = ?, run_count = run_count + 1, updated_at = ?
+            WHERE id = ?
+            """,
+            (started, now, now + every_seconds, status, exit_code, output[-4000:], error[-4000:], now, job_id),
+        )
+        conn.commit()
+
+
+def _cron_mark_skipped_sync(job_id: int, every_seconds: int) -> None:
+    now = _cron_now()
+    with _cron_connect() as conn:
+        conn.execute(
+            "UPDATE cron_jobs SET skip_count = skip_count + 1, next_run_at = ?, last_status = ?, updated_at = ? WHERE id = ?",
+            (now + every_seconds, "skipped_overlap", now, job_id),
+        )
+        conn.commit()
+
+
+def _cron_command(script_path: Path) -> list[str]:
+    suffix = script_path.suffix.lower()
+    if suffix == ".py":
+        return [sys.executable, str(script_path)]
+    if suffix == ".ps1":
+        return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)]
+    if suffix == ".js":
+        return ["node", str(script_path)]
+    raise RuntimeError(f"unsupported script suffix: {suffix}")
+
+
+async def _cron_run_job(job: dict) -> None:
+    job_id = job["id"]
+    if job_id in _cron_running:
+        await asyncio.to_thread(_cron_mark_skipped_sync, job_id, int(job["every_seconds"]))
+        return
+    _cron_running.add(job_id)
+    started = _cron_now()
+    try:
+        script_path, _ = _cron_validate_script(job["script"], job["workspace"])
+        proc = await asyncio.create_subprocess_exec(
+            *_cron_command(script_path),
+            cwd=job["workspace"],
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=os.environ.copy(),
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=min(max(int(job["every_seconds"]) - 5, 30), 3600))
+            output = stdout.decode("utf-8", errors="replace")
+            error = stderr.decode("utf-8", errors="replace")
+            exit_code = proc.returncode
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            output = ""
+            error = "cron job timed out"
+            exit_code = -1
+    except Exception as e:
+        output = ""
+        error = str(e)
+        exit_code = -1
+    finally:
+        _cron_running.discard(job_id)
+    await asyncio.to_thread(_cron_update_after_run_sync, job_id, started, exit_code, output, error, int(job["every_seconds"]))
+
+
+async def _cron_scheduler_loop() -> None:
+    while True:
+        try:
+            due = await asyncio.to_thread(_cron_due_jobs_sync, _cron_now())
+            for job in due:
+                asyncio.create_task(_cron_run_job(job))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[CRON] Scheduler error: {e}")
+        await asyncio.sleep(5)
+
+
+CRON_HELP = {
+    "purpose": "Create simple persisted interval jobs for scripts inside a Loom conversation workspace.",
+    "create_endpoint": "POST /api/conversations/{conv_id}/cronjobs",
+    "list_endpoint": "GET /api/cron/jobs?include_archived=false",
+    "archive_endpoint": "DELETE /api/cron/jobs/{job_id}",
+    "example": {
+        "script": "scripts/pull_bluesky.py",
+        "description": "Pull Bluesky profile data and update the conversation workspace cache.",
+        "every_seconds": 3600,
+        "enabled": True,
+    },
+    "rules": [
+        "script must be a relative path inside the conversation workspace",
+        f"script suffix must be one of {sorted(CRON_ALLOWED_SUFFIXES)}",
+        f"minimum interval is {CRON_MIN_INTERVAL_SECONDS} seconds",
+        "jobs skip overlapping runs by default",
+        "delete archives and disables the job; archived jobs remain visible to admin",
+        "scripts inherit the Loom server environment, so API keys should come from .env or process env",
+    ],
+    "rejected_patterns": list(CRON_DENY_PATTERNS),
+}
+
+
 app = FastAPI(title="Ex Astris Umbra — A Loom Interface", lifespan=lifespan)
 
 # --- Graceful shutdown endpoint ---
@@ -472,6 +795,62 @@ async def api_kill_generation(draft_msg_id: int):
     return {"status": "killed", "pid": pid, "pid_killed": killed}
 
 
+@app.get("/api/cron/help")
+async def api_cron_help():
+    """LLM-facing reference for creating Loom cron jobs."""
+    return CRON_HELP
+
+
+@app.get("/api/cron/jobs")
+async def api_cron_jobs(include_archived: bool = False):
+    return await _cron_list_jobs(include_archived=include_archived)
+
+
+@app.get("/api/conversations/{conv_id}/cronjobs")
+async def api_conversation_cron_jobs(conv_id: int, include_archived: bool = False):
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return await _cron_list_jobs(include_archived=include_archived, conv_id=conv_id)
+
+
+@app.post("/api/conversations/{conv_id}/cronjobs")
+async def api_create_conversation_cron_job(conv_id: int, data: dict = Body(...)):
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    workspace = conv.get("project_dir") or "."
+    if workspace == ".":
+        raise HTTPException(status_code=400, detail="conversation has no dedicated workspace directory")
+    every_seconds = _cron_interval_from_payload(data)
+    _, script = _cron_validate_script(data.get("script", ""), workspace)
+    description = str(data.get("description") or "").strip()
+    if len(description) > 2000:
+        raise HTTPException(status_code=400, detail="description must be 2000 characters or fewer")
+    enabled = bool(data.get("enabled", True))
+    job = await _cron_create_job(conv_id, str(Path(workspace).resolve()), script, description, every_seconds, enabled)
+    return JSONResponse(job, status_code=201)
+
+
+@app.put("/api/cron/jobs/{job_id}")
+async def api_update_cron_job(job_id: int, data: dict = Body(...)):
+    if "enabled" not in data:
+        raise HTTPException(status_code=400, detail="only enabled can be updated for now")
+    ok = await _cron_set_enabled(job_id, bool(data.get("enabled")))
+    if not ok:
+        raise HTTPException(status_code=404, detail="cron job not found")
+    jobs = await _cron_list_jobs(include_archived=True)
+    return next((j for j in jobs if j["id"] == job_id), {"status": "ok"})
+
+
+@app.delete("/api/cron/jobs/{job_id}")
+async def api_archive_cron_job(job_id: int):
+    ok = await _cron_archive_job(job_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="cron job not found")
+    return {"status": "archived", "id": job_id}
+
+
 # Ensure upload directory exists
 os.makedirs(config.upload_dir, exist_ok=True)
 
@@ -487,11 +866,69 @@ _active_hermes_procs: dict[int, asyncio.subprocess.Process] = {}
 _active_websockets: dict[int, set[WebSocket]] = {}
 # Pending hook-based permission requests: request_id -> {event, response, conv_id}
 _pending_hook_permissions: dict[str, dict] = {}
-# Sessions where user clicked "Allow All" — auto-approve for rest of generation
-_auto_approve_sessions: set[int] = set()
+# Permission requests the user approved for the current branch generation.
+# Keyed by (conversation id, permission scope), then an exact request fingerprint.
+_auto_approve_permissions: dict[tuple[int, str], set[str]] = {}
 # Live generation state — survives WS disconnects so reconnecting clients get a snapshot.
 # Keyed by gen_key (conv_id, parent_id, seq). Updated on every stream event.
 _generation_snapshots: dict[tuple[int, int | None, int], dict] = {}
+
+
+def _stable_json(value) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        return str(value)
+
+
+def _permission_fingerprint(tool_name: str, tool_input, approval_method: str = "") -> str:
+    """Stable key for the exact permission request a Loom approval grants."""
+    method = str(approval_method or "")
+    tool = str(tool_name or "Unknown")
+    if method == "item/permissions/requestApproval":
+        requested = {}
+        if isinstance(tool_input, dict):
+            for key in ("permissions", "requestedPermissions", "requested_permissions"):
+                if isinstance(tool_input.get(key), dict):
+                    requested = tool_input[key]
+                    break
+        return f"{method}:{_stable_json(requested)}"
+    if method == "item/fileChange/requestApproval":
+        return f"{method}:{_stable_json(tool_input)}"
+    if method == "item/commandExecution/requestApproval":
+        command = ""
+        if isinstance(tool_input, dict):
+            command = str(tool_input.get("command") or tool_input.get("cmd") or tool_input.get("execCommand") or "")
+            if not command and isinstance(tool_input.get("argv"), list):
+                command = " ".join(str(part) for part in tool_input["argv"])
+        return f"{method}:{command or _stable_json(tool_input)}"
+    if method:
+        return f"{method}:{tool}"
+    return tool
+
+
+def _permission_scope_for_active_generation(conv_id: int, explicit_scope: str = "") -> str:
+    """Return the branch-generation scope for remembered permissions."""
+    explicit = str(explicit_scope or "").strip()
+    if explicit:
+        return explicit
+    active = [
+        gk for gk, task in _active_generations.items()
+        if gk[0] == conv_id and not task.done()
+    ]
+    if len(active) == 1:
+        return f"gen:{active[0][2]}"
+    return "manual"
+
+
+def _permission_scope_gen_id(permission_scope: str) -> int | None:
+    scope = str(permission_scope or "")
+    if not scope.startswith("gen:"):
+        return None
+    try:
+        return int(scope.split(":", 1)[1])
+    except ValueError:
+        return None
 
 
 def _update_gen_snapshot(gen_key: tuple, **fields):
@@ -506,6 +943,7 @@ def _update_gen_snapshot(gen_key: tuple, **fields):
             "started_at": 0,
             "draft_msg_id": None,
             "parent_id": None,
+            "cc_model": "",
             "mode": "claude",
         }
         _generation_snapshots[gen_key] = snap
@@ -666,6 +1104,25 @@ async def api_health():
     return ollama_status
 
 
+@app.post("/api/nrol/mcp-activity")
+async def api_nrol_mcp_activity():
+    """Return recent NROL MCP activity from the admin sidecar without launching work."""
+    admin_port = int(os.environ.get("ADMIN_PORT", "3002"))
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"http://127.0.0.1:{admin_port}/tools/nrol-mcp-activity",
+                json={},
+            )
+        payload = resp.json() if resp.content else {}
+        return JSONResponse(payload, status_code=resp.status_code)
+    except Exception as e:
+        return JSONResponse(
+            {"status": "error", "output": f"Could not read NROL MCP activity via admin server: {e}"},
+            status_code=502,
+        )
+
+
 # Map of probe targets to (port, health_path). All run on localhost alongside
 # main Loom; main Loom proxies them so the settings panel can probe over HTTPS
 # without browser mixed-content blocking the direct HTTP request.
@@ -673,6 +1130,7 @@ _STATUS_TARGETS = {
     "admin":   (3002, "/api/status"),
     "ollama":  (11434, "/api/tags"),
     "vllm":    (8000, "/v1/models"),
+    "nrol":    (int(os.environ.get("ALPHA_OMEGA_PORT", "8098")), "/topics"),
     "comfyui": (8188, "/system_stats"),
 }
 
@@ -1472,7 +1930,7 @@ async def api_get_conversation(conv_id: int):
         cc_model = conv["cc_model"]
         is_api = any(
             cc_model.startswith(prefix)
-            for prefix in ("sonnet", "haiku", "opus", "gemini", "Gemini", "gpt", "GPT")
+            for prefix in ("claude-", "fable", "sonnet", "haiku", "opus", "gemini", "Gemini", "gpt", "GPT")
         )
         if not is_api and models_match(cc_model, config.llama_model):
             if cc_model != config.llama_model:
@@ -2350,13 +2808,25 @@ async def api_cc_models():
     return CC_MODELS
 
 
-# Families that support the 1M-context beta — surfaced as `<value>[1m]` entries.
-# Subscription users can only enable 1M via the CLI's `[1m]` model suffix
-# (`--betas` is API-key-only), and the CLI's suffix parser is independent of
-# alias-vs-full-ID resolution, so `opus[1m]` and `claude-opus-4-7[1m]` both work.
-_CC_ONEM_FAMILIES = {"opus", "sonnet"}
+# 1M-context support is per family+version, not per family. Subscription users
+# can only enable 1M via the CLI's `[1m]` model suffix (`--betas` is
+# API-key-only), and the CLI's suffix parser is independent of alias-vs-full-ID
+# resolution, so `sonnet[1m]` and `claude-sonnet-4-7[1m]` both work. Sonnet
+# supports 1M across our surfaced range; Opus only from 4.7 onward (Opus 4.6 has
+# no 1M tier and a pinned `claude-opus-4-6[1m]` just rate-limits/fails); Haiku
+# never. Aliases (`opus`, `sonnet`) resolve to the latest version, which always
+# supports 1M, so the Auto group emits `[1m]` for both.
+_CC_ONEM_MIN_VERSION = {"fable": (5, 0), "opus": (4, 7), "sonnet": (4, 5)}
+
+
+def _supports_1m(family: str, version: tuple[int, int]) -> bool:
+    floor = _CC_ONEM_MIN_VERSION.get(family)
+    return floor is not None and version >= floor
+
+
 # Family display order, applied to both the Auto group and within Pinned.
-_CC_FAMILY_ORDER = ["opus", "sonnet", "haiku"]
+_CC_FAMILY_ORDER = ["fable", "opus", "sonnet", "haiku"]
+_CC_ALIAS_FAMILIES = {"opus", "sonnet", "haiku"}
 
 import re as _re
 # claude-<family>-<major>[-<minor>][-<yyyymmdd>] — minor is 1-2 digits and
@@ -2364,7 +2834,7 @@ import re as _re
 # minor=20250514). The optional 8-digit date tail is anchored so it can't be
 # mistaken for the minor.
 _CC_MODEL_ID_RE = _re.compile(
-    r"^claude-(opus|sonnet|haiku)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$",
+    r"^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$",
     _re.IGNORECASE,
 )
 
@@ -2374,13 +2844,71 @@ def _read_oauth_token() -> str | None:
     credentials file. Returns None if missing/unreadable. The expiresAt timestamp
     is intentionally not checked — the API returns 401 if it's actually expired,
     and reading the file each call means the user can refresh their session via
-    the desktop app without restarting Loom."""
+    the Claude Code CLI without restarting Loom."""
     cred_path = Path.home() / ".claude" / ".credentials.json"
     try:
         data = json.loads(cred_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
     return (data.get("claudeAiOauth") or {}).get("accessToken")
+
+
+def _build_anthropic_model_dropdowns(api_models: list[dict]) -> tuple[list[dict], list[dict], dict[str, list]]:
+    # Group every returned claude-* model by family. display_name comes
+    # pre-formatted ("Claude Opus 4.8"); strip the "Claude " prefix so labels
+    # read "Opus 4.8" to match the compact dropdown style.
+    by_family: dict[str, list[tuple[tuple[int, int], str, str]]] = {
+        f: [] for f in _CC_FAMILY_ORDER
+    }
+    for m in api_models:
+        model_id = m.get("id", "")
+        match = _CC_MODEL_ID_RE.match(model_id)
+        if not match:
+            continue
+        family = match.group(1).lower()
+        if family not in by_family:
+            continue
+        version = (int(match.group(2)), int(match.group(3) or 0))
+        if version < (4, 5):
+            continue
+        label = (m.get("display_name") or "").removeprefix("Claude ").strip()
+        if not label:
+            label = f"{family.capitalize()} {version[0]}.{version[1]}"
+        by_family[family].append((version, model_id, label))
+
+    if not any(by_family.values()):
+        raise ValueError("Anthropic /v1/models returned no recognizable claude-* models.")
+
+    for family in by_family:
+        by_family[family].sort(key=lambda t: t[0], reverse=True)
+
+    # Auto group — one alias entry per family with a known Claude Code alias.
+    # The CLI's bundled alias map (frozen at the CLI's build time) decides which
+    # concrete ID runs, so the label can't honestly name a version.
+    auto_models: list[dict] = []
+    for family in _CC_FAMILY_ORDER:
+        if not by_family[family]:
+            continue
+        if family not in _CC_ALIAS_FAMILIES:
+            continue
+        cap = family.capitalize()
+        auto_models.append({"value": family, "label": f"{cap} (latest)"})
+        # Alias resolves to the family's latest version, which always supports 1M
+        # if any version in the family does.
+        if family in _CC_ONEM_MIN_VERSION:
+            auto_models.append({"value": f"{family}[1m]", "label": f"{cap} (latest, 1M)"})
+
+    # Pinned group — every concrete claude-* ID, with [1m] siblings interleaved
+    # per version so each release block stays together. Fable's documented API
+    # ID is already 1M-context, so we do not add a synthetic suffix variant.
+    pinned_models: list[dict] = []
+    for family in _CC_FAMILY_ORDER:
+        for _ver, model_id, label in by_family[family]:
+            pinned_models.append({"value": model_id, "label": label})
+            if family != "fable" and _supports_1m(family, _ver):
+                pinned_models.append({"value": f"{model_id}[1m]", "label": f"{label} (1M)"})
+
+    return auto_models, pinned_models, by_family
 
 
 @app.post("/api/cc-models/refresh")
@@ -2390,19 +2918,22 @@ async def api_cc_models_refresh():
     one free metadata request). Produces two groups in place of the old single
     "Anthropic" group:
 
-      • "Anthropic — Auto"   alias values (`opus`, `opus[1m]`, …) labeled
+      • "Anthropic — Auto"   alias values (`opus`, `sonnet[1m]`, …) labeled
                               "(latest)" without a specific version, since the
                               CLI's own bundled alias→ID map decides which
                               concrete model actually runs.
       • "Anthropic — Pinned" every full claude-* ID the API returns, so the
                               user can pin an exact version. Each version is
-                              followed by its `[1m]` sibling for opus/sonnet.
+                              followed by its `[1m]` sibling where the version
+                              supports an explicit 1M suffix (Sonnet ≥4.5,
+                              Opus ≥4.7). Fable is surfaced as a pinned ID
+                              because the documented API ID is `claude-fable-5`.
 
     Mutates CC_MODELS in place so existing references stay valid."""
     token = _read_oauth_token()
     if not token:
         raise HTTPException(
-            502,
+            401,
             "No Claude Code login found (~/.claude/.credentials.json). "
             "Run `claude` once to sign in, then retry.",
         )
@@ -2424,61 +2955,17 @@ async def api_cc_models_refresh():
 
     if resp.status_code == 401:
         raise HTTPException(
-            502,
+            401,
             "Anthropic rejected the login token (expired?). "
-            "Open the Claude Code desktop app and sign in again, then retry.",
+            "Run `claude` and complete sign-in again, then retry.",
         )
     if resp.status_code != 200:
         raise HTTPException(502, f"Anthropic /v1/models returned {resp.status_code}: {resp.text[:200]}")
 
-    # Group every returned claude-* model by family. display_name comes
-    # pre-formatted ("Claude Opus 4.8"); strip the "Claude " prefix so labels
-    # read "Opus 4.8" to match the compact dropdown style.
-    by_family: dict[str, list[tuple[tuple[int, int], str, str]]] = {
-        f: [] for f in _CC_FAMILY_ORDER
-    }
-    for m in resp.json().get("data", []):
-        model_id = m.get("id", "")
-        match = _CC_MODEL_ID_RE.match(model_id)
-        if not match:
-            continue
-        family = match.group(1).lower()
-        if family not in by_family:
-            continue
-        version = (int(match.group(2)), int(match.group(3) or 0))
-        if version < (4, 5):
-            continue
-        label = (m.get("display_name") or "").removeprefix("Claude ").strip()
-        if not label:
-            label = f"{family.capitalize()} {version[0]}.{version[1]}"
-        by_family[family].append((version, model_id, label))
-
-    if not any(by_family.values()):
-        raise HTTPException(502, "Anthropic /v1/models returned no recognizable claude-* models.")
-
-    for family in by_family:
-        by_family[family].sort(key=lambda t: t[0], reverse=True)
-
-    # Auto group — one alias entry per family that has any pinned model. The
-    # CLI's bundled alias map (frozen at the CLI's build time) decides which
-    # concrete ID runs, so the label can't honestly name a version.
-    auto_models: list[dict] = []
-    for family in _CC_FAMILY_ORDER:
-        if not by_family[family]:
-            continue
-        cap = family.capitalize()
-        auto_models.append({"value": family, "label": f"{cap} (latest)"})
-        if family in _CC_ONEM_FAMILIES:
-            auto_models.append({"value": f"{family}[1m]", "label": f"{cap} (latest, 1M)"})
-
-    # Pinned group — every concrete claude-* ID, with [1m] siblings interleaved
-    # per version so each release block stays together.
-    pinned_models: list[dict] = []
-    for family in _CC_FAMILY_ORDER:
-        for _ver, model_id, label in by_family[family]:
-            pinned_models.append({"value": model_id, "label": label})
-            if family in _CC_ONEM_FAMILIES:
-                pinned_models.append({"value": f"{model_id}[1m]", "label": f"{label} (1M)"})
+    try:
+        auto_models, pinned_models, by_family = _build_anthropic_model_dropdowns(resp.json().get("data", []))
+    except ValueError as e:
+        raise HTTPException(502, str(e))
 
     # Splice the two new groups in where the old Anthropic group(s) were, keep
     # everything else in original order. Handles both the initial hardcoded
@@ -2688,13 +3175,18 @@ async def handle_cc_permission(data: dict):
         f"[PERM] Hook request: conv={conv_id} tool={tool_name} request_id={request_id}"
     )
 
-    # These tools always need user interaction, even under "Allow All"
-    _interactive_tools = {"ExitPlanMode", "exit_plan_mode"}
+    approval_method = data.get("approval_method", "")
+    permission_scope = _permission_scope_for_active_generation(
+        conv_id,
+        data.get("permission_scope", ""),
+    )
+    permission_key = _permission_fingerprint(tool_name, tool_input, approval_method)
+    scoped_key = (conv_id, permission_scope)
 
-    # Auto-approve if user previously clicked "Allow All" for this session
-    if conv_id in _auto_approve_sessions and tool_name not in _interactive_tools:
-        print(f"[PERM] Auto-approved (Allow All active)")
-        return {"allow": True}
+    # Auto-approve only the same request within the same branch generation.
+    if permission_key in _auto_approve_permissions.get(scoped_key, set()):
+        print(f"[PERM] Auto-approved scoped permission: scope={permission_scope} key={permission_key}")
+        return {"allow": True, "always": True}
 
     # Build a human-readable summary
     input_summary = ""
@@ -2751,7 +3243,20 @@ async def handle_cc_permission(data: dict):
         "tool_name": tool_name,
         "tool_input": _sanitize(tool_input),
         "input_summary": _sanitize(input_summary),
+        "approval_method": approval_method,
+        "permission_key": permission_key,
+        "permission_scope": permission_scope,
     }
+    gen_id = _permission_scope_gen_id(permission_scope)
+    if gen_id is not None:
+        perm_msg["gen_id"] = gen_id
+    await _ws_broadcast_all(
+        {
+            "type": "status",
+            "text": f"Permission request pending: {tool_name}",
+            "conv_id": conv_id,
+        }
+    )
 
     # Persist to DB first (survives server restart)
     await db.save_pending_permission(
@@ -2786,15 +3291,15 @@ async def handle_cc_permission(data: dict):
         "tool_name": tool_name,
         "tool_input": tool_input,
         "input_summary": input_summary,
+        "approval_method": approval_method,
+        "permission_key": permission_key,
+        "permission_scope": permission_scope,
     }
 
     # Wait for user response with a timeout.
-    # Every 30s check whether any WebSocket is still connected for this conv —
-    # if not and we're past the initial grace period, auto-deny so Gemini
-    # doesn't hang waiting for a user who walked away.
-    # Total deadline: 15 min (matches the hook timeout in gemini_client.py).
-    _PERM_TOTAL_DEADLINE = 900  # 15 min
-    _PERM_GRACE = 60  # wait at least 60s before checking connectivity
+    # Keep the tool blocked while it waits for a real user decision. Pending
+    # requests are persisted and rebroadcast on reconnect/startup.
+    _PERM_TOTAL_DEADLINE = 24 * 60 * 60
     _PERM_POLL_INTERVAL = 30
 
     elapsed = 0
@@ -2808,13 +3313,6 @@ async def handle_cc_permission(data: dict):
             _pending_hook_permissions.pop(request_id, None)
             break
 
-        # Check auto-deny: no client connected past grace period
-        clients = _active_websockets.get(conv_id, set())
-        if elapsed > _PERM_GRACE and not clients:
-            print(f"[PERM] Auto-deny: no WebSocket for conv={conv_id} after {elapsed}s")
-            _pending_hook_permissions.pop(request_id, None)
-            return {"allow": False, "message": "No client connected to approve — tool denied"}
-
         # Wait on the event with a short timeout, then re-check
         try:
             await asyncio.wait_for(perm_data["event"].wait(), timeout=_PERM_POLL_INTERVAL)
@@ -2826,7 +3324,7 @@ async def handle_cc_permission(data: dict):
     print(f"[PERM] User decision: {'allow' if allowed else 'deny'}")
 
     if allowed:
-        return {"allow": True}
+        return {"allow": True, "always": bool(user_response.get("always", False))}
     else:
         return {"allow": False, "message": "Denied by user in Loom UI"}
 
@@ -2886,11 +3384,18 @@ async def list_skills(conv_id: int = None):
     Scans both built-in skills and .claude/skills/ in the project directory.
     """
     project_dir = None
+    agent = "claude"
     if conv_id:
         conv = await db.get_conversation(conv_id)
         if conv:
             project_dir = conv.get("project_dir")
-    skills = get_all_skills(project_dir)
+            cc_model = (conv.get("cc_model") or "").lower()
+            mode = (conv.get("mode") or "").lower()
+            if mode == "codex" or is_codex_model(conv.get("cc_model") or ""):
+                agent = "codex"
+            elif mode == "gemini" or is_gemini_model(conv.get("cc_model") or "") or "antigravity" in cc_model:
+                agent = "agy"
+    skills = get_all_skills(project_dir, agent=agent)
     return skills
 
 
@@ -2916,6 +3421,75 @@ async def get_cc_hooks():
         except Exception:
             pass
     return {"hooks": hooks, "paths": [str(p) for p in paths]}
+
+
+@app.get("/api/codex-diagnostics")
+async def codex_diagnostics(conv_id: int = None, project_dir: str = None):
+    """Report Codex state that can surprise Loom users across arbitrary folders."""
+    target_dir = project_dir
+    if conv_id:
+        conv = await db.get_conversation(conv_id)
+        if conv:
+            target_dir = conv.get("project_dir") or target_dir
+    target_path = Path(target_dir).resolve() if target_dir else Path.cwd().resolve()
+
+    config_path = Path.home() / ".codex" / "config.toml"
+    config_text = ""
+    stale_global_entries: list[str] = []
+    if config_path.is_file():
+        try:
+            config_text = config_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            config_text = f"<read failed: {e}>"
+    for marker in ("loom-file-edits", "loom-actions", "mcp_loom_file_edits", "mcp_loom_actions"):
+        if marker in config_text:
+            stale_global_entries.append(marker)
+
+    project_hook_path = target_path / ".codex" / "hooks.json"
+    project_hooks = None
+    if project_hook_path.is_file():
+        try:
+            project_hooks = json.loads(project_hook_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            project_hooks = {"error": str(e)}
+
+    expected_approval = codex_client._codex_approval_policy("default")
+    return {
+        "target_dir": str(target_path),
+        "expected_launch": {
+            "surface": "app-server",
+            "approval_policy": expected_approval,
+            "sandbox": "workspace-write",
+            "writable_roots": [str(target_path)],
+            "hook_scope": "disabled",
+            "mcp_servers": [],
+        },
+        "project_hook": {
+            "path": str(project_hook_path),
+            "exists": project_hook_path.is_file(),
+            "scope": "project-local" if project_hook_path.is_file() else None,
+            "ignored_by_loom_codex": True,
+            "reason": "Codex app-server launches use --disable hooks; approval requests come from app-server JSON-RPC.",
+            "hooks": project_hooks,
+        },
+        "global_config": {
+            "path": str(config_path),
+            "exists": config_path.is_file(),
+            "stale_loom_entries": stale_global_entries,
+        },
+        "warnings": [
+            *(
+                ["Project-local .codex/hooks.json exists; Loom disables Codex hooks for app-server launches so stale repo hooks are ignored."]
+                if project_hook_path.is_file()
+                else []
+            ),
+            *(
+                [f"Global Codex config contains stale Loom markers: {', '.join(stale_global_entries)}"]
+                if stale_global_entries
+                else []
+            ),
+        ],
+    }
 
 
 @app.get("/api/modules")
@@ -3137,6 +3711,7 @@ async def _send_active_gen_state(websocket: WebSocket, conv_id: int) -> bool:
                     "input_tokens": snap.get("input_tokens", 0),
                     "output_tokens": snap.get("output_tokens", 0),
                     "started_at": snap.get("started_at", 0),
+                    "cc_model": snap.get("cc_model", ""),
                     "mode": snap.get("mode", "claude"),
                 }
             )
@@ -3166,14 +3741,21 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 continue
             print(f"[WS] Resending pending permission request {rid} on reconnect")
             try:
-                await websocket.send_json(_scrub_surrogates({
+                perm_msg = {
                     "type": "permission_request",
                     "request_id": rid,
                     "conv_id": pending.get("conv_id"),
                     "tool_name": pending.get("tool_name", ""),
                     "tool_input": pending.get("tool_input", ""),
                     "input_summary": pending.get("input_summary", ""),
-                }))
+                    "approval_method": pending.get("approval_method", ""),
+                    "permission_key": pending.get("permission_key", ""),
+                    "permission_scope": pending.get("permission_scope", ""),
+                }
+                gen_id = _permission_scope_gen_id(pending.get("permission_scope", ""))
+                if gen_id is not None:
+                    perm_msg["gen_id"] = gen_id
+                await websocket.send_json(_scrub_surrogates(perm_msg))
             except Exception as e:
                 # One malformed pending perm must not kill the whole reconnect —
                 # UnicodeEncodeError on an unpaired surrogate in tool_input was
@@ -3185,14 +3767,21 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
             if pending.get("response"):
                 continue
             try:
-                await websocket.send_json(_scrub_surrogates({
+                perm_msg = {
                     "type": "permission_request",
                     "request_id": rid,
                     "conv_id": pending.get("conv_id"),
                     "tool_name": pending.get("tool_name", ""),
                     "tool_input": pending.get("tool_input", ""),
                     "input_summary": pending.get("input_summary", ""),
-                }))
+                    "approval_method": pending.get("approval_method", ""),
+                    "permission_key": pending.get("permission_key", ""),
+                    "permission_scope": pending.get("permission_scope", ""),
+                }
+                gen_id = _permission_scope_gen_id(pending.get("permission_scope", ""))
+                if gen_id is not None:
+                    perm_msg["gen_id"] = gen_id
+                await websocket.send_json(_scrub_surrogates(perm_msg))
             except Exception as e:
                 print(f"[WS] Failed to resend pending permission {rid}: {e!r} — skipping")
 
@@ -3260,18 +3849,35 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
 
             if action == "permission_response":
                 request_id = data.get("request_id", "")
-                if data.get("always"):
-                    _auto_approve_sessions.add(conv_id)
                 # Resolve the hook-based pending permission
                 pending = _pending_hook_permissions.get(request_id)
                 if pending:
+                    allow = bool(data.get("allow", False))
+                    pending_conv_id = int(pending.get("conv_id") or conv_id)
+                    permission_key = pending.get("permission_key") or _permission_fingerprint(
+                        pending.get("tool_name", ""),
+                        pending.get("tool_input", {}),
+                        pending.get("approval_method", ""),
+                    )
+                    permission_scope = pending.get("permission_scope") or _permission_scope_for_active_generation(pending_conv_id)
+                    always = bool(data.get("always"))
+                    if allow and always:
+                        _auto_approve_permissions.setdefault((pending_conv_id, permission_scope), set()).add(permission_key)
                     pending["response"] = {
-                        "allow": data.get("allow", False),
-                        "always": data.get("always", False),
+                        "allow": allow,
+                        "always": always,
                     }
                     pending["event"].set()
                     # Also clean up from DB
                     await db.delete_pending_permission(request_id)
+                    await _ws_broadcast_all(
+                        {
+                            "type": "permission_resolved",
+                            "request_id": request_id,
+                            "allowed": allow,
+                            "conv_id": pending_conv_id,
+                        }
+                    )
                 continue
 
             if action == "compact":
@@ -3360,11 +3966,11 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
 
 
 def _model_family(model_id: str) -> str | None:
-    """Return 'opus' / 'sonnet' / 'haiku' / None for a Claude model id or alias."""
+    """Return a Claude family name for a model id or alias."""
     if not model_id:
         return None
     m = model_id.lower()
-    for fam in ("opus", "sonnet", "haiku"):
+    for fam in ("fable", "opus", "sonnet", "haiku"):
         if fam in m:
             return fam
     return None
@@ -3786,7 +4392,13 @@ def is_codex_model(model: str) -> bool:
     if not model:
         return False
     ml = model.lower()
-    return ml.startswith("codex")
+    return (
+        ml.startswith("codex")
+        or ml.startswith("gpt-5")
+        or ml == "gpt-4o"
+        or ml.startswith("o3")
+        or ml.startswith("o4")
+    )
 
 
 def is_gemini_model(model: str) -> bool:
@@ -3827,7 +4439,7 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
         cc_model = conv["cc_model"]
         is_api = any(
             cc_model.startswith(prefix)
-            for prefix in ("sonnet", "haiku", "opus", "gemini", "Gemini", "gpt", "GPT")
+            for prefix in ("claude-", "fable", "sonnet", "haiku", "opus", "gemini", "Gemini", "gpt", "GPT")
         )
         if not is_api and models_match(cc_model, config.llama_model):
             if cc_model != config.llama_model:
@@ -4007,8 +4619,8 @@ async def _handle_claude_generation(
                     print(f"[CC] Skipping empty session on msg {msg['id']}")
                     continue
                 # Check if the session was created by a different provider.
-                # cc_model_used can hold either a shortcode alias ("opus[1m]")
-                # or a full Anthropic model id ("claude-opus-4-7[1m]") — the
+                # cc_model_used can hold either a shortcode alias ("sonnet[1m]")
+                # or a full Anthropic model id ("claude-sonnet-4-7[1m]") — the
                 # helper accepts both.
                 prev_model = msg.get("cc_model_used") or ""
                 prev_is_anthropic = model_context.is_anthropic(prev_model)
@@ -4227,6 +4839,7 @@ async def _handle_claude_generation(
                 conv_id, "assistant", "", parent_id=_draft_parent
             )
         draft_msg_id = draft_msg["id"]
+        await db.update_message_content(draft_msg_id, cc_model_used=cc_model)
         await db.set_active_branch(conv_id, draft_msg_id)
 
         # Initialize live snapshot for this generation (survives WS disconnects)
@@ -4242,6 +4855,7 @@ async def _handle_claude_generation(
                 started_at=_time.time(),
                 draft_msg_id=draft_msg_id,
                 parent_id=parent_id,
+                cc_model=cc_model,
                 mode="gemini" if is_gemini else ("codex" if is_codex else ("local" if use_llama else "claude")),
             )
 
@@ -4267,6 +4881,7 @@ async def _handle_claude_generation(
                 "type": "stream_start",
                 "parent_id": parent_id,
                 "draft_msg_id": draft_msg_id,
+                "cc_model": cc_model,
             },
         )
         # Mirror the FE's _streamStartTime so the persisted generation_ms
@@ -4306,6 +4921,7 @@ async def _handle_claude_generation(
                     resume_session_id=resume_session_id if use_resume else None,
                     fork_session=fork_session,
                     backstage_parent_id=conv.get("backstage_parent_id"),
+                    permission_request_handler=handle_cc_permission,
                 )
             else:
                 proc, event_stream = await claude_client.run_claude(
@@ -4347,6 +4963,7 @@ async def _handle_claude_generation(
                         model=cc_model,
                         effort=cc_effort,
                         permission_mode=cc_permission_mode,
+                        permission_request_handler=handle_cc_permission,
                     )
                 else:
                     proc, event_stream = await claude_client.run_claude(
@@ -4402,6 +5019,34 @@ async def _handle_claude_generation(
                     await db.update_active_generation_session(draft_msg_id, new_session_id)
                 except Exception:
                     pass
+
+            elif etype == "codex_launch_info":
+                if _gen_key_local:
+                    _update_gen_snapshot(
+                        _gen_key_local,
+                        codex_launch_info=evt,
+                        cc_model=evt.get("model", cc_model),
+                    )
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "status",
+                        "text": (
+                            f"Codex launch: approval={evt.get('approval_policy')}, "
+                            f"sandbox={evt.get('sandbox')}, cwd={evt.get('cwd')}"
+                        ),
+                    },
+                )
+
+            elif etype == "status":
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "status",
+                        "text": evt.get("text", ""),
+                        "parent_id": parent_id,
+                    },
+                )
 
             elif etype == "text_delta":
                 full_text += evt["text"]
@@ -4819,6 +5464,26 @@ async def _handle_claude_generation(
                             "parent_id": parent_id,
                         },
                     )
+                elif etype == "codex_launch_info":
+                    await _ws_send(
+                        conv_id,
+                        {
+                            "type": "status",
+                            "text": (
+                                f"Codex launch: approval={evt.get('approval_policy')}, "
+                                f"sandbox={evt.get('sandbox')}, cwd={evt.get('cwd')}"
+                            ),
+                        },
+                    )
+                elif etype == "status":
+                    await _ws_send(
+                        conv_id,
+                        {
+                            "type": "status",
+                            "text": evt.get("text", ""),
+                            "parent_id": parent_id,
+                        },
+                    )
                 elif etype == "text_delta":
                     full_text += evt["text"]
                     if current_block and current_block["type"] == "text":
@@ -5196,7 +5861,7 @@ async def _handle_claude_generation(
         if _gen_key:
             _active_generations.pop(_gen_key, None)
             _generation_snapshots.pop(_gen_key, None)
-        _auto_approve_sessions.discard(conv_id)
+            _auto_approve_permissions.pop((conv_id, f"gen:{_gen_key[2]}"), None)
         # Drop the orphan-tracking row — the generation finished (success,
         # cancel, or error), so there's nothing to reap on next startup.
         try:

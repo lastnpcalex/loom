@@ -9,7 +9,8 @@
     "flash_attn": true,
     "mlock": false,
     "mmproj": "mmproj-27B-BF16.gguf",
-    "extra_args": ""
+    "extra_args": "",
+    "server_model_id": "Qwen3.6-27B-NVFP4.gguf"
   },
   "mmproj-BF16.gguf": {
     "ctx_size": 150000,
@@ -34,24 +35,10 @@
     "flash_attn": true,
     "mlock": false,
     "mmproj": "mmproj-BF16.gguf",
-    "extra_args": "",
-    "server_model_id": "AxionML-Qwen3.5-9B-NVFP4.gguf"
+    "extra_args": ""
   },
   "mmproj-27B-BF16.gguf": {
     "ctx_size": 80000,
-    "ngl": 999,
-    "flash_attn": true,
-    "kv_quant": "none",
-    "threads": null,
-    "batch": null,
-    "ubatch": null,
-    "mlock": false,
-    "mmproj": null,
-    "extra_args": "",
-    "server_model_id": null
-  },
-  "nvidia_Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4.gguf": {
-    "ctx_size": 40000,
     "ngl": 999,
     "flash_attn": true,
     "kv_quant": "none",

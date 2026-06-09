@@ -131,6 +131,50 @@ BUILTIN_COMMANDS = [
 BUILTIN_SKILLS = [c for c in BUILTIN_COMMANDS if c.get("mode") == "headless"]
 
 
+# Codex CLI slash commands are mostly interactive TUI controls. In `codex exec`,
+# the dependable surface is still a prompt plus tools, so Loom exposes only
+# commands that can be represented as prompts or handled by Loom locally.
+CODEX_COMMANDS = [
+    {"name": "help", "command": "/help", "description": "Show Loom/Codex command help", "mode": "meta",
+     "prompt_template": None},
+    {"name": "status", "command": "/status", "description": "Show Loom generation status", "mode": "meta",
+     "prompt_template": None},
+    {"name": "diff", "command": "/diff", "description": "Ask Codex to inspect the current git diff", "mode": "headless",
+     "prompt_template": "Inspect the current git diff and summarize changed files, important hunks, and obvious risks. {args}"},
+    {"name": "review", "command": "/review", "description": "Ask Codex to review the working tree", "mode": "headless",
+     "prompt_template": "Review the current working tree for correctness bugs, regressions, missing tests, and risky changes. Lead with findings and include file references where possible. {args}"},
+    {"name": "explain", "command": "/explain", "description": "Explain code, files, or project behavior", "mode": "headless",
+     "prompt_template": "Explain the following code or project area clearly and concretely: {args}"},
+    {"name": "fix", "command": "/fix", "description": "Debug and fix an issue", "mode": "headless",
+     "prompt_template": "Debug and fix this issue. Reproduce or inspect first, make focused changes, and verify them when practical: {args}"},
+    {"name": "test", "command": "/test", "description": "Run or repair tests", "mode": "headless",
+     "prompt_template": "Run the relevant tests for this task. If tests fail, diagnose and fix the cause when it is in scope. {args}"},
+    {"name": "init", "command": "/init", "description": "Create or update AGENTS.md project guidance", "mode": "headless",
+     "prompt_template": "Create or update AGENTS.md with concise project guidance, build/test commands, conventions, and important repo context. {args}"},
+    {"name": "compact", "command": "/compact", "description": "Context compacts automatically in Loom", "mode": "meta",
+     "prompt_template": None},
+    {"name": "permissions", "command": "/permissions", "description": "View Loom permission handling", "mode": "meta",
+     "prompt_template": None},
+]
+
+
+# Antigravity's interactive slash commands are not exposed through a reliable
+# headless/stdout contract. Keep this deliberately small so Loom does not
+# advertise Claude/Codex-only controls as native agy commands.
+AGY_COMMANDS = [
+    {"name": "help", "command": "/help", "description": "Show Loom/Antigravity command help", "mode": "meta",
+     "prompt_template": None},
+    {"name": "status", "command": "/status", "description": "Show Loom generation status", "mode": "meta",
+     "prompt_template": None},
+    {"name": "tools", "command": "/tools", "description": "Ask Antigravity to describe available tools", "mode": "headless",
+     "prompt_template": "Describe the tools and capabilities available in this Antigravity CLI session. {args}"},
+    {"name": "model", "command": "/model", "description": "Ask Antigravity which model is active", "mode": "headless",
+     "prompt_template": "Report the active Antigravity model in human-readable terms. {args}"},
+    {"name": "agents", "command": "/agents", "description": "Ask Antigravity about subagent support", "mode": "headless",
+     "prompt_template": "Describe the available Antigravity subagent support and how it can be used for this task. {args}"},
+]
+
+
 def scan_skills_dir(project_dir: str) -> list[dict]:
     """Scan .claude/skills/ in a project directory for custom skill definitions.
 
@@ -223,7 +267,26 @@ def scan_user_commands() -> list[dict]:
     return found
 
 
-def get_all_skills(project_dir: str = None) -> list[dict]:
+def _materialize_builtin(commands: list[dict], source: str) -> list[dict]:
+    seen = set()
+    skills = []
+    for cmd in commands:
+        if cmd["name"] in seen or cmd.get("mode") == "cli-only":
+            continue
+        seen.add(cmd["name"])
+        skills.append({
+            "id": f"{source}:{cmd['name']}",
+            "name": cmd["name"],
+            "command": cmd["command"],
+            "description": cmd["description"],
+            "prompt_template": cmd.get("prompt_template"),
+            "source": source,
+            "mode": cmd.get("mode", "headless"),
+        })
+    return skills
+
+
+def get_all_skills(project_dir: str = None, agent: str = "claude") -> list[dict]:
     """Get all available commands/skills from three sources:
 
     1. Built-in CC commands (headless + meta) — always present
@@ -234,23 +297,14 @@ def get_all_skills(project_dir: str = None) -> list[dict]:
     source ('system'|'user'), mode ('headless'|'meta').
     CLI-only commands are excluded.
     """
-    seen = set()
-    skills = []
+    agent = (agent or "claude").lower()
+    if agent == "codex":
+        return _materialize_builtin(CODEX_COMMANDS, "codex")
+    if agent in ("agy", "gemini", "antigravity"):
+        return _materialize_builtin(AGY_COMMANDS, "agy")
 
-    # 1) Built-in CC commands (headless + meta, skip cli-only)
-    for cmd in BUILTIN_COMMANDS:
-        if cmd["name"] in seen or cmd.get("mode") == "cli-only":
-            continue
-        seen.add(cmd["name"])
-        skills.append({
-            "id": f"cmd:{cmd['name']}",
-            "name": cmd["name"],
-            "command": cmd["command"],
-            "description": cmd["description"],
-            "prompt_template": cmd.get("prompt_template"),
-            "source": "system",
-            "mode": cmd.get("mode", "headless"),
-        })
+    skills = _materialize_builtin(BUILTIN_COMMANDS, "claude")
+    seen = {s["name"] for s in skills}
 
     # 2) User commands from ~/.claude/commands/*.md (fresh scan every time)
     for s in scan_user_commands():

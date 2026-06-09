@@ -11,6 +11,9 @@ Claude Code output format:
 Antigravity (agy) output format:
   {"decision": "allow/deny", "reason": "..."}
 
+Codex PermissionRequest output format:
+  {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow/deny", ...}}}
+
 Environment variables (set by Loom when launching CC/agy):
   LOOM_PORT: Port of the Loom server (default: 3000)
   LOOM_CONV_ID: Conversation ID in Loom
@@ -43,6 +46,7 @@ def normalize_tool_name(name: str) -> str:
         "google_web_search": "WebSearch",
         "read_url_content": "WebFetch",
         "web_fetch": "WebFetch",
+        "apply_patch": "apply_patch",
     }
     return mapping.get(name, name)
 
@@ -68,6 +72,8 @@ def normalize_tool_args(name: str, args: dict) -> dict:
         mapped["new_string"] = cleaned.get("ReplacementContent", cleaned.get("new_string", ""))
     elif name in ("run_command", "execute_command", "run_shell_command"):
         mapped["command"] = cleaned.get("CommandLine", cleaned.get("command", ""))
+    elif name == "apply_patch":
+        mapped["command"] = cleaned.get("command", cleaned.get("patch", ""))
     elif name in ("grep_search", "grep"):
         mapped["query"] = cleaned.get("Query", cleaned.get("query", ""))
         mapped["dir"] = cleaned.get("SearchPath", cleaned.get("dir", ""))
@@ -116,6 +122,15 @@ def allow(reason="Auto-approved", event_name="PreToolUse"):
             "decision": "allow",
             "reason": reason
         }
+    elif event_name == "PermissionRequest":
+        output = {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {
+                    "behavior": "allow"
+                },
+            }
+        }
     else:
         output = {
             "hookSpecificOutput": {
@@ -136,6 +151,16 @@ def deny(reason="Blocked", event_name="PreToolUse"):
         output = {
             "decision": "deny",
             "reason": reason
+        }
+    elif event_name == "PermissionRequest":
+        output = {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {
+                    "behavior": "deny",
+                    "message": reason,
+                },
+            }
         }
     else:
         output = {
@@ -159,7 +184,7 @@ def main():
                 event_name = sys.argv[idx + 1]
         except ValueError:
             pass
-    elif len(sys.argv) > 1 and sys.argv[1] in ("PreToolUse", "PostToolUse", "BeforeTool"):
+    elif len(sys.argv) > 1 and sys.argv[1] in ("PreToolUse", "PermissionRequest", "PostToolUse", "BeforeTool"):
         event_name = sys.argv[1]
 
     sys.stderr.write(f"[PERM-HOOK] Hook started for event {event_name}\n")
@@ -183,14 +208,28 @@ def main():
     if "hook_event_name" in request:
         event_name = request["hook_event_name"]
 
-    tool_name = request.get("tool_name", "")
+    raw_tool = request.get("tool")
+    tool_name = (
+        request.get("tool_name")
+        or request.get("name")
+        or (raw_tool if isinstance(raw_tool, str) else "")
+        or request.get("command_name")
+        or request.get("action")
+        or ""
+    )
+    if not tool_name and isinstance(raw_tool, dict):
+        tool_name = raw_tool.get("tool_name") or raw_tool.get("name") or raw_tool.get("type") or ""
+    if not tool_name and isinstance(request.get("tool_call"), dict):
+        tool_call = request["tool_call"]
+        tool_name = tool_call.get("tool_name") or tool_call.get("name") or tool_call.get("type") or ""
     is_agy = tool_name in AGY_TOOLS
+    is_codex = event_name == "PermissionRequest" or tool_name == "apply_patch"
 
     # PostToolUse Hook Flow
     if event_name == "PostToolUse":
         # Extract content
         output_content = ""
-        for k in ["output", "result", "response", "content"]:
+        for k in ["tool_response", "output", "result", "response", "content"]:
             if k in request:
                 output_content = str(request[k])
                 break
@@ -200,7 +239,7 @@ def main():
             output_content = str(request["error"])
             is_error = True
             
-        tool_id = request.get("tool_id", str(request.get("stepIdx", "0")))
+        tool_id = request.get("tool_use_id", request.get("tool_id", str(request.get("stepIdx", "0"))))
         
         # POST to /api/cc-tool-result
         protocols = ["http", "https"]
@@ -233,11 +272,42 @@ def main():
 
     # PreToolUse Hook Flow
     # Notify Loom that tool execution has started (useful for read-only tools or tracking)
-    tool_id = request.get("tool_id", str(request.get("stepIdx", "0")))
-    tool_input = request.get("tool_input", {})
+    tool_id = request.get("tool_use_id", request.get("tool_id", str(request.get("stepIdx", "0"))))
+    tool_input = (
+        request.get("tool_input")
+        or request.get("input")
+        or request.get("arguments")
+        or request.get("args")
+        or request.get("params")
+        or {}
+    )
+    if not tool_input and isinstance(request.get("tool_call"), dict):
+        tool_call = request["tool_call"]
+        tool_input = (
+            tool_call.get("tool_input")
+            or tool_call.get("input")
+            or tool_call.get("arguments")
+            or tool_call.get("args")
+            or {}
+        )
+    if not tool_input and isinstance(raw_tool, dict):
+        tool_input = (
+            raw_tool.get("tool_input")
+            or raw_tool.get("input")
+            or raw_tool.get("arguments")
+            or raw_tool.get("args")
+            or {}
+        )
+    if isinstance(tool_input, str):
+        try:
+            tool_input = json.loads(tool_input)
+        except json.JSONDecodeError:
+            tool_input = {"input": tool_input}
+    if not tool_input and request.get("command"):
+        tool_input = {"command": request.get("command")}
     
-    mapped_name = normalize_tool_name(tool_name) if is_agy else tool_name
-    mapped_input = normalize_tool_args(tool_name, tool_input) if is_agy else tool_input
+    mapped_name = normalize_tool_name(tool_name) if (is_agy or is_codex) else tool_name
+    mapped_input = normalize_tool_args(tool_name, tool_input) if (is_agy or is_codex) else tool_input
     
     protocols = ["http", "https"]
     ctx = ssl.create_default_context()
@@ -276,7 +346,7 @@ def main():
             deny(f"Tool {mapped_name} is disabled in Backstage mode. Use the 'loom-state-cards' MCP tools to manage character and scene data.", event_name=event_name)
 
     # Auto-approve read-only tools
-    if mapped_name in READ_ONLY:
+    if event_name != "PermissionRequest" and mapped_name in READ_ONLY:
         allow(f"Read-only tool: {mapped_name}", event_name=event_name)
 
     request["loom_conv_id"] = conv_id

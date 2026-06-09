@@ -19,15 +19,46 @@ THRESHOLD_LOCAL_OLLAMA = 28_000     # conservative for 32k-window local models
 VLLM_SAFETY_MARGIN = 0.85           # 85% of configured max-model-len
 
 
+import re as _re
+
+# claude-<family>-<major>[-<minor>][-date], minor optional (matches server.py).
+_1M_ID_RE = _re.compile(r"^claude-(fable|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?")
+
+# Minimum version per family that actually has a 1M tier. Opus only from 4.7;
+# Opus 4.6[1m] rate-limits/fails. Sonnet across our range. Haiku never.
+_1M_MIN_VERSION = {"fable": (5, 0), "opus": (4, 7), "sonnet": (4, 5)}
+
+
 def is_1m_anthropic(model_id: str) -> bool:
     """True for 1M-context Anthropic models.
 
-    Loom surfaces 1M variants as `<base>[1m]` (e.g. `sonnet[1m]`, `opus[1m]`).
+    Loom surfaces supported 1M variants as `<base>[1m]` — either an alias
+    (`sonnet[1m]`, `opus[1m]`, which resolve to the family's latest version) or a
+    pinned full id (`claude-opus-4-7[1m]`). Family-level aliases always count
+    since the latest version supports 1M; pinned ids are gated by version so an
+    old `claude-opus-4-6[1m]` does not bypass the handoff as if it were real 1M.
     """
     if not model_id:
         return False
     m = model_id.lower()
-    return "[1m]" in m
+    base = m.split("[")[0] if "[" in m else m
+    if base.startswith("claude-fable-"):
+        match = _1M_ID_RE.match(base)
+        if not match:
+            return False
+        version = (int(match.group(2)), int(match.group(3) or 0))
+        return version >= _1M_MIN_VERSION["fable"]
+    if "[1m]" not in m:
+        return False
+    if base in ("sonnet", "opus"):
+        return True
+    match = _1M_ID_RE.match(base)
+    if not match:
+        return False
+    family = match.group(1)
+    version = (int(match.group(2)), int(match.group(3) or 0))
+    floor = _1M_MIN_VERSION.get(family)
+    return floor is not None and version >= floor
 
 
 def is_anthropic(model_id: str) -> bool:
@@ -41,7 +72,7 @@ def is_anthropic(model_id: str) -> bool:
     bl = base.lower()
     if bl in ("sonnet", "opus", "haiku"):
         return True
-    return bl.startswith(("claude-opus-", "claude-sonnet-", "claude-haiku-"))
+    return bl.startswith(("claude-fable-", "claude-opus-", "claude-sonnet-", "claude-haiku-"))
 
 
 def is_gemini(model_id: str) -> bool:
