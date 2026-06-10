@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Loom Admin</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text x='4' y='25' font-size='24' fill='%2300ffff'>◈</text></svg>">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/assets/admin.css?v=1">
+</head>
+<body>
+    <div class="bg-glow bg-glow-1"></div>
+    <div class="bg-glow bg-glow-2"></div>
+    <div class="bg-grid"></div>
+
+    <div id="shell">
+        <aside id="sidebar">
+            <div class="brand">
+                <span class="brand-mark">◈</span>
+                <span class="brand-text">LOOM<em>ADMIN</em></span>
+            </div>
+            <nav id="nav">
+                <button class="nav-item active" data-view="overview"><span class="nav-icon">⌂</span><span class="nav-label">Overview</span></button>
+                <button class="nav-item" data-view="servers"><span class="nav-icon">⛁</span><span class="nav-label">Servers</span></button>
+                <button class="nav-item" data-view="terminal"><span class="nav-icon">⌨</span><span class="nav-label">Terminal</span></button>
+                <button class="nav-item" data-view="tools"><span class="nav-icon">⚒</span><span class="nav-label">Tools</span></button>
+                <button class="nav-item" data-view="cron"><span class="nav-icon">⏲</span><span class="nav-label">Cron</span></button>
+            </nav>
+            <div class="sidebar-foot">
+                <div class="pulse-grid" id="pulse-grid" title="Live port probes"></div>
+                <button class="btn btn-cyan btn-block" id="btn-admin-restart">↻ Restart Admin</button>
+                <button class="btn btn-warn btn-block" id="btn-admin-shutdown">⏻ Shutdown Admin</button>
+                <div class="foot-note">admin :<span id="admin-port">…</span></div>
+            </div>
+        </aside>
+
+        <main id="content">
+            <header id="topbar">
+                <h1 id="view-title">Overview</h1>
+                <div id="quick-links" class="quick-links"></div>
+            </header>
+
+            <!-- ── Overview ─────────────────────────────────────────── -->
+            <section id="view-overview" class="view active">
+                <div class="card-row" id="instance-cards"></div>
+
+                <div class="card">
+                    <div class="card-head">
+                        <h2>Active Generations <span class="count" id="gens-count"></span></h2>
+                    </div>
+                    <div id="generations-empty" class="empty-note">None tracked.</div>
+                    <table id="generations-table" class="data-table" style="display:none;">
+                        <thead><tr><th>Conv</th><th>Draft</th><th>PID</th><th>Status</th><th>Mode</th><th>Age</th><th></th></tr></thead>
+                        <tbody id="generations-body"></tbody>
+                    </table>
+                </div>
+
+                <div class="card">
+                    <div class="card-head">
+                        <h2>System</h2>
+                        <button class="btn btn-ghost" id="btn-specs-refresh">↻ Refresh</button>
+                    </div>
+                    <div id="specs-panel" class="specs-host"><div class="empty-note">Loading specs…</div></div>
+                </div>
+            </section>
+
+            <!-- ── Servers ──────────────────────────────────────────── -->
+            <section id="view-servers" class="view">
+                <div class="card server-card" data-server="llama">
+                    <div class="card-head">
+                        <h2><span class="dot" id="dot-llama"></span> Llama Server <span class="port-tag" id="llama-port-tag"></span></h2>
+                        <div class="head-actions">
+                            <button class="btn btn-green" onclick="runTool('llama-start', {target:'out-llama'})">▶ Start</button>
+                            <button class="btn btn-cyan" onclick="runTool('llama-restart', {target:'out-llama'})">↻ Restart</button>
+                            <button class="btn btn-warn" onclick="confirmTool('llama-stop', 'Stop Llama Server?', {target:'out-llama'})">⏹ Stop</button>
+                        </div>
+                    </div>
+                    <div class="action-row">
+                        <button class="btn btn-ghost" onclick="runTool('llama-status', {target:'out-llama'})">Status</button>
+                        <button class="btn btn-ghost" onclick="runTool('llama-models', {target:'out-llama'})">Model list</button>
+                        <button class="btn btn-ghost" onclick="runTool('clear-vram', {target:'out-llama'})">💥 Clear VRAM</button>
+                    </div>
+                    <pre class="server-out" id="out-llama"></pre>
+                </div>
+
+                <div class="card server-card" data-server="comfy">
+                    <div class="card-head">
+                        <h2><span class="dot" id="dot-comfy"></span> ComfyUI <span class="port-tag">:8188</span></h2>
+                        <div class="head-actions">
+                            <button class="btn btn-green" onclick="runTool('comfyui-start', {target:'out-comfy'})">▶ Start</button>
+                            <button class="btn btn-warn" onclick="confirmTool('comfyui-stop', 'Kill ComfyUI?', {target:'out-comfy'})">⏹ Stop</button>
+                        </div>
+                    </div>
+                    <div class="action-row">
+                        <button class="btn btn-ghost" onclick="runTool('comfyui-status', {target:'out-comfy'})">Status</button>
+                        <button class="btn btn-ghost" onclick="runTool('comfyui-free', {target:'out-comfy'})">Free VRAM</button>
+                        <button class="btn btn-ghost" onclick="runTool('comfyui-log', {target:'out-comfy', method:'GET'})">Log</button>
+                        <button class="btn btn-ghost" onclick="runTool('comfyui-fix-deps', {target:'out-comfy'})">Fix deps</button>
+                    </div>
+                    <pre class="server-out" id="out-comfy"></pre>
+                </div>
+
+                <div class="card server-card" data-server="nrol">
+                    <div class="card-head">
+                        <h2><span class="dot" id="dot-nrol"></span> NROL-AO <span class="port-tag" id="nrol-port-tag"></span></h2>
+                        <div class="head-actions">
+                            <button class="btn btn-green" onclick="runTool('nrol-dashboard-start', {target:'out-nrol'})">▶ Start</button>
+                            <button class="btn btn-warn" onclick="confirmTool('nrol-dashboard-stop', 'Stop NROL-AO dashboard if Loom admin launched it?', {target:'out-nrol'})">⏹ Stop</button>
+                        </div>
+                    </div>
+                    <div class="action-row">
+                        <button class="btn btn-ghost" onclick="runTool('nrol-status', {target:'out-nrol'})">Status</button>
+                        <button class="btn btn-ghost" onclick="runTool('nrol-topic-status', {target:'out-nrol'})">Topics</button>
+                        <button class="btn btn-ghost" onclick="runTool('nrol-mcp-activity', {target:'out-nrol'})">MCP activity</button>
+                        <button class="btn btn-ghost" onclick="runTool('nrol-mcp-smoke', {target:'out-nrol'})">MCP smoke test</button>
+                        <button class="btn btn-ghost" onclick="confirmTool('nrol-mcp-register', 'Register nrol-ao MCP in Claude Code user config?', {target:'out-nrol'})">Register MCP</button>
+                    </div>
+                    <pre class="server-out" id="out-nrol"></pre>
+                </div>
+            </section>
+
+            <!-- ── Terminal ─────────────────────────────────────────── -->
+            <section id="view-terminal" class="view">
+                <div class="card term-card">
+                    <div class="card-head">
+                        <h2><span class="dot" id="dot-ttyd"></span> Web Terminal <span class="port-tag" id="ttyd-port-tag"></span></h2>
+                        <div class="head-actions">
+                            <select id="ttyd-shell" class="select">
+                                <option value="powershell">PowerShell</option>
+                                <option value="cmd">cmd</option>
+                                <option value="claude">Claude Code</option>
+                            </select>
+                            <button class="btn btn-green" id="btn-ttyd-start">▶ Start</button>
+                            <button class="btn btn-warn" id="btn-ttyd-stop">⏹ Stop</button>
+                            <a class="btn btn-ghost" id="ttyd-open" target="_blank" rel="noopener">⧉ Open in tab</a>
+                        </div>
+                    </div>
+                    <div id="ttyd-hint" class="empty-note"></div>
+                    <iframe id="ttyd-frame" title="ttyd terminal"></iframe>
+                </div>
+            </section>
+
+            <!-- ── Tools ────────────────────────────────────────────── -->
+            <section id="view-tools" class="view">
+                <div class="card">
+                    <div class="card-head"><h2>Claude Auth</h2></div>
+                    <div class="tools-grid">
+                        <button class="tool-btn" onclick="runTool('auth-status')"><span class="icon">🔑</span> Auth Status<span class="label">Check Claude login</span></button>
+                        <button class="tool-btn" onclick="runTool('auth-refresh')"><span class="icon">🔄</span> Auth Check/Fix<span class="label">Test auth, show fix steps</span></button>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-head"><h2>Maintenance</h2></div>
+                    <div class="tools-grid">
+                        <button class="tool-btn" onclick="runTool('clear-vram')"><span class="icon">💥</span> Clear VRAM<span class="label">Unload all models</span></button>
+                        <button class="tool-btn" onclick="runTool('disk-usage')"><span class="icon">💾</span> Disk Usage<span class="label">DB &amp; log sizes</span></button>
+                        <button class="tool-btn" onclick="runTool('system-specs')"><span class="icon">💻</span> System Specs<span class="label">CPU / RAM / VRAM</span></button>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-head"><h2>Output</h2></div>
+                    <div id="tool-output"></div>
+                </div>
+            </section>
+
+            <!-- ── Cron ─────────────────────────────────────────────── -->
+            <section id="view-cron" class="view">
+                <div class="card">
+                    <div class="card-head">
+                        <h2>Cron Jobs <span class="count" id="cron-count"></span></h2>
+                        <div class="head-actions">
+                            <button id="cron-active-tab" class="btn btn-ghost active" onclick="setCronTab(false)">Active</button>
+                            <button id="cron-archive-tab" class="btn btn-ghost" onclick="setCronTab(true)">Archive</button>
+                            <a href="/api/cron-help-proxy" target="_blank" class="btn btn-ghost">Help</a>
+                        </div>
+                    </div>
+                    <div id="cron-empty" class="empty-note">None tracked.</div>
+                    <table id="cron-table" class="data-table" style="display:none;">
+                        <thead><tr><th>ID</th><th>Conv</th><th>Script</th><th>Repeat</th><th>Last</th><th>Next</th><th>Status</th><th>Details</th><th>Actions</th></tr></thead>
+                        <tbody id="cron-body"></tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <div id="toast"></div>
+    <script src="/assets/admin.js?v=1"></script>
+</body>
+</html>

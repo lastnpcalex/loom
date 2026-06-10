@@ -40,7 +40,7 @@ if sys.platform == "win32":
 
 
 from fastapi import Body, FastAPI, Request, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 import uvicorn
 import httpx
 import io
@@ -1559,621 +1559,208 @@ async def terminal_ws(websocket: WebSocket):
 
 
 # ---------------------------------------------------------------------------
-# Dashboard
+# ttyd — real web terminal (embedded in the dashboard Terminal tab)
 # ---------------------------------------------------------------------------
+
+TTYD_PORT = int(os.getenv("TTYD_PORT", "7681"))
+# Localhost-only by default: ttyd is a full shell in a browser. Set
+# TTYD_HOST=0.0.0.0 plus TTYD_CRED=user:pass to expose it over Tailscale/LAN.
+TTYD_HOST = os.getenv("TTYD_HOST", "127.0.0.1")
+TTYD_CRED = os.getenv("TTYD_CRED", "")
+
+_TTYD_SHELLS = {
+    "powershell": ["powershell.exe", "-NoLogo"],
+    "cmd": ["cmd.exe"],
+    "claude": ["claude"],
+}
+
+
+def _find_ttyd_exe() -> str:
+    env_exe = os.getenv("TTYD_EXE", "")
+    if env_exe and Path(env_exe).exists():
+        return env_exe
+    local = Path(__file__).parent / "bin" / "ttyd.exe"
+    if local.exists():
+        return str(local)
+    import shutil
+    return shutil.which("ttyd") or ""
+
+
+def _ttyd_ssl_files() -> tuple[str, str]:
+    base = Path(__file__).resolve().parent
+    cert = os.getenv("LOOM_SSL_CERT", str(base / "certs" / "cert.pem"))
+    key = os.getenv("LOOM_SSL_KEY", str(base / "certs" / "key.pem"))
+    if os.path.exists(cert) and os.path.exists(key):
+        return cert, key
+    return "", ""
+
+
+def _port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+@app.get("/api/ttyd-status")
+async def api_ttyd_status():
+    proc = _child_procs.get("ttyd")
+    if proc and proc.poll() is not None:
+        _child_procs.pop("ttyd", None)
+        proc = None
+    running = _port_in_use(TTYD_PORT)
+    cert, _key = _ttyd_ssl_files()
+    return JSONResponse({
+        "running": running,
+        "pid": proc.pid if proc and running else None,
+        "port": TTYD_PORT,
+        "host": TTYD_HOST,
+        "ssl": bool(cert),
+        "auth": bool(TTYD_CRED),
+        "exe": _find_ttyd_exe(),
+        "shells": list(_TTYD_SHELLS.keys()),
+    })
+
+
+@app.post("/tools/ttyd-start")
+async def tool_ttyd_start(body: dict = Body(default={})):
+    """Launch ttyd serving an interactive shell over the web."""
+    exe = _find_ttyd_exe()
+    if not exe:
+        return JSONResponse({
+            "status": "error",
+            "output": "ttyd.exe not found — put it at bin/ttyd.exe, set TTYD_EXE, "
+                      "or add it to PATH (https://github.com/tsl0922/ttyd/releases)",
+        })
+    if _port_in_use(TTYD_PORT):
+        return JSONResponse({"status": "ok", "output": f"ttyd already running on :{TTYD_PORT}"})
+
+    shell_key = (body or {}).get("shell", "powershell")
+    shell_cmd = _TTYD_SHELLS.get(shell_key, _TTYD_SHELLS["powershell"])
+    if shell_key == "claude":
+        import shutil
+        resolved = shutil.which("claude")
+        if not resolved:
+            return JSONResponse({"status": "error", "output": "claude CLI not found on PATH"})
+        shell_cmd = [resolved]
+
+    cmd = [exe, "-p", str(TTYD_PORT), "-i", TTYD_HOST, "-W"]
+    if TTYD_CRED:
+        cmd += ["-c", TTYD_CRED]
+    cert, key = _ttyd_ssl_files()
+    if cert:
+        # Same self-signed certs as the dashboard — if the page is https an
+        # http iframe would be blocked as mixed content.
+        cmd += ["-S", "-C", cert, "-K", key]
+    cmd += shell_cmd
+
+    log_path = Path(__file__).parent / "ttyd.log"
+    try:
+        log = open(log_path, "a")
+        proc = subprocess.Popen(
+            cmd, cwd=str(Path(__file__).parent),
+            stdout=log, stderr=log,
+            creationflags=0x08000000 | 0x00000200,  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        )
+        _child_procs["ttyd"] = proc
+        await asyncio.sleep(1.0)
+        if proc.poll() is not None:
+            return JSONResponse({
+                "status": "error",
+                "output": f"ttyd exited immediately (code {proc.returncode}) — see ttyd.log",
+            })
+        scheme = "https" if cert else "http"
+        return JSONResponse({
+            "status": "ok",
+            "output": f"ttyd running ({shell_key}) on {scheme}://{TTYD_HOST}:{TTYD_PORT} (PID {proc.pid})",
+        })
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": f"Failed to launch ttyd: {e}"})
+
+
+@app.post("/tools/ttyd-stop")
+async def tool_ttyd_stop():
+    """Stop the tracked ttyd process (and any stray ttyd.exe)."""
+    lines = []
+    proc = _child_procs.pop("ttyd", None)
+    if proc and proc.poll() is None:
+        proc.kill()
+        lines.append(f"Killed tracked ttyd (PID {proc.pid}).")
+    try:
+        r = subprocess.run(
+            ["taskkill", "/F", "/IM", "ttyd.exe", "/T"],
+            capture_output=True, text=True, timeout=10,
+        )
+        out = (r.stdout or r.stderr or "").strip()
+        if out:
+            lines.append(out)
+    except Exception as e:
+        lines.append(f"taskkill: {e}")
+    return JSONResponse({"status": "ok", "output": "\n".join(lines) or "ttyd was not running."})
+
+
+# ---------------------------------------------------------------------------
+# Dashboard — static single-page app (static/admin/) over the JSON API
+# ---------------------------------------------------------------------------
+
+_ADMIN_STATIC = Path(__file__).parent / "static" / "admin"
+
+
+@app.get("/api/meta")
+async def api_meta():
+    """Ports and link targets for the dashboard. The client rebuilds links
+    with the page's own hostname so everything works over Tailscale."""
+    cert, _ = _ttyd_ssl_files()
+    return JSONResponse({
+        "admin_port": ADMIN_PORT,
+        "llama_port": _get_llama_port(),
+        "nrol_port": NROL_AO_PORT,
+        "comfy_port": 8188,
+        "main_port": INSTANCES["main"]["port"],
+        "test_port": INSTANCES["test"]["port"],
+        "ttyd": {"port": TTYD_PORT, "host": TTYD_HOST, "ssl": bool(cert)},
+    })
+
+
+@app.get("/api/ports-status")
+async def api_ports_status():
+    """Cheap TCP liveness probes for the dashboard status dots."""
+    ports = {
+        "main": INSTANCES["main"]["port"],
+        "test": INSTANCES["test"]["port"],
+        "llama": _get_llama_port(),
+        "nrol": NROL_AO_PORT,
+        "comfy": 8188,
+        "ttyd": TTYD_PORT,
+    }
+    results = await asyncio.gather(
+        *[asyncio.to_thread(_port_in_use, p) for p in ports.values()]
+    )
+    return JSONResponse({name: up for name, up in zip(ports, results)})
+
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    statuses = await asyncio.gather(
-        *[check_instance(name, info) for name, info in INSTANCES.items()]
-    )
+    index = _ADMIN_STATIC / "index.html"
+    if not index.exists():
+        return HTMLResponse("<h1>Loom Admin</h1><p>static/admin/index.html is missing.</p>", status_code=500)
+    return HTMLResponse(index.read_text(encoding="utf-8"))
 
-    rows = ""
-    for s in statuses:
-        color = "#0f6" if s["status"] == "online" else "#f44"
-        dot = f'<span style="color:{color}; font-size:20px;">&#9679;</span>'
-        managed_tag = ' <span class="tag">managed</span>' if s.get("managed") else ""
-        pid_info = f"PID {s['pid']}" if s.get("pid") else "\u2014"
 
-        actions = ""
-        if s["status"] == "online":
-            actions += f'<button onclick="doAction(\'{s["name"]}\', \'shutdown\')" class="btn btn-warn">Shutdown</button> '
-            actions += f'<button onclick="doAction(\'{s["name"]}\', \'restart\')" class="btn btn-cyan">Restart</button>'
-        else:
-            actions += f'<button onclick="doAction(\'{s["name"]}\', \'start\')" class="btn btn-green">Start</button>'
-
-        rows += f"""
-        <tr>
-            <td>{dot} {s['label']}{managed_tag}</td>
-            <td>:{s['port']}</td>
-            <td>{s['db']}</td>
-            <td>{pid_info}</td>
-            <td>{actions}</td>
-        </tr>"""
-
-    # Check terminal status
-    term_proc = _child_procs.get("claude_term")
-    term_status = "online" if term_proc and term_proc.poll() is None else "offline"
-    term_pid = term_proc.pid if term_proc and term_proc.poll() is None else None
-
-    # Terminal section HTML
-    if term_status == "online":
-        terminal_html = f"""
-<h2>Terminal</h2>
-<div style="margin-bottom: 12px;">
-    <button onclick="doAction('claude_term', 'shutdown')" class="btn btn-warn">Stop Terminal</button>
-</div>
-<div style="margin-bottom: 8px;">
-    <div style="font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; padding: 10px; background: #000; border-radius: 6px; height: 200px; overflow-y: auto; white-space: pre-wrap; color: #0f6;">
-        {""}
-    </div>
-    <textarea id="term-input" style="width: 100%; box-sizing: border-box; font-family: 'Consolas', monospace; font-size: 12px; padding: 8px; background: #111; border: 1px solid #0ff; color: #0f6; border-radius: 4px;" placeholder="Type commands here (e.g., claude auth status, /auth refresh)..."></textarea>
-    <div style="font-size: 11px; color: #666; margin-top: 6px;">Commands execute in Claude Code. Press Ctrl+C in the terminal to exit.</div>
-</div>
-"""
-    else:
-        terminal_html = """
-<h2>Terminal</h2>
-<button onclick="doAction('claude_term', 'start')" class="btn btn-green">Start Terminal</button>
-"""
-
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-<title>Loom Admin</title>
-<style>
-    body {{ font-family: 'Segoe UI', sans-serif; background: #0a0a19; color: #ddd; margin: 0; padding: 24px; }}
-    h1 {{ color: #0ff; font-size: 22px; margin-bottom: 20px; }}
-    h2 {{ color: #0ff; font-size: 16px; margin: 24px 0 12px 0; }}
-    table {{ width: 100%; border-collapse: collapse; }}
-    th {{ text-align: left; color: #888; font-size: 12px; text-transform: uppercase; padding: 8px; border-bottom: 1px solid #333; }}
-    td {{ padding: 12px 8px; border-bottom: 1px solid #1a1a2e; }}
-    .btn {{ padding: 6px 14px; border: 1px solid; border-radius: 4px; cursor: pointer; font-size: 13px; background: none; transition: 0.2s; }}
-    .btn-warn {{ color: #f90; border-color: #f90; }}
-    .btn-warn:hover {{ background: rgba(255,153,0,0.15); }}
-    .btn-cyan {{ color: #0ff; border-color: #0ff; }}
-    .btn-cyan:hover {{ background: rgba(0,255,255,0.15); }}
-    .btn-green {{ color: #0f6; border-color: #0f6; }}
-    .btn-green:hover {{ background: rgba(0,255,102,0.15); }}
-    .tag {{ font-size: 10px; background: rgba(0,255,255,0.15); color: #0ff; padding: 2px 6px; border-radius: 3px; }}
-    #toast {{ position: fixed; bottom: 20px; right: 20px; padding: 12px 20px; background: #1a1a2e; border: 1px solid #0ff; border-radius: 6px; display: none; z-index: 100; }}
-    .refresh-note {{ color: #666; font-size: 12px; margin-top: 16px; }}
-    .tools-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; margin-bottom: 12px; }}
-    .tool-btn {{ padding: 10px 14px; border: 1px solid #444; border-radius: 6px; cursor: pointer; font-size: 13px; background: rgba(255,255,255,0.03); color: #ccc; transition: 0.2s; text-align: left; }}
-    .tool-btn:hover {{ background: rgba(0,255,255,0.08); border-color: #0ff; color: #fff; }}
-    .tool-btn .icon {{ font-size: 18px; display: block; margin-bottom: 4px; }}
-    .tool-btn .label {{ font-size: 12px; color: #888; }}
-    #tool-output {{ font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; padding: 12px; background: #000; border-radius: 6px; min-height: 60px; max-height: 300px; overflow-y: auto; white-space: pre-wrap; color: #0f6; border: 1px solid #1a1a2e; display: none; }}
-    #tool-output.visible {{ display: block; }}
-    #tool-output.error {{ color: #f66; }}
-    .spinner {{ display: inline-block; width: 14px; height: 14px; border: 2px solid #0ff; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; }}
-    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-    .terminal-input {{ width: 100%; box-sizing: border-box; font-family: 'Consolas', monospace; font-size: 12px; padding: 8px; background: #111; border: 1px solid #0ff; color: #0f6; border-radius: 4px; }}
-    .quick-links {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }}
-    .quick-link {{ padding: 8px 14px; border: 1px solid #0ff; border-radius: 6px; color: #0ff; text-decoration: none; font-size: 13px; background: rgba(0,255,255,0.05); transition: 0.2s; }}
-    .quick-link:hover {{ background: rgba(0,255,255,0.18); }}
-    .tabs {{ display: flex; gap: 8px; margin: 4px 0 10px; }}
-    .tab-btn {{ padding: 5px 10px; border: 1px solid #444; background: rgba(255,255,255,0.03); color: #aaa; border-radius: 4px; cursor: pointer; }}
-    .tab-btn.active {{ border-color: #0ff; color: #0ff; background: rgba(0,255,255,0.08); }}
-    details.cron-detail summary {{ cursor: pointer; color: #0ff; }}
-    details.cron-detail pre {{ white-space: pre-wrap; color: #aaa; background: #070711; border: 1px solid #222; padding: 8px; border-radius: 4px; max-height: 180px; overflow: auto; }}
-    
-    /* System Specs Styles */
-    .specs-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 10px; font-family: 'Segoe UI', sans-serif; }}
-    .spec-card {{ background: rgba(255,255,255,0.02); border: 1px solid rgba(0,255,255,0.1); border-radius: 8px; padding: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); transition: transform 0.2s, border-color 0.2s; }}
-    .spec-card:hover {{ transform: translateY(-2px); border-color: rgba(0,255,255,0.3); background: rgba(255,255,255,0.04); }}
-    .spec-header {{ display: flex; align-items: center; gap: 8px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 8px; margin-bottom: 12px; }}
-    .spec-icon {{ font-size: 20px; }}
-    .spec-title {{ font-size: 14px; font-weight: bold; color: #0ff; text-transform: uppercase; letter-spacing: 0.5px; }}
-    .spec-body {{ display: flex; flex-direction: column; gap: 6px; }}
-    .spec-row {{ display: flex; justify-content: space-between; font-size: 12px; }}
-    .spec-lbl {{ color: #888; }}
-    .spec-val {{ color: #fff; font-weight: 500; text-align: right; }}
-    .spec-bar-container {{ margin-top: 12px; }}
-    .spec-bar-label {{ font-size: 11px; color: #aaa; margin-bottom: 4px; display: flex; justify-content: space-between; }}
-    .spec-bar-track {{ background: rgba(255,255,255,0.08); height: 8px; border-radius: 4px; overflow: hidden; border: 1px solid rgba(255,255,255,0.05); }}
-    .spec-bar-fill {{ height: 100%; border-radius: 4px; transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1); }}
-    .fill-cpu {{ background: linear-gradient(90deg, #00c6ff, #0072ff); box-shadow: 0 0 8px rgba(0, 198, 255, 0.5); }}
-    .fill-ram {{ background: linear-gradient(90deg, #00f2fe, #4facfe); box-shadow: 0 0 8px rgba(0, 242, 254, 0.5); }}
-    .fill-gpu {{ background: linear-gradient(90deg, #f9d423, #ff4e50); box-shadow: 0 0 8px rgba(255, 78, 80, 0.5); }}
-    .spec-error {{ font-size: 12px; color: #f66; padding: 10px; background: rgba(255,102,102,0.1); border-radius: 4px; text-align: center; }}
-    #tool-output.html-mode {{ font-family: inherit; color: inherit; white-space: normal; background: #0d0d21; border-color: rgba(0,255,255,0.15); max-height: none; }}
-</style>
-</head>
-<body>
-<h1>Loom Admin</h1>
-
-<div class="quick-links">
-    <a href="https://localhost:3000" target="_blank" class="quick-link">&#127760; Main Loom (:3000)</a>
-    <a href="http://localhost:3001" target="_blank" class="quick-link">&#129514; Test Server (:3001)</a>
-    <a href="http://localhost:{_get_llama_port()}" target="_blank" class="quick-link">&#129303; Llama Server (:{_get_llama_port()})</a>
-    <a href="http://localhost:{NROL_AO_PORT}" target="_blank" class="quick-link">&#128200; NROL-AO (:{NROL_AO_PORT})</a>
-    <a href="http://localhost:8188" target="_blank" class="quick-link">&#127912; ComfyUI (:8188)</a>
-</div>
-
-<table id="instances-table">
-    <tr><th>Instance</th><th>Port</th><th>Database</th><th>PID</th><th>Actions</th></tr>
-    <tbody id="instances-body">{rows}</tbody>
-</table>
-
-<h2>Active Generations <span id="gens-count" style="color:#888; font-size:12px; font-weight:normal;"></span></h2>
-<div id="generations-panel">
-    <div id="generations-empty" style="color:#666; font-size:12px; padding:8px 0;">None tracked.</div>
-    <table id="generations-table" style="display:none;">
-        <tr><th>Conv</th><th>Draft</th><th>PID</th><th>Status</th><th>Mode</th><th>Started</th><th></th></tr>
-        <tbody id="generations-body"></tbody>
-    </table>
-</div>
-
-<h2>Cron Jobs <span id="cron-count" style="color:#888; font-size:12px; font-weight:normal;"></span></h2>
-<div class="tabs">
-    <button id="cron-active-tab" class="tab-btn active" onclick="setCronTab(false)">Active</button>
-    <button id="cron-archive-tab" class="tab-btn" onclick="setCronTab(true)">Archive</button>
-    <a href="/api/cron-help-proxy" target="_blank" class="quick-link" style="padding:5px 10px;">Help</a>
-</div>
-<div id="cron-empty" style="color:#666; font-size:12px; padding:8px 0;">None tracked.</div>
-<table id="cron-table" style="display:none;">
-    <tr><th>ID</th><th>Conv</th><th>Script</th><th>Repeat</th><th>Last</th><th>Next</th><th>Status</th><th>Details</th><th>Actions</th></tr>
-    <tbody id="cron-body"></tbody>
-</table>
-
-{terminal_html}
-<h2>Tools</h2>
-<div class="tools-grid">
-    <button class="tool-btn" onclick="runTool('auth-status')">
-        <span class="icon">&#128273;</span> Auth Status
-        <span class="label">Check Claude login</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('auth-refresh')">
-        <span class="icon">&#128260;</span> Auth Check/Fix
-        <span class="label">Test auth, show fix steps</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('clear-vram')">
-        <span class="icon">&#128165;</span> Clear VRAM
-        <span class="label">Unload all models</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('llama-status')">
-        <span class="icon">&#128202;</span> Llama Status
-        <span class="label">Running server info</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('llama-models')">
-        <span class="icon">&#128451;</span> Model List
-        <span class="label">Available .gguf files</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('llama-start')">
-        <span class="icon">&#9658;</span> Start Llama
-        <span class="label">Launch llama-server</span>
-    </button>
-    <button class="tool-btn" onclick="confirmTool('llama-stop', 'Stop Llama Server?')">
-        <span class="icon">&#9209;</span> Stop Llama
-        <span class="label">Terminate llama-server</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('llama-restart')">
-        <span class="icon">&#128260;</span> Restart Llama
-        <span class="label">Stop + start llama-server</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('nrol-status')">
-        <span class="icon">&#128200;</span> NROL Status
-        <span class="label">Repo, MCP, dashboard, llama</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('nrol-topic-status')">
-        <span class="icon">&#128202;</span> NROL Topics
-        <span class="label">Freshness and queues</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('nrol-mcp-activity')">
-        <span class="icon">&#128221;</span> MCP Activity
-        <span class="label">Recent tool jobs</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('nrol-dashboard-start')">
-        <span class="icon">&#9658;</span> Start NROL
-        <span class="label">Launch NROL dashboard</span>
-    </button>
-    <button class="tool-btn" onclick="confirmTool('nrol-dashboard-stop', 'Stop NROL-AO dashboard if Loom admin launched it?')">
-        <span class="icon">&#9209;</span> Stop NROL
-        <span class="label">Terminate tracked dashboard</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('nrol-mcp-smoke')">
-        <span class="icon">&#129514;</span> NROL MCP Test
-        <span class="label">Import/status smoke test</span>
-    </button>
-    <button class="tool-btn" onclick="confirmTool('nrol-mcp-register', 'Register nrol-ao MCP in Claude Code user config?')">
-        <span class="icon">&#128279;</span> Register NROL MCP
-        <span class="label">claude mcp add nrol-ao</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('comfyui-status')">
-        <span class="icon">&#127912;</span> ComfyUI Status
-        <span class="label">Is it running?</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('comfyui-free')">
-        <span class="icon">&#128165;</span> ComfyUI Free
-        <span class="label">Unload models &amp; free VRAM</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('comfyui-start')">
-        <span class="icon">&#9658;</span> Start ComfyUI
-        <span class="label">py -3.12 main.py --listen</span>
-    </button>
-    <button class="tool-btn" onclick="confirmTool('comfyui-stop', 'Kill ComfyUI?')">
-        <span class="icon">&#9209;</span> Stop ComfyUI
-        <span class="label">Terminate ComfyUI process</span>
-    </button>
-    <button class="tool-btn" onclick="runToolGet('comfyui-log')">
-        <span class="icon">&#128221;</span> ComfyUI Log
-        <span class="label">Last 80 lines of startup log</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('comfyui-fix-deps')">
-        <span class="icon">&#128295;</span> Fix ComfyUI Deps
-        <span class="label">pip upgrade huggingface-hub + transformers</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('disk-usage')">
-        <span class="icon">&#128190;</span> Disk Usage
-        <span class="label">DB &amp; log sizes</span>
-    </button>
-    <button class="tool-btn" onclick="runTool('system-specs')">
-        <span class="icon">&#128187;</span> System Specs
-        <span class="label">CPU-Z / VRAM check</span>
-    </button>
-</div>
-<div id="tool-output"></div>
-
-<h2>Admin Server</h2>
-<div style="margin-bottom: 12px;">
-    <button onclick="adminAction('restart')" class="btn btn-cyan">Restart Admin</button>
-    <button onclick="adminAction('shutdown')" class="btn btn-warn">Shutdown Admin</button>
-    <span style="color:#666; font-size:12px; margin-left:10px;">(connection drops; page auto-reloads after restart)</span>
-</div>
-<p class="refresh-note">Live updates via AJAX (no page reload) &mdash; admin running on :{ADMIN_PORT}</p>
-<div id="toast"></div>
-<script>
-    // Rewrite the static localhost hrefs in the quick-links to use the page's
-    // own hostname, so the row of "Main Loom / Test / Ollama / ComfyUI" links
-    // works over Tailscale without hardcoding the host IP.
-    document.addEventListener('DOMContentLoaded', () => {{
-        document.querySelectorAll('a[href*="localhost"], a[href*="127.0.0.1"]').forEach(a => {{
-            try {{
-                const u = new URL(a.href);
-                u.hostname = location.hostname;
-                a.href = u.toString();
-            }} catch (e) {{}}
-        }});
-    }});
-    function showToast(msg) {{
-        const t = document.getElementById('toast');
-        t.textContent = msg;
-        t.style.display = 'block';
-        setTimeout(() => t.style.display = 'none', 3000);
-    }}
-    async function doAction(name, action) {{
-        showToast(action + 'ing ' + name + '...');
-        const r = await fetch('/action/' + name + '/' + action, {{method: 'POST'}});
-        const d = await r.json();
-        showToast(d.status || d.error || 'done');
-        setTimeout(refreshAll, 1500);
-    }}
-
-    async function adminAction(action) {{
-        showToast('admin ' + action + '...');
-        const url = action === 'shutdown' ? '/shutdown' : '/admin/restart';
-        try {{
-            const r = await fetch(url, {{method: 'POST'}});
-            const d = await r.json();
-            showToast(d.status || 'done');
-        }} catch (e) {{ /* connection drops — expected */ }}
-        if (action === 'restart') {{
-            // Poll until admin comes back, then reload
-            showToast('admin restarting — waiting for :' + {ADMIN_PORT} + '...');
-            const start = Date.now();
-            const poll = async () => {{
-                try {{
-                    const p = await fetch('/api/status', {{cache: 'no-store'}});
-                    if (p.ok) {{ location.reload(); return; }}
-                }} catch (e) {{}}
-                if (Date.now() - start < 20000) setTimeout(poll, 1000);
-                else showToast('admin did not come back — check logs');
-            }};
-            setTimeout(poll, 2500);
-        }}
-    }}
-
-    // ── AJAX status polling (no full-page reloads) ──
-    let refreshTimer = null;
-    function scheduleRefresh(delay = 10000) {{
-        clearTimeout(refreshTimer);
-        refreshTimer = setTimeout(refreshAll, delay);
-    }}
-
-    async function refreshAll() {{
-        try {{
-            await Promise.all([refreshInstances(), refreshGenerations(), refreshCronJobs()]);
-        }} catch (e) {{ /* keep ticking */ }}
-        scheduleRefresh();
-    }}
-
-    async function refreshInstances() {{
-        const r = await fetch('/api/status', {{cache: 'no-store'}});
-        if (!r.ok) return;
-        const d = await r.json();
-        const body = document.getElementById('instances-body');
-        if (!body) return;
-        const rows = (d.instances || []).map(s => {{
-            const color = s.status === 'online' ? '#0f6' : '#f44';
-            const dot = '<span style="color:' + color + '; font-size:20px;">&#9679;</span>';
-            const managedTag = s.managed ? ' <span class="tag">managed</span>' : '';
-            const pidInfo = s.pid ? 'PID ' + s.pid : '\u2014';
-            let actions = '';
-            if (s.status === 'online') {{
-                actions += '<button onclick="doAction(\\'' + s.name + '\\', \\'shutdown\\')" class="btn btn-warn">Shutdown</button> ';
-                actions += '<button onclick="doAction(\\'' + s.name + '\\', \\'restart\\')" class="btn btn-cyan">Restart</button>';
-            }} else {{
-                actions += '<button onclick="doAction(\\'' + s.name + '\\', \\'start\\')" class="btn btn-green">Start</button>';
-            }}
-            return '<tr><td>' + dot + ' ' + s.label + managedTag + '</td>' +
-                '<td>:' + s.port + '</td><td>' + s.db + '</td><td>' + pidInfo + '</td>' +
-                '<td>' + actions + '</td></tr>';
-        }}).join('');
-        body.innerHTML = rows;
-    }}
-
-    async function refreshGenerations() {{
-        let gens = [];
-        try {{
-            const r = await fetch('/api/generations-proxy', {{cache: 'no-store'}});
-            if (r.ok) gens = await r.json();
-        }} catch (e) {{ /* ignore */ }}
-        const empty = document.getElementById('generations-empty');
-        const table = document.getElementById('generations-table');
-        const body = document.getElementById('generations-body');
-        const count = document.getElementById('gens-count');
-        if (!gens.length) {{
-            empty.style.display = 'block';
-            table.style.display = 'none';
-            count.textContent = '';
-            return;
-        }}
-        empty.style.display = 'none';
-        table.style.display = 'table';
-        count.textContent = '(' + gens.length + ')';
-        body.innerHTML = gens.map(g => {{
-            const status = g.in_memory ? 'running' : (g.pid_alive ? 'orphan' : 'dead');
-            const statusColor = status === 'running' ? '#0f6' : (status === 'orphan' ? '#f90' : '#666');
-            const age = g.started_at ? Math.round(Date.now()/1000 - g.started_at) + 's' : '—';
-            return '<tr>' +
-                '<td>' + g.conv_id + '</td>' +
-                '<td>#' + g.draft_msg_id + '</td>' +
-                '<td>' + (g.pid || '—') + '</td>' +
-                '<td><span style="color:' + statusColor + '">' + status + '</span></td>' +
-                '<td>' + (g.mode || '—') + '</td>' +
-                '<td>' + age + '</td>' +
-                '<td><button class="btn btn-warn" onclick="killGen(' + g.draft_msg_id + ')">Kill</button></td>' +
-                '</tr>';
-        }}).join('');
-    }}
-
-    let cronArchiveTab = false;
-
-    function setCronTab(archive) {{
-        cronArchiveTab = archive;
-        document.getElementById('cron-active-tab').classList.toggle('active', !archive);
-        document.getElementById('cron-archive-tab').classList.toggle('active', archive);
-        refreshCronJobs();
-    }}
-
-    function esc(s) {{
-        return String(s ?? '').replace(/[&<>"']/g, ch => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[ch]));
-    }}
-
-    async function refreshCronJobs() {{
-        let jobs = [];
-        try {{
-            const r = await fetch('/api/cron-proxy?include_archived=' + (cronArchiveTab ? 'true' : 'false'), {{cache: 'no-store'}});
-            if (r.ok) jobs = await r.json();
-        }} catch (e) {{ /* ignore */ }}
-        jobs = jobs.filter(j => cronArchiveTab ? j.archived : !j.archived);
-        const empty = document.getElementById('cron-empty');
-        const table = document.getElementById('cron-table');
-        const body = document.getElementById('cron-body');
-        const count = document.getElementById('cron-count');
-        count.textContent = jobs.length ? '(' + jobs.length + ')' : '';
-        if (!jobs.length) {{
-            empty.style.display = 'block';
-            table.style.display = 'none';
-            body.innerHTML = '';
-            return;
-        }}
-        empty.style.display = 'none';
-        table.style.display = 'table';
-        body.innerHTML = jobs.map(j => {{
-            const desc = esc(j.description || 'No description');
-            const output = esc([j.last_output, j.last_error].filter(Boolean).join('\\n'));
-            const status = j.archived ? 'archived' : (j.enabled ? (j.last_status || 'enabled') : 'disabled');
-            const actions = j.archived ? '' : `
-                <button class="btn btn-cyan" onclick="toggleCron(${{j.id}}, ${{j.enabled ? 'false' : 'true'}})">${{j.enabled ? 'Disable' : 'Enable'}}</button>
-                <button class="btn btn-warn" onclick="archiveCron(${{j.id}})">Archive</button>`;
-            return `<tr>
-                <td>#${{j.id}}</td>
-                <td>${{j.conv_id}}</td>
-                <td><code>${{esc(j.script)}}</code></td>
-                <td>${{Math.round((j.every_seconds || 0) / 60)}} min</td>
-                <td>${{esc(j.last_run_at_display || 'never')}}</td>
-                <td>${{esc(j.next_run_at_display || '-')}}</td>
-                <td>${{esc(status)}}${{j.last_exit_code !== null && j.last_exit_code !== undefined ? ' (' + j.last_exit_code + ')' : ''}}</td>
-                <td><details class="cron-detail"><summary>Description</summary><pre>${{desc}}</pre>${{output ? '<pre>' + output + '</pre>' : ''}}</details></td>
-                <td>${{actions}}</td>
-            </tr>`;
-        }}).join('');
-    }}
-
-    async function toggleCron(id, enabled) {{
-        try {{
-            const r = await fetch('/api/cron-proxy/' + id, {{
-                method: 'PUT',
-                headers: {{'Content-Type': 'application/json'}},
-                body: JSON.stringify({{enabled}})
-            }});
-            showToast(r.ok ? 'cron updated' : 'cron update failed');
-        }} catch (e) {{ showToast('cron update failed: ' + e); }}
-        setTimeout(refreshCronJobs, 300);
-    }}
-
-    async function archiveCron(id) {{
-        if (!confirm('Archive cron job #' + id + '?')) return;
-        try {{
-            const r = await fetch('/api/cron-proxy/' + id, {{method: 'DELETE'}});
-            showToast(r.ok ? 'cron archived' : 'cron archive failed');
-        }} catch (e) {{ showToast('cron archive failed: ' + e); }}
-        setTimeout(refreshCronJobs, 300);
-    }}
-
-    async function killGen(draftId) {{
-        if (!confirm('Kill generation #' + draftId + '?')) return;
-        showToast('killing #' + draftId);
-        try {{
-            const r = await fetch('/api/generations-proxy/' + draftId + '/kill', {{method: 'POST'}});
-            if (r.ok) {{ const d = await r.json(); showToast(d.status || 'killed'); }}
-            else showToast('kill failed');
-        }} catch (e) {{ showToast('kill failed: ' + e); }}
-        setTimeout(refreshAll, 500);
-    }}
-
-    // Kick off first refresh shortly after load (server already SSRed initial state).
-    scheduleRefresh(2000);
-
-    function confirmTool(name, msg) {{
-        if (confirm(msg)) runTool(name);
-    }}
-
-    async function runTool(name) {{
-        clearTimeout(refreshTimer);
-        const out = document.getElementById('tool-output');
-        out.className = 'visible';
-        out.innerHTML = '<span class="spinner"></span> Running ' + name + '...';
-        try {{
-            const r = await fetch('/tools/' + name, {{method: 'POST'}});
-            const d = await r.json();
-            if (d.status === 'login_started' && d.url) {{
-                out.innerHTML = d.output.replace(/\\n/g, '<br>') +
-                    '<br><br><a href="' + d.url + '" target="_blank" style="color:#0ff; font-size:14px; word-break:break-all;">' + d.url + '</a>' +
-                    '<br><br><div style="margin-top:8px;">' +
-                    'After authenticating, paste the code from the callback page:<br>' +
-                    '<input id="auth-code-input" type="text" placeholder="paste authorization code" ' +
-                    'style="width:60%; min-width:280px; padding:6px; margin-top:6px; ' +
-                    'background:#111; color:#0ff; border:1px solid #0ff; font-family:monospace;">' +
-                    ' <button class="btn btn-cyan" onclick="submitAuthCode()" style="margin-left:6px;">Submit</button>' +
-                    '</div>' +
-                    '<br><span id="login-poll" style="color:#888;">Waiting for login to complete...</span>';
-                pollLoginStatus();
-                const inp = document.getElementById('auth-code-input');
-                if (inp) {{
-                    inp.addEventListener('keydown', (e) => {{ if (e.key === 'Enter') submitAuthCode(); }});
-                    inp.focus();
-                }}
-                return;
-            }}
-            if (d.status === 'ok_html') {{
-                out.innerHTML = d.output;
-                out.className = 'visible html-mode';
-            }} else {{
-                out.textContent = d.output || '(no output)';
-                out.className = d.status === 'error' ? 'visible error' : 'visible';
-            }}
-        }} catch (e) {{
-            out.textContent = 'Request failed: ' + e;
-            out.className = 'visible error';
-        }}
-        scheduleRefresh(30000);
-    }}
-
-    async function runToolGet(name) {{
-        clearTimeout(refreshTimer);
-        const out = document.getElementById('tool-output');
-        out.className = 'visible';
-        out.innerHTML = '<span class="spinner"></span> Loading ' + name + '...';
-        try {{
-            const r = await fetch('/tools/' + name, {{method: 'GET'}});
-            const d = await r.json();
-            out.textContent = d.output || '(no output)';
-            out.className = d.status === 'error' ? 'visible error' : 'visible';
-        }} catch (e) {{
-            out.textContent = 'Request failed: ' + e;
-            out.className = 'visible error';
-        }}
-        scheduleRefresh(30000);
-    }}
-
-    async function submitAuthCode() {{
-        const inp = document.getElementById('auth-code-input');
-        if (!inp) return;
-        const code = inp.value.trim();
-        if (!code) {{ showToast('Paste the authorization code first'); return; }}
-        inp.disabled = true;
-        try {{
-            const r = await fetch('/tools/auth-submit-code', {{
-                method: 'POST',
-                headers: {{ 'Content-Type': 'application/json' }},
-                body: JSON.stringify({{ code: code }}),
-            }});
-            const d = await r.json();
-            showToast(d.output || (d.status === 'ok' ? 'submitted' : 'failed'));
-            if (d.status !== 'ok') inp.disabled = false;
-        }} catch (e) {{
-            showToast('submit failed: ' + e);
-            inp.disabled = false;
-        }}
-    }}
-
-    async function pollLoginStatus() {{
-        const poll = document.getElementById('login-poll');
-        if (!poll) return;
-        try {{
-            const r = await fetch('/tools/auth-login-status');
-            const d = await r.json();
-            if (d.status === 'waiting') {{
-                poll.innerHTML = '<span class="spinner"></span> ' + d.output;
-                setTimeout(pollLoginStatus, 3000);
-            }} else if (d.status === 'ok') {{
-                poll.style.color = '#0f6';
-                poll.textContent = d.output;
-                scheduleRefresh(5000);
-            }} else {{
-                poll.style.color = '#f66';
-                poll.textContent = d.output;
-                scheduleRefresh(10000);
-            }}
-        }} catch (e) {{
-            poll.textContent = 'Poll failed: ' + e;
-            refreshTimer = setTimeout(() => location.reload(), 10000);
-        }}
-    }}
-
-    // Terminal WebSocket — use the page's own host so this works over
-    // Tailscale (or any non-localhost access) without hardcoding the IP.
-    const termSocket = new WebSocket(`ws://${{location.host}}/ws/terminal`);
-    termSocket.onopen = () => {{
-        document.getElementById('term-input')?.focus();
-    }};
-    termSocket.onmessage = (event) => {{
-        const output = document.querySelector('.terminal-output');
-        if (output) {{
-            output.textContent = output.textContent + event.data;
-            output.scrollTop = output.scrollHeight;
-        }}
-    }};
-    termSocket.onerror = () => {{
-        // Terminal may not have started yet
-    }};
-    // Enter key handler
-    document.getElementById('term-input')?.addEventListener('keydown', (e) => {{
-        if (e.key === 'Enter') {{
-            const input = document.getElementById('term-input');
-            const cmd = input.value.trim();
-            if (cmd && termSocket.readyState === WebSocket.OPEN) {{
-                termSocket.send(cmd);
-                input.value = '';
-            }}
-        }}
-    }});
-</script>
-</body>
-</html>"""
+@app.get("/assets/{filename}")
+async def admin_asset(filename: str):
+    """Serve dashboard assets without a StaticFiles mount (keeps deps slim)."""
+    safe = Path(filename).name  # strip any path components
+    path = _ADMIN_STATIC / safe
+    if not path.exists() or not path.is_file():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    media = {
+        ".css": "text/css; charset=utf-8",
+        ".js": "application/javascript; charset=utf-8",
+        ".html": "text/html; charset=utf-8",
+        ".png": "image/png",
+        ".svg": "image/svg+xml",
+    }.get(path.suffix.lower(), "application/octet-stream")
+    return Response(path.read_bytes(), media_type=media)
 
 
 @app.get("/api/status")
