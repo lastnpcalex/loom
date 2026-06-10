@@ -1610,6 +1610,7 @@ def review_parked(
                             f"re-adjudication of parked {ev_id}: "
                             + (d.get("reason") or d.get("claim") or "matcher re-decision")
                         )[:500],
+                        evidence_id=ev_id,
                     )
                     review["escalated_proposal_id"] = prop["id"]
                     proposals_filed.append(prop["id"])
@@ -1999,10 +2000,14 @@ def submit_transition(
     missing_direction: str = "",
     commit: bool = False,
     include_topic: bool = False,
+    existing_evidence_id: str = "",
 ) -> str:
     """Submit a typed runtime transition.
 
     transition must be PARK, FIRE, OBSERVE, SCHEMA_GAP, or IGNORE.
+    existing_evidence_id rebinds the transition to an entry ALREADY in the
+    evidence log (re-adjudicated parked evidence) instead of inserting a
+    new one — the resolution path for the parked queue.
     commit=false performs validation and preview only. commit=true mutates the
     NROL-AO topic JSON through the source repo's own engine/pipeline gates.
     Operators cannot provide target posteriors or freeform likelihoods here.
@@ -2121,6 +2126,7 @@ def submit_transition(
                 entry=entry,
                 fired_indicator_id=None,
                 reason=reason or "MCP PARK transition",
+                existing_evidence_id=existing_evidence_id or None,
             )
         elif transition_kind == "FIRE":
             result = pipeline.process_evidence(
@@ -2128,6 +2134,7 @@ def submit_transition(
                 entry=entry,
                 fired_indicator_id=indicator_id,
                 reason=reason or "MCP FIRE transition",
+                existing_evidence_id=existing_evidence_id or None,
             )
         elif transition_kind == "OBSERVE":
             result = pipeline.apply_observation(
@@ -2135,6 +2142,7 @@ def submit_transition(
                 entry=entry,
                 indicator_id=indicator_id,
                 observed_value=observed_value,
+                existing_evidence_id=existing_evidence_id or None,
             )
         else:
             raise ValueError(f"Unsupported mutating transition {transition_kind}")
@@ -2287,10 +2295,16 @@ def commit_match(proposal_id: str, include_topic: bool = False) -> str:
             prop.get("observed_value"),
         )
 
+        # Rebind proposals (from review_parked) point at evidence ALREADY in
+        # the ledger — that's their whole point, so the URL duplicate guard
+        # below does not apply to them. The engine binds the indicator to the
+        # existing entry instead of inserting a new one.
+        rebind_evidence_id = (prop.get("evidence_id") or "").strip()
+
         # Duplicate guard: the same URL must not be committed twice on a
         # topic (spec: same URL/canonical claim is not already committed).
         url = (article.get("url") or "").strip()
-        if url:
+        if url and not rebind_evidence_id:
             for entry in topic.get("evidenceLog", []) or []:
                 if (entry.get("url") or "").strip() == url:
                     store.mark_proposal(
@@ -2301,7 +2315,9 @@ def commit_match(proposal_id: str, include_topic: bool = False) -> str:
                         "proposal_id": proposal_id, "committed": False,
                         "status": "rejected",
                         "error": f"article URL already committed on {prop['slug']} "
-                                 f"(evidence {entry.get('id')})",
+                                 f"(evidence {entry.get('id')}). If this is "
+                                 "re-adjudicated parked evidence, the proposal "
+                                 "needs evidence_id set (review_parked does this).",
                     })
 
         evidence = {
@@ -2322,6 +2338,7 @@ def commit_match(proposal_id: str, include_topic: bool = False) -> str:
             missing_direction=prop.get("missing_direction") or "",
             commit=True,
             include_topic=include_topic,
+            existing_evidence_id=rebind_evidence_id,
         )
         result = json.loads(raw)
         if result.get("denied"):

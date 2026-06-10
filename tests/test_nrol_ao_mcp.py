@@ -733,6 +733,54 @@ def test_scan_deliberation_rescues_park_into_proposal(nrol, topic_path, monkeypa
     assert "rescued by jury" in digest
 
 
+def test_THE_LOOP_parked_evidence_moves_posteriors_end_to_end(nrol, topic_path, monkeypatch):
+    """THE acceptance test this system lacked: evidence that was parked gets
+    re-adjudicated, escalated as a rebind proposal, human-committed — and a
+    POSTERIOR MOVES. No duplicate evidence entry, the parked flag resolves,
+    and the update runs through every engine gate. If this fails, the system
+    is not usable, whatever else passes."""
+    ev_ids = _seed_parked(topic_path, n=1)
+    before_posteriors = _disk_posteriors(topic_path)
+    before_evidence_count = len(_disk_topic(topic_path)["evidenceLog"])
+
+    monkeypatch.setattr(nrol, "_fetch_article_excerpt", lambda url, mc, **kw: "")
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "canned", "model": "t", "host": "l",
+                         "finish_reason": "stop", "reasoning_chars": 0},
+    )
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "FIRE", "indicator_id": "ind_binary_mild"},
+         "tag": "EVENT", "claim": "event A confirmed", "reason": "threshold met"},
+    ])
+
+    out = json.loads(nrol.review_parked(slug=SLUG, dry_run=False))
+    assert "error" not in out, out
+    assert len(out["proposals_filed"]) == 1
+    pid = out["proposals_filed"][0]
+    queue = json.loads(nrol.list_proposals(slug=SLUG, status="pending"))
+    prop = next(p for p in queue["proposals"] if p["id"] == pid)
+    assert prop["evidence_id"] == ev_ids[0]  # rebind linkage carried
+
+    committed = json.loads(nrol.commit_match(proposal_id=pid))
+    assert committed.get("status") == "committed", committed
+
+    after = _disk_posteriors(topic_path)
+    assert after != before_posteriors                 # THE POINT
+    assert after["H1"] > before_posteriors["H1"]      # ind_binary_mild favors H1
+
+    topic = _disk_topic(topic_path)
+    # Rebind, not duplicate: the article's URL appears exactly once in the
+    # ledger (the engine may add DECISION-ledger audit entries; those carry
+    # no URL and are not evidence duplication).
+    seeded_url = f"https://example.test/parked/{ev_ids[0]}"
+    with_url = [e for e in topic["evidenceLog"] if e.get("url") == seeded_url]
+    assert len(with_url) == 1
+    assert "FIRED via rebind" in with_url[0]["posteriorImpact"]
+    assert ev_ids[0] not in topic["governance"]["flagged_for_indicator_review"]  # resolved
+
+
 def test_shadow_posteriors_derive_from_precommitted_dynamics(nrol, nrol_repo):
     """Shadow posteriors: first-passage probabilities from a lint-gated,
     pre-committed dynamics spec. Deterministic for fixed seed; elapsed time

@@ -80,6 +80,13 @@ class ProposalStore:
         conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
+        # Migration: evidence_id links a proposal to an EXISTING ledger entry
+        # (re-adjudicated parked evidence). commit_match uses it to rebind the
+        # indicator to that entry instead of inserting a duplicate article.
+        try:
+            conn.execute("ALTER TABLE proposals ADD COLUMN evidence_id TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         return conn
 
     # -- articles --
@@ -137,17 +144,18 @@ class ProposalStore:
         observed_value: float | None = None,
         rationale: str = "",
         missing_direction: str = "",
+        evidence_id: str = "",
     ) -> dict:
         pid = new_proposal_id()
         with contextlib.closing(self._conn()) as conn, conn:
             conn.execute(
                 "INSERT INTO proposals "
                 "(id, article_id, slug, action, indicator_id, observed_value, "
-                " rationale, missing_direction, status, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                " rationale, missing_direction, status, created_at, evidence_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
                 (
                     pid, article_id, slug, action, indicator_id, observed_value,
-                    rationale, missing_direction, _utc_now(),
+                    rationale, missing_direction, _utc_now(), evidence_id,
                 ),
             )
         return self.get_proposal(pid)
