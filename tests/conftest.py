@@ -2,12 +2,24 @@
 
 import os
 import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 import httpx
 
 import database as db
+
+
+def pytest_configure(config):
+    # pytest's default basetemp root (%TEMP%/pytest-of-<user>) can be created
+    # with an unreadable owner SID on Windows (e.g. by a sandboxed run); once
+    # that happens every tmp_path fixture dies in PermissionError after a long
+    # retry loop. Redirect to a private root unless the caller passed one.
+    # Outside the repo on purpose: a OneDrive-synced basetemp invites sync
+    # locks on test SQLite files.
+    if config.option.basetemp is None:
+        config.option.basetemp = Path(tempfile.gettempdir()) / "loom-pytest"
 
 
 @pytest.fixture(autouse=True)

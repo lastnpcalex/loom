@@ -227,6 +227,9 @@ async def test_permission_bridge_does_not_block_stream(monkeypatch):
             return {"allow": True}
 
     class _FakeAsyncClient:
+        def __init__(self, *a, **kw):  # accepts verify=False etc.
+            pass
+
         async def __aenter__(self):
             return self
 
