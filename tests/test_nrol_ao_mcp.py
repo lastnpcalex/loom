@@ -697,6 +697,28 @@ def _seed_parked(topic_path, n=2):
     return ids
 
 
+def test_parse_matcher_output_handles_blank_line_blocks(nrol):
+    """Models separate DECISION blocks with blank lines, no END terminator.
+    The old parser required a literal END and lazily scanned until it found
+    'end' as a substring of ordinary words, swallowing whole blocks (live
+    failure: 12 blocks emitted, 1 parsed). Both formats must parse fully."""
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    text = (
+        "DECISION\nARTICLE: A1\nACTION: FIRE ind_a\nTAG: EVENT\nCLAIM: c1\nREASON: r1\n\n"
+        "DECISION\nARTICLE: A2\nACTION: OBSERVE ind_b AT 17\nTAG: DATA\nCLAIM: c2\nREASON: r2\n\n"
+        "DECISION\nARTICLE: A3\nACTION: PARK\nTAG: EVENT\nCLAIM: c3\nREASON: r3\n"
+    )
+    ds = fw.parse_matcher_output(text)
+    assert [d["idx"] for d in ds] == [1, 2, 3]
+    assert ds[0]["action"]["kind"] == "FIRE"
+    assert ds[1]["action"]["kind"] == "OBSERVE"
+    assert float(ds[1]["action"]["value"]) == 17.0
+    assert ds[2]["action"]["kind"] == "PARK"
+
+    legacy = "DECISION\nARTICLE: A1\nACTION: PARK\nTAG: EVENT\nCLAIM: c\nREASON: r\nEND\n"
+    assert len(fw.parse_matcher_output(legacy)) == 1
+
+
 def test_review_parked_timestamps_without_clearing(nrol, topic_path, monkeypatch):
     """Kept-but-timestamped: re-reviewed items stay in the flagged queue but
     gain review records; FIRE re-decisions escalate to pending proposals
