@@ -24,6 +24,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 from .activity import ActivityStore, default_activity_dir, new_job_id
+from .proposals import ProposalStore
 from . import llama as llama_client
 
 mcp = FastMCP("nrol-ao")
@@ -48,6 +49,13 @@ def _activity_store() -> ActivityStore:
     configured = os.environ.get("NROL_AO_ACTIVITY_DIR", "").strip()
     root = Path(configured).resolve() if configured else default_activity_dir(_repo_path())
     return ActivityStore(root)
+
+
+def _proposal_store() -> ProposalStore:
+    """Proposals live beside the activity ledger (same configurable root)."""
+    configured = os.environ.get("NROL_AO_ACTIVITY_DIR", "").strip()
+    root = Path(configured).resolve() if configured else default_activity_dir(_repo_path())
+    return ProposalStore(root)
 
 
 def _ensure_repo() -> Path:
@@ -436,6 +444,13 @@ def help() -> str:
                 "Review the returned operator packet.",
                 "Use commit=true only when explicit mutation is intended and Loom approval is expected.",
             ],
+            "proposal_lifecycle": [
+                "submit_article(article) — store a candidate observation; no mutation.",
+                "propose_match(article_id, slug, action, ...) — record a typed proposal; no mutation.",
+                "list_proposals(slug, status) — review the pending queue.",
+                "commit_match(proposal_id) — validate + apply through engine gates and Loom approval.",
+                "withdraw_proposal(proposal_id) — the IGNORE decision for proposals.",
+            ],
             "scan_semantics": {
                 "commit_false": "No evidence/posterior mutation.",
                 "dry_run_false": "Records successful scan coverage by stamping topic.meta.lastScanned.",
@@ -457,6 +472,11 @@ def help() -> str:
                 "run_news_scan",
                 "list_activity",
                 "submit_transition",
+                "submit_article",
+                "propose_match",
+                "commit_match",
+                "list_proposals",
+                "withdraw_proposal",
             ],
         }
     )
@@ -1499,6 +1519,208 @@ def submit_transition(
         except Exception:
             pass
         return _json({"error": str(exc), "slug": slug, "transition": transition})
+
+
+_PROPOSAL_ACTIONS = {"PARK", "FIRE", "OBSERVE", "SCHEMA_GAP"}
+
+
+def _validate_proposal_shape(
+    topic: dict, action: str, indicator_id: str, observed_value: float | None
+) -> None:
+    """Static validation shared by propose_match and commit_match re-checks."""
+    if action not in _PROPOSAL_ACTIONS:
+        raise ValueError(
+            f"action must be one of {sorted(_PROPOSAL_ACTIONS)}, got {action!r}. "
+            "IGNORE is not proposable — simply do not propose, or withdraw."
+        )
+    if action in {"FIRE", "OBSERVE"}:
+        if not indicator_id:
+            raise ValueError(f"{action} proposals require indicator_id")
+        indicator, _tier = _find_indicator(topic, indicator_id)
+        if indicator is None:
+            slug = topic.get("meta", {}).get("slug")
+            raise ValueError(f"indicator {indicator_id!r} not found on topic {slug!r}")
+        if action == "OBSERVE":
+            if observed_value is None:
+                raise ValueError("OBSERVE proposals require observed_value")
+            if not indicator.get("observable"):
+                raise ValueError(f"indicator {indicator_id!r} has no observable block")
+
+
+@mcp.tool()
+def submit_article(article: dict) -> str:
+    """Store a fetched article/headline as a candidate observation.
+
+    No posterior movement, no topic mutation. Returns a stable article_id
+    (same URL resubmitted dedupes to the same id) for use with
+    propose_match. This is the entry point of the proposal lifecycle:
+    submit_article -> propose_match -> commit_match.
+    """
+    try:
+        if not isinstance(article, dict):
+            raise ValueError("article must be a JSON object")
+        if not (article.get("url") or article.get("headline") or article.get("title")):
+            raise ValueError("article requires url, headline, or title")
+        record = _proposal_store().submit_article(
+            article, submitted_by=os.environ.get("LOOM_CONV_ID", "headless")
+        )
+        record.pop("raw", None)
+        return _json(record)
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def propose_match(
+    article_id: str,
+    slug: str,
+    action: str,
+    indicator_id: str = "",
+    observed_value: float | None = None,
+    rationale: str = "",
+    missing_direction: str = "",
+) -> str:
+    """Record a typed match proposal for a submitted article. No mutation.
+
+    action is PARK, FIRE, OBSERVE, or SCHEMA_GAP. The proposal is validated
+    statically (article exists, topic is ACTIVE, indicator/observable shape)
+    and stored pending. Posteriors move only when commit_match(proposal_id)
+    passes the server's gates and Loom approval.
+    """
+    try:
+        action = (action or "").strip().upper()
+        if not rationale.strip():
+            raise ValueError("rationale is required — state the directional case")
+        store = _proposal_store()
+        if store.get_article(article_id) is None:
+            raise ValueError(f"article {article_id!r} not found; call submit_article first")
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(slug)
+        if topic.get("meta", {}).get("status") != "ACTIVE":
+            raise ValueError(f"topic {slug!r} is not ACTIVE")
+        _validate_proposal_shape(topic, action, indicator_id, observed_value)
+        record = store.add_proposal(
+            article_id=article_id, slug=slug, action=action,
+            indicator_id=indicator_id, observed_value=observed_value,
+            rationale=rationale, missing_direction=missing_direction,
+        )
+        record["next_step"] = f"commit_match({record['id']!r}) after operator review"
+        return _json(record)
+    except Exception as exc:
+        return _json({"error": str(exc), "article_id": article_id, "slug": slug})
+
+
+@mcp.tool()
+def commit_match(proposal_id: str, include_topic: bool = False) -> str:
+    """Validate and apply a pending proposal through the engine's gates.
+
+    Routes through the same machinery as submit_transition: typed
+    transition, pre-committed likelihoods only, Loom approval (fail-closed),
+    governance gates, activity ledger. Outcomes: committed (applied),
+    rejected (validation/governance refused — recorded with reason), or
+    pending (Loom approval denied; the proposal stays in the queue).
+    """
+    store = _proposal_store()
+    try:
+        prop = store.get_proposal(proposal_id)
+        if prop is None:
+            raise ValueError(f"proposal {proposal_id!r} not found")
+        if prop["status"] != "pending":
+            raise ValueError(
+                f"proposal {proposal_id!r} already decided: {prop['status']}"
+            )
+        article = store.get_article(prop["article_id"])
+        if article is None:
+            raise ValueError(f"article {prop['article_id']!r} missing from store")
+
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(prop["slug"])
+        _validate_proposal_shape(
+            topic, prop["action"], prop.get("indicator_id") or "",
+            prop.get("observed_value"),
+        )
+
+        # Duplicate guard: the same URL must not be committed twice on a
+        # topic (spec: same URL/canonical claim is not already committed).
+        url = (article.get("url") or "").strip()
+        if url:
+            for entry in topic.get("evidenceLog", []) or []:
+                if (entry.get("url") or "").strip() == url:
+                    store.mark_proposal(
+                        proposal_id, "rejected",
+                        note=f"duplicate: {url} already in evidenceLog as {entry.get('id')}",
+                    )
+                    return _json({
+                        "proposal_id": proposal_id, "committed": False,
+                        "status": "rejected",
+                        "error": f"article URL already committed on {prop['slug']} "
+                                 f"(evidence {entry.get('id')})",
+                    })
+
+        evidence = {
+            "headline": article.get("headline") or "",
+            "url": url,
+            "source": article.get("source") or "operator",
+            "text": article.get("headline") or article.get("body") or url,
+            "claim": prop.get("rationale") or "",
+            "tag": "EVENT",
+        }
+        raw = submit_transition(
+            slug=prop["slug"],
+            transition=prop["action"],
+            evidence=evidence,
+            indicator_id=prop.get("indicator_id") or "",
+            observed_value=prop.get("observed_value"),
+            reason=f"Proposal {proposal_id}: {prop.get('rationale') or ''}"[:300],
+            missing_direction=prop.get("missing_direction") or "",
+            commit=True,
+            include_topic=include_topic,
+        )
+        result = json.loads(raw)
+        if result.get("denied"):
+            # Human said no this time — the proposal remains reviewable.
+            return _json({
+                "proposal_id": proposal_id, "committed": False,
+                "status": "pending", "denied": result["denied"],
+            })
+        if result.get("error"):
+            store.mark_proposal(proposal_id, "rejected", note=result["error"], result=result)
+            return _json({
+                "proposal_id": proposal_id, "committed": False,
+                "status": "rejected", "error": result["error"],
+            })
+        store.mark_proposal(proposal_id, "committed", note="applied", result=result)
+        result["proposal_id"] = proposal_id
+        result["status"] = "committed"
+        return _json(result)
+    except Exception as exc:
+        return _json({"proposal_id": proposal_id, "committed": False, "error": str(exc)})
+
+
+@mcp.tool()
+def list_proposals(slug: str = "", status: str = "pending", limit: int = 50) -> str:
+    """List the proposal review queue (default: pending). Empty status = all."""
+    try:
+        rows = _proposal_store().list_proposals(slug=slug, status=status, limit=limit)
+        return _json({"proposals": rows, "count": len(rows)})
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def withdraw_proposal(proposal_id: str, reason: str = "") -> str:
+    """Withdraw a pending proposal (the IGNORE decision for proposals)."""
+    try:
+        store = _proposal_store()
+        prop = store.get_proposal(proposal_id)
+        if prop is None:
+            raise ValueError(f"proposal {proposal_id!r} not found")
+        if prop["status"] != "pending":
+            raise ValueError(f"proposal {proposal_id!r} already decided: {prop['status']}")
+        record = store.mark_proposal(proposal_id, "withdrawn", note=reason or "withdrawn")
+        return _json(record)
+    except Exception as exc:
+        return _json({"error": str(exc), "proposal_id": proposal_id})
 
 
 if sys.platform == "win32":

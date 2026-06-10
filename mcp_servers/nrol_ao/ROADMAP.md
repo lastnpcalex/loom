@@ -81,10 +81,18 @@ server via --mcp-config env per spawn. Math audit report:
   headless opt-out.
 - State/code split: `NROL_AO_STATE_DIR` owned by the MCP server; repo
   becomes code, state becomes data with one writer.
-- Proposal lifecycle: `submit_article` → `propose_match` →
-  `commit_match(proposal_id)` with persistent proposal store — review
-  queue + per-commit provenance.
-- Deprecate legacy `--posteriors` paths for active topics.
+- ✅ Proposal lifecycle (2026-06-09): `submit_article` (content-keyed
+  dedup) → `propose_match` (typed, statically validated, pending) →
+  `commit_match` (re-validates, duplicate-URL guard, routes through
+  submit_transition's full gate chain; Loom denial leaves the proposal
+  pending, engine rejection records the reason). `list_proposals` is the
+  review queue; `withdraw_proposal` is the IGNORE decision. Store:
+  SQLite (`proposals.db`) beside the activity ledger.
+- ✅ Legacy `--posteriors` path closed (2026-06-09): `run_update` refuses
+  explicit posteriors on ACTIVE topics without a signed
+  `NROL_AO_ADMIN_POSTERIORS_REASON`; the governance force-bypass branch
+  is deleted. (`runner.py`'s posterior arg was already dead code — wrong
+  parameter name.)
 
 ### Stage 2 — Bayesian everywhere (tasks #13–#14)
 

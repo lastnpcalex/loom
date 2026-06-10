@@ -406,6 +406,125 @@ def test_legacy_posterior_path_rejected_on_active_topic(nrol, topic_path, monkey
 
 
 # ---------------------------------------------------------------------------
+# Proposal lifecycle: submit_article -> propose_match -> commit_match
+# ---------------------------------------------------------------------------
+
+
+def _article(**extra) -> dict:
+    suffix = uuid.uuid4().hex[:8]
+    return {
+        "headline": f"Synthetic event report {suffix}",
+        "url": f"https://example.test/articles/{suffix}",
+        "source": "test-wire",
+        "date": "2026-06-09",
+        "body": "Official synthetic print released by test-rig.",
+        **extra,
+    }
+
+
+def test_submit_article_dedupes_by_url(nrol, topic_path):
+    art = _article()
+    first = json.loads(nrol.submit_article(art))
+    again = json.loads(nrol.submit_article(art))
+    assert "error" not in first
+    assert first["id"].startswith("art-")
+    assert again["id"] == first["id"]
+    assert again["deduped"] is True
+
+
+def test_propose_match_validates_without_mutation(nrol, topic_path):
+    art = json.loads(nrol.submit_article(_article()))
+    before_bytes = topic_path.read_bytes()
+
+    bad_action = json.loads(nrol.propose_match(
+        article_id=art["id"], slug=SLUG, action="IGNORE", rationale="meh"))
+    assert "error" in bad_action
+
+    bad_indicator = json.loads(nrol.propose_match(
+        article_id=art["id"], slug=SLUG, action="FIRE",
+        indicator_id="ind_nope", rationale="directional case"))
+    assert "error" in bad_indicator
+
+    no_rationale = json.loads(nrol.propose_match(
+        article_id=art["id"], slug=SLUG, action="PARK", rationale=""))
+    assert "error" in no_rationale
+
+    ok = json.loads(nrol.propose_match(
+        article_id=art["id"], slug=SLUG, action="FIRE",
+        indicator_id="ind_binary_mild",
+        rationale="threshold met per official synthetic print"))
+    assert ok.get("status") == "pending"
+    assert topic_path.read_bytes() == before_bytes  # proposals never mutate
+
+
+def test_commit_match_applies_fire_through_gates(nrol, topic_path):
+    art = json.loads(nrol.submit_article(_article()))
+    prop = json.loads(nrol.propose_match(
+        article_id=art["id"], slug=SLUG, action="FIRE",
+        indicator_id="ind_binary_mild",
+        rationale="threshold met per official synthetic print"))
+    before = _disk_posteriors(topic_path)
+
+    out = json.loads(nrol.commit_match(prop["id"]))
+    assert out.get("status") == "committed", out
+    after = _disk_posteriors(topic_path)
+    assert after["H1"] > before["H1"]
+    # engine rounds posteriors to 4 decimals; sum holds to ~5e-4
+    assert abs(sum(after.values()) - 1.0) < 5e-4
+
+    # A decided proposal cannot be committed again.
+    again = json.loads(nrol.commit_match(prop["id"]))
+    assert again.get("committed") is False
+    assert "already decided" in again.get("error", "")
+
+
+def test_commit_match_rejects_duplicate_url(nrol, topic_path):
+    art = json.loads(nrol.submit_article(_article()))
+    first = json.loads(nrol.propose_match(
+        article_id=art["id"], slug=SLUG, action="PARK",
+        rationale="relevant, no indicator matches"))
+    committed = json.loads(nrol.commit_match(first["id"]))
+    assert committed.get("status") == "committed", committed
+
+    second = json.loads(nrol.propose_match(
+        article_id=art["id"], slug=SLUG, action="FIRE",
+        indicator_id="ind_binary_mild",
+        rationale="same article again, dressed as new evidence"))
+    before = _disk_posteriors(topic_path)
+    out = json.loads(nrol.commit_match(second["id"]))
+    assert out.get("status") == "rejected"
+    assert "already committed" in out.get("error", "")
+    assert _disk_posteriors(topic_path) == before
+
+
+def test_commit_match_denied_without_loom_stays_pending(nrol, topic_path, monkeypatch):
+    art = json.loads(nrol.submit_article(_article()))
+    prop = json.loads(nrol.propose_match(
+        article_id=art["id"], slug=SLUG, action="PARK",
+        rationale="relevant, no indicator matches"))
+    monkeypatch.delenv("NROL_AO_ALLOW_UNGATED_COMMITS", raising=False)
+    monkeypatch.delenv("LOOM_CONV_ID", raising=False)
+    before = _disk_posteriors(topic_path)
+    out = json.loads(nrol.commit_match(prop["id"]))
+    assert out.get("committed") is False
+    assert out.get("status") == "pending"  # denial is not rejection
+    assert _disk_posteriors(topic_path) == before
+    queue = json.loads(nrol.list_proposals(slug=SLUG, status="pending"))
+    assert prop["id"] in [p["id"] for p in queue["proposals"]]
+
+
+def test_withdraw_proposal(nrol, topic_path):
+    art = json.loads(nrol.submit_article(_article()))
+    prop = json.loads(nrol.propose_match(
+        article_id=art["id"], slug=SLUG, action="PARK",
+        rationale="probably noise on reflection"))
+    out = json.loads(nrol.withdraw_proposal(prop["id"], reason="noise"))
+    assert out["status"] == "withdrawn"
+    again = json.loads(nrol.commit_match(prop["id"]))
+    assert again.get("committed") is False
+
+
+# ---------------------------------------------------------------------------
 # Loom approval gate
 # ---------------------------------------------------------------------------
 

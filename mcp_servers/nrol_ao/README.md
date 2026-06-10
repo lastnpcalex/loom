@@ -70,6 +70,11 @@ Override with `NROL_AO_ACTIVITY_DIR` if the dashboard should read another path.
 - `run_matcher_with_model`
 - `run_matcher_with_llama`
 - `submit_transition`
+- `submit_article`
+- `propose_match`
+- `commit_match`
+- `list_proposals`
+- `withdraw_proposal`
 
 Runtime transitions accepted by `submit_transition` are `PARK`, `FIRE`,
 `OBSERVE`, `SCHEMA_GAP`, and `IGNORE`.
