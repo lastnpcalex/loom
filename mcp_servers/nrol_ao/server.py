@@ -1420,6 +1420,28 @@ def latest_digest() -> str:
 
 
 @mcp.tool()
+def shadow_posteriors(slug: str, asof: str = "") -> str:
+    """Derive SHADOW posteriors from the topic's pre-committed dynamics spec.
+
+    Zero authority — never writes topic state. Posteriors here are
+    first-passage probabilities of a regime-switching process whose
+    transition-rate priors are pre-committed (with rationales, lint-gated)
+    in loom/topics/dynamics/<slug>.dynamics.json. Elapsed time in the
+    current regime updates the exit-rate posterior exactly (Gamma
+    conjugacy), so "still closed, N days later" is priced instead of
+    ignored. Compare against topic_status posteriors; divergence is the
+    calibration conversation, not an error. asof=YYYY-MM-DD for
+    counterfactual runs.
+    """
+    try:
+        root = _ensure_repo()
+        dyn = _import_from_repo("framework.dynamics_shadow")
+        return _json(dyn.run(root, slug, asof=asof))
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
 def review_parked(
     slug: str,
     limit: int = 12,

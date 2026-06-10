@@ -733,6 +733,56 @@ def test_scan_deliberation_rescues_park_into_proposal(nrol, topic_path, monkeypa
     assert "rescued by jury" in digest
 
 
+def test_shadow_posteriors_derive_from_precommitted_dynamics(nrol, nrol_repo):
+    """Shadow posteriors: first-passage probabilities from a lint-gated,
+    pre-committed dynamics spec. Deterministic for fixed seed; elapsed time
+    in the entrenched regime moves mass via exact Gamma conjugacy (the
+    'idle month is evidence' channel). Zero authority — read-only."""
+    dyn_dir = nrol_repo / "loom" / "topics" / "dynamics"
+    dyn_dir.mkdir(parents=True, exist_ok=True)
+    spec = {
+        "slug": SLUG,
+        "entrenched_since": "2026-04-23",
+        "sustain_days": 30,
+        "sustain_hazard_factor": 0.5,
+        "residual_hypothesis": "H3",
+        "hypothesis_windows": {"H1": "2026-09-30", "H2": "2027-03-31"},
+        "priors": {
+            "lam_exit": {"alpha": 2.0, "beta_days": 480,
+                         "rationale": "synthetic reference class"},
+            "lam_ramp": {"alpha": 3.0, "beta_days": 225,
+                         "rationale": "synthetic ramp duration"},
+            "lam_relapse": {"alpha": 2.0, "beta_days": 240,
+                            "rationale": "synthetic relapse cadence"},
+        },
+        "evidence_nudges": [],
+    }
+    (dyn_dir / f"{SLUG}.dynamics.json").write_text(json.dumps(spec), encoding="utf-8")
+
+    out1 = json.loads(nrol.shadow_posteriors(slug=SLUG, asof="2026-06-10"))
+    assert "error" not in out1, out1
+    post = out1["shadow_posteriors"]
+    assert abs(sum(post.values()) - 1.0) < 1e-6
+    assert out1["elapsed_in_entrenched_days"] == 48
+    assert "SHADOW" in out1["mode"]
+
+    # Deterministic: same spec, asof, seed -> identical numbers
+    out2 = json.loads(nrol.shadow_posteriors(slug=SLUG, asof="2026-06-10"))
+    assert out2["shadow_posteriors"] == post
+
+    # Time is evidence: a later asof with no exit shifts mass toward the
+    # residual (later/never) hypothesis and away from the earliest window
+    late = json.loads(nrol.shadow_posteriors(slug=SLUG, asof="2026-09-01"))["shadow_posteriors"]
+    assert late["H1"] < post["H1"]
+    assert late["H3"] > post["H3"]
+
+    # Lint gate: a prior without a rationale refuses to run
+    spec["priors"]["lam_exit"]["rationale"] = ""
+    (dyn_dir / f"{SLUG}.dynamics.json").write_text(json.dumps(spec), encoding="utf-8")
+    bad = json.loads(nrol.shadow_posteriors(slug=SLUG))
+    assert "error" in bad and "rationale" in bad["error"]
+
+
 # ---------------------------------------------------------------------------
 # Parked-queue re-adjudication: kept-but-timestamped + reverse staleness
 # ---------------------------------------------------------------------------
