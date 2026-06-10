@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/assets/admin.css?v=1">
+    <link rel="stylesheet" href="/assets/admin.css?v=2">
 </head>
 <body>
     <div class="bg-glow bg-glow-1"></div>
@@ -79,8 +79,12 @@
                     </div>
                     <div class="action-row">
                         <button class="btn btn-ghost" onclick="runTool('llama-status', {target:'out-llama'})">Status</button>
-                        <button class="btn btn-ghost" onclick="runTool('llama-models', {target:'out-llama'})">Model list</button>
                         <button class="btn btn-ghost" onclick="runTool('clear-vram', {target:'out-llama'})">💥 Clear VRAM</button>
+                        <span class="action-spacer"></span>
+                        <select id="llama-model-switch" class="select" title="Switch llama-server to another GGUF (stop + reload, ~30-90s)">
+                            <option value="">Loading models…</option>
+                        </select>
+                        <button class="btn btn-cyan" id="btn-llama-switch" title="Restart llama-server with the selected model">⇆ Switch model</button>
                     </div>
                     <pre class="server-out" id="out-llama"></pre>
                 </div>
@@ -187,6 +191,6 @@
     </div>
 
     <div id="toast"></div>
-    <script src="/assets/admin.js?v=1"></script>
+    <script src="/assets/admin.js?v=2"></script>
 </body>
 </html>

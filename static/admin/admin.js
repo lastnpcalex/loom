@@ -28,6 +28,37 @@ function setView(name) {
     localStorage.setItem('loom-admin-view', name);
     if (name === 'overview' && !specsLoaded) loadSpecs();
     if (name === 'terminal') refreshTtyd();
+    if (name === 'servers') loadLlamaModels();
+}
+
+// ── Llama switch-model control ──────────────────────────────────────
+async function loadLlamaModels() {
+    const sel = document.getElementById('llama-model-switch');
+    if (!sel || sel.dataset.loaded === '1') return;
+    try {
+        const r = await fetch('/api/llama-models', { cache: 'no-store' });
+        if (!r.ok) return;
+        const d = await r.json();
+        const loaded = (d.loaded || []).map(m => m.split(/[\\/]/).pop());
+        sel.innerHTML = (d.models || []).map(m => {
+            const marks = [];
+            if (loaded.some(l => l === m)) marks.push('loaded');
+            if (m === d.configured) marks.push('default');
+            return `<option value="${esc(m)}"${m === d.configured ? ' selected' : ''}>${esc(m)}${marks.length ? ' — ' + marks.join(', ') : ''}</option>`;
+        }).join('') || '<option value="">(no .gguf files found)</option>';
+        sel.dataset.loaded = '1';
+    } catch (e) { /* admin down or no models dir */ }
+}
+
+async function llamaSwitchModel() {
+    const sel = document.getElementById('llama-model-switch');
+    const model = sel ? sel.value : '';
+    if (!model) { showToast('Pick a model first'); return; }
+    if (!confirm('Restart llama-server with ' + model + '? Cold load takes ~30-90s.')) return;
+    const btn = document.getElementById('btn-llama-switch');
+    btn.disabled = true;
+    await runTool('llama-restart?model=' + encodeURIComponent(model), { target: 'out-llama' });
+    btn.disabled = false;
 }
 
 // ── Meta / quick links ──────────────────────────────────────────────
@@ -455,6 +486,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('btn-specs-refresh').addEventListener('click', loadSpecs);
     document.getElementById('btn-ttyd-start').addEventListener('click', ttydStart);
     document.getElementById('btn-ttyd-stop').addEventListener('click', ttydStop);
+    document.getElementById('btn-llama-switch').addEventListener('click', llamaSwitchModel);
 
     await loadMeta();
     const saved = localStorage.getItem('loom-admin-view');

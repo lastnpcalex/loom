@@ -775,12 +775,14 @@ function buildConvItem(conv) {
 
     const isCCMode = conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini';
     const ccModel = (conv.cc_model || '').toLowerCase();
-    const isGemini = isCCMode && ccModel.includes('gemini');
-    const isCodex = isCCMode && ccModel.startsWith('codex');
-    const isClaude = isCCMode && !isGemini && !isCodex;
+    const isNrol = isCCMode && !!conv.nrol_operator;
+    const isGemini = isCCMode && !isNrol && ccModel.includes('gemini');
+    const isCodex = isCCMode && !isNrol && ccModel.startsWith('codex');
+    const isClaude = isCCMode && !isNrol && !isGemini && !isCodex;
     const isLocal = conv.mode === 'local';
     const isHermes = conv.mode === 'hermes';
-    const charName = isGemini ? (conv.cc_model || 'Gemini')
+    const charName = isNrol ? (conv.cc_model || 'NROL-AO')
+        : isGemini ? (conv.cc_model || 'Gemini')
         : isCodex ? (conv.cc_model || 'Codex')
         : isClaude ? (conv.cc_model || 'Claude')
         : isLocal ? (conv.local_model || State.loadedModel || 'Llama')
@@ -788,7 +790,8 @@ function buildConvItem(conv) {
         : conv.character_id
         ? (State.characters.find(c => c.id === conv.character_id)?.name || conv.character_id)
         : 'Freeform';
-    const modeBadge = isGemini ? '<span class="mode-badge" title="Antigravity (agy) in the browser">Loom {agy}</span>'
+    const modeBadge = isNrol ? '<span class="mode-badge" title="NROL-AO epistemic engine operator — typed transitions only">NROL-AO {Operator}</span>'
+        : isGemini ? '<span class="mode-badge" title="Antigravity (agy) in the browser">Loom {agy}</span>'
         : isCodex ? '<span class="mode-badge" title="ChatGPT Codex in the browser">Loom {Codex}</span>'
         : isClaude ? '<span class="mode-badge" title="Claude Code in the browser">Loom {Claude}</span>'
         : isLocal ? '<span class="mode-badge" title="Claude Code powered by a local Llama model">Braid {Local}</span>'

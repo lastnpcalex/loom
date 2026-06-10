@@ -377,7 +377,9 @@ html, body {
 }
 
 /* ── Server cards ── */
-.action-row { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 10px; }
+.action-row { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
+.action-spacer { flex: 1; }
+#llama-model-switch { max-width: 320px; text-overflow: ellipsis; }
 .server-out {
     font-family: 'Consolas', 'Monaco', monospace;
     font-size: 12px;

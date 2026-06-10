@@ -113,6 +113,18 @@ NROL_SCAN_WORKSPACE = Path(
 
 app = FastAPI(title="Loom Admin")
 
+# The main Loom UI (https://host:3000) calls admin endpoints straight from the
+# browser (e.g. Settings -> Apply & Restart llama-server). Without CORS headers
+# the POST still executes but the browser can't read the response, so the UI
+# reported "error contacting admin" for actions that actually succeeded.
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 async def check_instance(name: str, info: dict) -> dict:
     """Probe an instance for liveness."""
@@ -355,11 +367,16 @@ async def tool_llama_status():
         return JSONResponse({"status": "ok", "output": f"Llama Server is NOT running on :{port}"})
 
 
+def _llama_models_dir() -> Path:
+    _reload_config()
+    configured = (_loom_config.llama_models_dir or "").strip() if _loom_config else ""
+    return Path(configured or LLAMA_MODELS_DIR)
+
+
 @app.post("/tools/llama-models")
 async def tool_llama_models():
     """List available .gguf model files from the models directory."""
-    from pathlib import Path
-    models_dir = Path(r"C:\LlamaServer\models")
+    models_dir = _llama_models_dir()
     try:
         if not models_dir.exists():
             return JSONResponse({"status": "error", "output": f"Models dir not found: {models_dir}"})
@@ -370,6 +387,30 @@ async def tool_llama_models():
         })
     except Exception as e:
         return JSONResponse({"status": "error", "output": str(e)})
+
+
+@app.get("/api/llama-models")
+async def api_llama_models():
+    """Structured model list for the dashboard's switch-model control."""
+    models_dir = _llama_models_dir()
+    models = []
+    if models_dir.exists():
+        models = sorted(
+            p.name for p in models_dir.glob("*.gguf")
+            if not p.name.lower().startswith("mmproj")  # vision projectors aren't standalone models
+        )
+    configured = ""
+    if _loom_config is not None:
+        configured = (_loom_config.llama_model or "").strip()
+    loaded = []
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(f"http://127.0.0.1:{_get_llama_port()}/v1/models")
+            if r.status_code == 200:
+                loaded = [m["id"] for m in r.json().get("data", [])]
+    except Exception:
+        pass
+    return JSONResponse({"models": models, "configured": configured, "loaded": loaded})
 
 
 
