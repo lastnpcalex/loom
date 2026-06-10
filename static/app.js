@@ -1359,11 +1359,11 @@ async function updateInlineCCControls(conv) {
             API.put(`/api/conversations/${conv.id}`, { cc_model: resolvedModel }).catch(console.error);
         }
         
-        const isAnthropicModel = _isAnthropicValue(resolvedModel);
+        const modelSupportsEffort = _supportsEffortValue(resolvedModel);
         // Braid picks its model in Settings (cfg-braid-model); the cc-model/effort
         // selects don't apply, so hide them.
         modelSel.style.display = isBraid ? 'none' : '';
-        effortSel.style.display = (isBraid || !isAnthropicModel) ? 'none' : '';
+        effortSel.style.display = (isBraid || !modelSupportsEffort) ? 'none' : '';
         if (permSel) permSel.style.display = '';
         statePanelChat?.classList.add('hidden');
     } else if (conv && conv.mode === 'hermes') {
@@ -1426,6 +1426,18 @@ function _isOpusValue(v) {
     if (!v) return false;
     const base = (v.includes('[') ? v.split('[')[0] : v).toLowerCase();
     return base === 'opus' || base.startsWith('claude-opus-');
+}
+// Mirrors _agentKindForModel's codex detection in chat.js.
+function _isCodexValue(v) {
+    if (!v) return false;
+    const base = (v.includes('[') ? v.split('[')[0] : v).toLowerCase();
+    return base.startsWith('codex') || base.startsWith('gpt-5')
+        || base === 'gpt-4o' || base.startsWith('o3') || base.startsWith('o4');
+}
+// Anthropic and Codex models both take the thinking-effort knob
+// (codex_client forwards minimal..xhigh); gemini/local models do not.
+function _supportsEffortValue(v) {
+    return _isAnthropicValue(v) || _isCodexValue(v);
 }
 
 function _modelsMatch(a, b) {
@@ -1508,7 +1520,7 @@ function initInlineCCControls() {
     }
 
     function _syncEffortVisibility(model) {
-        effortSel.style.display = _isAnthropicValue(model) ? '' : 'none';
+        effortSel.style.display = _supportsEffortValue(model) ? '' : 'none';
     }
 
     modelSel.addEventListener('change', () => {
@@ -2327,27 +2339,25 @@ function setupEventListeners() {
         });
     });
 
-    // Model selection — disable "max"/"xhigh" effort when not Opus family,
-    // hide effort entirely for non-Anthropic models.
+    // Model selection — effort shows for Anthropic and Codex models (both
+    // backends take the knob). "max" is Opus-only; "xhigh" is Opus or Codex.
     document.getElementById('cc-model').addEventListener('change', () => {
         const model = document.getElementById('cc-model').value;
         const effortGroup = document.getElementById('cc-effort-group');
-        if (!_isAnthropicValue(model)) {
+        if (!_supportsEffortValue(model)) {
             effortGroup.classList.add('hidden');
         } else {
             effortGroup.classList.remove('hidden');
+            const isOpus = _isOpusValue(model);
+            const allowXhigh = isOpus || _isCodexValue(model);
             const maxOpt = document.querySelector('#cc-effort option[value="max"]');
             const xhighOpt = document.querySelector('#cc-effort option[value="xhigh"]');
-            if (!_isOpusValue(model)) {
-                if (maxOpt) maxOpt.disabled = true;
-                if (xhighOpt) xhighOpt.disabled = true;
-                const curEffort = document.getElementById('cc-effort').value;
-                if (curEffort === 'max' || curEffort === 'xhigh') {
-                    document.getElementById('cc-effort').value = 'high';
-                }
-            } else {
-                if (maxOpt) maxOpt.disabled = false;
-                if (xhighOpt) xhighOpt.disabled = false;
+            if (maxOpt) maxOpt.disabled = !isOpus;
+            if (xhighOpt) xhighOpt.disabled = !allowXhigh;
+            const effortSel = document.getElementById('cc-effort');
+            if ((effortSel.value === 'max' && !isOpus)
+                || (effortSel.value === 'xhigh' && !allowXhigh)) {
+                effortSel.value = 'high';
             }
         }
     });
@@ -2658,7 +2668,7 @@ function setupEventListeners() {
     // Settings model change — toggle effort visibility
     document.getElementById('cfg-cc-model').addEventListener('change', () => {
         const v = document.getElementById('cfg-cc-model').value || '';
-        document.getElementById('cfg-cc-effort-group').classList.toggle('hidden', !_isAnthropicValue(v));
+        document.getElementById('cfg-cc-effort-group').classList.toggle('hidden', !_supportsEffortValue(v));
     });
 
     document.getElementById('btn-save-settings').addEventListener('click', async () => {
