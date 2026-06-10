@@ -1807,6 +1807,30 @@ async def api_create_conversation(data: dict = None):
         if not project_dir:
             operator_dir = Path(__file__).parent / "workspaces" / "nrol_operator"
             operator_dir.mkdir(parents=True, exist_ok=True)
+            # Provision the scheduled-scan shim so a Loom cron job can be
+            # registered on this conversation (cron scripts must live in the
+            # conversation workspace). POST /api/conversations/{id}/cronjobs
+            # with script="nrol_scan_tick.py" to enable scheduled scans.
+            tick = operator_dir / "nrol_scan_tick.py"
+            if not tick.exists():
+                tick.write_text(
+                    '"""NROL-AO scheduled scan tick (Loom cron shim).\n'
+                    "\n"
+                    "Safe-policy scan: PARK/SCHEMA_GAP auto-apply (cannot move\n"
+                    "posteriors), FIRE/OBSERVE are filed as pending proposals for\n"
+                    "operator review, digest written beside the activity ledger.\n"
+                    '"""\n'
+                    "import sys\n"
+                    "from pathlib import Path\n"
+                    "\n"
+                    "sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))\n"
+                    "\n"
+                    "from bin.nrol_scan_tick import main\n"
+                    "\n"
+                    'if __name__ == "__main__":\n'
+                    "    sys.exit(main())\n",
+                    encoding="utf-8",
+                )
             project_dir = str(operator_dir)
 
     first_turn = data.get("first_turn", "character")  # "character" or "user"

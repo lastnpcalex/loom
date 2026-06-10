@@ -525,6 +525,73 @@ def test_withdraw_proposal(nrol, topic_path):
 
 
 # ---------------------------------------------------------------------------
+# Scheduled scan with safe commit policy (spec Flow B)
+# ---------------------------------------------------------------------------
+
+
+def test_safe_policy_scan_parks_and_files_proposals(nrol, topic_path, monkeypatch):
+    """commit_policy="safe": PARK auto-applies (no posterior movement),
+    FIRE is filed as a pending proposal, a digest is written. No posterior
+    moves without a human."""
+    import importlib
+
+    suffix = uuid.uuid4().hex[:6]
+    articles = [
+        {
+            "headline": f"Background development {suffix}",
+            "url": f"https://example.test/scan/{suffix}-a",
+            "source": "test-wire", "date": "2026-06-09",
+            "relevance": "relevant but matches no indicator",
+        },
+        {
+            "headline": f"Official threshold print {suffix}",
+            "url": f"https://example.test/scan/{suffix}-b",
+            "source": "test-wire", "date": "2026-06-09",
+            "relevance": "synthetic event A confirmed",
+        },
+    ]
+    monkeypatch.setattr(
+        nrol, "_search_web_articles",
+        lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
+    )
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local"},
+    )
+    fw = importlib.import_module("framework.news_observation_pipeline")
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "PARK"}, "tag": "EVENT",
+         "claim": "relevant, unmatched", "reason": "no indicator threshold met"},
+        {"idx": 2, "action": {"kind": "FIRE", "indicator_id": "ind_binary_mild"},
+         "tag": "EVENT", "claim": "event A confirmed", "reason": "threshold met"},
+    ])
+
+    before = _disk_posteriors(topic_path)
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
+    ))
+    assert "error" not in out, out
+    assert _disk_posteriors(topic_path) == before  # nothing moved beliefs
+
+    topic = _disk_topic(topic_path)
+    assert len(topic["governance"]["flagged_for_indicator_review"]) >= 1  # PARK landed
+
+    packet = out["topics"][0]
+    filed = packet["commit_policy"]["proposals_filed"]
+    assert len(filed) == 1  # FIRE awaits human review
+    queue = json.loads(nrol.list_proposals(slug=SLUG, status="pending"))
+    queued = {p["id"]: p for p in queue["proposals"]}
+    assert filed[0] in queued
+    assert queued[filed[0]]["action"] == "FIRE"
+    assert queued[filed[0]]["indicator_id"] == "ind_binary_mild"
+
+    assert out.get("digest_path")
+    digest = Path(out["digest_path"]).read_text(encoding="utf-8")
+    assert SLUG in digest
+    assert "proposals filed for review: 1" in digest
+
+
+# ---------------------------------------------------------------------------
 # State/code split: NROL_AO_STATE_DIR
 # ---------------------------------------------------------------------------
 

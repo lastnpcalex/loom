@@ -12,6 +12,7 @@ process turnover and tolerate two sessions writing at once.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import sqlite3
@@ -85,7 +86,7 @@ class ProposalStore:
 
     def submit_article(self, article: dict, submitted_by: str = "") -> dict:
         art_id = article_id_for(article)
-        with self._conn() as conn:
+        with contextlib.closing(self._conn()) as conn, conn:
             existing = conn.execute(
                 "SELECT id FROM articles WHERE id = ?", (art_id,)
             ).fetchone()
@@ -110,14 +111,14 @@ class ProposalStore:
         return record
 
     def get_article(self, article_id: str) -> dict | None:
-        with self._conn() as conn:
+        with contextlib.closing(self._conn()) as conn, conn:
             row = conn.execute(
                 "SELECT * FROM articles WHERE id = ?", (article_id,)
             ).fetchone()
         return dict(row) if row else None
 
     def list_articles(self, limit: int = 50) -> list[dict]:
-        with self._conn() as conn:
+        with contextlib.closing(self._conn()) as conn, conn:
             rows = conn.execute(
                 "SELECT id, submitted_at, headline, url, source, date, submitted_by "
                 "FROM articles ORDER BY submitted_at DESC LIMIT ?",
@@ -138,7 +139,7 @@ class ProposalStore:
         missing_direction: str = "",
     ) -> dict:
         pid = new_proposal_id()
-        with self._conn() as conn:
+        with contextlib.closing(self._conn()) as conn, conn:
             conn.execute(
                 "INSERT INTO proposals "
                 "(id, article_id, slug, action, indicator_id, observed_value, "
@@ -152,7 +153,7 @@ class ProposalStore:
         return self.get_proposal(pid)
 
     def get_proposal(self, proposal_id: str) -> dict | None:
-        with self._conn() as conn:
+        with contextlib.closing(self._conn()) as conn, conn:
             row = conn.execute(
                 "SELECT * FROM proposals WHERE id = ?", (proposal_id,)
             ).fetchone()
@@ -179,7 +180,7 @@ class ProposalStore:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(max(1, min(int(limit), 500)))
-        with self._conn() as conn:
+        with contextlib.closing(self._conn()) as conn, conn:
             rows = conn.execute(query, params).fetchall()
         out = []
         for r in rows:
@@ -195,7 +196,7 @@ class ProposalStore:
     def mark_proposal(
         self, proposal_id: str, status: str, note: str = "", result: dict | None = None
     ) -> dict | None:
-        with self._conn() as conn:
+        with contextlib.closing(self._conn()) as conn, conn:
             conn.execute(
                 "UPDATE proposals SET status = ?, decided_at = ?, decision_note = ?, "
                 "result = ? WHERE id = ?",

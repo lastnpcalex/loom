@@ -822,6 +822,7 @@ def run_news_scan(
     max_tokens: int = 4096,
     timeout_sec: int = 900,
     dry_run: bool = False,
+    commit_policy: str = "",
 ) -> str:
     """Run the full NROL-AO news scan on the MCP/server side.
 
@@ -833,6 +834,13 @@ def run_news_scan(
     dry_run=true never mutates state and does not stamp lastScanned.
     dry_run=false records successful scan coverage by stamping lastScanned.
     commit=true additionally applies evidence decisions after Loom approval.
+
+    commit_policy="safe" is the scheduled-scan policy (spec Flow B): PARK
+    and SCHEMA_GAP decisions auto-apply (they cannot move posteriors —
+    engine-enforced), while FIRE/OBSERVE decisions are filed as pending
+    proposals for operator review via list_proposals/commit_match. No
+    posterior ever moves without a human approving it. A digest is written
+    beside the activity ledger.
     """
     store = _activity_store()
     job_id = new_job_id("news-scan-worker")
@@ -896,6 +904,7 @@ def run_news_scan(
             matcher_output = ""
             decisions = []
             applied = None
+            packet_policy = None
             if deduped:
                 matcher_prompt = news.build_matcher_prompt(topic, deduped)
                 store.record(
@@ -921,6 +930,50 @@ def run_news_scan(
                 matcher_output = response.get("text", "")
                 decisions = news.parse_matcher_output(matcher_output)
                 total_decisions += len(decisions)
+
+                if commit_policy == "safe" and not commit and not dry_run and decisions:
+                    safe_decisions = [
+                        d for d in decisions
+                        if d.get("action", {}).get("kind") in {"PARK", "SCHEMA_GAP", "IGNORE"}
+                    ]
+                    review_decisions = [
+                        d for d in decisions
+                        if d.get("action", {}).get("kind") in {"FIRE", "OBSERVE"}
+                    ]
+                    if safe_decisions:
+                        # PARK/SCHEMA_GAP cannot move posteriors (engine-
+                        # enforced, capability-tested) — safe to auto-apply.
+                        applied = news.apply_decisions(slug, deduped, safe_decisions)
+                    proposals_filed = []
+                    pstore = _proposal_store()
+                    for d in review_decisions:
+                        idx = d.get("idx") or 0
+                        art = deduped[idx - 1] if 0 < idx <= len(deduped) else None
+                        if art is None:
+                            continue
+                        try:
+                            art_rec = pstore.submit_article(art, submitted_by="scheduled-scan")
+                            action = d.get("action", {})
+                            _validate_proposal_shape(
+                                topic, action.get("kind", ""),
+                                action.get("indicator_id", ""), action.get("value"),
+                            )
+                            prop = pstore.add_proposal(
+                                article_id=art_rec["id"],
+                                slug=slug,
+                                action=action.get("kind", ""),
+                                indicator_id=action.get("indicator_id", ""),
+                                observed_value=action.get("value"),
+                                rationale=(d.get("reason") or d.get("claim") or "matcher decision")[:500],
+                            )
+                            proposals_filed.append(prop["id"])
+                        except Exception as exc:
+                            search_errors[f"proposal_idx_{idx}"] = str(exc)
+                    packet_policy = {
+                        "policy": "safe",
+                        "auto_committed": (applied or {}),
+                        "proposals_filed": proposals_filed,
+                    }
 
                 if commit:
                     denied = _ask_loom_permission(
@@ -978,6 +1031,7 @@ def run_news_scan(
                 "dry_run": dry_run,
                 "scan_record": scan_record,
                 "applied": applied,
+                "commit_policy": packet_policy,
             }
             topic_packets.append(packet)
 
@@ -985,11 +1039,17 @@ def run_news_scan(
             "job_id": job_id,
             "committed": bool(commit),
             "dry_run": dry_run,
+            "commit_policy": commit_policy or None,
             "topics_scanned": len(topic_packets),
             "article_count": total_articles,
             "decision_count": total_decisions,
             "topics": topic_packets,
         }
+        if not dry_run:
+            try:
+                operator_packet["digest_path"] = _write_digest(operator_packet)
+            except Exception as exc:
+                operator_packet["digest_error"] = str(exc)
         store.record(
             job_id,
             "completed",
@@ -1019,6 +1079,78 @@ def run_news_scan(
             error=str(exc),
         )
         return _json({"job_id": job_id, "error": str(exc), "committed": False})
+
+
+def _write_digest(packet: dict) -> str:
+    """Write a scan digest (json + markdown) beside the activity ledger.
+
+    The digest makes non-mutations visible: a scan that found nothing, or
+    only parked evidence, is reported with the same weight as one that
+    moved posteriors — otherwise operators pressure the system to "do
+    something", which is how freeform updates return.
+    """
+    root = _activity_store().snapshot_path.parent / "digests"
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    (root / f"digest-{stamp}.json").write_text(_json(packet), encoding="utf-8")
+
+    lines = [
+        f"# NROL-AO scan digest — {stamp}",
+        "",
+        f"- topics scanned: {packet.get('topics_scanned')}",
+        f"- articles (deduped): {packet.get('article_count')}",
+        f"- matcher decisions: {packet.get('decision_count')}",
+        f"- commit policy: {packet.get('commit_policy') or 'review-only'}",
+        "",
+    ]
+    for tp in packet.get("topics", []):
+        lines.append(f"## {tp.get('slug')}")
+        kinds: dict[str, int] = {}
+        for d in tp.get("decisions", []) or []:
+            kind = (d.get("action") or {}).get("kind", "?")
+            kinds[kind] = kinds.get(kind, 0) + 1
+        lines.append(
+            f"- articles: {len(tp.get('articles') or [])}; decisions: "
+            + (", ".join(f"{k}×{v}" for k, v in sorted(kinds.items())) or "none")
+        )
+        policy = tp.get("commit_policy") or {}
+        if policy:
+            auto = policy.get("auto_committed") or {}
+            lines.append(
+                f"- auto-committed (safe): park={auto.get('park', 0)} "
+                f"schema_gap={auto.get('schema_gap', 0)} "
+                f"rejections={auto.get('engine_rejections', 0)}"
+            )
+            filed = policy.get("proposals_filed") or []
+            lines.append(
+                f"- proposals filed for review: {len(filed)}"
+                + (f" ({', '.join(filed)})" if filed else "")
+            )
+        if tp.get("search_errors"):
+            lines.append(f"- search errors: {tp['search_errors']}")
+        rec = tp.get("scan_record") or {}
+        lines.append(
+            f"- scan coverage: {'recorded ' + str(rec.get('timestamp')) if rec.get('recorded') else rec.get('skipped_reason', 'not recorded')}"
+        )
+        if not (tp.get("decisions") or []):
+            lines.append("- no actionable evidence this window (a valid result)")
+        lines.append("")
+    (root / f"digest-{stamp}.md").write_text("\n".join(lines), encoding="utf-8")
+    return str(root / f"digest-{stamp}.md")
+
+
+@mcp.tool()
+def latest_digest() -> str:
+    """Return the most recent scan digest (markdown) and its path."""
+    try:
+        root = _activity_store().snapshot_path.parent / "digests"
+        files = sorted(root.glob("digest-*.md"))
+        if not files:
+            return _json({"digest": None, "note": "no digests yet — run run_news_scan"})
+        latest = files[-1]
+        return _json({"path": str(latest), "digest": latest.read_text(encoding="utf-8")})
+    except Exception as exc:
+        return _json({"error": str(exc)})
 
 
 @mcp.tool()
