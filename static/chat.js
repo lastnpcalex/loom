@@ -1711,7 +1711,7 @@ async function sendMessage() {
     let content = input.value.trim();
     const isClaudeMode = State.currentConv && State.currentConv.mode === 'claude';
     const hasImages = State.pendingImages.length > 0;
-    if (!content && !(hasImages && !isClaudeMode)) return;
+    if (!content && !State.pendingReply && !(hasImages && !isClaudeMode)) return;
 
     // Handle slash commands — meta commands work in all modes
     if (content.startsWith('/')) {
@@ -1728,6 +1728,10 @@ async function sendMessage() {
             showToast(`Running: /${translated.skillName}`);
         }
     }
+
+    // Fold any highlight-to-reply excerpt into the outgoing text — after slash
+    // translation so the quote never masks a /command
+    content = _composeReplyContent(content);
 
     // Add user message via REST — send image paths as JSON array
     const imagePaths = hasImages ? State.pendingImages.map(img => img.path) : null;
@@ -1753,6 +1757,7 @@ async function sendMessage() {
         input.value = '';
         autoResizeTextarea();
         clearPendingImages();
+        clearPendingReply();
 
         // If sent from tree view, switch to that branch in chat
         if (isFromTree) {
@@ -3907,6 +3912,141 @@ function copyMessage(msgId) {
             () => showToast('Copy failed', 'error')
         );
     }
+}
+
+// ── Highlight to Reply ──
+// Select text inside any message bubble and a floating "Reply ↩" button
+// appears; clicking it pins the excerpt above the input, and the next send
+// carries it as a quoted block. Mode-agnostic by design: the excerpt rides
+// inside the message text itself, so every backend (Loom, Braid, Hermes,
+// Weave, NROL-AO) sees it without attachment plumbing.
+
+let _replyFloatBtn = null;
+
+function _selectionInSingleMessage() {
+    // Selecting inside an edit box focuses it — that's editing, not quoting
+    const ae = document.activeElement;
+    if (ae && (ae.tagName === 'TEXTAREA' || ae.tagName === 'INPUT')) return null;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+    const text = sel.toString().trim();
+    if (!text) return null;
+    const range = sel.getRangeAt(0);
+    const contentOf = (node) => {
+        const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+        return el ? el.closest('#messages .message .message-content') : null;
+    };
+    const start = contentOf(range.startContainer);
+    const end = contentOf(range.endContainer);
+    // Only offer Reply when the whole selection sits inside one message body
+    if (!start || start !== end) return null;
+    return { msgEl: start.closest('.message'), text, rect: range.getBoundingClientRect() };
+}
+
+function _hideReplyFloatBtn() {
+    if (_replyFloatBtn) {
+        _replyFloatBtn.remove();
+        _replyFloatBtn = null;
+    }
+}
+
+function _showReplyFloatBtn(hit) {
+    _hideReplyFloatBtn();
+    const btn = document.createElement('button');
+    btn.id = 'reply-float-btn';
+    btn.innerHTML = 'Reply <span class="reply-float-arrow">&#x21A9;</span>';
+    // mousedown (not click) so we beat the browser collapsing the selection
+    btn.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setPendingReply(hit.msgEl, hit.text);
+        _hideReplyFloatBtn();
+        window.getSelection()?.removeAllRanges();
+    });
+    document.body.appendChild(btn);
+    const bw = btn.offsetWidth, bh = btn.offsetHeight;
+    let left = hit.rect.left + (hit.rect.width - bw) / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - bw - 8));
+    let top = hit.rect.top - bh - 8;
+    if (top < 8) top = hit.rect.bottom + 8;
+    btn.style.left = `${left}px`;
+    btn.style.top = `${top}px`;
+    _replyFloatBtn = btn;
+}
+
+function setPendingReply(msgEl, text) {
+    const roleLabel = msgEl.querySelector('.message-role')?.textContent?.trim()
+        || (msgEl.classList.contains('user') ? 'You' : 'Assistant');
+    State.pendingReply = {
+        msgId: msgEl.dataset.msgId || null,
+        label: roleLabel,
+        text,
+    };
+    renderReplyQuoteBar();
+}
+
+function clearPendingReply() {
+    State.pendingReply = null;
+    renderReplyQuoteBar();
+}
+
+function renderReplyQuoteBar() {
+    const bar = document.getElementById('reply-quote-bar');
+    if (!bar) return;
+    const reply = State.pendingReply;
+    if (!reply) {
+        bar.classList.add('hidden');
+        return;
+    }
+    bar.classList.remove('hidden');
+    bar.querySelector('.reply-quote-label').textContent = `Replying to ${reply.label}`;
+    bar.querySelector('.reply-quote-text').textContent = reply.text;
+}
+
+/** Format the pending excerpt as a quoted block prepended to the outgoing message. */
+function _composeReplyContent(content) {
+    const reply = State.pendingReply;
+    if (!reply) return content;
+    const quoted = reply.text.split('\n').map(l => '> ' + l).join('\n');
+    const header = `Replying to ${reply.label}:`;
+    return content
+        ? `${header}\n${quoted}\n\n${content}`
+        : `${header}\n${quoted}`;
+}
+
+function _initHighlightReply() {
+    // Re-evaluate the selection after mouse/touch interactions settle
+    const refresh = () => {
+        setTimeout(() => {
+            const hit = _selectionInSingleMessage();
+            if (hit) _showReplyFloatBtn(hit);
+            else _hideReplyFloatBtn();
+        }, 0);
+    };
+    document.addEventListener('mouseup', refresh);
+    document.addEventListener('touchend', refresh);
+    document.addEventListener('selectionchange', () => {
+        const sel = window.getSelection();
+        if (!sel || sel.isCollapsed) _hideReplyFloatBtn();
+    });
+    // The floating button is fixed-positioned; hide rather than track on scroll
+    document.getElementById('messages-container')
+        ?.addEventListener('scroll', _hideReplyFloatBtn, { passive: true });
+
+    const clearBtn = document.getElementById('btn-reply-quote-clear');
+    if (clearBtn) clearBtn.addEventListener('click', clearPendingReply);
+    // Click the chip body to jump back to the quoted message
+    document.getElementById('reply-quote-bar')?.addEventListener('click', (e) => {
+        if (e.target.closest('#btn-reply-quote-clear')) return;
+        const msgId = State.pendingReply?.msgId;
+        if (!msgId) return;
+        const target = document.querySelector(`#messages .message[data-msg-id="${msgId}"]`);
+        if (target) {
+            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            target.classList.add('message-highlight');
+            setTimeout(() => target.classList.remove('message-highlight'), 1600);
+        }
+    });
 }
 
 /** Re-describe all images attached to a user message */

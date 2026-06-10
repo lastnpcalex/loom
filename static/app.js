@@ -79,6 +79,7 @@ const State = {
     ws: null,
     isStreaming: false,
     pendingImages: [],  // [{path, url}, ...] — max 5
+    pendingReply: null,  // {msgId, label, text} — highlight-to-reply excerpt
     bookmarks: [],
     stateCards: [],
     config: {},
@@ -1021,6 +1022,8 @@ async function loadConversation(convId) {
     // Clear compactify banner when switching conversations
     const compBanner = document.getElementById('compactify-banner');
     if (compBanner) compBanner.classList.add('hidden');
+    // A quoted excerpt belongs to the conversation it was selected in
+    if (typeof clearPendingReply === 'function') clearPendingReply();
     State.currentConvId = convId;
     localStorage.setItem('loom-last-conv', convId);
     sessionStorage.setItem('loom-tab-conv', convId);
@@ -1601,6 +1604,9 @@ function initInlineCCControls() {
     // Slash command autocomplete — preload skills cache in background
     if (typeof _initSlashAutocomplete === 'function') _initSlashAutocomplete();
     if (typeof _loadSkills === 'function') _loadSkills();
+
+    // Highlight-to-reply: floating Reply button + quote chip (all chat modes)
+    if (typeof _initHighlightReply === 'function') _initHighlightReply();
 
     // Chat state panel (bottom sheet)
     const statePanel = document.getElementById('state-panel');

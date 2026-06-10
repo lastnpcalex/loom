@@ -9,7 +9,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
-    <link rel="stylesheet" href="/static/style.css?v=115">
+    <link rel="stylesheet" href="/static/style.css?v=116">
 </head>
 <body>
     <div id="blackhole-container"></div>
@@ -219,6 +219,14 @@
         <!-- Shared input area (visible on both chat and tree views) -->
         <div id="input-area" class="hidden">
             <div id="image-preview" class="hidden"></div>
+            <div id="reply-quote-bar" class="hidden" title="Click to jump to the quoted message">
+                <span class="reply-quote-icon">&#x21A9;</span>
+                <div class="reply-quote-body">
+                    <span class="reply-quote-label"></span>
+                    <span class="reply-quote-text"></span>
+                </div>
+                <button id="btn-reply-quote-clear" title="Remove quoted excerpt">&#x2715;</button>
+            </div>
             <div id="describe-context-bar" class="hidden">
                 <label for="describe-context" title="Extra focus for vision model image description — not sent to chat model">Describe focus</label>
                 <textarea id="describe-context" rows="2" placeholder="e.g. focus on body language and composition" autocomplete="off" spellcheck="false"></textarea>
@@ -705,8 +713,8 @@ assistant: *Another example response*"></textarea>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=14"></script>
-    <script src="/static/app.js?v=89"></script>
-    <script src="/static/chat.js?v=129"></script>
+    <script src="/static/app.js?v=90"></script>
+    <script src="/static/chat.js?v=130"></script>
     <script src="/static/tree.js?v=37"></script>
 </body>
 </html>
