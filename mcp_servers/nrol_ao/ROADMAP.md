@@ -79,8 +79,16 @@ server via --mcp-config env per spawn. Math audit report:
 - ✅ Fail-closed permission default (2026-06-09): commit=true without
   LOOM_CONV_ID is denied; NROL_AO_ALLOW_UNGATED_COMMITS=1 is the explicit
   headless opt-out.
-- State/code split: `NROL_AO_STATE_DIR` owned by the MCP server; repo
-  becomes code, state becomes data with one writer.
+- ✅ State/code split, core (2026-06-09): `NROL_AO_STATE_DIR` relocates
+  topics/briefs/dashboards for the engine (the sole writer), the runtime
+  framework modules (dependencies, triage), and the dashboard server;
+  Loom forwards the var into the per-conversation MCP config. Default
+  unset = historical repo-local layout, fully backward compatible.
+  **Before flipping the var in production:** convert the standalone
+  maintenance scripts that still hardcode repo-local topic paths
+  (framework/: extrapolation, meta_health, post_edit_check, runner,
+  stamp_deadlines, stamp_resolution_dates, replay_indicators,
+  migrate_to_lr, lens_calibration, topic_search) and move the files.
 - ✅ Proposal lifecycle (2026-06-09): `submit_article` (content-keyed
   dedup) → `propose_match` (typed, statically validated, pending) →
   `commit_match` (re-validates, duplicate-URL guard, routes through

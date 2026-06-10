@@ -614,6 +614,11 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         if nrol_repo.exists() and nrol_server.is_file() and "nrol-ao" not in mcp_servers:
             nrol_env = {
                 "NROL_AO_REPO": str(nrol_repo),
+                **(
+                    {"NROL_AO_STATE_DIR": os.environ["NROL_AO_STATE_DIR"]}
+                    if os.environ.get("NROL_AO_STATE_DIR", "").strip()
+                    else {}
+                ),
                 "NROL_AO_ACTIVITY_DIR": os.environ.get(
                     "NROL_AO_ACTIVITY_DIR",
                     str(nrol_repo / "loom" / "mcp_activity"),

@@ -525,6 +525,48 @@ def test_withdraw_proposal(nrol, topic_path):
 
 
 # ---------------------------------------------------------------------------
+# State/code split: NROL_AO_STATE_DIR
+# ---------------------------------------------------------------------------
+
+
+def test_state_dir_relocates_topics(nrol_repo, tmp_path):
+    """With NROL_AO_STATE_DIR set, the engine reads and writes topics in the
+    state dir, not the repo. Run in a subprocess: the engine computes its
+    paths at import time, and this session already imported it repo-rooted."""
+    import subprocess
+    import sys as _sys
+
+    state = tmp_path / "state_root"
+    (state / "topics").mkdir(parents=True)
+    (state / "topics" / f"{SLUG}.json").write_text(
+        json.dumps(_fixture_topic(), indent=2), encoding="utf-8"
+    )
+    script = (
+        "import engine, json\n"
+        f"t = engine.load_topic({SLUG!r})\n"
+        "engine.save_topic(t)\n"
+        "print(json.dumps({'topics_dir': str(engine.TOPICS_DIR),"
+        " 'slug': t['meta']['slug']}))\n"
+    )
+    env = {
+        **os.environ,
+        "NROL_AO_STATE_DIR": str(state),
+        "PYTHONPATH": str(nrol_repo),
+    }
+    proc = subprocess.run(
+        [_sys.executable, "-c", script],
+        capture_output=True, text=True, env=env, cwd=str(nrol_repo), timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["slug"] == SLUG
+    assert Path(out["topics_dir"]) == state / "topics"
+    # save_topic stamped lastUpdated in the STATE dir copy, not the repo's
+    saved = json.loads((state / "topics" / f"{SLUG}.json").read_text(encoding="utf-8"))
+    assert saved["meta"]["lastUpdated"] > "2026-06-01"
+
+
+# ---------------------------------------------------------------------------
 # Loom approval gate
 # ---------------------------------------------------------------------------
 
