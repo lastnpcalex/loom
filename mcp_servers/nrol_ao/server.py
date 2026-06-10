@@ -369,6 +369,42 @@ def _search_web_articles(query: str, channel: str, max_results: int) -> list[dic
     return articles
 
 
+def _fetch_article_excerpt(url: str, max_chars: int, timeout_sec: float = 15.0) -> str:
+    """Fetch a URL and extract readable article text (trafilatura).
+
+    Search snippets are ~500 chars of SEO text; the numeric values OBSERVE
+    decisions need usually live in the article body. Returns "" on any
+    failure — a missing excerpt degrades one article, never the scan.
+    """
+    if not url:
+        return ""
+    try:
+        import trafilatura
+
+        # trafilatura's own fetcher gets past bot walls that refuse plain
+        # httpx requests (observed: 403 for httpx with a browser UA, 200 for
+        # fetch_url on the same article).
+        html = None
+        try:
+            html = trafilatura.fetch_url(url)
+        except Exception:
+            html = None
+        if not html:
+            with httpx.Client(
+                timeout=timeout_sec,
+                follow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; NROL-AO scan)"},
+            ) as client:
+                r = client.get(url)
+                r.raise_for_status()
+                html = r.text
+        text = trafilatura.extract(html, include_comments=False, include_tables=True) or ""
+        text = " ".join(text.split())
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+
 def _load_topics(engine, slugs: list[str] | None = None) -> tuple[list[dict], list[dict]]:
     """Load topics tolerantly: one malformed file must not fail the whole call.
 
@@ -823,8 +859,15 @@ def run_news_scan(
     timeout_sec: int = 900,
     dry_run: bool = False,
     commit_policy: str = "",
+    fetch_full_articles: bool = True,
+    excerpt_chars: int = 2800,
 ) -> str:
     """Run the full NROL-AO news scan on the MCP/server side.
+
+    fetch_full_articles=true (default) downloads each deduped article and
+    feeds the matcher a bounded readable-text excerpt alongside the search
+    snippet — snippets alone rarely contain the numeric values OBSERVE
+    decisions require.
 
     This is the one-call operational path: select stale topics, perform
     server-side web search, dedupe articles, deliberate with the local
@@ -905,6 +948,28 @@ def run_news_scan(
             decisions = []
             applied = None
             packet_policy = None
+            excerpt_stats = None
+            if deduped and fetch_full_articles:
+                store.record(
+                    job_id,
+                    "running",
+                    task="run_news_scan",
+                    slug=slug,
+                    model=model or llama_client.llama_model(),
+                    summary={"phase": "fetching", "article_count": len(deduped)},
+                )
+                fetched = 0
+                for item in deduped:
+                    art = item.get("article", item) if isinstance(item, dict) else item
+                    excerpt = _fetch_article_excerpt(art.get("url", ""), excerpt_chars)
+                    if excerpt:
+                        art["excerpt"] = excerpt
+                        fetched += 1
+                excerpt_stats = {
+                    "fetched": fetched,
+                    "of": len(deduped),
+                    "chars_cap": excerpt_chars,
+                }
             if deduped:
                 matcher_prompt = news.build_matcher_prompt(topic, deduped)
                 store.record(
@@ -1042,6 +1107,7 @@ def run_news_scan(
                 "search_errors": search_errors,
                 "articles": deduped,
                 "surfaced": surfaced,
+                "excerpts": excerpt_stats,
                 "decisions": decisions,
                 "matcher_output": matcher_output,
                 "committed": bool(commit and applied and not applied.get("denied")),
@@ -1130,6 +1196,12 @@ def _write_digest(packet: dict) -> str:
             f"- articles: {len(tp.get('articles') or [])}; decisions: "
             + (", ".join(f"{k}×{v}" for k, v in sorted(kinds.items())) or "none")
         )
+        if tp.get("excerpts"):
+            ex = tp["excerpts"]
+            lines.append(
+                f"- article excerpts: {ex.get('fetched', 0)}/{ex.get('of', 0)} fetched "
+                f"(cap {ex.get('chars_cap')} chars)"
+            )
         policy = tp.get("commit_policy") or {}
         if policy:
             auto = policy.get("auto_committed") or {}

@@ -569,6 +569,7 @@ def test_safe_policy_scan_parks_and_files_proposals(nrol, topic_path, monkeypatc
     before = _disk_posteriors(topic_path)
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
+        fetch_full_articles=False,
     ))
     assert "error" not in out, out
     assert _disk_posteriors(topic_path) == before  # nothing moved beliefs
@@ -615,7 +616,9 @@ def test_empty_matcher_output_is_an_error_not_a_quiet_window(nrol, topic_path, m
     )
 
     before_scanned = _disk_topic(topic_path)["meta"].get("lastScanned")
-    out = json.loads(nrol.run_news_scan(slugs=[SLUG], commit=False, dry_run=False))
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=False, fetch_full_articles=False,
+    ))
     assert "error" not in out, out
 
     packet = out["topics"][0]
@@ -629,6 +632,42 @@ def test_empty_matcher_output_is_an_error_not_a_quiet_window(nrol, topic_path, m
     digest = Path(out["digest_path"]).read_text(encoding="utf-8")
     assert "MATCHER FAILED" in digest
     assert "a valid result" not in digest
+
+
+def test_scan_feeds_matcher_full_article_excerpts(nrol, topic_path, monkeypatch):
+    """Search snippets are ~500 chars of SEO text; OBSERVE needs the numbers
+    from the article body. The scan fetches each deduped article and the
+    matcher prompt carries an EXCERPT block with the extracted text."""
+    suffix = uuid.uuid4().hex[:6]
+    articles = [{
+        "headline": f"Transit data print {suffix}",
+        "url": f"https://example.test/full/{suffix}",
+        "source": "test-wire", "date": "2026-06-10",
+        "relevance": "short snippet only",
+    }]
+    monkeypatch.setattr(
+        nrol, "_search_web_articles",
+        lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
+    )
+    monkeypatch.setattr(
+        nrol, "_fetch_article_excerpt",
+        lambda url, max_chars, **kw: f"FULL BODY {suffix}: AIS shows transit at 10% of baseline.",
+    )
+    seen = {}
+
+    def fake_chat(prompt, **kw):
+        seen["prompt"] = prompt
+        return {"text": "canned", "model": "t", "host": "l",
+                "finish_reason": "stop", "reasoning_chars": 0}
+
+    monkeypatch.setattr(nrol.llama_client, "chat", fake_chat)
+
+    out = json.loads(nrol.run_news_scan(slugs=[SLUG], commit=False, dry_run=True))
+    assert "error" not in out, out
+    assert "EXCERPT:" in seen["prompt"]
+    assert f"FULL BODY {suffix}" in seen["prompt"]
+    packet = out["topics"][0]
+    assert packet["excerpts"] == {"fetched": 1, "of": 1, "chars_cap": 2800}
 
 
 # ---------------------------------------------------------------------------
