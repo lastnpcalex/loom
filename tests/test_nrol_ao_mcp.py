@@ -670,6 +670,69 @@ def test_scan_feeds_matcher_full_article_excerpts(nrol, topic_path, monkeypatch)
     assert packet["excerpts"] == {"fetched": 1, "of": 1, "chars_cap": 2800}
 
 
+def test_scan_deliberation_rescues_park_into_proposal(nrol, topic_path, monkeypatch):
+    """The strict matcher's PARK is not the last word: the advocate/rebut/
+    jury debate can rescue a parked article into an OBSERVE, which lands in
+    the proposal queue for human commit — recall widened, authority intact.
+    Stage outputs use blank-line blocks (no END terminators), exercising the
+    real stage parsers."""
+    suffix = uuid.uuid4().hex[:6]
+    articles = [{
+        "headline": f"Metric print {suffix}",
+        "url": f"https://example.test/debate/{suffix}",
+        "source": "test-wire", "date": "2026-06-10",
+        "relevance": "metric reported at 55 percent",
+    }]
+    monkeypatch.setattr(
+        nrol, "_search_web_articles",
+        lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
+    )
+    stage_outputs = [
+        "DECISION\nARTICLE: A1\nACTION: PARK\nTAG: DATA\n"
+        "CLAIM: metric at 55\nREASON: strict matcher unsure\n",
+        "ADVOCATE\nARTICLE: A1\nVERDICT: ARGUE_MOVE\n"
+        "PROPOSED_ACTION: OBSERVE ind_observable_metric AT 55\n"
+        "CITE: '55 percent'\nINFERENCE: none\nREASON: directly cited value\n",
+        "REBUT\nARTICLE: A1\nVERDICT: UPHOLD_MOVE\nREASON: citation is sound\n",
+        "JURY\nARTICLE: A1\nVERDICT: MOVE_TO OBSERVE ind_observable_metric AT 55\n"
+        "RATIONALE: cited, correct units\n",
+    ]
+    calls = {"n": 0}
+
+    def staged_chat(*a, **k):
+        text = stage_outputs[min(calls["n"], len(stage_outputs) - 1)]
+        calls["n"] += 1
+        return {"text": text, "model": "test-llm", "host": "local",
+                "finish_reason": "stop", "reasoning_chars": 0}
+
+    monkeypatch.setattr(nrol.llama_client, "chat", staged_chat)
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
+        fetch_full_articles=False,
+    ))
+    assert "error" not in out, out
+    assert calls["n"] == 4  # matcher + advocate + rebut + jury
+    packet = out["topics"][0]
+    assert packet["deliberation"]["parks"] == 1
+    assert packet["deliberation"]["argue_moves"] == 1
+    assert packet["deliberation"]["rescued"] == 1
+
+    rescued = packet["decisions"][0]
+    assert rescued["action"]["kind"] == "OBSERVE"
+    assert rescued["jury_override"] is True
+
+    filed = packet["commit_policy"]["proposals_filed"]
+    assert len(filed) == 1
+    queue = json.loads(nrol.list_proposals(slug=SLUG, status="pending"))
+    prop = next(p for p in queue["proposals"] if p["id"] == filed[0])
+    assert prop["action"] == "OBSERVE"
+    assert prop["indicator_id"] == "ind_observable_metric"
+
+    digest = Path(out["digest_path"]).read_text(encoding="utf-8")
+    assert "rescued by jury" in digest
+
+
 # ---------------------------------------------------------------------------
 # Parked-queue re-adjudication: kept-but-timestamped + reverse staleness
 # ---------------------------------------------------------------------------

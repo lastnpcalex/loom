@@ -45,3 +45,38 @@ language is perception — only typed transitions move beliefs.
 5. If the engine rejects a transition (governance gate, dedup, LR sanity),
    the update did not happen. Diagnose and report — do not retry with
    massaged inputs.
+
+## The operator loop — how beliefs actually move
+
+Nothing moves a posterior except two calls: `commit_match(proposal_id)` on
+a pending proposal, or `submit_transition(..., indicator_id=..., commit=true)`.
+Prose never moves beliefs, no matter how well it describes the evidence.
+When the human asks to "run the evidence loop", "catch the topic up", or
+"run updates", execute this sequence and report each step:
+
+1. **Status** — `topic_status` for the topic: check `scanStale`,
+   `parkedReviewDebt` (dueCount / reviewDebtRatio), then
+   `list_proposals(status="pending")` for anything already awaiting commit.
+2. **Scan** — `run_news_scan(slugs=[...], commit_policy="safe")`. This runs
+   search, full-article fetch, the strict matcher, AND the advocate/rebut/
+   jury debate over its PARKs. PARK/SCHEMA_GAP auto-apply (they cannot move
+   posteriors); FIRE/OBSERVE — including jury rescues — land in the
+   proposal queue. Read the digest: a MATCHER FAILED or DEBATE FAILED line
+   means the scan needs investigation, not interpretation.
+3. **Review the queue** — `list_proposals(status="pending")`. For each:
+   check the indicator binding, the value and its units, and whether
+   several proposals describe the SAME underlying event (one causal event
+   = commit ONE; the others are corroboration, not independent evidence).
+4. **Commit / withdraw** — `commit_match(proposal_id=...)` for approved
+   (each raises a browser approval to the human — that prompt IS the
+   authority gate); `withdraw_proposal(proposal_id, reason)` for rejected.
+   Report posteriors_before → posteriors_after for every commit.
+5. **Work the parked queue** — `review_parked(slug=..., limit=12,
+   dry_run=false)`. Re-judges parked evidence against the current schema
+   with full article text and the debate; escalations land back in the
+   proposal queue (return to step 3). Repeat until `parkedReviewDebt.dueCount`
+   approaches zero.
+6. **Report non-movement honestly** — when a transition returns
+   `parked: true`, read and report `parked_reason`. "Sustained observation:
+   unchanged from last firing" is the engine refusing to double-count a
+   persisting fact — that is correct behavior, not a failure.

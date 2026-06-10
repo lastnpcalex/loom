@@ -388,6 +388,131 @@ def _search_web_articles(query: str, channel: str, max_results: int) -> list[dic
     return articles
 
 
+def _run_debate(
+    topic: dict,
+    articles: list,
+    decisions: list,
+    news,
+    *,
+    model: str,
+    temperature: float,
+    max_tokens: int,
+    timeout_sec: int,
+    store=None,
+    job_id: str = "",
+    slug: str = "",
+) -> tuple[dict, dict]:
+    """3-stage deliberation (advocate / rebut / jury) over PARKed decisions.
+
+    The strict matcher is deliberately conservative; without this structure
+    every borderline observation dies in PARK on a single model's one-shot
+    judgment. The advocate argues to rescue parks (OBSERVE on observable
+    indicators only), the rebuttal attacks, a fresh jury renders verdicts
+    with KEEP_PARK as the burden-of-proof default.
+
+    Returns (jury_overrides, debate_packet) where jury_overrides maps
+    idx -> {"action": {...}, "rationale": str} for MOVE_TO verdicts only.
+    Never raises — a failed stage returns no overrides and reports why.
+    """
+    packet: dict[str, Any] = {"parks": 0, "argue_moves": 0, "jury_verdicts": {}}
+    try:
+        parks = news.get_parks_with_reasons(decisions)
+        packet["parks"] = len(parks)
+        if not parks:
+            packet["note"] = "no parks to deliberate"
+            return {}, packet
+
+        def _stage(name: str, prompt: str, system: str) -> str:
+            response = llama_client.chat(
+                prompt,
+                system_prompt=system,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout_sec=timeout_sec,
+                disable_thinking=True,
+            )
+            text = response.get("text", "")
+            if store is not None:
+                store.record(
+                    job_id,
+                    "running",
+                    task="debate",
+                    slug=slug,
+                    model=response.get("model"),
+                    summary={"stage": name, "output_chars": len(text),
+                             "finish_reason": response.get("finish_reason")},
+                    response=text,
+                )
+            return text
+
+        adv_text = _stage(
+            "advocate",
+            news.build_advocate_prompt(topic, articles, parks),
+            "You are the ADVOCATE in the NROL-AO debate. Return only ADVOCATE "
+            "blocks in the requested format.",
+        )
+        advocate_moves = [
+            a for a in news.parse_advocate_output(adv_text)
+            if str(a.get("verdict", "")).upper().startswith("ARGUE")
+        ]
+        packet["argue_moves"] = len(advocate_moves)
+        if not advocate_moves:
+            packet["note"] = "advocate found no defensible moves"
+            return {}, packet
+
+        strict_reasons = news.get_strict_reasons_map(decisions)
+        reb_text = _stage(
+            "rebut",
+            news.build_rebut_prompt(topic, articles, advocate_moves, strict_reasons),
+            "You are the REBUTTAL in the NROL-AO debate. Return only REBUT "
+            "blocks in the requested format.",
+        )
+        rebuts = news.parse_rebut_output(reb_text)
+        packet["rebuttals"] = len(rebuts)
+
+        jury_text = _stage(
+            "jury",
+            news.build_jury_prompt(topic, articles, advocate_moves, rebuts),
+            "You are the JURY in the NROL-AO debate. Return only JURY blocks "
+            "in the requested format. In doubt, KEEP_PARK.",
+        )
+        jury = news.parse_jury_output(jury_text)
+        packet["jury_verdicts"] = {
+            str(i): v.get("verdict_raw", "") for i, v in jury.items()
+        }
+        overrides = {
+            idx: {"action": v["action"], "rationale": v.get("rationale", "")}
+            for idx, v in jury.items()
+            if (v.get("action") or {}).get("kind") not in (None, "", "PARK")
+        }
+        packet["rescued"] = len(overrides)
+        return overrides, packet
+    except Exception as exc:
+        packet["error"] = str(exc)
+        return {}, packet
+
+
+def _apply_jury_overrides(decisions: list, jury_overrides: dict) -> list:
+    """Fold MOVE_TO verdicts into the decision list (PARKs only)."""
+    if not jury_overrides:
+        return decisions
+    effective = []
+    for d in decisions:
+        idx = d.get("idx")
+        if idx in jury_overrides and (d.get("action") or {}).get("kind") == "PARK":
+            nd = dict(d)
+            nd["action"] = jury_overrides[idx]["action"]
+            nd["jury_override"] = True
+            nd["reason"] = (
+                "jury: " + (jury_overrides[idx].get("rationale") or "MOVE_TO verdict")
+            )[:500]
+            effective.append(nd)
+        else:
+            effective.append(d)
+    return effective
+
+
 def _fetch_article_excerpt(url: str, max_chars: int, timeout_sec: float = 15.0) -> str:
     """Fetch a URL and extract readable article text (trafilatura).
 
@@ -880,6 +1005,7 @@ def run_news_scan(
     commit_policy: str = "",
     fetch_full_articles: bool = True,
     excerpt_chars: int = 2800,
+    deliberate: bool = True,
 ) -> str:
     """Run the full NROL-AO news scan on the MCP/server side.
 
@@ -887,6 +1013,11 @@ def run_news_scan(
     feeds the matcher a bounded readable-text excerpt alongside the search
     snippet — snippets alone rarely contain the numeric values OBSERVE
     decisions require.
+
+    deliberate=true (default) runs the 3-stage advocate/rebut/jury debate
+    over the strict matcher's PARKs. Jury MOVE_TO verdicts supersede the
+    PARK and flow into the same proposal/commit gates as direct matcher
+    decisions — the debate widens recall, never authority.
 
     This is the one-call operational path: select stale topics, perform
     server-side web search, dedupe articles, deliberate with the local
@@ -968,6 +1099,8 @@ def run_news_scan(
             applied = None
             packet_policy = None
             excerpt_stats = None
+            debate_packet = None
+            jury_overrides = {}
             if deduped and fetch_full_articles:
                 store.record(
                     job_id,
@@ -1026,6 +1159,15 @@ def run_news_scan(
                     )
                 decisions = news.parse_matcher_output(matcher_output)
                 total_decisions += len(decisions)
+
+                if deliberate and decisions and "matcher" not in search_errors:
+                    jury_overrides, debate_packet = _run_debate(
+                        topic, deduped, decisions, news,
+                        model=model, temperature=temperature,
+                        max_tokens=max_tokens, timeout_sec=timeout_sec,
+                        store=store, job_id=job_id, slug=slug,
+                    )
+                    decisions = _apply_jury_overrides(decisions, jury_overrides)
 
                 if commit_policy == "safe" and not commit and not dry_run and decisions:
                     safe_decisions = [
@@ -1128,6 +1270,7 @@ def run_news_scan(
                 "surfaced": surfaced,
                 "excerpts": excerpt_stats,
                 "decisions": decisions,
+                "deliberation": debate_packet,
                 "matcher_output": matcher_output,
                 "committed": bool(commit and applied and not applied.get("denied")),
                 "dry_run": dry_run,
@@ -1221,6 +1364,16 @@ def _write_digest(packet: dict) -> str:
                 f"- article excerpts: {ex.get('fetched', 0)}/{ex.get('of', 0)} fetched "
                 f"(cap {ex.get('chars_cap')} chars)"
             )
+        if tp.get("deliberation"):
+            db = tp["deliberation"]
+            if db.get("error"):
+                lines.append(f"- ⚠ DEBATE FAILED: {db['error']}")
+            else:
+                lines.append(
+                    f"- deliberation: {db.get('parks', 0)} parks debated, "
+                    f"{db.get('argue_moves', 0)} argued, "
+                    f"{db.get('rescued', 0)} rescued by jury"
+                )
         policy = tp.get("commit_policy") or {}
         if policy:
             auto = policy.get("auto_committed") or {}
@@ -1278,8 +1431,14 @@ def review_parked(
     temperature: float = 0.2,
     max_tokens: int = 4096,
     timeout_sec: int = 900,
+    deliberate: bool = True,
 ) -> str:
     """Re-adjudicate parked evidence against the CURRENT indicator schema.
+
+    deliberate=true (default) runs the advocate/rebut/jury debate over
+    re-decisions that remain PARK — these items already died once on a
+    one-shot judgment; the debate is what makes re-review more than a
+    second coin flip from the same model.
 
     Kept-but-timestamped: items never leave the flagged queue here — every
     reviewed item gets a review record (engine.record_parked_reviews) so the
@@ -1387,6 +1546,16 @@ def review_parked(
             })
         decisions = news.parse_matcher_output(matcher_output)
 
+        debate_packet = None
+        if deliberate and decisions:
+            jury_overrides, debate_packet = _run_debate(
+                topic, articles, decisions, news,
+                model=model, temperature=temperature,
+                max_tokens=max_tokens, timeout_sec=timeout_sec,
+                store=store, job_id=job_id, slug=slug,
+            )
+            decisions = _apply_jury_overrides(decisions, jury_overrides)
+
         pstore = _proposal_store()
         reviews = []
         proposals_filed = []
@@ -1439,6 +1608,7 @@ def review_parked(
             "dry_run": dry_run,
             "considered": len(selected),
             "reviews": reviews,
+            "deliberation": debate_packet,
             "proposals_filed": proposals_filed,
             "proposal_errors": errors,
             "recorded": recorded,
