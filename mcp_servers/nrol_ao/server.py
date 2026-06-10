@@ -926,8 +926,20 @@ def run_news_scan(
                     temperature=temperature,
                     max_tokens=max_tokens,
                     timeout_sec=timeout_sec,
+                    disable_thinking=True,
                 )
                 matcher_output = response.get("text", "")
+                if not matcher_output.strip():
+                    # An empty matcher is a failure, not a quiet news window —
+                    # reasoning models can spend the whole token budget in the
+                    # think channel and return no content at all.
+                    search_errors["matcher"] = (
+                        "matcher returned no content "
+                        f"(finish_reason={response.get('finish_reason') or '?'}, "
+                        f"reasoning_chars={response.get('reasoning_chars', 0)}, "
+                        f"model={response.get('model') or 'default'}) — "
+                        "articles NOT marked scanned; raise max_tokens or check the chat template"
+                    )
                 decisions = news.parse_matcher_output(matcher_output)
                 total_decisions += len(decisions)
 
@@ -998,7 +1010,8 @@ def run_news_scan(
                     else:
                         applied = news.apply_decisions(slug, deduped, decisions)
 
-            search_failed_all = bool(channels) and len(search_errors) == len(channels)
+            search_failed_all = bool(channels) and all(c in search_errors for c in channels)
+            matcher_failed = "matcher" in search_errors
             scan_record = {
                 "recorded": False,
                 "dry_run": dry_run,
@@ -1008,6 +1021,10 @@ def run_news_scan(
                 scan_record["skipped_reason"] = "dry_run=true"
             elif search_failed_all:
                 scan_record["skipped_reason"] = "all search channels failed"
+            elif matcher_failed:
+                # Stamping lastScanned would shrink the next adaptive window
+                # and silently drop these articles from ever being matched.
+                scan_record["skipped_reason"] = "matcher returned no content — window left open"
             else:
                 try:
                     stamped = mutation.stamp_last_scanned(slug)
@@ -1133,7 +1150,12 @@ def _write_digest(packet: dict) -> str:
             f"- scan coverage: {'recorded ' + str(rec.get('timestamp')) if rec.get('recorded') else rec.get('skipped_reason', 'not recorded')}"
         )
         if not (tp.get("decisions") or []):
-            lines.append("- no actionable evidence this window (a valid result)")
+            if "matcher" in (tp.get("search_errors") or {}):
+                lines.append("- ⚠ MATCHER FAILED — zero decisions is an error here, not a quiet window")
+            elif tp.get("articles"):
+                lines.append("- no actionable evidence this window (a valid result)")
+            else:
+                lines.append("- no articles surfaced this window (a valid result)")
         lines.append("")
     (root / f"digest-{stamp}.md").write_text("\n".join(lines), encoding="utf-8")
     return str(root / f"digest-{stamp}.md")
@@ -1306,6 +1328,7 @@ def run_matcher_with_llama(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout_sec=timeout_sec,
+            disable_thinking=True,
         )
         output_text = response["text"]
         decisions = news.parse_matcher_output(output_text)
@@ -1316,6 +1339,12 @@ def run_matcher_with_llama(
             "llama_host": response.get("host"),
             "model": response.get("model"),
         }
+        if articles and not output_text.strip():
+            parsed_summary["matcher_error"] = (
+                "matcher returned no content "
+                f"(finish_reason={response.get('finish_reason') or '?'}, "
+                f"reasoning_chars={response.get('reasoning_chars', 0)})"
+            )
         store.record(
             job_id,
             "running",

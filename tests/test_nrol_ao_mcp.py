@@ -591,6 +591,46 @@ def test_safe_policy_scan_parks_and_files_proposals(nrol, topic_path, monkeypatc
     assert "proposals filed for review: 1" in digest
 
 
+def test_empty_matcher_output_is_an_error_not_a_quiet_window(nrol, topic_path, monkeypatch):
+    """A reasoning model can burn the whole token budget in the think channel
+    and return empty content (observed live: Qwen3.6-27B, finish_reason=length,
+    content=""). That must surface as a matcher error, must NOT stamp
+    lastScanned (stamping shrinks the next adaptive window and drops the
+    articles forever), and must not read as a quiet news window in the digest."""
+    suffix = uuid.uuid4().hex[:6]
+    articles = [{
+        "headline": f"Relevant development {suffix}",
+        "url": f"https://example.test/empty-matcher/{suffix}",
+        "source": "test-wire", "date": "2026-06-10",
+        "relevance": "clearly relevant",
+    }]
+    monkeypatch.setattr(
+        nrol, "_search_web_articles",
+        lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
+    )
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "", "reasoning_chars": 4096, "finish_reason": "length",
+                         "model": "test-thinker", "host": "local"},
+    )
+
+    before_scanned = _disk_topic(topic_path)["meta"].get("lastScanned")
+    out = json.loads(nrol.run_news_scan(slugs=[SLUG], commit=False, dry_run=False))
+    assert "error" not in out, out
+
+    packet = out["topics"][0]
+    assert "matcher" in packet["search_errors"]
+    assert "finish_reason=length" in packet["search_errors"]["matcher"]
+    assert packet["decisions"] == []
+    assert packet["scan_record"]["recorded"] is False
+    assert "matcher" in packet["scan_record"]["skipped_reason"]
+    assert _disk_topic(topic_path)["meta"].get("lastScanned") == before_scanned
+
+    digest = Path(out["digest_path"]).read_text(encoding="utf-8")
+    assert "MATCHER FAILED" in digest
+    assert "a valid result" not in digest
+
+
 # ---------------------------------------------------------------------------
 # State/code split: NROL_AO_STATE_DIR
 # ---------------------------------------------------------------------------

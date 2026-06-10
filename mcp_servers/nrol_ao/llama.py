@@ -65,7 +65,14 @@ def chat(
     temperature: float = 0.2,
     max_tokens: int = 2048,
     timeout_sec: int = 600,
+    disable_thinking: bool = False,
 ) -> dict:
+    """disable_thinking=True asks the chat template to skip the reasoning
+    channel (Qwen-style enable_thinking). Reasoning models otherwise spend
+    the whole max_tokens budget inside reasoning_content and return an
+    empty message.content — observed with Qwen3.6-27B on matcher prompts
+    (finish_reason=length, 0 content tokens). Templates without the
+    variable ignore the kwarg."""
     host = llama_host()
     resolved_model = llama_model(model)
     messages: list[dict[str, Any]] = []
@@ -80,6 +87,8 @@ def chat(
     }
     if resolved_model:
         payload["model"] = resolved_model
+    if disable_thinking:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
 
     with httpx.Client(timeout=timeout_sec) as client:
         response = client.post(f"{host}/v1/chat/completions", json=payload)
@@ -87,14 +96,22 @@ def chat(
         data = response.json()
 
     text = ""
+    reasoning = ""
+    finish_reason = ""
     try:
-        text = data["choices"][0]["message"]["content"] or ""
+        choice = data["choices"][0]
+        message = choice.get("message") or {}
+        text = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        finish_reason = choice.get("finish_reason") or ""
     except Exception:
         text = json.dumps(data, ensure_ascii=True)
     return {
         "host": host,
         "model": resolved_model,
         "text": text,
+        "reasoning_chars": len(reasoning),
+        "finish_reason": finish_reason,
         "raw": data,
     }
 
