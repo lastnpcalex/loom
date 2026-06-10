@@ -194,7 +194,26 @@ def _topic_scan_status(topic: dict) -> dict:
         "flaggedForIndicatorReview": len(gov.get("flagged_for_indicator_review", []) or []),
         "flaggedSchemaGaps": len(gov.get("flagged_schema_gaps", []) or []),
         "proposedSchemaExtensions": len(gov.get("proposed_schema_extensions", []) or []),
+        "parkedReviewDebt": _parked_review_debt(topic),
     }
+
+
+def _parked_review_debt(topic: dict) -> dict | None:
+    """Reverse staleness summary for the parked queue (None if engine lacks it)."""
+    try:
+        engine = _import_from_repo("engine")
+        if not hasattr(engine, "parked_review_status"):
+            return None
+        status = engine.parked_review_status(topic)
+        return {
+            "parkedTotal": status["parked_total"],
+            "dueCount": status["due_count"],
+            "reviewDebtRatio": status["review_debt_ratio"],
+            "oldestDueDays": status["oldest_due_days"],
+            "schemaFingerprint": status["schema_fingerprint"],
+        }
+    except Exception:
+        return None
 
 
 def _find_indicator(topic: dict, indicator_id: str) -> tuple[dict | None, str | None]:
@@ -1244,6 +1263,209 @@ def latest_digest() -> str:
         latest = files[-1]
         return _json({"path": str(latest), "digest": latest.read_text(encoding="utf-8")})
     except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def review_parked(
+    slug: str,
+    limit: int = 12,
+    refetch: bool = True,
+    excerpt_chars: int = 2800,
+    dry_run: bool = True,
+    review_interval_days: float = 14.0,
+    model: str = "",
+    temperature: float = 0.2,
+    max_tokens: int = 4096,
+    timeout_sec: int = 900,
+) -> str:
+    """Re-adjudicate parked evidence against the CURRENT indicator schema.
+
+    Kept-but-timestamped: items never leave the flagged queue here — every
+    reviewed item gets a review record (engine.record_parked_reviews) so the
+    review-debt metric in topic_status stays honest. Clearing the queue
+    remains the indicator-cleanup session's job.
+
+    Selection order (the reverse staleness detector): schema-changed first
+    (their PARK was conditioned on a schema that no longer exists), then
+    never-reviewed, then oldest past the review interval. Recently reviewed
+    items are NOT due — the interval doubles as a refractory period that
+    caps multiple-comparisons noise from re-rolling the matcher.
+
+    OBSERVE/FIRE re-decisions are filed as pending proposals for human
+    commit via commit_match; posteriors never move here. refetch=true pulls
+    full article text for each item's URL so the matcher re-judges on the
+    body, not the snippet it originally parked on.
+    """
+    store = _activity_store()
+    job_id = new_job_id("review-parked")
+    start = time.time()
+    try:
+        engine = _import_from_repo("engine")
+        news = _import_from_repo("framework.news_observation_pipeline")
+        if not hasattr(engine, "parked_review_status"):
+            return _json({"error": "engine lacks parked_review_status — update the NROL-AO repo"})
+        topic = engine.load_topic(slug)
+        debt_before = engine.parked_review_status(topic, review_interval_days)
+
+        priority = {"schema_changed": 0, "never_reviewed": 1, "interval_elapsed": 2}
+        due = sorted(
+            debt_before["due"],
+            key=lambda d: (priority.get(d["reason"], 9), -(d.get("age_days") or 0)),
+        )[: max(1, min(int(limit), 30))]
+        if not due:
+            return _json({
+                "slug": slug,
+                "considered": 0,
+                "reviews": [],
+                "debt": debt_before,
+                "note": "no parked items due for review",
+            })
+
+        evidence_by_id = {
+            e.get("id"): e for e in topic.get("evidenceLog", []) or []
+            if isinstance(e, dict) and e.get("id")
+        }
+        selected = []
+        articles = []
+        for d in due:
+            ev = evidence_by_id.get(d["evidence_id"])
+            if not ev:
+                continue
+            art = {
+                "headline": (ev.get("text") or "")[:140] or d["evidence_id"],
+                "url": ev.get("url") or "",
+                "source": ev.get("source") or "evidence_log",
+                "date": str(ev.get("time") or "")[:10],
+                "relevance": (ev.get("text") or "")[:500],
+            }
+            if refetch and art["url"]:
+                excerpt = _fetch_article_excerpt(art["url"], excerpt_chars)
+                if excerpt:
+                    art["excerpt"] = excerpt
+            selected.append(d["evidence_id"])
+            articles.append(art)
+
+        store.record(
+            job_id,
+            "running",
+            task="review_parked",
+            slug=slug,
+            model=model or llama_client.llama_model(),
+            summary={
+                "phase": "matching",
+                "due_total": debt_before["due_count"],
+                "reviewing": len(selected),
+                "refetched": sum(1 for a in articles if a.get("excerpt")),
+            },
+        )
+        prompt = news.build_matcher_prompt(topic, articles)
+        response = llama_client.chat(
+            prompt,
+            system_prompt=(
+                "You are the NROL-AO evidence matcher re-reviewing previously parked "
+                "evidence against the CURRENT indicator schema. Return only DECISION "
+                "blocks in the requested format. Do not invent indicators or values."
+            ),
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+            disable_thinking=True,
+        )
+        matcher_output = response.get("text", "")
+        if not matcher_output.strip():
+            store.record(
+                job_id, "error", task="review_parked", slug=slug,
+                summary={"error": "matcher returned no content — nothing recorded"},
+            )
+            return _json({
+                "slug": slug,
+                "error": "matcher returned no content "
+                         f"(finish_reason={response.get('finish_reason') or '?'}) — "
+                         "no reviews recorded, queue untouched",
+            })
+        decisions = news.parse_matcher_output(matcher_output)
+
+        pstore = _proposal_store()
+        reviews = []
+        proposals_filed = []
+        errors = {}
+        for d in decisions:
+            idx = d.get("idx") or 0
+            if not (0 < idx <= len(selected)):
+                continue
+            ev_id = selected[idx - 1]
+            action = d.get("action", {}) or {}
+            kind = action.get("kind", "")
+            review = {
+                "evidence_id": ev_id,
+                "decision": kind or "NO_DECISION",
+                "note": (d.get("reason") or d.get("claim") or "")[:300],
+            }
+            if kind in {"FIRE", "OBSERVE"} and not dry_run:
+                try:
+                    art_rec = pstore.submit_article(articles[idx - 1], submitted_by="review-parked")
+                    _validate_proposal_shape(
+                        topic, kind, action.get("indicator_id", ""), action.get("value"),
+                    )
+                    prop = pstore.add_proposal(
+                        article_id=art_rec["id"],
+                        slug=slug,
+                        action=kind,
+                        indicator_id=action.get("indicator_id", ""),
+                        observed_value=action.get("value"),
+                        rationale=(
+                            f"re-adjudication of parked {ev_id}: "
+                            + (d.get("reason") or d.get("claim") or "matcher re-decision")
+                        )[:500],
+                    )
+                    review["escalated_proposal_id"] = prop["id"]
+                    proposals_filed.append(prop["id"])
+                except Exception as exc:
+                    errors[ev_id] = str(exc)
+            reviews.append(review)
+
+        recorded = None
+        debt_after = None
+        if not dry_run and reviews:
+            recorded = engine.record_parked_reviews(slug, reviews, reviewer="review_parked")
+            debt_after = engine.parked_review_status(engine.load_topic(slug), review_interval_days)
+            # Trim the verbose due list out of the after-summary
+            debt_after.pop("due", None)
+
+        packet = {
+            "slug": slug,
+            "dry_run": dry_run,
+            "considered": len(selected),
+            "reviews": reviews,
+            "proposals_filed": proposals_filed,
+            "proposal_errors": errors,
+            "recorded": recorded,
+            "debt_before": {k: v for k, v in debt_before.items() if k != "due"},
+            "debt_after": debt_after,
+            "matcher_model": response.get("model"),
+        }
+        store.record(
+            job_id,
+            "completed",
+            task="review_parked",
+            slug=slug,
+            model=response.get("model"),
+            duration_ms=int((time.time() - start) * 1000),
+            summary={
+                "reviewed": len(reviews),
+                "proposals_filed": len(proposals_filed),
+                "dry_run": dry_run,
+            },
+            response=_json(packet),
+        )
+        return _json(packet)
+    except Exception as exc:
+        store.record(
+            job_id, "error", task="review_parked", slug=slug,
+            summary={"error": str(exc)},
+        )
         return _json({"error": str(exc)})
 
 

@@ -671,6 +671,116 @@ def test_scan_feeds_matcher_full_article_excerpts(nrol, topic_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# Parked-queue re-adjudication: kept-but-timestamped + reverse staleness
+# ---------------------------------------------------------------------------
+
+
+def _seed_parked(topic_path, n=2):
+    """Append n parked evidence entries to the fixture topic on disk."""
+    topic = json.loads(topic_path.read_text(encoding="utf-8"))
+    ids = []
+    for i in range(n):
+        ev_id = f"ev_test_{uuid.uuid4().hex[:6]}"
+        topic.setdefault("evidenceLog", []).append({
+            "id": ev_id,
+            "time": "2026-05-07T12:00:00+00:00",
+            "tag": "EVENT",
+            "text": f"Parked development number {i}: threshold-adjacent report.",
+            "url": f"https://example.test/parked/{ev_id}",
+            "source": "test-wire",
+        })
+        topic.setdefault("governance", {}).setdefault(
+            "flagged_for_indicator_review", []
+        ).append(ev_id)
+        ids.append(ev_id)
+    topic_path.write_text(json.dumps(topic, indent=2), encoding="utf-8")
+    return ids
+
+
+def test_review_parked_timestamps_without_clearing(nrol, topic_path, monkeypatch):
+    """Kept-but-timestamped: re-reviewed items stay in the flagged queue but
+    gain review records; FIRE re-decisions escalate to pending proposals
+    (human commit); an immediate second run finds nothing due (refractory)."""
+    ev_ids = _seed_parked(topic_path, n=2)
+    monkeypatch.setattr(
+        nrol, "_fetch_article_excerpt",
+        lambda url, max_chars, **kw: "FULL TEXT: event A confirmed at threshold.",
+    )
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local",
+                         "finish_reason": "stop", "reasoning_chars": 0},
+    )
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "FIRE", "indicator_id": "ind_binary_mild"},
+         "tag": "EVENT", "claim": "event A confirmed", "reason": "threshold met"},
+        {"idx": 2, "action": {"kind": "PARK"},
+         "tag": "EVENT", "claim": "still nothing extractable", "reason": "no threshold"},
+    ])
+
+    out = json.loads(nrol.review_parked(slug=SLUG, dry_run=False))
+    assert "error" not in out, out
+    assert out["considered"] == 2
+
+    topic = _disk_topic(topic_path)
+    flagged = topic["governance"]["flagged_for_indicator_review"]
+    for ev_id in ev_ids:
+        assert ev_id in flagged  # kept, never cleared here
+    book = topic["governance"]["parked_reviews"]
+    assert book[ev_ids[0]]["last_decision"] == "FIRE"
+    assert book[ev_ids[1]]["last_decision"] == "PARK"
+    assert book[ev_ids[0]]["review_count"] == 1
+    assert book[ev_ids[0]]["history"][-1]["escalated_proposal_id"]
+
+    # FIRE escalated to a pending proposal, posteriors untouched by review
+    assert len(out["proposals_filed"]) == 1
+    queue = json.loads(nrol.list_proposals(slug=SLUG, status="pending"))
+    assert any(p["id"] == out["proposals_filed"][0] for p in queue["proposals"])
+
+    # Refractory: immediately re-running finds nothing due
+    again = json.loads(nrol.review_parked(slug=SLUG, dry_run=False))
+    assert again["considered"] == 0
+    assert again["debt"]["due_count"] == 0
+
+    # Debt accounting moved from due to fresh
+    assert out["debt_after"]["fresh_count"] >= 2
+
+
+def test_schema_change_makes_reviewed_items_due_again(nrol, topic_path, monkeypatch):
+    """A PARK is conditioned on the schema: changing an indicator makes
+    previously reviewed items due again via the fingerprint."""
+    _seed_parked(topic_path, n=1)
+    monkeypatch.setattr(nrol, "_fetch_article_excerpt", lambda url, max_chars, **kw: "")
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "canned", "model": "t", "host": "l",
+                         "finish_reason": "stop", "reasoning_chars": 0},
+    )
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "PARK"}, "tag": "EVENT",
+         "claim": "nothing", "reason": "no threshold"},
+    ])
+    out = json.loads(nrol.review_parked(slug=SLUG, dry_run=False))
+    assert "error" not in out, out
+    assert out["debt_after"]["due_count"] == 0
+
+    # Mutate an indicator description on disk — the PARK's conditional changed
+    topic = json.loads(topic_path.read_text(encoding="utf-8"))
+    tiers = topic["indicators"]["tiers"]
+    first_tier = next(iter(tiers.values()))
+    first_tier[0]["desc"] = first_tier[0]["desc"] + " (threshold revised)"
+    topic_path.write_text(json.dumps(topic, indent=2), encoding="utf-8")
+
+    again = json.loads(nrol.review_parked(slug=SLUG, dry_run=True))
+    assert again["considered"] >= 1
+    status = json.loads(nrol.topic_status(slugs=[SLUG]))
+    debt = status["topics"][0]["parkedReviewDebt"]
+    assert debt["dueCount"] >= 1
+
+
+# ---------------------------------------------------------------------------
 # State/code split: NROL_AO_STATE_DIR
 # ---------------------------------------------------------------------------
 
