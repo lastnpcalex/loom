@@ -3624,6 +3624,13 @@ body::after {
     background: var(--border);
 }
 .settings-overrides { margin-bottom: 8px; }
+/* Inapplicable per-conversation override groups: visible but inert */
+.settings-overrides.overrides-inactive label { color: var(--text-muted); }
+.settings-overrides.overrides-inactive select:disabled,
+.settings-overrides.overrides-inactive input:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
 .form-row {
     display: flex;
     gap: 12px;

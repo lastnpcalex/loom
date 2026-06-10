@@ -2522,13 +2522,28 @@ function setupEventListeners() {
         const selModel = llamaModelSelect ? llamaModelSelect.value : '';
         _showModelTuning(selModel);
 
-        // Override visibility
+        // Per-conversation overrides: the settings layout stays invariant —
+        // every group always renders, only the open conversation's group is
+        // editable. Hidden controls are how features get "lost"; disabled
+        // ones stay discoverable. Safe because the save handler only writes
+        // the active mode's fields. Buttons inside groups stay live (the
+        // Anthropic refresh is a global action, not per-conversation).
         const mode = conv ? conv.mode : null;
-        document.getElementById('cfg-overrides-loom').classList.toggle('hidden', mode !== 'claude');
-        document.getElementById('cfg-overrides-braid').classList.toggle('hidden', mode !== 'local');
-        document.getElementById('cfg-overrides-hermes').classList.toggle('hidden', mode !== 'hermes');
-        document.getElementById('cfg-overrides-weave').classList.toggle('hidden', mode !== 'weave');
-        document.getElementById('cfg-conv-overrides-divider').classList.toggle('hidden', !mode);
+        const overrideGroups = {
+            'cfg-overrides-loom': mode === 'claude' || mode === 'codex',
+            'cfg-overrides-braid': mode === 'local',
+            'cfg-overrides-hermes': mode === 'hermes',
+            'cfg-overrides-weave': mode === 'weave',
+        };
+        for (const [id, active] of Object.entries(overrideGroups)) {
+            const group = document.getElementById(id);
+            if (!group) continue;
+            group.classList.remove('hidden');
+            group.classList.toggle('overrides-inactive', !active);
+            group.querySelectorAll('select, input').forEach(c => { c.disabled = !active; });
+        }
+        const ovHint = document.getElementById('cfg-overrides-divider-hint');
+        if (ovHint) ovHint.textContent = mode ? '' : '(open a conversation to edit)';
 
         // Advanced
         document.getElementById('cfg-host').value = cfg.llama_host || '';
