@@ -290,6 +290,26 @@ def test_codex_diff_events_normalize_to_edit_tool_payload():
     assert payload["diff"].startswith("diff --git")
 
 
+def test_codex_app_server_status_notifications_can_finalize_turns():
+    import codex_client
+
+    completed = {
+        "method": "thread/status/changed",
+        "params": {"threadId": "thr", "status": "idle"},
+    }
+    failed = {
+        "method": "turn/status/changed",
+        "params": {
+            "turn": {"id": "turn-1", "status": "failed"},
+            "error": {"message": "boom"},
+        },
+    }
+
+    assert codex_client._codex_terminal_status(completed) == (True, False, "")
+    assert codex_client._codex_turn_id(failed) == "turn-1"
+    assert codex_client._codex_terminal_status(failed) == (True, True, "boom")
+
+
 def test_permission_scope_gen_id_parses_generation_scope():
     import server
 

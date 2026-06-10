@@ -19,7 +19,6 @@ _IGNORED_APP_SERVER_EVENTS = {
     "account/rateLimits/updated",
     "remoteControl/status/changed",
     "serverRequest/resolved",
-    "thread/status/changed",
     "thread/tokenUsage/updated",
     "turn/started",
 }
@@ -303,6 +302,71 @@ def _codex_usage(raw: dict) -> dict | None:
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
     }
+
+
+def _codex_status_payload(raw: dict, params: dict | None = None) -> dict:
+    """Return the nested status-bearing payload from app-server notifications."""
+    params = params or raw.get("params") or {}
+    for container in (
+        params.get("turn"),
+        raw.get("turn"),
+        params.get("thread"),
+        raw.get("thread"),
+        params,
+        raw,
+    ):
+        if isinstance(container, dict):
+            return container
+    return {}
+
+
+def _codex_status_value(raw: dict, params: dict | None = None) -> str:
+    payload = _codex_status_payload(raw, params)
+    value = (
+        payload.get("status")
+        or payload.get("state")
+        or payload.get("phase")
+        or payload.get("lifecycle")
+        or ""
+    )
+    return str(value).lower()
+
+
+def _codex_turn_id(raw: dict, params: dict | None = None) -> str:
+    params = params or raw.get("params") or {}
+    payload = _codex_status_payload(raw, params)
+    return str(
+        payload.get("id")
+        or payload.get("turnId")
+        or payload.get("turn_id")
+        or raw.get("turnId")
+        or raw.get("turn_id")
+        or params.get("turnId")
+        or params.get("turn_id")
+        or ""
+    )
+
+
+def _codex_terminal_status(raw: dict, params: dict | None = None) -> tuple[bool, bool, str]:
+    """Return (is_terminal, is_error, message) for status notifications."""
+    params = params or raw.get("params") or {}
+    etype = raw.get("type") or raw.get("method") or ""
+    status = _codex_status_value(raw, params)
+    if etype in ("thread/status/changed", "thread.status.changed"):
+        if status in ("idle", "completed", "complete", "finished", "success", "succeeded"):
+            return True, False, ""
+        if status in ("failed", "error", "cancelled", "canceled", "interrupted"):
+            return True, True, _text_from_value(
+                params.get("error") or raw.get("error") or "Codex thread failed"
+            )
+    if etype in ("turn/status/changed", "turn.status.changed"):
+        if status in ("completed", "complete", "finished", "success", "succeeded"):
+            return True, False, ""
+        if status in ("failed", "error", "cancelled", "canceled", "interrupted"):
+            return True, True, _text_from_value(
+                params.get("error") or raw.get("error") or "Codex turn failed"
+            )
+    return False, False, ""
 
 
 def _find_codex_exe() -> str:
@@ -673,6 +737,9 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
         session_id = resume_session_id or str(conv_id)
         full_text = ""
         got_result = False
+        turn_inflight = False
+        turn_activity_seen = False
+        active_turn_id = ""
         started_tool_ids: set[str] = set()
         diff_tool_ids: set[str] = set()
         unknown_event_types: set[str] = set()
@@ -750,6 +817,16 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     await _cleanup()
                     yield {"type": "error", "message": json.dumps(turn_start["error"])}
                     return
+                turn_result = turn_start.get("result") or {}
+                turn = turn_result.get("turn") or {}
+                active_turn_id = str(
+                    turn.get("id")
+                    or turn.get("turnId")
+                    or turn_result.get("turnId")
+                    or turn_result.get("turn_id")
+                    or ""
+                )
+                turn_inflight = True
             except Exception as e:
                 await _cleanup()
                 yield {"type": "error", "message": f"Codex app-server launch failed: {e}"}
@@ -777,9 +854,17 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                 etype = raw.get("type") or method
                 usage_evt = _codex_usage(raw)
                 if usage_evt:
+                    turn_activity_seen = True
                     yield usage_evt
 
-                if etype in ("thread.started", "thread/started"):
+                if etype in ("turn.started", "turn/started"):
+                    event_turn_id = _codex_turn_id(raw, params)
+                    if not active_turn_id and event_turn_id:
+                        active_turn_id = event_turn_id
+                    if not event_turn_id or not active_turn_id or event_turn_id == active_turn_id:
+                        turn_activity_seen = True
+
+                elif etype in ("thread.started", "thread/started"):
                     thread = params.get("thread") or raw.get("thread") or {}
                     session_id = raw.get("thread_id") or params.get("threadId") or thread.get("id") or session_id
                     yield {
@@ -788,7 +873,36 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                         "model": codex_model,
                     }
 
+                elif etype in (
+                    "thread/status/changed",
+                    "thread.status.changed",
+                    "turn/status/changed",
+                    "turn.status.changed",
+                ):
+                    terminal, is_error, err_msg = _codex_terminal_status(raw, params)
+                    event_turn_id = _codex_turn_id(raw, params)
+                    if (
+                        terminal
+                        and turn_inflight
+                        and (not active_turn_id or not event_turn_id or event_turn_id == active_turn_id)
+                        and (etype.startswith("turn") or turn_activity_seen)
+                    ):
+                        got_result = True
+                        await _cleanup()
+                        yield {
+                            "type": "result",
+                            "is_error": is_error,
+                            "result_text": full_text,
+                            "session_id": session_id,
+                            "error": err_msg if is_error else "",
+                        }
+                        break
+                    status = _codex_status_value(raw, params)
+                    if status and status not in {"idle", "running", "in_progress", "active"}:
+                        yield {"type": "status", "text": f"Codex status: {status}"}
+
                 elif etype in ("thread/diff/updated", "thread.diff.updated", "turn/diff/updated", "turn.diff.updated"):
+                    turn_activity_seen = True
                     tool_id = _codex_diff_tool_id(raw)
                     payload = _codex_diff_payload(raw)
                     if tool_id not in diff_tool_ids:
@@ -821,6 +935,7 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     yield {"type": "status", "text": text}
 
                 elif etype in ("item.started", "item/started"):
+                    turn_activity_seen = True
                     item = raw.get("item") or params.get("item") or params
                     item_type = item.get("type")
                     item_id = _codex_item_id(item, raw)
@@ -845,6 +960,7 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                         print(f"[CODEX] Ignoring item.started type={item_type}: {json.dumps(item, default=str)[:500]}")
 
                 elif etype in ("item.completed", "item/completed"):
+                    turn_activity_seen = True
                     item = raw.get("item") or params.get("item") or params
                     item_type = item.get("type")
                     item_id = _codex_item_id(item, raw)
@@ -898,6 +1014,7 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                         print(f"[CODEX] Ignoring item.completed type={item_type}: {json.dumps(item, default=str)[:500]}")
 
                 elif etype in ("item.updated", "item.delta", "item/agentMessage/delta", "item/reasoning/delta"):
+                    turn_activity_seen = True
                     item = raw.get("item") or params.get("item") or {}
                     delta = (
                         raw.get("delta")
