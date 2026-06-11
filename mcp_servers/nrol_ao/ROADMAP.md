@@ -152,8 +152,10 @@ three steps shipped 2026-06-11. Unit layer:
   deny-list keyed on `LOOM_NROL_OPERATOR` (the same proven combination
   backstage mode uses: --dangerously-skip-permissions skips agy's own
   approvals, never the PreToolUse hook; Write/Edit/Bash deny with no
-  prompt). The `--sandbox` flag was tried and dropped — it hangs headless
-  -p mode (verified 2026-06-11: zero output, empty cli log). OPERATOR.md
+  prompt). The `--sandbox` flag is omitted, unverified: bare headless
+  smoke runs hang with and without it outside the Loom harness
+  (2026-06-11), so it could not be validated; the hook deny-list does
+  not depend on it. OPERATOR.md
   lands as `GEMINI.md`; `.agents/mcp_config.json` carries exactly
   nrol-ao + web-tools. Open verification: whether workspace
   mcp_config.json replaces or merges with global agy MCP config — probe

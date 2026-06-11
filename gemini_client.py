@@ -375,9 +375,10 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         "--dangerously-skip-permissions",
         "--print-timeout", "5m",
     ]
-    # NOTE: --sandbox was tried for operator convs and hangs headless -p mode
-    # (verified 2026-06-11: zero output, empty cli log, killed after 5 min).
-    # The PreToolUse hook deny-list is the tool-blocking layer instead
+    # NOTE: --sandbox is deliberately not passed for operator convs: bare
+    # headless smoke runs hang with AND without the flag outside the Loom
+    # harness (2026-06-11), so it cannot be validated. The PreToolUse hook
+    # deny-list is the tool-blocking layer and does not depend on it
     # (--dangerously-skip-permissions only skips agy's own approvals, never
     # the hook — same combination backstage mode relies on).
 
