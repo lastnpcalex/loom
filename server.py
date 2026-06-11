@@ -3468,10 +3468,12 @@ async def get_cc_hooks():
 async def codex_diagnostics(conv_id: int = None, project_dir: str = None):
     """Report Codex state that can surprise Loom users across arbitrary folders."""
     target_dir = project_dir
+    nrol_operator = False
     if conv_id:
         conv = await db.get_conversation(conv_id)
         if conv:
             target_dir = conv.get("project_dir") or target_dir
+            nrol_operator = bool(conv.get("nrol_operator"))
     target_path = Path(target_dir).resolve() if target_dir else Path.cwd().resolve()
 
     config_path = Path.home() / ".codex" / "config.toml"
@@ -3494,16 +3496,18 @@ async def codex_diagnostics(conv_id: int = None, project_dir: str = None):
         except Exception as e:
             project_hooks = {"error": str(e)}
 
-    expected_approval = codex_client._codex_approval_policy("default")
+    expected_approval, expected_sandbox = codex_client._codex_launch_policies(
+        "default", nrol_operator
+    )
     return {
         "target_dir": str(target_path),
         "expected_launch": {
             "surface": "app-server",
             "approval_policy": expected_approval,
-            "sandbox": "workspace-write",
-            "writable_roots": [str(target_path)],
+            "sandbox": expected_sandbox,
+            "writable_roots": [] if nrol_operator else [str(target_path)],
             "hook_scope": "disabled",
-            "mcp_servers": [],
+            "mcp_servers": ["nrol-ao", "web-tools"] if nrol_operator else [],
         },
         "project_hook": {
             "path": str(project_hook_path),
@@ -4457,7 +4461,7 @@ def is_gemini_model(model: str) -> bool:
 # port lands — see mcp_servers/nrol_ao/ROADMAP.md "Multi-provider operator
 # parity". "claude" covers the whole claude_client launch family (incl.
 # local llama, which reuses the same CLI flags and tool stripping).
-NROL_OPERATOR_PROVIDERS = {"claude"}
+NROL_OPERATOR_PROVIDERS = {"claude", "codex"}
 
 
 def _nrol_operator_block_reason(cc_model: str) -> str | None:
@@ -5000,6 +5004,7 @@ async def _handle_claude_generation(
                     resume_session_id=resume_session_id if use_resume else None,
                     fork_session=fork_session,
                     backstage_parent_id=conv.get("backstage_parent_id"),
+                    nrol_operator=bool(conv.get("nrol_operator")),
                     permission_request_handler=handle_cc_permission,
                 )
             else:
@@ -5043,6 +5048,7 @@ async def _handle_claude_generation(
                         model=cc_model,
                         effort=cc_effort,
                         permission_mode=cc_permission_mode,
+                        nrol_operator=bool(conv.get("nrol_operator")),
                         permission_request_handler=handle_cc_permission,
                     )
                 else:

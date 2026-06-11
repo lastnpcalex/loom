@@ -42,8 +42,8 @@ def _codex_config_args(key: str, value: str) -> list[str]:
     return ["-c", f"{key}={value}"]
 
 
-def _nrol_mcp_config(conv_id: int, server_port: int) -> dict:
-    if os.environ.get("NROL_AO_AUTO_MCP", "1") in {"0", "false", "False"}:
+def _nrol_mcp_config(conv_id: int, server_port: int, force: bool = False) -> dict:
+    if not force and os.environ.get("NROL_AO_AUTO_MCP", "1") in {"0", "false", "False"}:
         return {}
     root = Path(__file__).parent
     nrol_repo = Path(os.environ.get("NROL_AO_REPO", r"C:\Claude-Code\NROL-AO\temp-repo"))
@@ -82,19 +82,78 @@ def _nrol_mcp_config(conv_id: int, server_port: int) -> dict:
     }
 
 
-def _nrol_mcp_config_args(conv_id: int, server_port: int) -> list[str]:
-    config = _nrol_mcp_config(conv_id, server_port)
+def _web_tools_mcp_config() -> dict:
+    """Keyless web_search/web_fetch (DuckDuckGo + trafilatura) for operators.
+
+    Mirrors the claude_client web-tools registration: NROL operators read
+    sources on the open web but codex has no Anthropic WebSearch/WebFetch.
+    """
+    script = Path(__file__).parent / "mcp_web_tools.py"
+    if not script.is_file():
+        return {}
+    return {
+        "command": sys.executable,
+        "args": [str(script)],
+        "startup_timeout_sec": 20.0,
+        "tool_timeout_sec": 600.0,
+        "default_tools_approval_mode": "approve",
+    }
+
+
+def _ensure_operator_instructions(workspace_root: Path) -> None:
+    """Land the operator role rules where codex auto-loads them: AGENTS.md in cwd.
+
+    The operator workspace is shared across operator conversations, so an
+    idempotent overwrite keeps it current with OPERATOR.md. The app-server
+    baseInstructions field is deliberately not used — it replaces codex's
+    default instructions wholesale instead of adding to them.
+    """
+    operator_md = Path(__file__).parent / "mcp_servers" / "nrol_ao" / "OPERATOR.md"
+    if operator_md.is_file():
+        (workspace_root / "AGENTS.md").write_text(
+            operator_md.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+
+def _thread_mcp_servers(conv_id: int, server_port: int, nrol_operator: bool = False) -> dict:
+    """MCP servers for a codex thread, keyed by server name.
+
+    Operator threads get exactly nrol-ao + web-tools — the codex mirror of
+    --strict-mcp-config. That holds because the thread config is the whole
+    MCP surface only while ~/.codex/config.toml carries no mcp_servers of
+    its own (true as of 2026-06-11); if user-scope servers ever appear they
+    need explicit `enabled=false` overrides here.
+    """
+    servers: dict[str, dict] = {}
+    nrol = _nrol_mcp_config(conv_id, server_port, force=nrol_operator)
+    if nrol:
+        servers["nrol-ao"] = nrol
+    if nrol_operator:
+        web = _web_tools_mcp_config()
+        if web:
+            servers["web-tools"] = web
+    return servers
+
+
+def _mcp_server_config_args(name: str, config: dict) -> list[str]:
     if not config:
         return []
     args: list[str] = []
-    server_key = 'mcp_servers."nrol-ao"'
+    server_key = f'mcp_servers."{name}"'
     args += _codex_config_args(f"{server_key}.command", _toml_literal(config["command"]))
     args += _codex_config_args(f"{server_key}.args", _toml_array(config["args"]))
-    args += _codex_config_args(f"{server_key}.required", "true")
-    args += _codex_config_args(f"{server_key}.startup_timeout_sec", "20.0")
-    args += _codex_config_args(f"{server_key}.tool_timeout_sec", "1200.0")
-    args += _codex_config_args(f"{server_key}.default_tools_approval_mode", _toml_literal("approve"))
-    for key, value in config["env"].items():
+    if config.get("required"):
+        args += _codex_config_args(f"{server_key}.required", "true")
+    if "startup_timeout_sec" in config:
+        args += _codex_config_args(f"{server_key}.startup_timeout_sec", str(config["startup_timeout_sec"]))
+    if "tool_timeout_sec" in config:
+        args += _codex_config_args(f"{server_key}.tool_timeout_sec", str(config["tool_timeout_sec"]))
+    if "default_tools_approval_mode" in config:
+        args += _codex_config_args(
+            f"{server_key}.default_tools_approval_mode",
+            _toml_literal(config["default_tools_approval_mode"]),
+        )
+    for key, value in config.get("env", {}).items():
         args += _codex_config_args(f"{server_key}.env.{key}", _toml_literal(value))
     return args
 
@@ -438,6 +497,20 @@ def _codex_approval_policy(permission_mode: str | None) -> str:
     return "on-request"
 
 
+def _codex_launch_policies(permission_mode: str | None, nrol_operator: bool = False) -> tuple[str, str]:
+    """(approval_policy, sandbox_mode) for a codex launch.
+
+    Operator threads: read-only sandbox with approvalPolicy=never, so write
+    and escalation attempts fail instead of raising a clickable prompt.
+    Codex cannot drop its shell, so the guarantee is "shell exists but
+    cannot write"; posterior commits still raise their own Loom approval
+    inside the nrol-ao MCP server.
+    """
+    if nrol_operator:
+        return "never", "read-only"
+    return _codex_approval_policy(permission_mode), "workspace-write"
+
+
 def _json_dumps_line(payload: dict) -> bytes:
     return (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
 
@@ -456,7 +529,10 @@ def _app_user_input(prompt: str) -> list[dict]:
     return [{"type": "text", "text": prompt}]
 
 
-def _app_sandbox_policy(cwd: str) -> dict:
+def _app_sandbox_policy(cwd: str, nrol_operator: bool = False) -> dict:
+    if nrol_operator:
+        # Operators read sources but never write through the shell.
+        return {"type": "readOnly"}
     return {
         "type": "workspaceWrite",
         "writableRoots": [cwd],
@@ -555,6 +631,7 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     permission_mode: str = "default",
                     resume_session_id: str = None, fork_session: bool = False,
                     backstage_parent_id: int | None = None,
+                    nrol_operator: bool = False,
                     permission_request_handler=None):
     """Launch Codex app-server and yield Loom-compatible stream events."""
     workspace_root = Path(cwd).resolve()
@@ -563,16 +640,22 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
 
     codex_model = _loom_model_to_codex(model)
     codex_exe = _find_codex_exe()
-    approval_policy = _codex_approval_policy(permission_mode)
+    approval_policy, sandbox_mode = _codex_launch_policies(permission_mode, nrol_operator)
     gen_key = getattr(asyncio.current_task(), "_gen_key", None)
     permission_scope = f"gen:{gen_key[2]}" if gen_key else ""
-    nrol_mcp_config = _nrol_mcp_config(conv_id, server_port)
-    nrol_mcp_args = _nrol_mcp_config_args(conv_id, server_port)
-    cmd = [codex_exe, "app-server", *nrol_mcp_args, "--stdio", "--disable", "hooks"]
+    if nrol_operator:
+        _ensure_operator_instructions(workspace_root)
+    mcp_servers_cfg = _thread_mcp_servers(conv_id, server_port, nrol_operator)
+    mcp_args = [
+        arg
+        for name, server_cfg in mcp_servers_cfg.items()
+        for arg in _mcp_server_config_args(name, server_cfg)
+    ]
+    cmd = [codex_exe, "app-server", *mcp_args, "--stdio", "--disable", "hooks"]
     print(f"[CODEX] CMD: {' '.join(cmd)}")
     print(
         f"[CODEX] app-server model={codex_model}, approval={approval_policy}, "
-        f"sandbox=workspace-write, cwd={cwd}, prompt_len={len(prompt)}"
+        f"sandbox={sandbox_mode}, cwd={cwd}, prompt_len={len(prompt)}"
     )
     launch_info = {
         "type": "codex_launch_info",
@@ -580,18 +663,12 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
         "model": codex_model,
         "approval_policy": approval_policy,
         "approvals_reviewer": "user",
-        "sandbox": "workspace-write",
+        "sandbox": sandbox_mode,
         "cwd": cwd,
-        "writable_roots": [cwd],
+        "writable_roots": [] if nrol_operator else [cwd],
         "hook_path": None,
         "hook_scope": "disabled",
-        "mcp_servers": [
-            name
-            for name, enabled in (
-                ("nrol-ao", bool(nrol_mcp_config)),
-            )
-            if enabled
-        ],
+        "mcp_servers": list(mcp_servers_cfg),
     }
 
     env = {
@@ -603,6 +680,8 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
     }
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
+    if nrol_operator:
+        env["LOOM_NROL_OPERATOR"] = "1"
 
     kwargs = {}
     if sys.platform == "win32":
@@ -761,16 +840,13 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     return
                 await _send({"method": "initialized"})
 
-                mcp_servers = {}
-                if nrol_mcp_config:
-                    mcp_servers["nrol-ao"] = nrol_mcp_config
-                thread_config = {"mcp_servers": mcp_servers} if mcp_servers else None
+                thread_config = {"mcp_servers": mcp_servers_cfg} if mcp_servers_cfg else None
                 thread_params = {
                     "cwd": cwd,
                     "model": codex_model,
                     "approvalPolicy": approval_policy,
                     "approvalsReviewer": "user",
-                    "sandbox": "workspace-write",
+                    "sandbox": sandbox_mode,
                     "sessionStartSource": "startup",
                     "threadSource": "user",
                 }
@@ -794,7 +870,7 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     "session_id": session_id,
                     "model": thread_result.get("model") or codex_model,
                 }
-                if nrol_mcp_config:
+                if "nrol-ao" in mcp_servers_cfg:
                     yield {
                         "type": "status",
                         "text": "NROL MCP configured for this Codex thread; waiting for startup status",
@@ -809,7 +885,7 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                         "model": codex_model,
                         "approvalPolicy": approval_policy,
                         "approvalsReviewer": "user",
-                        "sandboxPolicy": _app_sandbox_policy(cwd),
+                        "sandboxPolicy": _app_sandbox_policy(cwd, nrol_operator),
                         "effort": effort if effort in ("minimal", "low", "medium", "high", "xhigh") else None,
                     },
                 )
