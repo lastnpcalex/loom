@@ -387,6 +387,28 @@ def main():
         try:
             with urllib.request.urlopen(req, timeout=None, context=ctx) as resp:
                 response = json.loads(resp.read().decode("utf-8"))
+                # Headless CC never honors ExitPlanMode approval in-session:
+                # even after a PreToolUse allow, CC runs its built-in plan
+                # prompt, which -p mode cannot render, so it auto-denies with
+                # the bare title "Exit plan mode?" (reproduced 2026-06-11 on
+                # CC 2.1.173 with an unconditional auto-allow hook). Loom's
+                # frontend flips the conversation to Act mode on approval, so
+                # the honest in-session signal is an explicit message — not a
+                # cryptic error the model reads as a rejection.
+                if mapped_name == "ExitPlanMode":
+                    if response.get("allow"):
+                        deny(
+                            "Plan APPROVED by the user in Loom. Headless Claude "
+                            "Code cannot exit plan mode mid-session; the next "
+                            "turn starts in Act mode with the plan in effect. "
+                            "End your turn now — do not retry ExitPlanMode.",
+                            event_name=event_name,
+                        )
+                    deny(
+                        "User requested plan revisions in Loom — stay in plan "
+                        "mode and refine the plan.",
+                        event_name=event_name,
+                    )
                 if response.get("allow"):
                     allow(f"Approved by user in Loom UI via {proto}", event_name=event_name)
                 else:
