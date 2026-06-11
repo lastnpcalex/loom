@@ -1,0 +1,157 @@
+{
+  "slug": "synthetic-meridia-reopen",
+  "description": "Authored ground truth for the synthetic Meridia replay. The world is fictional; every event below actually happens in it on the stated date. 'gold' is the correct typed transition an ideal perception layer would file for that event; the oracle lane feeds these directly. 'articles' is how many corpus pieces the generator writes for the event (>1 = duplicate coverage of one causal event, which the pipeline must not double-fire). Distractor entries (gold.action == IGNORE) are real articles about the fictional region that match no indicator.",
+  "start": "2026-07-01",
+  "end": "2026-09-30",
+  "truth": {
+    "hypothesis": "H3",
+    "reopen_date": "2026-09-12",
+    "sustained_70pct_date": "2026-09-24",
+    "note": "The strait reopens 2026-09-12 (inside H3's tranche) and transit sustains >= 70% of baseline from 2026-09-24."
+  },
+  "regimes": [
+    {"from": "2026-07-01", "to": "2026-08-14", "name": "blockade_hold"},
+    {"from": "2026-08-15", "to": "2026-09-05", "name": "de_escalation"},
+    {"from": "2026-09-06", "to": "2026-09-30", "name": "recovery"}
+  ],
+  "deadline_crossings": [
+    {"date": "2026-08-01", "hypothesis": "H1"},
+    {"date": "2026-09-01", "hypothesis": "H2"}
+  ],
+  "events": [
+    {
+      "id": "E01",
+      "date": "2026-07-03",
+      "summary": "Coalition naval forces report new sea mines laid across the southern Meridia channel; two bulk carriers turn back.",
+      "gold": {"action": "FIRE", "indicator_id": "t2_blockade_reinforcement"},
+      "articles": 3
+    },
+    {
+      "id": "D01",
+      "date": "2026-07-08",
+      "summary": "Regional fishing fleets dispute quota allocations in waters 200nm east of the strait; talks scheduled.",
+      "gold": {"action": "IGNORE"},
+      "articles": 1
+    },
+    {
+      "id": "E02",
+      "date": "2026-07-12",
+      "summary": "Direct talks between the blockading power and the riparian coalition resume in Qoros under neutral mediation.",
+      "gold": {"action": "FIRE", "indicator_id": "t3_talks_resumed"},
+      "articles": 2
+    },
+    {
+      "id": "E03",
+      "date": "2026-07-18",
+      "summary": "Lloyd-equivalent tracking data shows daily transits at roughly 4 percent of the pre-crisis baseline; brokers describe traffic as a trickle.",
+      "gold": {"action": "OBSERVE", "indicator_id": "t2_transit_volume", "observed_value": 4},
+      "articles": 2
+    },
+    {
+      "id": "E04",
+      "date": "2026-07-24",
+      "summary": "A products tanker is seized by fast attack craft near the strait's western approach; crew detained.",
+      "gold": {"action": "FIRE", "indicator_id": "t2_blockade_reinforcement"},
+      "articles": 2
+    },
+    {
+      "id": "D02",
+      "date": "2026-07-29",
+      "summary": "Port authority east of the strait announces a five-year container terminal expansion plan unrelated to the blockade.",
+      "gold": {"action": "IGNORE"},
+      "articles": 1
+    },
+    {
+      "id": "E05",
+      "date": "2026-08-05",
+      "summary": "Marine insurers publish updated Meridia route pricing; the normalization index stands at 12 of 100, barely above crisis floor.",
+      "gold": {"action": "OBSERVE", "indicator_id": "t3_insurance_normalization", "observed_value": 12},
+      "articles": 1
+    },
+    {
+      "id": "E06",
+      "date": "2026-08-10",
+      "summary": "Two major insurance syndicates withdraw Meridia hull coverage entirely rather than re-price it; coverage availability is now a distinct question from price.",
+      "gold": {"action": "SCHEMA_GAP", "missing_direction": "Coverage WITHDRAWAL (availability) is not captured by the insurance_normalization price index; needs its own observable or indicator."},
+      "articles": 1
+    },
+    {
+      "id": "E07",
+      "date": "2026-08-15",
+      "summary": "Both sides announce a temporary maritime de-escalation understanding; no transit arrangements specified, no timetable, terms unpublished.",
+      "gold": {"action": "PARK", "reason": "Material to the question but matches no pre-committed indicator: no named transit mechanism, no date, unverifiable terms."},
+      "articles": 2
+    },
+    {
+      "id": "E08",
+      "date": "2026-08-20",
+      "summary": "A five-nation escort framework named Operation Open Water is announced; first escorted convoy scheduled within two weeks.",
+      "gold": {"action": "FIRE", "indicator_id": "t2_escort_convoy_program"},
+      "articles": 3
+    },
+    {
+      "id": "E09",
+      "date": "2026-08-26",
+      "summary": "Tracking data shows daily transits recovering to about 15 percent of baseline as escorted movements begin.",
+      "gold": {"action": "OBSERVE", "indicator_id": "t2_transit_volume", "observed_value": 15},
+      "articles": 1
+    },
+    {
+      "id": "M01",
+      "date": "2026-08-28",
+      "type": "maintenance",
+      "summary": "Indicator-cleanup session: red-team review of the recovery trend recorded; devil's advocate finds no strong counter-evidence (score 0.4).",
+      "gold": {"action": "REDTEAM", "devil_advocate_score": 0.4, "challenge": "Could the escorted-convoy recovery stall if insurers balk? Reviewed: clearance contracts and insurance repricing argue no."},
+      "articles": 0
+    },
+    {
+      "id": "D03",
+      "date": "2026-08-30",
+      "summary": "The blockading power's energy ministry reports record domestic refinery output; analysts debate sanctions leakage.",
+      "gold": {"action": "IGNORE"},
+      "articles": 1
+    },
+    {
+      "id": "E10",
+      "date": "2026-09-03",
+      "summary": "Clearance consortium awarded contracts for mine disposal and wreck salvage across the southern channel; survey vessels deploy.",
+      "gold": {"action": "FIRE", "indicator_id": "t3_channel_clearance_ops"},
+      "articles": 2
+    },
+    {
+      "id": "E11",
+      "date": "2026-09-08",
+      "summary": "Joint decree announces the strait will formally reopen to commercial transit on 12 September under escort and insurance protocols.",
+      "gold": {"action": "FIRE", "indicator_id": "t1_reopening_decree"},
+      "articles": 3
+    },
+    {
+      "id": "E12",
+      "date": "2026-09-12",
+      "summary": "First post-decree convoys transit in both directions; tracking shows daily transits near 38 percent of baseline.",
+      "gold": {"action": "OBSERVE", "indicator_id": "t2_transit_volume", "observed_value": 38},
+      "articles": 2
+    },
+    {
+      "id": "E13",
+      "date": "2026-09-18",
+      "summary": "Insurance normalization index rises to 64 as war-risk premiums fall for escorted transits.",
+      "gold": {"action": "OBSERVE", "indicator_id": "t3_insurance_normalization", "observed_value": 64},
+      "articles": 1
+    },
+    {
+      "id": "D04",
+      "date": "2026-09-20",
+      "summary": "A cruise operator announces it will resume regional itineraries next season, citing improving outlook; no transit data included.",
+      "gold": {"action": "IGNORE"},
+      "articles": 1
+    },
+    {
+      "id": "E14",
+      "date": "2026-09-24",
+      "summary": "Daily transits reach 78 percent of the pre-crisis baseline for the fifth consecutive day; brokers call the recovery sustained.",
+      "gold": {"action": "OBSERVE", "indicator_id": "t2_transit_volume", "observed_value": 78},
+      "articles": 2
+    }
+  ]
+}

@@ -1,0 +1,190 @@
+{
+  "meta": {
+    "slug": "synthetic-meridia-reopen",
+    "title": "Strait of Meridia Reopen Date (synthetic)",
+    "question": "When does the Strait of Meridia reopen to commercial transit?",
+    "resolution": "Resolves to the tranche containing the first date on which daily commercial transits sustain >= 70% of the pre-crisis baseline. Fictional scenario: ground truth is authored in timeline.json.",
+    "resolutionDate": "2026-09-30",
+    "classification": "CALIBRATION",
+    "status": "ACTIVE",
+    "lens": "OPERATOR_JUDGMENT",
+    "calibrationStatus": "SKIPPED_OPERATOR_JUDGMENT",
+    "calibrationSkipReason": "Synthetic replay-harness fixture; no real-world claim. Ground truth authored in timeline.json (truth: H3, reopen 2026-09-12).",
+    "created": "2026-07-01T00:00:00+00:00",
+    "startDate": "2026-07-01",
+    "dayCount": 1,
+    "lastUpdated": "2026-07-01T00:00:00+00:00",
+    "lastScanned": "2026-07-01T00:00:00+00:00"
+  },
+  "model": {
+    "hypotheses": {
+      "H1": {
+        "label": "Reopens by 2026-08-01 (fast diplomatic resolution)",
+        "midpoint": 16,
+        "posterior": 0.15,
+        "resolution_deadline": "2026-08-01"
+      },
+      "H2": {
+        "label": "Reopens 2026-08-02 to 2026-09-01 (negotiated de-escalation)",
+        "midpoint": 47,
+        "posterior": 0.3,
+        "resolution_deadline": "2026-09-01"
+      },
+      "H3": {
+        "label": "Reopens 2026-09-02 to 2026-09-30 (slow recovery)",
+        "midpoint": 76,
+        "posterior": 0.3,
+        "resolution_deadline": "2026-09-30"
+      },
+      "H4": {
+        "label": "No reopen by 2026-09-30 (blockade holds)",
+        "midpoint": 120,
+        "posterior": 0.25
+      }
+    },
+    "posteriorHistory": [
+      {
+        "date": "2026-07-01",
+        "timestamp": "2026-07-01T00:00:00+00:00",
+        "posteriors": {"H1": 0.15, "H2": 0.3, "H3": 0.3, "H4": 0.25},
+        "note": "Initial priors: synthetic fixture, authored by design. H1 discounted because a fast resolution contradicts the opening blockade posture; H2/H3 equal-weighted; H4 carries blockade-persistence mass. Non-uniform by design of the test scenario."
+      }
+    ]
+  },
+  "governance": {
+    "health": "HEALTHY",
+    "issues": [],
+    "flagged_for_indicator_review": [],
+    "flagged_schema_gaps": [],
+    "proposed_schema_extensions": []
+  },
+  "indicators": {
+    "tiers": {
+      "tier1_critical": [
+        {
+          "id": "t1_reopening_decree",
+          "desc": "Official decree or joint statement announcing a concrete reopening date for the Strait of Meridia.",
+          "status": "NOT_FIRED",
+          "firedDate": null,
+          "note": null,
+          "posteriorEffect": "H1 +8pp; H2 +6pp; H3 +4pp; H4 -18pp (decree names a date inside the horizon).",
+          "likelihoods": {"H1": 0.7, "H2": 0.65, "H3": 0.6, "H4": 0.05},
+          "lr_decay": 1.0,
+          "n_firings": 0,
+          "resolution_class": false,
+          "shape": "per_event_member",
+          "causal_event_id": "meridia_decree"
+        }
+      ],
+      "tier2_strong": [
+        {
+          "id": "t2_blockade_reinforcement",
+          "desc": "New interdiction event: mining, vessel seizure, or kinetic attack on commercial shipping in or near the strait.",
+          "status": "NOT_FIRED",
+          "firedDate": null,
+          "note": null,
+          "posteriorEffect": "H4 +10pp; H3 -2pp; H2 -4pp; H1 -4pp; refires decay.",
+          "likelihoods": {"H1": 0.1, "H2": 0.3, "H3": 0.45, "H4": 0.8},
+          "lr_decay": 0.6,
+          "n_firings": 0,
+          "resolution_class": false,
+          "shape": "per_event_member",
+          "causal_event_id": "meridia_blockade_ops"
+        },
+        {
+          "id": "t2_escort_convoy_program",
+          "desc": "A named multinational escort or convoy operation for Meridia transit is announced and initiated.",
+          "status": "NOT_FIRED",
+          "firedDate": null,
+          "note": null,
+          "posteriorEffect": "H1 +6pp; H2 +5pp; H3 -2pp; H4 -9pp.",
+          "likelihoods": {"H1": 0.65, "H2": 0.6, "H3": 0.45, "H4": 0.15},
+          "lr_decay": 1.0,
+          "n_firings": 0,
+          "resolution_class": false,
+          "shape": "per_event_member",
+          "causal_event_id": "meridia_convoy_op"
+        },
+        {
+          "id": "t2_transit_volume",
+          "desc": "Daily commercial transits through the strait as a percent of the pre-crisis baseline (~140 ships/day).",
+          "status": "NOT_FIRED",
+          "firedDate": null,
+          "note": null,
+          "posteriorEffect": "H1 +6pp; H2 +4pp; H3 -1pp; H4 -9pp as recovery approaches the 70% threshold.",
+          "likelihoods": {"H1": 0.7, "H2": 0.6, "H3": 0.5, "H4": 0.2},
+          "lr_decay": 1.0,
+          "n_firings": 0,
+          "resolution_class": false,
+          "shape": "per_event_member",
+          "causal_event_id": "meridia_transit_recovery",
+          "observable": {
+            "metric": "meridia:daily_transit_pct",
+            "family": "logistic",
+            "threshold_value": 70,
+            "baseline": 5,
+            "direction": "higher_strengthens"
+          }
+        }
+      ],
+      "tier3_suggestive": [
+        {
+          "id": "t3_insurance_normalization",
+          "desc": "Marine insurance normalization index for Meridia routes: 0 = full war-risk crisis pricing, 100 = pre-crisis pricing.",
+          "status": "NOT_FIRED",
+          "firedDate": null,
+          "note": null,
+          "posteriorEffect": "H1 +3pp; H2 +2pp; H3 -1pp; H4 -4pp.",
+          "likelihoods": {"H1": 0.6, "H2": 0.55, "H3": 0.5, "H4": 0.3},
+          "lr_decay": 1.0,
+          "n_firings": 0,
+          "resolution_class": false,
+          "shape": "per_event_member",
+          "causal_event_id": "meridia_insurance_reprice",
+          "observable": {
+            "metric": "meridia:insurance_normalization_pct",
+            "family": "logistic",
+            "threshold_value": 75,
+            "baseline": 10,
+            "direction": "higher_strengthens"
+          }
+        },
+        {
+          "id": "t3_talks_resumed",
+          "desc": "Direct talks between the blockading power and the riparian coalition resume or produce a named framework.",
+          "status": "NOT_FIRED",
+          "firedDate": null,
+          "note": null,
+          "posteriorEffect": "H1 +3pp; H2 +2pp; H3 -1pp; H4 -4pp.",
+          "likelihoods": {"H1": 0.6, "H2": 0.55, "H3": 0.5, "H4": 0.3},
+          "lr_decay": 0.7,
+          "n_firings": 0,
+          "resolution_class": false,
+          "shape": "per_event_member",
+          "causal_event_id": "meridia_talks"
+        },
+        {
+          "id": "t3_channel_clearance_ops",
+          "desc": "Mine-clearance, wreck salvage, or channel-survey operations contracted or underway in the strait.",
+          "status": "NOT_FIRED",
+          "firedDate": null,
+          "note": null,
+          "posteriorEffect": "H3 +6pp; H2 +2pp; H1 -4pp; H4 -4pp (clearance implies a weeks-long physical runway: too slow for H1, real enough to refute H4).",
+          "likelihoods": {"H1": 0.3, "H2": 0.5, "H3": 0.65, "H4": 0.25},
+          "lr_decay": 0.8,
+          "n_firings": 0,
+          "resolution_class": false,
+          "shape": "per_event_member",
+          "causal_event_id": "meridia_clearance"
+        }
+      ]
+    },
+    "anti_indicators": []
+  },
+  "actorModel": {},
+  "dataFeeds": {},
+  "predictionScoring": {},
+  "contradictionTracker": {},
+  "evidenceLog": [],
+  "sourceCalibration": {}
+}
