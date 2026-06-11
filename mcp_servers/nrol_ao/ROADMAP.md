@@ -117,54 +117,53 @@ server via --mcp-config env per spawn. Math audit report:
 - Resolution + Brier calibration loop feeding source/lens trust back into
   update weighting.
 
-## Multi-provider operator parity — codex + agy (planned 2026-06-11)
+## Multi-provider operator parity — codex + agy — ✅ DONE 2026-06-11
 
 Observed live: a Codex-model operator ran shell freely in the operator
-workspace (rg of parent dirs) and had no OPERATOR.md — the lockdown is
-claude_client-only. One framing fact before the plan: **the authority gate
-is already provider-agnostic.** `_ask_loom_permission` lives inside the MCP
-server, so no model can commit a posterior through the MCP without the
-browser prompt. The gap is the side-channel (shell writes to topic JSON
-bypassing the engine entirely) and the missing role instructions.
+workspace (rg of parent dirs) and had no OPERATOR.md — the lockdown was
+claude_client-only. The authority gate was never at risk
+(`_ask_loom_permission` lives inside the MCP server, provider-agnostic);
+the gap was the shell side-channel and missing role instructions. All
+three steps shipped 2026-06-11. Unit layer:
+`tests/test_operator_parity.py`.
 
-Claude lockdown today, for parity reference: `--disallowedTools Write, Edit,
-NotebookEdit, Bash, Agent, Task, KillShell, SlashCommand` + reads/web kept
-deliberately (operators read sources) + `--strict-mcp-config` (nrol-ao +
-web-tools only) + OPERATOR.md via `--append-system-prompt`.
+- **Guard (Step 0):** `NROL_OPERATOR_PROVIDERS` allowlist in server.py,
+  checked at conversation creation (400) and at generation dispatch. The
+  actual hole was the per-generation model picker — operator convs are
+  forced to mode=claude at creation, but cc_model routing happens per
+  generation. The guard stays as the safety net for future providers.
+- **Codex port:** operator threads launch sandbox=read-only +
+  approvalPolicy=never (set in BOTH thread/start and turn/start), so
+  shell writes and escalations fail with no clickable prompt. OPERATOR.md
+  lands as `AGENTS.md` in the workspace (the app-server baseInstructions
+  field is deliberately unused — it replaces codex's defaults wholesale
+  instead of adding role rules). Thread MCP surface = exactly nrol-ao +
+  web-tools; that mirrors --strict-mcp-config only while
+  `~/.codex/config.toml` carries no mcp_servers of its own (true
+  2026-06-11) — if user-scope servers ever appear, emit `enabled=false`
+  overrides per foreign server. Documented delta vs claude: codex cannot
+  drop its shell, so the guarantee is "shell exists but cannot write";
+  reads remain possible (info exposure on the operator's own machine, no
+  authority risk).
+- **agy port:** the excludeTools/coreTools hope did not survive contact —
+  the installed agy CLI exposes no tool-restriction settings (verified
+  via --help and settings.json, 2026-06-11), so there is no true tool
+  removal on this provider. Enforcement is the permission hook's NROL
+  deny-list keyed on `LOOM_NROL_OPERATOR` (the same proven combination
+  backstage mode uses: --dangerously-skip-permissions skips agy's own
+  approvals, never the PreToolUse hook; Write/Edit/Bash deny with no
+  prompt). The `--sandbox` flag was tried and dropped — it hangs headless
+  -p mode (verified 2026-06-11: zero output, empty cli log). OPERATOR.md
+  lands as `GEMINI.md`; `.agents/mcp_config.json` carries exactly
+  nrol-ao + web-tools. Open verification: whether workspace
+  mcp_config.json replaces or merges with global agy MCP config — probe
+  via acceptance test (d).
 
-### Step 0 — guard (ship first, ~10 lines)
-server.py refuses to create or generate an `nrol_operator` conversation on
-a codex/gemini model with a clear error naming this roadmap entry. Removes
-the silent-hole state while the ports land.
+Corrections to the original plan: `run_codex`/`run_gemini` have 2 call
+sites each (primary + resume-fallback), not 3.
 
-### Codex port (codex_client.py + server.py call sites)
-1. Thread `nrol_operator: bool` into `run_codex` (3 call sites).
-2. Sandbox: operator conversations get a **read-only** sandbox policy
-   (today: workspace-write) and an approval policy that auto-DENIES
-   escalation — write attempts fail instead of raising a clickable prompt.
-   Codex cannot drop its shell, so the guarantee becomes "shell exists but
-   cannot write"; reads remain possible (acceptable: info exposure on the
-   operator's own machine, no authority risk). Document this delta.
-3. Instructions: write OPERATOR.md into the operator workspace as
-   `AGENTS.md` at conversation creation (codex auto-loads it from cwd);
-   also pass via the app-server instructions field if supported.
-4. MCP config: operator conversations get ONLY nrol-ao + web-tools
-   (mirror --strict-mcp-config semantics when building the codex config).
-
-### agy/Gemini port (gemini_client.py)
-1. Same `nrol_operator` threading.
-2. gemini-cli supports tool restriction via settings (coreTools /
-   excludeTools — verify exact keys for the installed version): write a
-   per-conversation `.gemini/settings.json` into the workspace excluding
-   shell/write/edit tools, with mcpServers = nrol-ao + web-tools only.
-   This can reach closer to claude-parity than codex (true tool removal).
-3. Context: OPERATOR.md as `GEMINI.md` in the workspace (auto-loaded).
-
-### Shared acceptance test (per provider)
+### Acceptance (per provider, live)
 (a) operator attempts a direct topic-JSON write -> blocked, no prompt;
 (b) MCP commit -> browser approval appears; (c) probe "state your role
-rules" -> the operator recites OPERATOR.md content (instructions landed).
-
-### Sequencing
-Blocked on the parallel session's uncommitted server.py / codex_client.py
-work. Step 0 the moment that workspace settles; codex; then agy.
+rules" -> the operator recites OPERATOR.md content; (d) probe "list your
+tools/MCP servers" -> only nrol-ao + web-tools surface.
