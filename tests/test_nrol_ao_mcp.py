@@ -733,11 +733,18 @@ def test_scan_deliberation_rescues_park_into_proposal(nrol, topic_path, monkeypa
     assert "rescued by jury" in digest
 
 
-def test_FULL_LIFECYCLE_design_activate_evidence_posterior(nrol, nrol_repo):
+def test_FULL_LIFECYCLE_design_activate_evidence_posterior(nrol, nrol_repo, monkeypatch):
     """The whole system in one test: an operator designs a topic through the
-    governor gates, activation refuses without a dynamics spec, activation
-    succeeds with one, evidence commits, and the posterior moves. If this
-    passes, 'create a topic and run it' is true end to end."""
+    governor gates (mandatory red team included), activation refuses without
+    a dynamics spec, activation succeeds with one, evidence commits, and the
+    posterior moves. If this passes, 'create a topic and run it' is true
+    end to end."""
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "Priors are justified by the stated design.\nVERDICT: SOUND",
+                         "model": "test-red", "host": "local",
+                         "finish_reason": "stop", "reasoning_chars": 0},
+    )
     slug = f"lifecycle-{uuid.uuid4().hex[:6]}"
     fixture = _fixture_topic()
     hyps = {
@@ -758,10 +765,10 @@ def test_FULL_LIFECYCLE_design_activate_evidence_posterior(nrol, nrol_repo):
         indicators=inds,
         priors_rationale="synthetic fixture priors; H1 favored by design so directional asserts have headroom",
         resolution_date="2030-12-31",
-        deliberate=False,
     ))
     assert "error" not in out, out
     assert out["status"] == "DRAFT"
+    assert out["red_team"]["verdict"] == "SOUND"
 
     # Drafts are invisible to active-topic listings
     hyp_list = json.loads(nrol.list_hypotheses(slug=slug, active_only=True))
@@ -799,6 +806,61 @@ def test_FULL_LIFECYCLE_design_activate_evidence_posterior(nrol, nrol_repo):
     after = _disk_posteriors(topic_file)
     assert after["H1"] > before["H1"]
     assert abs(sum(after.values()) - 1.0) < 5e-4
+
+
+def test_red_team_review_gates_activation(nrol, nrol_repo, monkeypatch):
+    """The red team is not optional: an UNREVIEWED draft (model unreachable
+    at design time) cannot activate; a REVISE verdict blocks activation
+    unless the human passes the explicit logged override."""
+    fixture = _fixture_topic()
+    hyps = {
+        hk: {"label": hv["label"], "prior": hv["posterior"], "midpoint": hv["midpoint"]}
+        for hk, hv in fixture["model"]["hypotheses"].items()
+    }
+    inds = {"tier1_critical": fixture["indicators"]["tiers"]["tier1_critical"],
+            "anti_indicators": []}
+    slug = f"redgate-{uuid.uuid4().hex[:6]}"
+
+    def _boom(*a, **k):
+        raise RuntimeError("llama unreachable")
+
+    monkeypatch.setattr(nrol.llama_client, "chat", _boom)
+    out = json.loads(nrol.design_topic(
+        slug=slug, title="Red gate test", question=fixture["meta"]["question"],
+        resolution=fixture["meta"]["resolution"], hypotheses=hyps, indicators=inds,
+        priors_rationale="synthetic priors for gate test",
+        dynamics={
+            "entrenched_since": "2026-06-01", "sustain_days": 30,
+            "residual_hypothesis": "H3",
+            "hypothesis_windows": {"H1": "2029-12-31", "H2": "2030-12-31"},
+            "priors": {
+                "lam_exit": {"alpha": 2.0, "beta_days": 480, "rationale": "synthetic"},
+                "lam_ramp": {"alpha": 3.0, "beta_days": 225, "rationale": "synthetic"},
+                "lam_relapse": {"alpha": 2.0, "beta_days": 240, "rationale": "synthetic"},
+            },
+        },
+    ))
+    assert "error" not in out, out
+    assert out["red_team"]["verdict"] == "UNREVIEWED"
+
+    refused = json.loads(nrol.activate_topic(slug=slug))
+    assert "error" in refused and "UNREVIEWED" in refused["error"]
+
+    # Model comes back, red team says REVISE
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "H1 prior looks anchored to the operator's hope.\nVERDICT: REVISE",
+                         "model": "test-red", "host": "local",
+                         "finish_reason": "stop", "reasoning_chars": 0},
+    )
+    rt = json.loads(nrol.red_team_topic(slug=slug))
+    assert rt["design_review"]["verdict"] == "REVISE"
+
+    blocked = json.loads(nrol.activate_topic(slug=slug))
+    assert "error" in blocked and "REVISE" in blocked["error"]
+
+    overridden = json.loads(nrol.activate_topic(slug=slug, accept_red_team_revise=True))
+    assert overridden.get("activated") is True, overridden
 
 
 def test_THE_LOOP_parked_evidence_moves_posteriors_end_to_end(nrol, topic_path, monkeypatch):

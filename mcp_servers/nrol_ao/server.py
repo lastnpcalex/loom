@@ -1419,6 +1419,109 @@ def latest_digest() -> str:
         return _json({"error": str(exc)})
 
 
+def _red_team_design(
+    slug: str,
+    question: str,
+    resolution: str,
+    priors_rationale: str,
+    hypotheses: dict,
+    indicators: dict,
+    *,
+    model: str = "",
+    timeout_sec: int = 600,
+) -> dict:
+    """Mandatory adversarial pass over a topic design.
+
+    Returns a design_review record: verdict SOUND / REVISE / UNREVIEWED.
+    A critique that renders no parseable verdict counts as REVISE (fail
+    toward review); an unreachable model leaves UNREVIEWED, which
+    activate_topic refuses outright.
+    """
+    review: dict[str, Any] = {
+        "verdict": "UNREVIEWED",
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "model": "",
+        "critique": "",
+    }
+    try:
+        prompt_lines = [
+            "You are the RED TEAM reviewing a freshly designed NROL-AO topic. "
+            "Attack the design: anchored priors, unfalsifiable hypotheses, "
+            "compound or correlated indicators, missing anti-indicators, "
+            "resolution ambiguity. Be specific; cite the field you attack. "
+            "End with VERDICT: SOUND or VERDICT: REVISE.",
+            f"TOPIC: {slug}",
+            f"QUESTION: {question}",
+            f"RESOLUTION: {resolution}",
+            f"PRIORS RATIONALE: {priors_rationale}",
+            "HYPOTHESES: " + json.dumps(hypotheses, default=str)[:2000],
+            "INDICATORS: " + json.dumps(indicators, default=str)[:4000],
+        ]
+        response = llama_client.chat(
+            "\n".join(prompt_lines),
+            system_prompt="You are an adversarial topic-design reviewer.",
+            model=model, temperature=0.3, max_tokens=2048,
+            timeout_sec=timeout_sec, disable_thinking=True,
+        )
+        text = response.get("text", "")
+        review["model"] = response.get("model") or ""
+        review["critique"] = text
+        verdicts = re.findall(r"VERDICT:\s*(SOUND|REVISE)", text.upper())
+        if verdicts:
+            review["verdict"] = verdicts[-1]
+        elif text.strip():
+            review["verdict"] = "REVISE"
+    except Exception as exc:
+        review["error"] = str(exc)
+    return review
+
+
+def _stamp_design_review(engine, slug: str, review: dict) -> None:
+    """Write the verdict summary onto the draft's meta (full critique lives
+    in the activity ledger and the returned packet)."""
+    topic = engine.load_topic(slug)
+    summary = {k: v for k, v in review.items() if k != "critique"}
+    summary["critique_chars"] = len(review.get("critique") or "")
+    topic["meta"]["design_review"] = summary
+    engine.save_topic(topic)
+
+
+@mcp.tool()
+def red_team_topic(slug: str, model: str = "", timeout_sec: int = 600) -> str:
+    """(Re)run the mandatory red-team design review on a DRAFT topic.
+
+    Use after revising a draft, or when design_topic left the verdict
+    UNREVIEWED because the model was unreachable. Re-reviewing ACTIVE
+    topics is the indicator-cleanup session's job, not this tool's.
+    """
+    try:
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(slug)
+        if (topic.get("meta", {}).get("status") or "").upper() != "DRAFT":
+            return _json({"error": f"topic {slug!r} is not a DRAFT"})
+        history = topic.get("model", {}).get("posteriorHistory", []) or []
+        rationale = (history[0].get("note") if history else "") or "(none recorded)"
+        review = _red_team_design(
+            slug,
+            topic.get("meta", {}).get("question", ""),
+            topic.get("meta", {}).get("resolution", ""),
+            rationale,
+            topic.get("model", {}).get("hypotheses", {}),
+            topic.get("indicators", {}),
+            model=model, timeout_sec=timeout_sec,
+        )
+        _stamp_design_review(engine, slug, review)
+        _activity_store().record(
+            new_job_id("red-team-topic"), "completed", task="red_team_topic",
+            slug=slug, model=review.get("model"),
+            summary={"verdict": review["verdict"]},
+            response=review.get("critique") or "",
+        )
+        return _json({"slug": slug, "design_review": review})
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
 @mcp.tool()
 def design_topic(
     slug: str,
@@ -1431,7 +1534,6 @@ def design_topic(
     classification: str = "CALIBRATION",
     resolution_date: str = "",
     dynamics: dict | None = None,
-    deliberate: bool = True,
     model: str = "",
     timeout_sec: int = 600,
 ) -> str:
@@ -1452,8 +1554,14 @@ def design_topic(
     dynamics: optional shadow-model spec (priors with rationales); REQUIRED
       before activate_topic will accept the topic, so time-as-evidence
       works from day one.
-    deliberate=true runs a llama red-team critique of priors + indicator
-    set (advisory — recorded and returned, mutates nothing).
+
+    The red-team critique is NOT optional. Design is the highest-leverage
+    judgment point in the system — runtime evidence gets a full debate, so
+    design gets at least one adversarial pass. The verdict (SOUND/REVISE)
+    is stamped on the draft; activate_topic refuses UNREVIEWED drafts and
+    requires an explicit override to activate over a REVISE. If llama is
+    down at design time, the draft saves as UNREVIEWED — run
+    red_team_topic(slug) when it's back.
     """
     store = _activity_store()
     job_id = new_job_id("design-topic")
@@ -1518,42 +1626,28 @@ def design_topic(
             dyn_mod = _import_from_repo("framework.dynamics_shadow")
             dynamics_path = dyn_mod.write_spec(_ensure_repo(), slug, dynamics)
 
-        red_team = None
-        if deliberate:
-            try:
-                prompt_lines = [
-                    "You are the RED TEAM reviewing a freshly designed NROL-AO topic. "
-                    "Attack the design: anchored priors, unfalsifiable hypotheses, "
-                    "compound or correlated indicators, missing anti-indicators, "
-                    "resolution ambiguity. Be specific; cite the field you attack. "
-                    "End with VERDICT: SOUND or VERDICT: REVISE.",
-                    f"QUESTION: {question}",
-                    f"RESOLUTION: {resolution}",
-                    f"PRIORS RATIONALE: {priors_rationale}",
-                    "HYPOTHESES: " + json.dumps(hypotheses)[:2000],
-                    "INDICATORS: " + json.dumps(indicators)[:4000],
-                ]
-                response = llama_client.chat(
-                    "\n".join(prompt_lines),
-                    system_prompt="You are an adversarial topic-design reviewer.",
-                    model=model, temperature=0.3, max_tokens=2048,
-                    timeout_sec=timeout_sec, disable_thinking=True,
-                )
-                red_team = {
-                    "critique": response.get("text", ""),
-                    "model": response.get("model"),
-                }
-            except Exception as exc:
-                red_team = {"error": str(exc)}
+        review = _red_team_design(
+            slug, question, resolution, priors_rationale, hypotheses, indicators,
+            model=model, timeout_sec=timeout_sec,
+        )
+        _stamp_design_review(engine, slug, review)
 
+        next_step = {
+            "SOUND": f"Review the above, then activate_topic(slug={slug!r}) to go live.",
+            "REVISE": "Red team says REVISE — address the critique (then "
+                      f"red_team_topic(slug={slug!r})), or activate with "
+                      "accept_red_team_revise=true as a logged override.",
+            "UNREVIEWED": f"Model unreachable for red team — run red_team_topic(slug={slug!r}) "
+                          "before activation (UNREVIEWED drafts cannot activate).",
+        }[review["verdict"]]
         packet = {
             "slug": slug,
             "status": "DRAFT",
             "hypothesis_admissibility": "passed (creation would have raised otherwise)",
             "indicator_lint": lint_report,
             "dynamics_spec": dynamics_path or "MISSING — required before activate_topic",
-            "red_team": red_team,
-            "next": f"Review the above, then activate_topic(slug={slug!r}) to go live.",
+            "red_team": review,
+            "next": next_step,
         }
         store.record(job_id, "completed", task="design_topic", slug=slug,
                      summary={"status": "DRAFT", "dynamics": bool(dynamics_path)},
@@ -1566,13 +1660,15 @@ def design_topic(
 
 
 @mcp.tool()
-def activate_topic(slug: str) -> str:
+def activate_topic(slug: str, accept_red_team_revise: bool = False) -> str:
     """Activate a DRAFT topic — the human-gated commit of the design loop.
 
     Hard requirements: topic exists in DRAFT status, hypotheses re-pass
-    admissibility, and a lint-clean dynamics spec exists (no topic goes
-    live without pricing time-as-evidence). Raises a Loom browser approval
-    (fail-closed) before flipping status to ACTIVE.
+    admissibility, a lint-clean dynamics spec exists (no topic goes live
+    without pricing time-as-evidence), and the mandatory red-team review
+    has run. UNREVIEWED drafts never activate; a REVISE verdict requires
+    accept_red_team_revise=true — an explicit, logged human override.
+    Raises a Loom browser approval (fail-closed) before flipping ACTIVE.
     """
     try:
         engine = _import_from_repo("engine")
@@ -1592,9 +1688,29 @@ def activate_topic(slug: str) -> str:
         if bad:
             return _json({"error": f"inadmissible hypotheses block activation: {sorted(bad)}"})
 
+        verdict = str(
+            (topic.get("meta", {}).get("design_review") or {}).get("verdict") or "UNREVIEWED"
+        ).upper()
+        if verdict == "UNREVIEWED":
+            return _json({
+                "error": "design is UNREVIEWED — the red-team pass is mandatory; "
+                         f"run red_team_topic(slug={slug!r}) first",
+            })
+        if verdict == "REVISE" and not accept_red_team_revise:
+            return _json({
+                "error": "red team verdict is REVISE — revise the draft (then "
+                         "red_team_topic again), or activate with "
+                         "accept_red_team_revise=true as a logged override",
+            })
+
         denied = _ask_loom_permission(
             "nrol_ao_activate_topic",
-            {"slug": slug, "title": topic.get("meta", {}).get("title")},
+            {
+                "slug": slug,
+                "title": topic.get("meta", {}).get("title"),
+                "red_team_verdict": verdict,
+                "revise_overridden": bool(verdict == "REVISE" and accept_red_team_revise),
+            },
         )
         if denied:
             return _json({"slug": slug, "activated": False, "denied": denied})
@@ -1603,7 +1719,11 @@ def activate_topic(slug: str) -> str:
         engine.save_topic(topic)
         _activity_store().record(
             new_job_id("activate-topic"), "completed", task="activate_topic",
-            slug=slug, summary={"activated": True},
+            slug=slug, summary={
+                "activated": True,
+                "red_team_verdict": verdict,
+                "revise_overridden": bool(verdict == "REVISE" and accept_red_team_revise),
+            },
         )
         return _json({
             "slug": slug,
