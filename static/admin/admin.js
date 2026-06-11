@@ -19,7 +19,7 @@ function showToast(msg) {
 }
 
 // ── View switching ──────────────────────────────────────────────────
-const VIEW_TITLES = { overview: 'Overview', servers: 'Servers', terminal: 'Terminal', tools: 'Tools', cron: 'Cron Jobs' };
+const VIEW_TITLES = { overview: 'Overview', servers: 'Servers', terminal: 'Terminal', tools: 'Tools', cron: 'Cron Jobs', guide: 'User Guide' };
 
 function setView(name) {
     document.querySelectorAll('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.view === name));

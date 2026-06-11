@@ -552,6 +552,31 @@ details.cron-detail pre {
 .fill-gpu { background: linear-gradient(90deg, #f9d423, #ff4e50); box-shadow: 0 0 8px rgba(255, 78, 80, 0.5); }
 .spec-error { font-size: 12px; color: var(--red); padding: 10px; background: rgba(255, 102, 102, 0.1); border-radius: 4px; text-align: center; }
 
+/* ── Guide ── */
+.guide p, .guide li {
+    font-size: 13.5px;
+    line-height: 1.65;
+    color: var(--text-dim);
+}
+.guide p strong, .guide li strong { color: var(--text); }
+.guide em { color: var(--cyan); font-style: normal; }
+.guide ol { padding-left: 22px; margin: 8px 0; }
+.guide li { margin-bottom: 8px; }
+.guide code {
+    background: rgba(0, 0, 0, 0.45);
+    border: 1px solid rgba(0, 255, 255, 0.12);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+    color: var(--cyan);
+}
+.guide-rule {
+    border-left: 3px solid var(--violet);
+    padding: 8px 12px;
+    background: rgba(191, 0, 255, 0.06);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
 /* ── Responsive ── */
 @media (max-width: 840px) {
     #sidebar { width: 62px; padding: 14px 7px; }

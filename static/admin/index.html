@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/assets/admin.css?v=2">
+    <link rel="stylesheet" href="/assets/admin.css?v=3">
 </head>
 <body>
     <div class="bg-glow bg-glow-1"></div>
@@ -27,6 +27,7 @@
                 <button class="nav-item" data-view="terminal"><span class="nav-icon">⌨</span><span class="nav-label">Terminal</span></button>
                 <button class="nav-item" data-view="tools"><span class="nav-icon">⚒</span><span class="nav-label">Tools</span></button>
                 <button class="nav-item" data-view="cron"><span class="nav-icon">⏲</span><span class="nav-label">Cron</span></button>
+                <button class="nav-item" data-view="guide"><span class="nav-icon">✦</span><span class="nav-label">Guide</span></button>
             </nav>
             <div class="sidebar-foot">
                 <div class="pulse-grid" id="pulse-grid" title="Live port probes"></div>
@@ -187,10 +188,79 @@
                     </table>
                 </div>
             </section>
+            <!-- ── Guide ────────────────────────────────────────────── -->
+            <section id="view-guide" class="view">
+                <div class="card guide">
+                    <div class="card-head"><h2>System Map</h2></div>
+                    <table class="data-table">
+                        <thead><tr><th>Service</th><th>Port</th><th>What it is</th></tr></thead>
+                        <tbody>
+                            <tr><td>Main Loom</td><td>:3000</td><td>The branching chat interface — all five conversation modes</td></tr>
+                            <tr><td>Test Loom</td><td>:3001</td><td>Second instance against <code>loom_test.db</code></td></tr>
+                            <tr><td>Admin (this page)</td><td>:3002</td><td>Service lifecycle, terminal, tools, cron</td></tr>
+                            <tr><td>llama-server</td><td>:8000</td><td>llama.cpp serving the local GGUF — powers Braid, Hermes, Weave, and all NROL-AO matching/deliberation</td></tr>
+                            <tr><td>NROL-AO dashboard</td><td>:8098</td><td>Topic posteriors and governance views</td></tr>
+                            <tr><td>ComfyUI</td><td>:8188</td><td>Image generation</td></tr>
+                            <tr><td>ttyd</td><td>:7681</td><td>Web terminal (Terminal tab; localhost-bound by default)</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="card guide">
+                    <div class="card-head"><h2>Loom Conversation Modes</h2></div>
+                    <p><strong>Loom</strong> — Claude Code via the Anthropic API; the model dropdown also carries Codex and Antigravity groups, switchable mid-conversation. <strong>Braid</strong> — Claude Code on the local llama-server. <strong>Hermes</strong> — the ACP agent on the same local model. <strong>Weave</strong> — structured RP with characters, personas, and the OODA state harness. <strong>NROL-AO</strong> — the locked-down epistemic-engine operator: file and shell tools stripped, beliefs move only through typed, human-approved transitions.</p>
+                    <p>Everything shares one branching tree, one search index, one chat surface: highlight any message text to quote it in your next send; attach files; queue messages mid-generation; branch, fork, and regenerate without losing anything.</p>
+                </div>
+
+                <div class="card guide">
+                    <div class="card-head"><h2>NROL-AO — The Operator Loop</h2></div>
+                    <p class="guide-rule">Nothing moves a posterior except <code>commit_match</code> on a pending proposal, or <code>submit_transition</code> with an <code>indicator_id</code> and <code>commit=true</code>. Prose never moves beliefs — no matter how well it describes the evidence.</p>
+                    <p>In an NROL-AO conversation, these plain requests run the whole machine:</p>
+                    <ol>
+                        <li><strong>"Run the evidence loop on &lt;topic&gt;"</strong> — status check, then a scan: web search per hypothesis, full-article fetch, strict matcher, and the advocate / rebuttal / jury debate over its PARKs. Safe policy: PARK and SCHEMA_GAP auto-apply (they cannot move posteriors); FIRE and OBSERVE land in the proposal queue.</li>
+                        <li><strong>"Show me the pending proposals"</strong> — review each: indicator binding, value and units, and whether several proposals describe the <em>same underlying event</em> (one causal event = commit ONE; the engine decays and de-correlates repeats, but don't lean on it).</li>
+                        <li><strong>"Commit #N, withdraw the rest"</strong> — each commit raises a browser approval prompt. <em>That click is the authority gate.</em> Posteriors move through pre-committed likelihoods, repeat-fire decay, and the confidence-inflation guard; the result reports before → after.</li>
+                        <li><strong>"Work down the parked queue"</strong> — <code>review_parked</code> re-judges shelved evidence against the current schema with full article text and the debate. Items stay in the queue (kept-but-timestamped) but escalations return to step 2 as <em>rebind</em> proposals that commit against the existing ledger entry. The <code>parkedReviewDebt</code> ratio in topic_status is the accountability number — due items, not queue size.</li>
+                        <li><strong>"Show shadow posteriors"</strong> — the dynamics model's first-passage probabilities, derived from pre-committed regime priors plus elapsed time (Gamma conjugacy prices "still closed, day N"). Zero authority; divergence from committed posteriors is a calibration conversation, not an error.</li>
+                    </ol>
+                </div>
+
+                <div class="card guide">
+                    <div class="card-head"><h2>NROL-AO — Creating a Topic</h2></div>
+                    <p>Say: <em>"Design a topic for &lt;question&gt; — hypotheses with priors and a written rationale, tier-1 indicators with pre-committed LRs, and a dynamics spec."</em> The pipeline behind it:</p>
+                    <ol>
+                        <li><code>design_topic</code> drafts through the governor gates — inadmissible hypotheses (unclear, unobservable, unfalsifiable) block creation outright; a <code>priors_rationale</code> is required and recorded as the topic's first history entry.</li>
+                        <li>The <strong>red-team review is mandatory</strong> and runs automatically: verdict SOUND or REVISE stamped on the draft. UNREVIEWED drafts can never activate; activating over a REVISE requires an explicit, logged override.</li>
+                        <li><code>activate_topic</code> is the final human-gated commit — it also <em>refuses</em> any topic without a lint-clean dynamics spec, so every topic prices time-as-evidence from day one.</li>
+                    </ol>
+                    <p>Drafts move no beliefs and stay out of active listings until you approve activation in the browser.</p>
+                </div>
+
+                <div class="card guide">
+                    <div class="card-head"><h2>Reading the Digests (failure modes have names now)</h2></div>
+                    <table class="data-table">
+                        <thead><tr><th>Digest line</th><th>Meaning</th></tr></thead>
+                        <tbody>
+                            <tr><td><code>no actionable evidence this window (a valid result)</code></td><td>Real quiet window — articles were found and judged; nothing crossed a threshold.</td></tr>
+                            <tr><td><code>⚠ MATCHER FAILED</code></td><td>The model returned no content (e.g. thinking budget exhausted). The scan window is left open so nothing is lost; investigate, don't interpret.</td></tr>
+                            <tr><td><code>⚠ DEBATE FAILED</code></td><td>A deliberation stage errored — zero rescues is a malfunction here, not consensus.</td></tr>
+                            <tr><td><code>deliberation: N parks debated, M argued, K rescued</code></td><td>The jury layer working: K parked items escalated to proposals.</td></tr>
+                            <tr><td><code>parked: true, parked_reason: sustained observation…</code></td><td>The engine declining to double-count an unchanged fact on an already-fired indicator. Correct behavior.</td></tr>
+                            <tr><td><code>scan coverage: … window left open</code></td><td>lastScanned deliberately not stamped after a failure — the next scan re-covers these articles.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="card guide">
+                    <div class="card-head"><h2>Status &amp; Known Gaps <span class="count">as of 2026-06-11</span></h2></div>
+                    <p><strong>Working, with acceptance tests:</strong> the full lifecycle (design → red team → activate → scan → deliberate → propose → human commit → posterior moves) and the parked-queue loop (re-adjudication → rebind commit). Pinned by <code>test_FULL_LIFECYCLE…</code> and <code>test_THE_LOOP…</code> in the NROL suite.</p>
+                    <p><strong>Open items:</strong> dynamics <code>evidence_nudges</code> have no gated write tool yet (specs are repo-edited); the shadow model needs 2–3 weeks of comparison against committed posteriors before promotion to a typed transition; debate quality on live batches is unproven; the Hormuz parked backlog (~109 due) awaits a full <code>review_parked</code> sweep now that rebind commits land.</p>
+                </div>
+            </section>
         </main>
     </div>
 
     <div id="toast"></div>
-    <script src="/assets/admin.js?v=2"></script>
+    <script src="/assets/admin.js?v=3"></script>
 </body>
 </html>
