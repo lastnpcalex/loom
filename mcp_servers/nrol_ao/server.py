@@ -283,9 +283,16 @@ def _evidence_entry(evidence: dict, default_tag: str = "EVENT") -> dict:
         "surfaced_via",
         "scanRound",
         "queryProvenance",
+        "time",
+        "published",
     ):
         if key in evidence:
             entry[key] = evidence[key]
+    # Date evidence by the article's publication, not by when the operator
+    # got around to committing it. The engine's add_evidence honors a "time"
+    # field and only falls back to now() when it is absent.
+    if not entry.get("time") and entry.get("published"):
+        entry["time"] = entry["published"]
     return entry
 
 
@@ -2643,6 +2650,12 @@ def commit_match(proposal_id: str, include_topic: bool = False) -> str:
             "claim": prop.get("rationale") or "",
             "tag": "EVENT",
         }
+        published = (
+            article.get("published") or article.get("published_at")
+            or article.get("date") or ""
+        ).strip()
+        if published:
+            evidence["published"] = published
         raw = submit_transition(
             slug=prop["slug"],
             transition=prop["action"],

@@ -1152,3 +1152,64 @@ def test_commit_without_loom_denied_by_default(nrol, topic_path, monkeypatch):
     assert out.get("committed") is not True
     assert "Loom" in (out.get("denied") or "")
     assert _disk_posteriors(topic_path) == before
+
+
+# ---------------------------------------------------------------------------
+# Simulated clock + evidence dating (synthetic-replay seam)
+# ---------------------------------------------------------------------------
+
+
+def test_as_of_pins_engine_clock(nrol, monkeypatch):
+    engine = nrol._import_from_repo("engine")
+    monkeypatch.setenv("NROL_AO_AS_OF", "2026-07-03")
+    assert engine._now_iso() == "2026-07-03T00:00:00+00:00"
+    # Non-UTC offsets normalize to UTC.
+    monkeypatch.setenv("NROL_AO_AS_OF", "2026-07-03T05:00:00-05:00")
+    assert engine._now_iso() == "2026-07-03T10:00:00+00:00"
+    # A replay must never fall back to the wall clock silently.
+    monkeypatch.setenv("NROL_AO_AS_OF", "not-a-date")
+    with pytest.raises(ValueError):
+        engine._now_dt()
+    monkeypatch.delenv("NROL_AO_AS_OF")
+    assert engine._now_iso() != "2026-07-03T00:00:00+00:00"
+
+
+def test_evidence_entry_dates_by_publication(nrol):
+    entry = nrol._evidence_entry(
+        {"headline": "x", "published": "2026-07-01T00:00:00+00:00"}
+    )
+    assert entry["time"] == "2026-07-01T00:00:00+00:00"
+    # An explicit evidence time wins over the article date.
+    entry = nrol._evidence_entry({
+        "headline": "x",
+        "time": "2026-06-30T00:00:00+00:00",
+        "published": "2026-07-01",
+    })
+    assert entry["time"] == "2026-06-30T00:00:00+00:00"
+    # Neither present: no time key — the engine stamps now() at add_evidence.
+    assert "time" not in nrol._evidence_entry({"headline": "x"})
+
+
+def test_fire_under_simulated_clock_dates_state(nrol, topic_path, monkeypatch):
+    monkeypatch.setenv("NROL_AO_AS_OF", "2026-07-03T12:00:00+00:00")
+    out = _submit(
+        nrol, slug=SLUG, transition="FIRE",
+        evidence=_evidence(
+            "Simulated event for the clock seam.",
+            published="2026-07-02T08:00:00+00:00",
+        ),
+        indicator_id="ind_binary_mild", reason="clock seam test", commit=True,
+    )
+    assert out.get("committed") is True
+    topic = _disk_topic(topic_path)
+    # Evidence is dated by publication, not by commit wall-clock.
+    times = [e.get("time") for e in topic["evidenceLog"]]
+    assert "2026-07-02T08:00:00+00:00" in times
+    # Engine-stamped state (firedDate) follows the simulated clock.
+    fired = [
+        ind.get("firedDate")
+        for tier in topic["indicators"]["tiers"].values()
+        for ind in tier
+        if ind.get("id") == "ind_binary_mild"
+    ]
+    assert fired and fired[0].startswith("2026-07-03")
