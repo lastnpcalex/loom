@@ -116,3 +116,55 @@ server via --mcp-config env per spawn. Math audit report:
   human-approved. Daily digest surfaces non-updates as first-class output.
 - Resolution + Brier calibration loop feeding source/lens trust back into
   update weighting.
+
+## Multi-provider operator parity — codex + agy (planned 2026-06-11)
+
+Observed live: a Codex-model operator ran shell freely in the operator
+workspace (rg of parent dirs) and had no OPERATOR.md — the lockdown is
+claude_client-only. One framing fact before the plan: **the authority gate
+is already provider-agnostic.** `_ask_loom_permission` lives inside the MCP
+server, so no model can commit a posterior through the MCP without the
+browser prompt. The gap is the side-channel (shell writes to topic JSON
+bypassing the engine entirely) and the missing role instructions.
+
+Claude lockdown today, for parity reference: `--disallowedTools Write, Edit,
+NotebookEdit, Bash, Agent, Task, KillShell, SlashCommand` + reads/web kept
+deliberately (operators read sources) + `--strict-mcp-config` (nrol-ao +
+web-tools only) + OPERATOR.md via `--append-system-prompt`.
+
+### Step 0 — guard (ship first, ~10 lines)
+server.py refuses to create or generate an `nrol_operator` conversation on
+a codex/gemini model with a clear error naming this roadmap entry. Removes
+the silent-hole state while the ports land.
+
+### Codex port (codex_client.py + server.py call sites)
+1. Thread `nrol_operator: bool` into `run_codex` (3 call sites).
+2. Sandbox: operator conversations get a **read-only** sandbox policy
+   (today: workspace-write) and an approval policy that auto-DENIES
+   escalation — write attempts fail instead of raising a clickable prompt.
+   Codex cannot drop its shell, so the guarantee becomes "shell exists but
+   cannot write"; reads remain possible (acceptable: info exposure on the
+   operator's own machine, no authority risk). Document this delta.
+3. Instructions: write OPERATOR.md into the operator workspace as
+   `AGENTS.md` at conversation creation (codex auto-loads it from cwd);
+   also pass via the app-server instructions field if supported.
+4. MCP config: operator conversations get ONLY nrol-ao + web-tools
+   (mirror --strict-mcp-config semantics when building the codex config).
+
+### agy/Gemini port (gemini_client.py)
+1. Same `nrol_operator` threading.
+2. gemini-cli supports tool restriction via settings (coreTools /
+   excludeTools — verify exact keys for the installed version): write a
+   per-conversation `.gemini/settings.json` into the workspace excluding
+   shell/write/edit tools, with mcpServers = nrol-ao + web-tools only.
+   This can reach closer to claude-parity than codex (true tool removal).
+3. Context: OPERATOR.md as `GEMINI.md` in the workspace (auto-loaded).
+
+### Shared acceptance test (per provider)
+(a) operator attempts a direct topic-JSON write -> blocked, no prompt;
+(b) MCP commit -> browser approval appears; (c) probe "state your role
+rules" -> the operator recites OPERATOR.md content (instructions landed).
+
+### Sequencing
+Blocked on the parallel session's uncommitted server.py / codex_client.py
+work. Step 0 the moment that workspace settles; codex; then agy.
