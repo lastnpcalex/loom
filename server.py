@@ -1840,6 +1840,11 @@ async def api_create_conversation(data: dict = None):
     cc_effort = data.get("cc_effort", "high")
     local_model = data.get("local_model")
 
+    if nrol_operator:
+        blocked = _nrol_operator_block_reason(cc_model)
+        if blocked:
+            raise HTTPException(status_code=400, detail=blocked)
+
     conv = await db.create_conversation(
         title, character_id, mode=mode, project_dir=project_dir
     )
@@ -4448,6 +4453,34 @@ def is_gemini_model(model: str) -> bool:
     )
 
 
+# Providers with a verified NROL operator lockdown port. Extended as each
+# port lands — see mcp_servers/nrol_ao/ROADMAP.md "Multi-provider operator
+# parity". "claude" covers the whole claude_client launch family (incl.
+# local llama, which reuses the same CLI flags and tool stripping).
+NROL_OPERATOR_PROVIDERS = {"claude"}
+
+
+def _nrol_operator_block_reason(cc_model: str) -> str | None:
+    """Refuse operator traffic on providers without a lockdown port.
+
+    The nrol-ao MCP commit gate is provider-agnostic, but an unported
+    provider runs with its full default toolset (shell, file writes) in the
+    operator workspace — the side-channel the lockdown exists to close.
+    """
+    provider = (
+        "gemini" if is_gemini_model(cc_model)
+        else "codex" if is_codex_model(cc_model)
+        else "claude"
+    )
+    if provider in NROL_OPERATOR_PROVIDERS:
+        return None
+    return (
+        f"NROL operator mode is not ported to provider '{provider}' yet "
+        f"(model {cc_model!r}); pick a supported model instead. See "
+        'mcp_servers/nrol_ao/ROADMAP.md "Multi-provider operator parity".'
+    )
+
+
 def models_match(a: str, b: str) -> bool:
     if not a or not b:
         return False
@@ -4572,6 +4605,16 @@ async def _handle_claude_generation(
         print(f"[CC] Model routing: cc_model={cc_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} is_codex={is_codex} is_llama={is_llama} use_llama={use_llama} conv._use_llama={conv.get('_use_llama')} conv.mode={conv.get('mode')}")
 
         target_mode = "gemini" if is_gemini else ("codex" if is_codex else ("local" if use_llama else "claude"))
+
+        # Operator conversations only launch on providers with a ported
+        # lockdown — the model picker can otherwise route a locked-down conv
+        # to a client that knows nothing about nrol_operator.
+        if conv.get("nrol_operator"):
+            blocked = _nrol_operator_block_reason(cc_model)
+            if blocked:
+                await _ws_send(conv_id, {"type": "error", "error": blocked})
+                return
+
         if conv.get("mode") != target_mode:
             print(f"[CC] Updating conversation {conv_id} mode from {conv.get('mode')} to {target_mode}")
             await db.update_conversation_fields(conv_id, mode=target_mode)
