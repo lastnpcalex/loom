@@ -733,6 +733,74 @@ def test_scan_deliberation_rescues_park_into_proposal(nrol, topic_path, monkeypa
     assert "rescued by jury" in digest
 
 
+def test_FULL_LIFECYCLE_design_activate_evidence_posterior(nrol, nrol_repo):
+    """The whole system in one test: an operator designs a topic through the
+    governor gates, activation refuses without a dynamics spec, activation
+    succeeds with one, evidence commits, and the posterior moves. If this
+    passes, 'create a topic and run it' is true end to end."""
+    slug = f"lifecycle-{uuid.uuid4().hex[:6]}"
+    fixture = _fixture_topic()
+    hyps = {
+        hk: {"label": hv["label"], "prior": hv["posterior"], "midpoint": hv["midpoint"]}
+        for hk, hv in fixture["model"]["hypotheses"].items()
+    }
+    inds = {
+        "tier1_critical": fixture["indicators"]["tiers"]["tier1_critical"],
+        "anti_indicators": [],
+    }
+
+    out = json.loads(nrol.design_topic(
+        slug=slug,
+        title="Lifecycle test topic",
+        question=fixture["meta"]["question"],
+        resolution=fixture["meta"]["resolution"],
+        hypotheses=hyps,
+        indicators=inds,
+        priors_rationale="synthetic fixture priors; H1 favored by design so directional asserts have headroom",
+        resolution_date="2030-12-31",
+        deliberate=False,
+    ))
+    assert "error" not in out, out
+    assert out["status"] == "DRAFT"
+
+    # Drafts are invisible to active-topic listings
+    hyp_list = json.loads(nrol.list_hypotheses(slug=slug, active_only=True))
+    assert not any(t.get("slug") == slug for t in hyp_list.get("topics", []))
+
+    # Activation refuses without a dynamics spec — time-as-evidence is not optional
+    refused = json.loads(nrol.activate_topic(slug=slug))
+    assert "error" in refused and "dynamics" in refused["error"].lower()
+
+    dyn_mod = nrol._import_from_repo("framework.dynamics_shadow")
+    dyn_mod.write_spec(nrol._ensure_repo(), slug, {
+        "entrenched_since": "2026-06-01",
+        "sustain_days": 30,
+        "residual_hypothesis": "H3",
+        "hypothesis_windows": {"H1": "2029-12-31", "H2": "2030-12-31"},
+        "priors": {
+            "lam_exit": {"alpha": 2.0, "beta_days": 480, "rationale": "synthetic"},
+            "lam_ramp": {"alpha": 3.0, "beta_days": 225, "rationale": "synthetic"},
+            "lam_relapse": {"alpha": 2.0, "beta_days": 240, "rationale": "synthetic"},
+        },
+    })
+
+    act = json.loads(nrol.activate_topic(slug=slug))
+    assert act.get("activated") is True, act
+
+    topic_file = nrol_repo / "topics" / f"{slug}.json"
+    before = _disk_posteriors(topic_file)
+    res = _submit(
+        nrol, slug=slug, transition="FIRE", indicator_id="ind_binary_mild",
+        evidence=_evidence("Event A confirmed by test-rig",
+                           url=f"https://example.test/lifecycle/{slug}"),
+        commit=True,
+    )
+    assert res.get("committed") is True, res
+    after = _disk_posteriors(topic_file)
+    assert after["H1"] > before["H1"]
+    assert abs(sum(after.values()) - 1.0) < 5e-4
+
+
 def test_THE_LOOP_parked_evidence_moves_posteriors_end_to_end(nrol, topic_path, monkeypatch):
     """THE acceptance test this system lacked: evidence that was parked gets
     re-adjudicated, escalated as a rebind proposal, human-committed — and a

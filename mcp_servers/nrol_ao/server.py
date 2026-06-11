@@ -1420,6 +1420,201 @@ def latest_digest() -> str:
 
 
 @mcp.tool()
+def design_topic(
+    slug: str,
+    title: str,
+    question: str,
+    resolution: str,
+    hypotheses: dict,
+    indicators: dict,
+    priors_rationale: str,
+    classification: str = "CALIBRATION",
+    resolution_date: str = "",
+    dynamics: dict | None = None,
+    deliberate: bool = True,
+    model: str = "",
+    timeout_sec: int = 600,
+) -> str:
+    """Create a new topic as a DRAFT through the engine's design gates.
+
+    The full operator lifecycle starts here: design_topic -> review the
+    lint + red-team output -> activate_topic (human-gated). Drafts move no
+    beliefs and are excluded from active-topic status until activated.
+
+    hypotheses: {"H1": {"label": ..., "prior": 0.5, "midpoint": 100}, ...}
+      — labels must be concrete and falsifiable (governor admissibility is
+      a HARD gate: inadmissible hypotheses block creation with details).
+      priors_rationale is required: non-uniform priors without a written
+      justification are the documented design failure mode.
+    indicators: {"tier1_critical": [...], "tier2_strong": [...],
+      "tier3_suggestive": [...], "anti_indicators": [...]} with
+      pre-committed likelihoods per indicator.
+    dynamics: optional shadow-model spec (priors with rationales); REQUIRED
+      before activate_topic will accept the topic, so time-as-evidence
+      works from day one.
+    deliberate=true runs a llama red-team critique of priors + indicator
+    set (advisory — recorded and returned, mutates nothing).
+    """
+    store = _activity_store()
+    job_id = new_job_id("design-topic")
+    try:
+        engine = _import_from_repo("engine")
+        try:
+            engine.load_topic(slug)
+            return _json({"error": f"topic {slug!r} already exists — design_topic never overwrites"})
+        except FileNotFoundError:
+            pass
+
+        meta = {
+            "slug": slug,
+            "title": title,
+            "question": question,
+            "resolution": resolution,
+            "classification": classification,
+            "status": "DRAFT",
+            "lens": "OPERATOR_JUDGMENT",
+            "calibrationStatus": "SKIPPED_OPERATOR_JUDGMENT",
+            "calibrationSkipReason": "Operator-designed topic; calibration via design gates.",
+        }
+        if resolution_date:
+            meta["resolutionDate"] = resolution_date
+        config = {
+            "slug": slug, "title": title, "question": question,
+            "resolution": resolution, "classification": classification,
+            "status": "DRAFT",
+            "meta": meta,
+            "hypotheses": hypotheses,
+            "indicators": indicators,
+        }
+        store.record(job_id, "running", task="design_topic", slug=slug,
+                     summary={"phase": "create", "hypotheses": list(hypotheses)})
+        topic = engine.create_topic(config)
+
+        # Record the prior justification as the first posteriorHistory entry —
+        # the design-gate requirement, satisfied structurally.
+        topic = engine.load_topic(slug)
+        topic.setdefault("model", {}).setdefault("posteriorHistory", []).insert(0, {
+            "date": datetime.now(timezone.utc).date().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "posteriors": {k: v.get("posterior") for k, v in topic["model"]["hypotheses"].items()},
+            "note": f"Initial priors: {priors_rationale}"[:500],
+        })
+        engine.save_topic(topic)
+
+        lint_report = None
+        try:
+            lint_mod = _import_from_repo("framework.lint_indicators")
+            flat = []
+            for tier_list in (topic.get("indicators", {}).get("tiers", {}) or {}).values():
+                flat.extend(i for i in (tier_list or []) if isinstance(i, dict))
+            flat.extend(i for i in (topic.get("indicators", {}).get("anti_indicators", []) or [])
+                        if isinstance(i, dict))
+            lint_report = lint_mod.propose_indicators_lint(topic, flat)
+        except Exception as exc:
+            lint_report = {"error": f"lint unavailable: {exc}"}
+
+        dynamics_path = None
+        if dynamics:
+            dyn_mod = _import_from_repo("framework.dynamics_shadow")
+            dynamics_path = dyn_mod.write_spec(_ensure_repo(), slug, dynamics)
+
+        red_team = None
+        if deliberate:
+            try:
+                prompt_lines = [
+                    "You are the RED TEAM reviewing a freshly designed NROL-AO topic. "
+                    "Attack the design: anchored priors, unfalsifiable hypotheses, "
+                    "compound or correlated indicators, missing anti-indicators, "
+                    "resolution ambiguity. Be specific; cite the field you attack. "
+                    "End with VERDICT: SOUND or VERDICT: REVISE.",
+                    f"QUESTION: {question}",
+                    f"RESOLUTION: {resolution}",
+                    f"PRIORS RATIONALE: {priors_rationale}",
+                    "HYPOTHESES: " + json.dumps(hypotheses)[:2000],
+                    "INDICATORS: " + json.dumps(indicators)[:4000],
+                ]
+                response = llama_client.chat(
+                    "\n".join(prompt_lines),
+                    system_prompt="You are an adversarial topic-design reviewer.",
+                    model=model, temperature=0.3, max_tokens=2048,
+                    timeout_sec=timeout_sec, disable_thinking=True,
+                )
+                red_team = {
+                    "critique": response.get("text", ""),
+                    "model": response.get("model"),
+                }
+            except Exception as exc:
+                red_team = {"error": str(exc)}
+
+        packet = {
+            "slug": slug,
+            "status": "DRAFT",
+            "hypothesis_admissibility": "passed (creation would have raised otherwise)",
+            "indicator_lint": lint_report,
+            "dynamics_spec": dynamics_path or "MISSING — required before activate_topic",
+            "red_team": red_team,
+            "next": f"Review the above, then activate_topic(slug={slug!r}) to go live.",
+        }
+        store.record(job_id, "completed", task="design_topic", slug=slug,
+                     summary={"status": "DRAFT", "dynamics": bool(dynamics_path)},
+                     response=_json(packet))
+        return _json(packet)
+    except Exception as exc:
+        store.record(job_id, "error", task="design_topic", slug=slug,
+                     summary={"error": str(exc)})
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def activate_topic(slug: str) -> str:
+    """Activate a DRAFT topic — the human-gated commit of the design loop.
+
+    Hard requirements: topic exists in DRAFT status, hypotheses re-pass
+    admissibility, and a lint-clean dynamics spec exists (no topic goes
+    live without pricing time-as-evidence). Raises a Loom browser approval
+    (fail-closed) before flipping status to ACTIVE.
+    """
+    try:
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(slug)
+        status = (topic.get("meta", {}).get("status") or "").upper()
+        if status != "DRAFT":
+            return _json({"error": f"topic {slug!r} is {status or 'unknown'}, not DRAFT"})
+
+        dyn_mod = _import_from_repo("framework.dynamics_shadow")
+        try:
+            dyn_mod.load_spec(Path(_ensure_repo()), slug)
+        except Exception as exc:
+            return _json({"error": f"dynamics spec required before activation: {exc}"})
+
+        admissibility = engine.validate_hypotheses(topic)
+        bad = {k: v for k, v in admissibility.items() if v.get("grade") == "INADMISSIBLE"}
+        if bad:
+            return _json({"error": f"inadmissible hypotheses block activation: {sorted(bad)}"})
+
+        denied = _ask_loom_permission(
+            "nrol_ao_activate_topic",
+            {"slug": slug, "title": topic.get("meta", {}).get("title")},
+        )
+        if denied:
+            return _json({"slug": slug, "activated": False, "denied": denied})
+
+        topic["meta"]["status"] = "ACTIVE"
+        engine.save_topic(topic)
+        _activity_store().record(
+            new_job_id("activate-topic"), "completed", task="activate_topic",
+            slug=slug, summary={"activated": True},
+        )
+        return _json({
+            "slug": slug,
+            "activated": True,
+            "scan_status": _topic_scan_status(engine.load_topic(slug)),
+        })
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
 def shadow_posteriors(slug: str, asof: str = "") -> str:
     """Derive SHADOW posteriors from the topic's pre-committed dynamics spec.
 
