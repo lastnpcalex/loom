@@ -201,6 +201,46 @@ def _ensure_hook_trusted(cwd: str, hook_command: str):
         log.info(f"[AGY] Hook trusted for {norm_cwd}")
 
 
+def _configure_operator(cwd: str, conv_id: int, server_port: int):
+    """NROL operator lockdown for agy: role instructions + strict MCP surface.
+
+    Tool blocking itself is the permission hook's NROL deny-list, keyed on
+    LOOM_NROL_OPERATOR (set in run_gemini): the installed agy CLI exposes no
+    excludeTools/coreTools settings surface (verified 2026-06-11), so unlike
+    claude there is no true tool removal — write/shell attempts are denied by
+    the PreToolUse hook without a prompt. See ROADMAP.md "Multi-provider
+    operator parity".
+    """
+    workspace = Path(cwd)
+
+    # agy auto-loads GEMINI.md from the workspace. The operator workspace is
+    # shared across operator conversations, so an idempotent overwrite keeps
+    # it current with OPERATOR.md.
+    operator_md = Path(__file__).parent / "mcp_servers" / "nrol_ao" / "OPERATOR.md"
+    if operator_md.is_file():
+        (workspace / "GEMINI.md").write_text(
+            operator_md.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    # Strict MCP surface: exactly nrol-ao + web-tools. Reuse codex_client's
+    # builders, stripped to the keys agy's mcp_config.json understands.
+    from codex_client import _nrol_mcp_config, _web_tools_mcp_config
+
+    mcp_servers = {}
+    nrol_cfg = _nrol_mcp_config(conv_id, server_port, force=True)
+    if nrol_cfg:
+        mcp_servers["nrol-ao"] = {k: nrol_cfg[k] for k in ("command", "args", "env")}
+    web_cfg = _web_tools_mcp_config()
+    if web_cfg:
+        mcp_servers["web-tools"] = {k: web_cfg[k] for k in ("command", "args")}
+
+    agents_dir = workspace / ".agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    mcp_path = agents_dir / "mcp_config.json"
+    mcp_path.write_text(json.dumps({"mcpServers": mcp_servers}, indent=2), encoding="utf-8")
+    log.info(f"[AGY] NROL operator MCP surface configured: {mcp_path}")
+
+
 def normalize_tool_name(name: str) -> str:
     mapping = {
         "view_file": "Read",
@@ -258,9 +298,12 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                      model: str = "Gemini 3.5 Flash (High)", effort: str = "high",
                      permission_mode: str = "default",
                      resume_session_id: str = None, fork_session: bool = False,
-                     backstage_parent_id: int | None = None):
+                     backstage_parent_id: int | None = None,
+                     nrol_operator: bool = False):
     """Launch agy in headless mode, watch its transcript, and yield events in real time."""
     _configure_permission_hook(cwd, backstage_parent_id, server_port)
+    if nrol_operator:
+        _configure_operator(cwd, conv_id, server_port)
 
     agy_model = _loom_model_to_agy(model, effort)
     _set_agy_model(agy_model)
@@ -332,6 +375,11 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         "--dangerously-skip-permissions",
         "--print-timeout", "5m",
     ]
+    # NOTE: --sandbox was tried for operator convs and hangs headless -p mode
+    # (verified 2026-06-11: zero output, empty cli log, killed after 5 min).
+    # The PreToolUse hook deny-list is the tool-blocking layer instead
+    # (--dangerously-skip-permissions only skips agy's own approvals, never
+    # the hook — same combination backstage mode relies on).
 
     env = {
         **os.environ,
@@ -340,6 +388,10 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     }
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
+    if nrol_operator:
+        # cc_permission_hook denies Write/Edit/Bash/etc. without prompting
+        # when this is set — agy's only tool-blocking surface.
+        env["LOOM_NROL_OPERATOR"] = "1"
 
     import time as _time
     launch_ts = _time.time()

@@ -4461,7 +4461,7 @@ def is_gemini_model(model: str) -> bool:
 # port lands — see mcp_servers/nrol_ao/ROADMAP.md "Multi-provider operator
 # parity". "claude" covers the whole claude_client launch family (incl.
 # local llama, which reuses the same CLI flags and tool stripping).
-NROL_OPERATOR_PROVIDERS = {"claude", "codex"}
+NROL_OPERATOR_PROVIDERS = {"claude", "codex", "gemini"}
 
 
 def _nrol_operator_block_reason(cc_model: str) -> str | None:
@@ -4991,6 +4991,7 @@ async def _handle_claude_generation(
                     resume_session_id=resume_session_id if use_resume else None,
                     fork_session=fork_session,
                     backstage_parent_id=conv.get("backstage_parent_id"),
+                    nrol_operator=bool(conv.get("nrol_operator")),
                 )
             elif is_codex:
                 proc, event_stream = await codex_client.run_codex(
@@ -5038,6 +5039,7 @@ async def _handle_claude_generation(
                         model=cc_model,
                         effort=cc_effort,
                         permission_mode=cc_permission_mode,
+                        nrol_operator=bool(conv.get("nrol_operator")),
                     )
                 elif is_codex:
                     proc, event_stream = await codex_client.run_codex(
