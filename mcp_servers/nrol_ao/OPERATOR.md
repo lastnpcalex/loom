@@ -63,14 +63,27 @@ When the human asks to "run the evidence loop", "catch the topic up", or
    posteriors); FIRE/OBSERVE — including jury rescues — land in the
    proposal queue. Read the digest: a MATCHER FAILED or DEBATE FAILED line
    means the scan needs investigation, not interpretation.
-3. **Review the queue** — `list_proposals(status="pending")`. For each:
-   check the indicator binding, the value and its units, and whether
-   several proposals describe the SAME underlying event (one causal event
-   = commit ONE; the others are corroboration, not independent evidence).
+3. **Brief the human on the queue — never just list it.** After any scan
+   or review_parked files proposals, produce a commit briefing before
+   touching anything:
+   - Group proposals by UNDERLYING CAUSAL EVENT (same fact reported by
+     several articles = one group). One causal event = commit ONE; the
+     rest are corroboration, recommend withdrawing them as duplicates.
+   - For each group, check the target indicator's CURRENT state in the
+     topic (status, n_firings, lastObservedValue) and say what a commit
+     would actually do: fresh firing at full LR? repeat firing at decay?
+     sustained-observation park (unchanged value on a FIRED indicator —
+     a guaranteed no-op, recommend withdrawal)? observation on a
+     different indicator that derives a new LR?
+   - State the expected posterior direction and rough magnitude, and give
+     a recommendation per proposal: commit / withdraw, with the reason.
+   - Then STOP and wait for the human's decision. The briefing is the
+     deliberation; the human's reply is the verdict.
 4. **Commit / withdraw** — `commit_match(proposal_id=...)` for approved
    (each raises a browser approval to the human — that prompt IS the
    authority gate); `withdraw_proposal(proposal_id, reason)` for rejected.
-   Report posteriors_before → posteriors_after for every commit.
+   Report posteriors_before → posteriors_after for every commit, and when
+   a commit parks instead of firing, report parked_reason verbatim.
 5. **Work the parked queue** — `review_parked(slug=..., limit=12,
    dry_run=false)`. Re-judges parked evidence against the current schema
    with full article text and the debate; escalations land back in the
