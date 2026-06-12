@@ -1,0 +1,18 @@
+{
+  "id": "E01-a1",
+  "event_id": "E01",
+  "label": "E01",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t2_blockade_reinforcement"
+  },
+  "published": "2026-07-03T08:10:00+00:00",
+  "outlet": "Harbor & Hull",
+  "url": "synthetic://harbor-hull/E01-a1",
+  "headline": "New Mines Block Southern Meridia Channel; Two Bulkers Abort Transits",
+  "body": "Coalition naval forces on July 3 identified and reported newly laid sea mines across the southern passage of the Strait of Meridia, marking an escalation in the maritime blockade that has choked the chokepoint for two months. Two bulk carriers detected the mines during attempted transits and reversed course.\n\nThe discovery comes 63 days into the Varessan blockade that has reduced daily commercial traffic to near zero from a pre-crisis norm of roughly 140 transits daily. Market sources said the mine-laying will suppress any residual appetite for attempted passages.\n\n\"This changes the risk calculus entirely,\" said Tarson Webb, principal analyst at Kelos Shipping Advisors. \"We were already pricing war-risk at the top end. Now you have active ordnance in the water. Insurance will price accordingly, and traffic will simply not flow.\"\n\nThe Qoros Marine Underwriters' Association's Meridia Route Normalization Index stood at 12 this morning—down from 100 pre-crisis—reflecting war-risk premium dominance. Industry contacts expect further compression on any new quotations.\n\nThe Meridian Compact nations have demanded mine-clearance operations but offered no immediate timeline. Varessan officials have not commented on the placement.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:49:54.949840+00:00"
+  }
+}

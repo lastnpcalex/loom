@@ -1,0 +1,18 @@
+{
+  "id": "E10-a1",
+  "event_id": "E10",
+  "label": "E10",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t3_channel_clearance_ops"
+  },
+  "published": "2026-09-03T08:10:00+00:00",
+  "outlet": "The Ostrev Gazette",
+  "url": "synthetic://the-ostrev-gazette/E10-a1",
+  "headline": "Consortium Awarded Contracts for Meridia Strait Salvage and Mine Disposal",
+  "body": "OSTREV, September 3 — Clearance contracts for the southern channel of the Strait of Meridia have been awarded to an international consortium of salvage operators, the Meridian Maritime Clearance Authority announced today. The consortium will conduct comprehensive surveys of navigation channels and identify obstructions for removal, with survey vessels deploying within the week. The scope encompasses approximately 340 nautical miles of primary and secondary shipping routes. Participating firms in the consortium include Aldent Salvage, Varessan Heavy Lift, and Khorethi Clearance Services. The Authority said full-scale mine disposition and wreck salvage operations will commence following the initial survey phase. No timeline or budget figures were released. The clearance effort represents the first coordinated multi-nation maritime operations in the Strait since the blockade commenced in May 2026.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:46:35.793521+00:00"
+  }
+}

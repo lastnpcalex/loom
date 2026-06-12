@@ -1,0 +1,19 @@
+{
+  "id": "E03-a1",
+  "event_id": "E03",
+  "label": "E03",
+  "gold": {
+    "action": "OBSERVE",
+    "indicator_id": "t2_transit_volume",
+    "observed_value": 4
+  },
+  "published": "2026-07-18T08:10:00+00:00",
+  "outlet": "The Meridian Courier",
+  "url": "synthetic://the-meridian-courier/E03-a1",
+  "headline": "Strait Traffic Plummets to Historic Lows as Blockade Persists",
+  "body": "OSTREV — Shipping data from HarborTrack shows daily transits through the Strait of Meridia have fallen to approximately 4 percent of prewar levels, underscoring the blockade's grip on regional maritime traffic. The tracking data, which the shipping industry relies on for operational planning, recorded roughly six commercial transits on July 18, down from the 140 vessels that typically traverse the chokepoint daily before the closure.\n\nMaritime brokers described the remaining traffic as \"a trickle,\" with most passages attributed to humanitarian and essential supply movements. The near-total cessation of commercial traffic has triggered fresh concern within the Meridian Compact coalition, where member economies depend heavily on the Strait as a crucial trade corridor. Insurance underwriters at the Qoros Marine Underwriters' Association have maintained elevated war-risk premiums for any vessels attempting transit. The blockade, which began in May, shows no signs of easing as diplomatic efforts continue in neutral Qoros.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:50:40.807580+00:00"
+  }
+}

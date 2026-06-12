@@ -1,0 +1,18 @@
+{
+  "id": "E06-a1",
+  "event_id": "E06",
+  "label": "E06",
+  "gold": {
+    "action": "SCHEMA_GAP",
+    "missing_direction": "Coverage WITHDRAWAL (availability) is not captured by the insurance_normalization price index; needs its own observable or indicator."
+  },
+  "published": "2026-08-10T08:10:00+00:00",
+  "outlet": "Qoros Wire",
+  "url": "synthetic://qoros-wire/E06-a1",
+  "headline": "Two Major Syndicates Withdraw Meridia Hull Coverage Entirely",
+  "body": "QOROS — Aug. 10 — Two major insurance syndicates have ceased offering hull coverage for vessels transiting the Strait of Meridia, effective immediately, marking a significant shift in the maritime insurance market three months into the Varessan blockade.\n\nThe withdrawal represents a fundamental change in coverage availability rather than a pricing adjustment. The Meridia Route Normalization Index, which measures market pricing conditions, was not updated in response to the decision, reflecting the distinction between repricing risk and withdrawing capacity entirely.\n\nIndustry sources indicated both syndicates determined that existing pricing frameworks no longer adequately reflected risk exposure given the blockade's persistence and uncertain resolution timeline. Rather than continue offering coverage at adjusted rates, both firms opted for complete market exit.\n\nThe blockade, initiated in May 2026, has closed the Strait to commercial traffic. Pre-crisis transit volumes averaged approximately 140 vessels daily through the chokepoint. HarborTrack reports current transits remain suspended.\n\nThe decision affects insurers' ability to support the Meridian Compact's maritime commerce, with Khoreth, Sundaria, and Elbar-flagged vessels now facing coverage gaps. Qoros continues hosting mediation talks between the blockading Varessan Coastal Forces and the Compact coalition. Insurance market participants are monitoring whether additional carriers follow the syndicates' withdrawal.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T04:36:50.197705+00:00"
+  }
+}

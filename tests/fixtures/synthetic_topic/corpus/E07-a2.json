@@ -1,0 +1,18 @@
+{
+  "id": "E07-a2",
+  "event_id": "E07",
+  "label": "DUPLICATE-of-E07",
+  "gold": {
+    "action": "PARK",
+    "reason": "Material to the question but matches no pre-committed indicator: no named transit mechanism, no date, unverifiable terms."
+  },
+  "published": "2026-08-15T12:40:00+00:00",
+  "outlet": "Continental News Service",
+  "url": "synthetic://continental-news-service/E07-a2",
+  "headline": "Varessa and Compact confirm de-escalation talks; shipping market awaits operational terms",
+  "body": "The Republic of Varessa and the three-member Meridian Compact jointly announced a temporary de-escalation understanding Thursday, marking a diplomatic shift after the Strait of Meridia blockade that has strangled commercial shipping since May 2026.\n\nThe Republic's government and the compact's member states—Khoreth, Sundaria, and Elbar—confirmed the agreement through statements released from Qoros, where mediation talks continue. Both sides declined to publish terms, specify corridors, or provide a timetable for implementation.\n\nShipping industry officials said the announcement's vagueness masks continued operational uncertainty. Pre-blockade traffic through the strait averaged roughly 140 commercial transits daily. That volume has fallen to zero since May, according to maritime tracking firm HarborTrack.\n\nThe Qoros Marine Underwriters' Association, which sets war-risk pricing benchmarks through the Meridia Route Normalization Index, reported no movement on Thursday. The index stands at 22 points out of a pre-crisis baseline of 100, reflecting insurers' continued assessment that passage remains hazardous.\n\nA shipping broker in Qoros said the announcement signals diplomatic progress but leaves practitioners without the operational detail necessary to resume traffic. \"When do we move? What protection do we get? Nobody knows yet,\" the broker said. \"We're waiting for the next signal.\"",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:45:09.741080+00:00"
+  }
+}

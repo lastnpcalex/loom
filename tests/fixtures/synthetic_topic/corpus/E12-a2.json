@@ -1,0 +1,19 @@
+{
+  "id": "E12-a2",
+  "event_id": "E12",
+  "label": "DUPLICATE-of-E12",
+  "gold": {
+    "action": "OBSERVE",
+    "indicator_id": "t2_transit_volume",
+    "observed_value": 38
+  },
+  "published": "2026-09-12T12:40:00+00:00",
+  "outlet": "Harbor & Hull",
+  "url": "synthetic://harbor-hull/E12-a2",
+  "headline": "Meridia Convoys Resume at 50 Ships Daily; War-Risk Premiums Persist",
+  "body": "QOROS, Sept. 12 — The first commercial convoys moved through the Strait of Meridia today under Operation Open Water escort, with HarborTrack recording approximately 50 transits—roughly 36 percent of the 140 pre-crisis daily average. While the resumption marks a symbolic breakthrough, brokers cautioned that the pace reflects significant operational constraints ahead.\n\n\"We're looking at convoy cycles every 48 to 72 hours,\" said Marcus Chen, a senior broker at Meridian Freight Solutions. \"That translates to roughly 35 to 50 ships daily. We're at the low end.\"\n\nWar-risk insurance pricing reflects market hesitation. The Qoros Marine Underwriters' Association reported daily premiums for Meridia transit at 4.2 percent of cargo value—down from peak crisis rates of 7.8 percent but triple pre-crisis norms of 1.4 percent. \"One day of convoys doesn't eliminate blockade hazard,\" said underwriter Natalia Voroshin. \"The market is pricing structural uncertainty.\"\n\nShipping lines report substantial backlogs. \"We have three weeks of deferred cargo,\" noted a managing director at Thorne Shipping. \"Even at optimal convoy schedules, queue clearance takes months.\"\n\nThe Meridia Route Normalization Index rose to 31 points (0 = full crisis; 100 = pre-crisis pricing), indicating traders remain skeptical about sustained passage. Additional transits are scheduled through week's end.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:48:01.819078+00:00"
+  }
+}

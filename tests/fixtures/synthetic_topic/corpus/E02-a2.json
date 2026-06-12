@@ -1,0 +1,18 @@
+{
+  "id": "E02-a2",
+  "event_id": "E02",
+  "label": "DUPLICATE-of-E02",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t3_talks_resumed"
+  },
+  "published": "2026-07-12T12:40:00+00:00",
+  "outlet": "The Meridian Courier",
+  "url": "synthetic://the-meridian-courier/E02-a2",
+  "headline": "Trade Flow at Impasse as Varessa, Coalition Return to Qoros Talks",
+  "body": "QOROS — Representatives of shipping, insurance, and trade industries are closely monitoring today's resumption of direct talks between Varessa and the Meridian Compact, hoping movement at the negotiating table translates to reopening of the Strait of Meridia.\n\nThe blockade has reduced transits through the critical waterway from approximately 140 commercial vessels daily to zero for more than 60 days. The Qoros Marine Underwriters' Association's Meridia Route Normalization Index, which measures insurance pricing relative to pre-crisis baseline (0 = full war-risk crisis pricing, 100 = pre-crisis normal), remained at depressed levels, reflecting continued uncertainty among market participants.\n\n\"The longer this remains closed, the more it affects regional supply chains and shipowner planning,\" said a maritime logistics specialist familiar with coalition-side operations. \"Any serious negotiation is better than the status quo.\"\n\nShipping records from HarborTrack, the maritime tracking service, confirm zero transits during the blockade period. Coalition ports in Khoreth, Sundaria, and Elbar have accumulated cargo backlogs and diverted vessel routes to longer, more costly alternatives around the southern strait passages.\n\nQoros mediation officials offered no public details on negotiation substance or timeline. Participants stated readiness to engage in sustained talks, though each side's public position on underlying grievances remains unchanged.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:50:15.158195+00:00"
+  }
+}

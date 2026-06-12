@@ -1,0 +1,18 @@
+{
+  "id": "E04-a2",
+  "event_id": "E04",
+  "label": "DUPLICATE-of-E04",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t2_blockade_reinforcement"
+  },
+  "published": "2026-07-24T12:40:00+00:00",
+  "outlet": "Sundaria Times",
+  "url": "synthetic://sundaria-times/E04-a2",
+  "headline": "Meridia Blockade Claims Latest Tanker as Insurance Premiums Surge",
+  "body": "Qoros — July 24, 2026\n\nFast attack craft seized a products tanker near the Strait of Meridia's western approach today, detaining the crew and adding to the roster of merchant vessels caught in the ongoing blockade enforcement.\n\nThe seizure marks at least the third commercial vessel detained since the blockade began in May. Current traffic through the strait has collapsed to 40-50 daily transits, down from a pre-blockade average of roughly 140 vessels per day, and continues declining from the 70-80 observed just two weeks prior.\n\n\"This is the operating environment we face,\" said Maritime Association director Kess Thorne. \"Every voyage through that corridor now carries unquantifiable risk. Insurers are repricing routes daily.\"\n\nThe Qoros Marine Underwriters' Association reported this morning that the Meridia Route Normalization Index had fallen to 22 points from 24 yesterday—roughly where it stood following the May closure. The index measures risk-adjusted pricing against pre-crisis levels (100 points). Industry analysts cited the fresh seizure as triggering overnight coverage rate increases of 8-12 percent for unescorted transits.\n\n\"The message to the maritime community is clear: independent passage is increasingly untenable,\" said Sundarian shipping analyst Venn Morley. \"Operators are consolidating routes and seeking armed escort or alternative passages.\"\n\nVessel diversions around the southern cape have added an estimated 16 days to Asia-bound routes, compounding costs for time-sensitive cargo.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:51:26.860187+00:00"
+  }
+}

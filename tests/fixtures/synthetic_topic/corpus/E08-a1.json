@@ -1,0 +1,18 @@
+{
+  "id": "E08-a1",
+  "event_id": "E08",
+  "label": "E08",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t2_escort_convoy_program"
+  },
+  "published": "2026-08-20T08:10:00+00:00",
+  "outlet": "Continental News Service",
+  "url": "synthetic://continental-news-service/E08-a1",
+  "headline": "Five-Nation Coalition Announces Strait Escort Framework",
+  "body": "A five-nation coalition announced Operation Open Water today, establishing a coordinated framework to escort commercial vessels through the blockaded Strait of Meridia. The initiative brings together Khoreth, Sundaria, and Elbar—the core members of the Meridian Compact—alongside distant partners Aldenport and Virelles. Coalition officials said the first escorted convoy will depart within two weeks. The Strait has remained closed to commercial traffic since May 2026 following the imposition of a naval blockade by the Varessan Coastal Forces. The five nations, in a joint statement, characterized Operation Open Water as a response to what they described as a threat to regional stability and freedom of navigation. The blockade has disrupted global shipping patterns; pre-crisis transit volumes through the chokepoint averaged roughly 140 commercial passages daily. Officials provided no details about escort composition, vessel protection measures, or the anticipated frequency of convoy operations. Qoros, the neutral city-state hosting ongoing mediation efforts, said it was reviewing the announcement. The Varessan government has not yet issued a formal response.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:45:35.078901+00:00"
+  }
+}

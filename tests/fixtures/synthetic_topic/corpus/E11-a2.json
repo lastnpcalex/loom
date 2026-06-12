@@ -1,0 +1,18 @@
+{
+  "id": "E11-a2",
+  "event_id": "E11",
+  "label": "DUPLICATE-of-E11",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t1_reopening_decree"
+  },
+  "published": "2026-09-08T12:40:00+00:00",
+  "outlet": "Qoros Wire",
+  "url": "synthetic://qoros-wire/E11-a2",
+  "headline": "Meridia Strait Reopens 12 September; Escort Protocol, Insurance Terms Published",
+  "body": "QOROS — Joint decree today formalized the reopening of the Strait of Meridia effective 12 September 2026, with five-nation escort framework and revised underwriting protocols. The announcement concludes four months of blockade that reduced transit traffic from pre-crisis norms of approximately 140 vessels daily to near zero.\n\nOperation Open Water naval assets will provide continuous escort under protocols published by Qoros Marine Underwriters' Association. Participating underwriters will price risk under three revised categories tied to convoy participation and routing compliance.\n\n\"The insurance terms are structured to encourage registered transits,\" said Katherine Voss, underwriting coordinator for the QMUA. \"We expect initial utilization at roughly 60-70 percent of pre-crisis daily volume by end of week,\" she told Qoros Wire.\n\nShipping brokers report immediate container bookings. HarborTrack's preliminary tracking indicates three vessels prepared to depart 12 September under the escort framework. The Meridia Route Normalization Index, tracking insurance and operational costs against baseline pre-crisis levels, was priced at 34 points yesterday and is expected to rise sharply as operational confidence increases.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:47:02.000103+00:00"
+  }
+}

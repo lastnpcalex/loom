@@ -1,0 +1,19 @@
+{
+  "id": "E05-a1",
+  "event_id": "E05",
+  "label": "E05",
+  "gold": {
+    "action": "OBSERVE",
+    "indicator_id": "t3_insurance_normalization",
+    "observed_value": 12
+  },
+  "published": "2026-08-05T08:10:00+00:00",
+  "outlet": "Sundaria Times",
+  "url": "synthetic://sundaria-times/E05-a1",
+  "headline": "Meridia Route Insurance Index Holds at Crisis Levels",
+  "body": "The Qoros Marine Underwriters' Association released updated Meridia route pricing, with the Meridia Route Normalization Index holding at 12 of 100—barely above the crisis floor since the Varessan blockade commenced in May.\n\nThe index measures the gap between current war-risk insurance premiums and pre-blockade baseline rates, providing a market assessment of passage conditions. A reading of 100 would indicate a return to peacetime rates; the current level reflects ongoing severe disruption of a critical maritime corridor that previously averaged 140 daily commercial transits.\n\nThe Varessan blockade has now persisted for three months, maintaining effective closure of the Strait of Meridia to commercial traffic. The blockading Varessan Coastal Forces and the opposing Meridian Compact coalition—comprising Khoreth, Sundaria, and Elbar—remain in standoff.\n\nMediation efforts hosted in the neutral city-state of Qoros have continued without announcing substantive progress. The insurance premium structure directly impacts operating costs for shippers reliant on the Meridia corridor, making the index a key indicator for the trading community.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T04:36:29.644612+00:00"
+  }
+}

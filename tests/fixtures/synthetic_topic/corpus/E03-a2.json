@@ -1,0 +1,19 @@
+{
+  "id": "E03-a2",
+  "event_id": "E03",
+  "label": "DUPLICATE-of-E03",
+  "gold": {
+    "action": "OBSERVE",
+    "indicator_id": "t2_transit_volume",
+    "observed_value": 4
+  },
+  "published": "2026-07-18T12:40:00+00:00",
+  "outlet": "The Ostrev Gazette",
+  "url": "synthetic://the-ostrev-gazette/E03-a2",
+  "headline": "Blockade Operations Reduce Strait to Single-Digit Daily Transits",
+  "body": "OSTREV — Current operational conditions in the Strait of Meridia have achieved a marked reduction in maritime activity, with HarborTrack confirming only six commercial vessels transiting on July 18—a decline from the pre-closure norm of approximately 140 daily transits. Varessan Coastal Forces confirm that blockade interdiction protocols remain fully effective across all crossing points.\n\nMarket practitioners in the maritime insurance sector report that elevated war-risk assessment continues to deter commercial traffic. One Qoros-based broker noted that shipping lines have largely redirected operations to alternative, longer routes despite substantially higher transit costs. The Meridia Route Normalization Index, compiled by the Qoros Marine Underwriters' Association, reflects the persistent market disruption. Analysts indicate that the current traffic volume represents essential and humanitarian movements, with commercial operators maintaining a wait-and-see posture regarding Strait access. Varessan officials characterize the blockade's operational effectiveness as demonstrable through the tracking data now publicly available.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:50:40.808177+00:00"
+  }
+}

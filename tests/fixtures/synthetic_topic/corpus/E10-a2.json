@@ -1,0 +1,18 @@
+{
+  "id": "E10-a2",
+  "event_id": "E10",
+  "label": "DUPLICATE-of-E10",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t3_channel_clearance_ops"
+  },
+  "published": "2026-09-03T12:40:00+00:00",
+  "outlet": "Sundaria Times",
+  "url": "synthetic://sundaria-times/E10-a2",
+  "headline": "Consortium Survey Vessels Deploy; Maritime Sector Eyes Clearance Progress",
+  "body": "QOROS, September 3 — Survey vessels for the newly awarded Meridia Strait clearance consortium began deployment this week, marking the first major operational step toward restoring the strategic chokepoint to commercial traffic. Current passage through the Strait remains minimal—approximately 3 vessels per day against the pre-crisis average of roughly 140 daily transits. The Meridia Route Normalization Index, the standard measure of insurance costs for Strait passages, stands at 18 out of 100. Captain Helena Voss, director of the Compact Shipping Federation, said that \"detailed survey results will determine the scope and timeline for actual clearance work.\" A representative from Qoros Marine Underwriters' Association stated that \"even preliminary survey data showing a clear path forward could influence insurance assessments significantly.\" Operation Open Water coordination officers confirmed that escort vessels will support clearance operations. The consortium has not yet disclosed project milestones or performance schedules.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:46:35.794121+00:00"
+  }
+}

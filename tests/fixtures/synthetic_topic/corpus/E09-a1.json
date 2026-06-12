@@ -1,0 +1,19 @@
+{
+  "id": "E09-a1",
+  "event_id": "E09",
+  "label": "E09",
+  "gold": {
+    "action": "OBSERVE",
+    "indicator_id": "t2_transit_volume",
+    "observed_value": 15
+  },
+  "published": "2026-08-26T08:10:00+00:00",
+  "outlet": "The Meridian Courier",
+  "url": "synthetic://the-meridian-courier/E09-a1",
+  "headline": "Escorted Transits Resume Through Meridia; Daily Traffic Recovers to 15 Percent of Pre-Crisis Levels",
+  "body": "OSTREV — Tracking data released by HarborTrack showed daily maritime transits through the Strait of Meridia reached approximately 21 vessels on August 26, recovering to roughly 15 percent of the pre-blockade baseline of 140 daily commercial movements, as Operation Open Water escort operations began moving traffic through the contested chokepoint.\n\nThe Meridian Compact's five-nation escort framework—coordinating naval assets from Khoreth, Sundaria, Elbar, Aldenport, and Virelles—commenced protective operations following weeks of diplomatic negotiations and logistical preparation. HarborTrack data indicated the resumption of movement beginning in early morning hours, with escorted convoys proceeding at controlled speeds.\n\nAnalysts at the Qoros Marine Underwriters' Association noted that insurance rates for the Meridia Route, which had spiked to near-crisis levels following the Varessan blockade in May, showed early signs of moderation. The association's Meridia Route Normalization Index, which measures war-risk pricing against pre-crisis baselines, moved fractionally upward from lows recorded during the closure.\n\nOperational commanders declined to specify vessel composition or convoy schedules, citing security considerations. Varessan Coastal Forces officials neither confirmed nor commented on the resumption of traffic. Qoros mediation talks are scheduled to resume September 3.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:45:45.424012+00:00"
+  }
+}

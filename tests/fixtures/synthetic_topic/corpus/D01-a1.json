@@ -1,0 +1,17 @@
+{
+  "id": "D01-a1",
+  "event_id": "D01",
+  "label": "DISTRACTOR",
+  "gold": {
+    "action": "IGNORE"
+  },
+  "published": "2026-07-08T08:10:00+00:00",
+  "outlet": "Harbor & Hull",
+  "url": "synthetic://harbor-hull/D01-a1",
+  "headline": "Regional Fishing Fleets Meet Over Quota Dispute",
+  "body": "QOROS, July 8 — Representatives from Khoreth, Sundaria, and Elbar fishing consortiums opened negotiations today to resolve escalating tensions over quota allocations in contested waters 200 nautical miles east of the Strait of Meridia. The dispute centers on overlapping maritime claims and equitable distribution of fishing rights among regional fleets. 'We've entered these talks in good faith,' said Theron Brask, chief negotiator for the Khoreth Fishing Council. 'Our objective is a framework that honors historical precedent while ensuring sustainable yield across all three jurisdictions.' The regional fishing industry generates substantial economic activity; uncertainty over quota authority has prompted some vessel operators to avoid the contested zone pending resolution. Preliminary discussions suggest potential agreement on temporary harvest restrictions while negotiations continue. No timeline has been announced, though negotiators indicated they expect substantive progress within the week. The outcome will likely determine regional fishing operations and export schedules for months ahead.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:41:25.627105+00:00"
+  }
+}

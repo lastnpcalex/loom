@@ -1,0 +1,18 @@
+{
+  "id": "E02-a1",
+  "event_id": "E02",
+  "label": "E02",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t3_talks_resumed"
+  },
+  "published": "2026-07-12T08:10:00+00:00",
+  "outlet": "Continental News Service",
+  "url": "synthetic://continental-news-service/E02-a1",
+  "headline": "Varessa, Meridian Coalition Resume Direct Talks on Strait Blockade",
+  "body": "QOROS — Direct negotiations between the Republic of Varessa and the Meridian Compact resumed today under neutral mediation, marking the first formal talks between the blockading power and the riparian coalition since the closure of the Strait of Meridia in May.\n\nDelegations representing Khoreth, Sundaria, and Elbar convened with Varessan officials in Qoros to address the blockade's impact on maritime commerce through the critical chokepoint. The Varessan Coastal Forces have maintained the closure for more than two months, halting roughly 140 daily commercial transits that characterized pre-crisis traffic patterns.\n\nThe mediated discussions represent a potential shift toward diplomatic resolution of the dispute. Qoros, which hosts the marine insurance market and serves as venue for numerous international negotiations, provided neutral ground for the talks.\n\nNo statements were immediately released regarding the substance or duration of negotiations. The Qoros government facilitated the mediation. Participants in previous shuttle diplomacy had indicated strong incentives for both sides to pursue negotiated settlement, though the fundamental positions of each party remain subject of public dispute.\n\nThe blockade has disrupted regional trade and elevated shipping insurance premiums significantly. The Qoros Marine Underwriters' Association continues monitoring market conditions through its Meridia Route Normalization Index.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:50:15.157535+00:00"
+  }
+}

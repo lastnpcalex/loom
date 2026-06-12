@@ -1,0 +1,18 @@
+{
+  "id": "E08-a2",
+  "event_id": "E08",
+  "label": "DUPLICATE-of-E08",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t2_escort_convoy_program"
+  },
+  "published": "2026-08-20T12:40:00+00:00",
+  "outlet": "The Meridian Courier",
+  "url": "synthetic://the-meridian-courier/E08-a2",
+  "headline": "Coalition Launches Escorted Convoy Program; First Departure Set Within Two Weeks",
+  "body": "The Meridian Compact and allied partners unveiled Operation Open Water today, a five-nation escort framework designed to restore shipping through the blockaded Strait of Meridia by deploying coordinated naval protection for commercial convoys. The first protected passage is scheduled to depart within two weeks. Maritime sector officials and industry representatives welcomed the initiative as a step toward normalizing the 140-transit-per-day traffic volumes that characterized pre-crisis operations. \"This represents a concrete commitment from the coalition,\" said Marin Ketsov, operations director at the Qoros Marine Underwriters' Association, adding that current war-risk premiums on Meridia-route insurance remain historically elevated. The operation links Khoreth, Sundaria, and Elbar—the coalition members currently enforcing the blockade response—with Aldenport and Virelles, whose naval participation signals broader regional backing for the initiative. Coalition commanders declined to specify escort vessel types, numbers, or the proposed frequency of convoy operations, citing operational security. Port authorities in coalition member states reported increased activity in preparation for the first departure. Insurance markets showed modest upward movement on the Meridia Route Normalization Index following the announcement, though the index remains substantially below pre-crisis baselines.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:45:35.079508+00:00"
+  }
+}

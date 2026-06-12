@@ -1,0 +1,18 @@
+{
+  "id": "E01-a2",
+  "event_id": "E01",
+  "label": "DUPLICATE-of-E01",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t2_blockade_reinforcement"
+  },
+  "published": "2026-07-03T12:40:00+00:00",
+  "outlet": "Continental News Service",
+  "url": "synthetic://continental-news-service/E01-a2",
+  "headline": "Coalition Reports Sea Mines in Meridia Strait as Blockade Tightens",
+  "body": "QOROS — Coalition naval forces announced July 3 that new sea mines have been laid across the southern channel of the Strait of Meridia. Two bulk carriers attempting transit detected the obstacles and reversed course, the first confirmed Varessan escalation since the blockade began May 1, 2026.\n\nThe mine-laying intensifies pressure on commercial shipping already devastated by the five-week-old closure. Pre-blockade traffic through Meridia averaged 140 transits per day; current transit levels are effectively zero. The Qoros Marine Underwriters' Association's trade normalization benchmark—the Meridia Route Index, scaled from 0 to 100—currently reads 12, reflecting war-risk premiums that make legitimate commerce uninsurable at historical rates.\n\nBrokers reached July 3 said the mine discovery will eliminate any marginal economics for passage attempts.\n\n\"The index reflects what insurance costs when you're operating in a mine field,\" said broker Ren Castellan of Harborside Maritime. \"You're not getting quotes at any price now. The channel is closed.\"\n\nCoalition capitals have called for immediate mine-clearance operations. Varessa's Foreign Ministry has not responded to inquiries about the placement or timing.\n\nThe blockade has disrupted commodity flows and tied up roughly 300 vessels regionally, according to HarborTrack vessel-tracking data.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:49:54.950362+00:00"
+  }
+}

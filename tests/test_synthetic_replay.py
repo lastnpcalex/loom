@@ -121,3 +121,55 @@ def test_replay_is_deterministic(trajectory, tmp_path):
     assert [t["posteriors"] for t in second] == [
         t["posteriors"] for t in trajectory
     ]
+
+
+def test_corpus_is_valid():
+    # Leakage/anachronism/coverage scan of the committed corpus — no API.
+    sys.path.insert(0, str(LOOM_ROOT / "tests" / "synthetic"))
+    import generate_corpus
+
+    assert generate_corpus.scan_corpus() == 0
+
+
+# --- pipeline lane -----------------------------------------------------------
+# Opt-in: ~18 matcher calls against the local llama server (minutes, not
+# seconds). The report, not a pass/fail on the matcher model, is the
+# deliverable — these tests assert mechanics only.
+
+pipeline_mark = pytest.mark.skipif(
+    os.environ.get("NROL_SYNTHETIC_PIPELINE") != "1",
+    reason="set NROL_SYNTHETIC_PIPELINE=1 to run the llama pipeline lane",
+)
+
+
+@pipeline_mark
+def test_pipeline_lane_mechanics(tmp_path):
+    corpus = sorted((FIXTURES / "corpus").glob("*.json"))
+    assert corpus, "corpus missing; run tests/synthetic/generate_corpus.py"
+
+    out = tmp_path / "pipeline.jsonl"
+    decisions_path = tmp_path / "decisions.jsonl"
+    env = {**os.environ}
+    env.pop("NROL_AO_AS_OF", None)
+    env.pop("LOOM_CONV_ID", None)
+    proc = subprocess.run(
+        [sys.executable, str(LOOM_ROOT / "tests" / "synthetic" / "replay.py"),
+         "--lane", "pipeline", "--out", str(out),
+         "--decisions", str(decisions_path)],
+        capture_output=True, text=True, env=env, timeout=3600,
+    )
+    assert proc.returncode == 0, f"pipeline lane failed:\n{proc.stdout}\n{proc.stderr}"
+
+    rows = [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert rows, "empty pipeline trajectory"
+    for row in rows:
+        assert abs(sum(row["posteriors"].values()) - 1.0) < 0.01, row["date"]
+        assert not row.get("error"), f"{row['date']}: {row['error']}"
+        assert not row.get("denied"), f"{row['date']}: Loom gate fired in harness"
+    decisions = [json.loads(l) for l in decisions_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    # The matcher must produce a decision for most articles (a missing block
+    # is a matcher format failure, not a perception judgment).
+    decided = {d["article_id"] for d in decisions if d.get("article_id")}
+    assert len(decided) >= int(0.8 * len(corpus)), (
+        f"only {len(decided)}/{len(corpus)} articles decided"
+    )

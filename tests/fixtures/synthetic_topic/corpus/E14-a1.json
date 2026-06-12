@@ -1,0 +1,19 @@
+{
+  "id": "E14-a1",
+  "event_id": "E14",
+  "label": "E14",
+  "gold": {
+    "action": "OBSERVE",
+    "indicator_id": "t2_transit_volume",
+    "observed_value": 78
+  },
+  "published": "2026-09-24T08:10:00+00:00",
+  "outlet": "Continental News Service",
+  "url": "synthetic://continental-news-service/E14-a1",
+  "headline": "Strait of Meridia Shows Sustained Recovery as Transit Levels Hold",
+  "body": "Daily commercial transits through the Strait of Meridia maintained their recovery momentum on the fifth consecutive day at 78 percent of pre-crisis levels, according to maritime tracking data analyzed by brokers and insurers. The stable traffic pattern, bringing approximately 109 ships through the strategic waterway daily, prompted major market participants to characterize the recovery as sustained rather than temporary.\n\nThe blockade, imposed by Varessa's Coastal Forces in May 2026, had reduced transits to near-zero levels before Operation Open Water began escort operations. The five-day consistency at the three-quarter baseline represents the first prolonged period of stability since the coalition began shipping convoys in the disputed waters.\n\n\"The holding pattern at this level is significant,\" said an analyst with the Qoros Marine Underwriters' Association, which tracks the Meridia Route Normalization Index. The index, which gauges war-risk pricing from 0 (full crisis) to 100 (pre-crisis), has stabilized as broker confidence in sustained operations strengthens.\n\nKhoreth, Sundaria, and Elbar—the primary coalition members operating escorts—have not reported new incidents at the blockade point. Distant partners Aldenport and Virelles continue their support roles in the five-nation framework. Varessa has made no public statement regarding the transit levels or its blockade posture.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:48:58.533579+00:00"
+  }
+}

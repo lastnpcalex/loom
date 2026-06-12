@@ -1,0 +1,19 @@
+{
+  "id": "E13-a1",
+  "event_id": "E13",
+  "label": "E13",
+  "gold": {
+    "action": "OBSERVE",
+    "indicator_id": "t3_insurance_normalization",
+    "observed_value": 64
+  },
+  "published": "2026-09-18T08:10:00+00:00",
+  "outlet": "Harbor & Hull",
+  "url": "synthetic://harbor-hull/E13-a1",
+  "headline": "Meridia Index Hits 64 on Easing War-Risk Premiums for Escorted Traffic",
+  "body": "QOROS, Sept. 18 — The Meridia Route Normalization Index climbed to 64 today, marking a substantial easing of war-risk premiums as shippers increasingly opt for escorted transits through the Strait of Meridia.\n\nThe Qoros Marine Underwriters' Association reported the daily index rise from previous levels, reflecting what brokers described as \"a fundamental shift in underwriting appetite\" for convoys operating under the Operation Open Water framework.\n\n\"We're seeing measurable premium compression on every Meridia routing that moves under escort,\" said Marcus Thorne, head of hull underwriting at Qoros-based Castellan & Associates. \"A week ago, war-risk loadings were running 8-10 percent above baseline. We're now seeing 3-4 percent for vessels in coordinated convoys.\"\n\nThe improvement follows sustained escort operations by the five-nation coalition, which has maintained continuous corridor coverage since the blockade began. HarborTrack data showed 47 escorted transits logged through the strait today, compared with an average of 31 per day in early September.\n\n\"The index reflects what we're seeing in the market,\" said Underwriting Manager Ricard Volkov of Qoros Mutual. \"Risk premium falls when transits run safely. Underwriters price probability. These numbers are improving.\"\n\nThe index remains well below pre-crisis readings of 100, though today's level represents the highest point since blockade declarations in May.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:48:22.277078+00:00"
+  }
+}

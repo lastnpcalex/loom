@@ -1,0 +1,18 @@
+{
+  "id": "E11-a1",
+  "event_id": "E11",
+  "label": "E11",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t1_reopening_decree"
+  },
+  "published": "2026-09-08T08:10:00+00:00",
+  "outlet": "Sundaria Times",
+  "url": "synthetic://sundaria-times/E11-a1",
+  "headline": "Strait Reopens September 12 Under Joint Escort Framework",
+  "body": "The Meridian Compact and international partners announced today that the Strait of Meridia will formally reopen to commercial transit beginning 12 September 2026, ending the four-month blockade that has disrupted regional trade. The joint decree establishes escort protocols and insurance arrangements for transiting vessels, with Operation Open Water providing naval security under the framework agreement signed by Khoreth, Sundaria, Elbar, Aldenport, and Virelles.\n\n\"This agreement marks a decisive step toward normalizing regional commerce,\" said Sundaria's Trade Ministry in a statement. The reopening follows intensive mediation coordinated through Qoros, where representatives from the Meridian Compact negotiated terms with international mediators.\n\nEffective protocols require participating vessels to register with convoy coordinators at designated departure ports and comply with established routing. The Qoros Marine Underwriters' Association will administer war-risk insurance categories under the new framework. Shipping registries expect the first commercial transits under the protocols to depart within 48 hours of the 12 September implementation date.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:47:01.999569+00:00"
+  }
+}

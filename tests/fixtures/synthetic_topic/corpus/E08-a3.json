@@ -1,0 +1,18 @@
+{
+  "id": "E08-a3",
+  "event_id": "E08",
+  "label": "DUPLICATE-of-E08",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t2_escort_convoy_program"
+  },
+  "published": "2026-08-20T17:25:00+00:00",
+  "outlet": "The Ostrev Gazette",
+  "url": "synthetic://the-ostrev-gazette/E08-a3",
+  "headline": "Coalition Announces Strait Escort Program; Varessa Assesses Response",
+  "body": "Five nations announced Operation Open Water yesterday, a coordinated maritime framework to escort commercial convoys through the blockaded Strait of Meridia, following weeks of unilateral blockade enforcement by the Varessan Coastal Forces. As first reported by regional and international news services, the coalition—comprising Khoreth, Sundaria, Elbar, Aldenport, and Virelles—plans its first escorted passage within two weeks. Varessan officials indicated today that the government is studying the announcement before issuing a comprehensive statement. \"We are reviewing the operational details and the intent behind this initiative,\" said Dmitri Nevolin, a spokesperson for the Varessan Maritime Authority, adding that \"the Strait of Meridia remains under lawful blockade pending resolution of the underlying dispute.\" Coalition members have characterized Operation Open Water as a response to the blockade, which closed the Strait in May 2026 and reduced traffic from approximately 140 daily transits to zero. Qoros mediation efforts continue in parallel, with all parties engaged in talks on the underlying political issues. Port readiness preparations are underway in coalition territories. The operation marks the first coordinated military response by the Compact and its allies to maintain shipping through the contested waterway.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:45:35.079978+00:00"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "id": "E04-a1",
+  "event_id": "E04",
+  "label": "E04",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t2_blockade_reinforcement"
+  },
+  "published": "2026-07-24T08:10:00+00:00",
+  "outlet": "The Ostrev Gazette",
+  "url": "synthetic://the-ostrev-gazette/E04-a1",
+  "headline": "Fast Attack Craft Detain Products Tanker at Strait Approach",
+  "body": "Ostrev — July 24, 2026\n\nA products tanker was intercepted by fast attack craft near the western approach to the Strait of Meridia on July 24, with the vessel's crew detained pending investigation. The interception occurred during routine maritime enforcement operations in the blockade zone.\n\nThe Varessan Coastal Forces confirmed the operation, stating that the vessel had not obtained proper clearance for transit. Officials indicated the detention was consistent with existing protocols established since the blockade commenced in May 2026. The crew is being held in secure custody while maritime authorities conduct their investigation.\n\nThe Coastal Forces did not immediately disclose the vessel's flag or registry, nor provided details regarding the cargo. A spokesperson noted that such enforcement actions remain necessary to maintain security and stability in the strait region. The incident marks the latest interdiction by blockade enforcement assets maintaining the Varessa government's strategic position in the dispute over the strait's status.\n\nTransit restrictions remain in effect indefinitely pending resolution of broader diplomatic matters between Varessa and the Meridian Compact member states.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:51:26.859627+00:00"
+  }
+}

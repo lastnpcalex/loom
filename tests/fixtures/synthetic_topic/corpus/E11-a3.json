@@ -1,0 +1,18 @@
+{
+  "id": "E11-a3",
+  "event_id": "E11",
+  "label": "DUPLICATE-of-E11",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t1_reopening_decree"
+  },
+  "published": "2026-09-08T17:25:00+00:00",
+  "outlet": "Harbor & Hull",
+  "url": "synthetic://harbor-hull/E11-a3",
+  "headline": "Shipping Markets React as Meridia Corridor Opens; Underwriters Offer 'Measured' Risk Terms",
+  "body": "As first reported by Qoros Wire yesterday, the Strait of Meridia formally reopens to commercial traffic today, 12 September, under a five-nation escort agreement and new insurance protocols designed to rebuild confidence in the chokepoint that handled 140 daily transits before the May blockade.\n\nShipping brokers and underwriters reported heavy inquiry, with the Qoros Marine Underwriters' Association fielding requests from operators planning immediate transits. Initial market reaction suggests measured optimism: brokers noted container rates on the Meridia corridor have stabilized within 15-20 percent of pre-crisis levels, compared to 70-80 percent premiums during blockade conditions.\n\n\"Operators are cautious but ready to resume,\" said Marcus Chen, senior broker with Ostrev Shipping Services. \"The escort commitment is credible, and the insurance framework is transparent—that's what the market needed to move.\"\n\n\"Confidence rebuilds slowly after crisis disruption,\" said Voss, the association's underwriting coordinator. HarborTrack projects initial daily transit volume at 85-95 vessels on 12 September, ramping toward pre-crisis norms over two weeks as operators accumulate positive operational experience.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:47:02.000410+00:00"
+  }
+}

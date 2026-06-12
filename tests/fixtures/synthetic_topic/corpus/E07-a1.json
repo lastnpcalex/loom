@@ -1,0 +1,18 @@
+{
+  "id": "E07-a1",
+  "event_id": "E07",
+  "label": "E07",
+  "gold": {
+    "action": "PARK",
+    "reason": "Material to the question but matches no pre-committed indicator: no named transit mechanism, no date, unverifiable terms."
+  },
+  "published": "2026-08-15T08:10:00+00:00",
+  "outlet": "Harbor & Hull",
+  "url": "synthetic://harbor-hull/E07-a1",
+  "headline": "Varessa, Meridian Compact announce de-escalation understanding as Meridia blockade enters new phase",
+  "body": "Officials from the Republic of Varessa and the Meridian Compact announced a temporary maritime de-escalation understanding on Thursday, with both sides confirming talks but declining to specify transit arrangements, timetables, or published terms for the agreement.\n\nThe announcement, made during ongoing mediation in Qoros, offers no clarity on when commercial transits through the Strait of Meridia might resume after the blockade that began in May 2026 forced a near-total halt to the roughly 140 daily commercial transits that characterized pre-crisis traffic.\n\nInsurance underwriters and shipping brokers said the vague language reflects the precarious state of negotiations. \"Until we have concrete details on corridor operations and immunity frameworks, we can't adjust our risk models,\" said a spokeswoman for the Qoros Marine Underwriters' Association, which manages the Meridia Route Normalization Index. The index remained at 22 points—roughly a fifth of pre-crisis pricing—as market participants waited for clarity.\n\nHarborTrack reported zero transits through the strait on Thursday. One Qoros-based broker said the announcement, while \"a necessary first step,\" offered insufficient detail to guide shipping decisions. \"We need to know: Are escorts resuming? What's the corridor geometry? When?\" the broker said.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:45:09.740548+00:00"
+  }
+}

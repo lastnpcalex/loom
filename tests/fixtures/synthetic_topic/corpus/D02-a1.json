@@ -1,0 +1,17 @@
+{
+  "id": "D02-a1",
+  "event_id": "D02",
+  "label": "DISTRACTOR",
+  "gold": {
+    "action": "IGNORE"
+  },
+  "published": "2026-07-29T08:10:00+00:00",
+  "outlet": "Continental News Service",
+  "url": "synthetic://continental-news-service/D02-a1",
+  "headline": "Port Authority Unveils Five-Year Container Terminal Expansion East of Meridia Strait",
+  "body": "The port authority for Sundaria's primary maritime gateway announced Thursday a five-year capital expansion plan focused on container terminal capacity, citing long-term regional trade growth as the primary driver.\n\nThe expansion will increase container throughput capacity by 35 percent through the construction of two additional deepwater berths, enhanced yard infrastructure, and modernized cargo-handling equipment. Total projected investment stands at 420 million in local currency, to be funded through a combination of port revenues and development financing.\n\nPort officials emphasized the initiative responds to anticipated commercial traffic trends independent of current regional geopolitical factors. \"This expansion reflects our assessment of underlying demand from importers, exporters, and shipping lines across the Indian Ocean corridor,\" the port authority stated in a formal announcement.\n\nConstruction is scheduled to begin in the third quarter of 2027, with phased completion between 2031 and 2032. The announcement carries no reference to ongoing blockade conditions or regional transport disruptions. Industry analysts noted the timeline aligns with port authority capital planning cycles established well before the current maritime tensions.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:43:52.459613+00:00"
+  }
+}

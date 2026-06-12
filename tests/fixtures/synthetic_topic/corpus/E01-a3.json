@@ -1,0 +1,18 @@
+{
+  "id": "E01-a3",
+  "event_id": "E01",
+  "label": "DUPLICATE-of-E01",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t2_blockade_reinforcement"
+  },
+  "published": "2026-07-03T17:25:00+00:00",
+  "outlet": "The Meridian Courier",
+  "url": "synthetic://the-meridian-courier/E01-a3",
+  "headline": "Coalition Confirms Fresh Mines in Southern Channel; Trade Prospects Dim Further",
+  "body": "The Meridian Compact's naval command confirmed July 3 that new sea mines have been laid across the southern passage of the Strait of Meridia, as first reported by Coalition Maritime Operations. Two bulk carriers attempting transits detected the ordnance and reversed course, ending speculation that commerce might resume through the blockaded waterway.\n\nThe discovery marks the first active Varessan escalation since the blockade's imposition on May 1 and underscores hardening positions on both sides of the maritime crisis. Coalition leadership has demanded Varessan clearance of all ordnance and unblocking of legitimate shipping, but neither demand shows signs of near-term resolution.\n\n\"This is not an accident—it is a calculated move,\" said Coalition maritime strategist Elena Thorne in a statement. \"It signals Varessa intends to harden this blockade for a protracted period.\"\n\nRegional maritime insurers said July 3 they are withdrawing coverage entirely from Meridia passages. The Qoros Marine Underwriters' Association's Meridia Route Index measured 100 before the crisis and tracked 140 transits daily under normal conditions. It now stands at 12, reflecting war-risk premiums most carriers consider economically unviable.\n\nHarborTrack data shows approximately 300 vessels now delayed regionally, with aggregate cargo value estimated in the low billions.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T03:49:54.950894+00:00"
+  }
+}
