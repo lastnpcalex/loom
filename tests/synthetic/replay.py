@@ -1,18 +1,26 @@
-"""Synthetic-topic replay — oracle lane.
+"""Synthetic-topic replay — oracle and pipeline lanes.
 
 Replays the authored timeline (tests/fixtures/synthetic_topic/) through the
 real MCP boundary + engine in an isolated repo, stepping the NROL_AO_AS_OF
-simulation clock through the simulated days. The gold transitions ARE the
-reference: the engine is deterministic given typed observations, so this
-trajectory is what a perfect perception layer would produce. The pipeline
-lane (articles -> matcher -> commits) is compared against it; divergence is
-perception error, cleanly separated from engine math.
+simulation clock through the simulated days.
+
+Oracle lane: the gold transitions ARE the reference — the engine is
+deterministic given typed observations, so this trajectory is what a perfect
+perception layer would produce.
+
+Pipeline lane: the generated corpus goes through the real perception path —
+submit_article -> run_matcher_with_llama (local llama-server) -> committed
+decisions — and its divergence from the oracle is perception error, cleanly
+separated from engine math. v1 auto-commits everything the matcher decides;
+an operator-review-policy lane is a later extension.
 
 Runs as a subprocess (own interpreter) so the engine module binds to the
 isolated repo without fighting other test fixtures' module caches.
 
 Usage:
     python tests/synthetic/replay.py --out trajectory.jsonl [--keep-repo DIR]
+    python tests/synthetic/replay.py --lane pipeline --out pipe.jsonl \
+        --decisions decisions.jsonl
 """
 
 import argparse
@@ -150,10 +158,96 @@ def run_oracle(server, repo: Path, timeline: dict) -> list[dict]:
     return trajectory
 
 
+def load_corpus() -> list[dict]:
+    corpus_dir = FIXTURES / "corpus"
+    articles = [
+        json.loads(p.read_text(encoding="utf-8"))
+        for p in sorted(corpus_dir.glob("*.json"))
+    ]
+    if not articles:
+        raise SystemExit(f"no corpus articles in {corpus_dir}; "
+                         "run tests/synthetic/generate_corpus.py first")
+    return sorted(articles, key=lambda a: a["published"])
+
+
+def run_pipeline(server, repo: Path, timeline: dict,
+                 corpus: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Articles through the real perception path, one simulated day at a time.
+
+    All of a day's articles go to the matcher in one batch — duplicate
+    coverage of one causal event lands in the same prompt, which is exactly
+    the dedup discipline the corpus was authored to test.
+    """
+    slug = timeline["slug"]
+    trajectory: list[dict] = []
+    decision_rows: list[dict] = []
+
+    by_day: dict[str, list[dict]] = {}
+    for art in corpus:
+        by_day.setdefault(art["published"][:10], []).append(art)
+
+    for day in sorted(by_day):
+        day_articles = by_day[day]
+        os.environ["NROL_AO_AS_OF"] = f"{day}T12:00:00+00:00"
+        before = disk_posteriors(repo, slug)
+
+        matcher_articles = []
+        for art in day_articles:
+            # The store's entry point of record; the matcher batch below is
+            # what actually decides.
+            json.loads(server.submit_article({
+                "url": art["url"], "headline": art["headline"],
+                "source": art["outlet"], "published": art["published"],
+                "text": art["body"],
+            }))
+            matcher_articles.append({
+                "headline": art["headline"], "url": art["url"],
+                "source": art["outlet"], "date": art["published"],
+                "excerpt": art["body"],
+            })
+
+        result = json.loads(server.run_matcher_with_llama(
+            slug, matcher_articles, commit=True, temperature=0.0,
+        ))
+        after = disk_posteriors(repo, slug)
+        decisions = result.get("decisions") or []
+        for d in decisions:
+            idx = d.get("idx")
+            art = day_articles[idx - 1] if idx and idx <= len(day_articles) else None
+            decision_rows.append({
+                "date": day,
+                "article_id": art["id"] if art else None,
+                "event_id": art["event_id"] if art else None,
+                "label": art["label"] if art else None,
+                "gold": art["gold"] if art else None,
+                "decision": d,
+            })
+        trajectory.append({
+            "date": day,
+            "articles": [a["id"] for a in day_articles],
+            "decision_count": len(decisions),
+            "applied": result.get("applied"),
+            "error": result.get("error"),
+            "denied": result.get("denied"),
+            "posteriors": after,
+            "moved": after != before,
+            "tv_distance": 0.5 * sum(abs(after[k] - before[k]) for k in after),
+        })
+        status = "moved" if after != before else "no move"
+        print(f"  {day}: {len(day_articles)} articles, "
+              f"{len(decisions)} decisions, {status}")
+        if result.get("error"):
+            print(f"    ERROR: {result['error']}")
+    return trajectory, decision_rows
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="trajectory JSONL path")
     ap.add_argument("--keep-repo", default="", help="build repo here and keep it")
+    ap.add_argument("--lane", choices=("oracle", "pipeline"), default="oracle")
+    ap.add_argument("--decisions", default="",
+                    help="pipeline lane: per-article decision JSONL path")
     args = ap.parse_args()
 
     topic = json.loads((FIXTURES / "topic.json").read_text(encoding="utf-8"))
@@ -172,7 +266,19 @@ def main() -> int:
         setup_env(repo)
         from mcp_servers.nrol_ao import server
 
-        trajectory = run_oracle(server, repo, timeline)
+        if args.lane == "pipeline":
+            corpus = load_corpus()
+            trajectory, decision_rows = run_pipeline(
+                server, repo, timeline, corpus
+            )
+            if args.decisions:
+                dec_out = Path(args.decisions)
+                dec_out.parent.mkdir(parents=True, exist_ok=True)
+                with dec_out.open("w", encoding="utf-8") as f:
+                    for row in decision_rows:
+                        f.write(json.dumps(row) + "\n")
+        else:
+            trajectory = run_oracle(server, repo, timeline)
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         with out.open("w", encoding="utf-8") as f:
@@ -180,15 +286,16 @@ def main() -> int:
                 f.write(json.dumps(row) + "\n")
 
         final = trajectory[-1]["posteriors"]
-        print(f"oracle lane: {len(trajectory)} events replayed")
+        print(f"{args.lane} lane: {len(trajectory)} rows replayed")
         print(f"final posteriors: {json.dumps(final)}")
         print(f"argmax: {max(final, key=final.get)} "
               f"(authored truth: {timeline['truth']['hypothesis']})")
         errors = [t for t in trajectory if t.get("error")]
         if errors:
-            print(f"ERRORS in {len(errors)} events:")
+            print(f"ERRORS in {len(errors)} rows:")
             for t in errors:
-                print(f"  {t['event_id']} {t['date']}: {t['error']}")
+                where = t.get("event_id") or ",".join(t.get("articles", []))
+                print(f"  {where} {t['date']}: {t['error']}")
             return 1
         return 0
     finally:

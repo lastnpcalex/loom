@@ -169,3 +169,51 @@ sites each (primary + resume-fallback), not 3.
 (b) MCP commit -> browser approval appears; (c) probe "state your role
 rules" -> the operator recites OPERATOR.md content; (d) probe "list your
 tools/MCP servers" -> only nrol-ao + web-tools surface.
+
+## Synthetic-topic replay harness (started 2026-06-11)
+
+End-to-end acceptance for the whole epistemic pipeline against authored
+ground truth: a fictional topic (Strait of Meridia reopen), an authored
+90-day timeline with gold typed transitions, and two replay lanes — the
+oracle lane (gold transitions straight through submit_transition = the
+deterministic reference trajectory) and the pipeline lane (generated
+articles -> matcher -> commits), whose divergence from the oracle is
+perception error isolated from engine math. Plan file:
+`~/.claude/plans/it-seems-to-be-smooth-bee.md`.
+
+- ✅ Simulation clock (2026-06-11): `NROL_AO_AS_OF` pins engine AND
+  governor "now" (temp-repo 4aa250f, 286ed79); deadline eliminations,
+  dayCount, R_t freshness all run in simulated time. Found+fixed live
+  bug: a future-dated lastUpdated crashed R_t (log2 of negative).
+- ✅ Evidence dated by publication (2026-06-11): article `published`
+  flows into evidence `time` through _evidence_entry/commit_match — late
+  processing no longer falsifies evidence dates (live fix too).
+- ✅ Oracle lane green (2026-06-11): `tests/synthetic/replay.py` +
+  `tests/test_synthetic_replay.py` (8 assertions: commits, sum-to-1,
+  deadline floors in simulated time, PARK/SCHEMA_GAP no-ops, refire
+  attenuation, baseline observation as visible non-update, convergence
+  on authored truth H3=0.98, determinism). Authoring against the real
+  design gates surfaced the conventions: posteriorEffect text IS the
+  coverage matrix; >15pp moves need >=2 evidence_refs; saturating past
+  0.85 needs a red-team record within 30 (simulated) days.
+- ✅ Corpus committed (2026-06-11): 31 Haiku-authored articles via
+  `tests/synthetic/generate_corpus.py` — gold labels copied from the
+  timeline by the script (Haiku never sees the indicator schema), dupes
+  as dedup bait, awkward-unit observables, authored near-misses. The
+  world bible is time-aware (generation caught July articles citing the
+  August escort op); `--scan` validates leakage/anachronism/label-drift
+  and runs in CI as test_corpus_is_valid. Spot-check gate: corpus is
+  provisional ground truth until a human reviews sampled articles.
+- ✅ Pipeline lane + scoring (2026-06-11): `replay.py --lane pipeline`
+  (per-day submit_article -> run_matcher_with_llama(Qwen, temp 0) ->
+  auto-commit) + `score.py` (TV divergence naming culprit articles,
+  confusion matrix, Brier at authored resolutions). First run: both
+  lanes converge on authored truth (oracle H3=0.98, pipeline H3=0.9833;
+  peak TV 0.079 day 1 decaying to 0.003). The matcher reproduced the
+  live hormuz failure on day 1 — three duplicate articles, three FIREs
+  of one causal event — bounded by lr_decay; dedup belongs in the
+  perception layer. Off-diagonal errors all conservative (FIREs parked,
+  distractors parked-not-ignored = review-debt generators); E06
+  SCHEMA_GAP and E07 PARK bait both handled correctly; OBSERVE
+  extraction 5/6 exact, awkward-units piece within 2pp. Matcher-path
+  evidence now also dated by publication (engine repo 59f439a).
