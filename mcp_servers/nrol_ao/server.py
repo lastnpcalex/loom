@@ -574,6 +574,38 @@ def _deliberation_stamp_from_debate(decision: dict, debate_packet: dict | None) 
     return record
 
 
+def _split_safe_policy_decisions(news, articles: list, decisions: list) -> tuple[list, list]:
+    """Return (safe_to_apply, posterior_moving_to_propose).
+
+    Safe policy means apply_decisions must never see FIRE/OBSERVE. A previous
+    safe-scan path filtered only canonical decisions, then appended duplicate
+    decisions unfiltered; posterior-moving duplicates could therefore bypass
+    the proposal gate. This splitter classifies every grouped decision and
+    keeps movement on the proposal side.
+    """
+    canonical, duplicate_map = news.group_decisions_by_duplicates(articles, decisions)
+    safe_to_apply: list[dict] = []
+    to_propose: list[dict] = []
+
+    for d in canonical:
+        kind = (d.get("action") or {}).get("kind")
+        dups = duplicate_map.get(d.get("idx"), [])
+        if kind in {"FIRE", "OBSERVE"}:
+            d = dict(d)
+            d["_duplicate_decisions"] = dups
+            to_propose.append(d)
+        elif kind in {"PARK", "SCHEMA_GAP", "IGNORE"}:
+            safe_to_apply.append(d)
+            for dup in dups:
+                dup_kind = (dup.get("action") or {}).get("kind")
+                if dup_kind in {"FIRE", "OBSERVE"}:
+                    to_propose.append(dup)
+                elif dup_kind in {"PARK", "SCHEMA_GAP", "IGNORE"}:
+                    safe_to_apply.append(dup)
+
+    return safe_to_apply, to_propose
+
+
 def _fetch_article_excerpt(url: str, max_chars: int, timeout_sec: float = 15.0) -> str:
     """Fetch a URL and extract readable article text (trafilatura).
 
@@ -824,6 +856,165 @@ def read_topic(slug: str, include_indicators: bool = True, evidence_limit: int =
         )
     except Exception as exc:
         return _json({"error": str(exc), "slug": slug})
+
+
+@mcp.tool()
+def list_schema_gaps(slug: str, clustered: bool = True) -> str:
+    """List flagged schema gaps for a topic, optionally clustered by pattern."""
+    try:
+        engine = _import_from_repo("engine")
+        resolver = _import_from_repo("framework.schema_gap_resolver")
+        topic = engine.load_topic(slug)
+        gaps = topic.get("governance", {}).get("flagged_schema_gaps", []) or []
+        payload = {"slug": slug, "count": len(gaps), "gaps": gaps}
+        if clustered:
+            payload["clusters"] = resolver.cluster_gaps(topic)
+        return _json(payload)
+    except Exception as exc:
+        return _json({"error": str(exc), "slug": slug})
+
+
+@mcp.tool()
+def run_schema_gap_resolver(
+    slug: str,
+    persist: bool = False,
+    model: str = "",
+    temperature: float = 0.2,
+    max_tokens: int = 4096,
+    timeout_sec: int = 900,
+) -> str:
+    """Ask the local model to propose schema extensions for flagged gaps.
+
+    persist=false (default) is preview only. persist=true writes proposals to
+    governance.proposed_schema_extensions for operator review; it does not
+    apply schema edits. Application remains a cleanup/design task.
+    """
+    store = _activity_store()
+    job_id = new_job_id("schema-gap-resolver")
+    try:
+        engine = _import_from_repo("engine")
+        resolver = _import_from_repo("framework.schema_gap_resolver")
+        topic = engine.load_topic(slug)
+        clusters = resolver.cluster_gaps(topic)
+        if not clusters:
+            return _json({
+                "job_id": job_id, "slug": slug, "clusters": [],
+                "proposals": [], "note": "no flagged schema gaps",
+                "persisted": False,
+            })
+        prompt = resolver.build_resolver_prompt(topic, clusters)
+        store.record(
+            job_id, "running", task="run_schema_gap_resolver", slug=slug,
+            model=model or llama_client.llama_model(),
+            summary={"clusters": len(clusters), "persist": persist},
+            prompt=prompt,
+        )
+        response = llama_client.chat(
+            prompt,
+            system_prompt=(
+                "You are the NROL-AO schema-gap resolver. Return only "
+                "PROPOSAL blocks in the requested format. Do not edit topic JSON."
+            ),
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+            disable_thinking=False,
+        )
+        text = response.get("text", "")
+        proposals = resolver.parse_resolver_proposals(text)
+        proposals = resolver.validate_proposals_balance(topic, proposals)
+        persisted_count = 0
+        if persist and proposals:
+            updated = resolver.persist_proposals(slug, proposals, validated=False)
+            persisted_count = len(
+                updated.get("governance", {}).get("proposed_schema_extensions", []) or []
+            )
+        payload = {
+            "job_id": job_id, "slug": slug, "clusters": clusters,
+            "model": response.get("model"), "response": text,
+            "proposals": proposals, "persisted": bool(persist and proposals),
+            "proposed_schema_extensions_count": persisted_count,
+        }
+        store.record(
+            job_id, "completed", task="run_schema_gap_resolver", slug=slug,
+            model=response.get("model"), summary={
+                "clusters": len(clusters),
+                "proposals": len(proposals),
+                "persisted": bool(persist and proposals),
+            },
+            response=_json(payload),
+        )
+        return _json(payload)
+    except Exception as exc:
+        try:
+            store.record(job_id, "failed", task="run_schema_gap_resolver",
+                         slug=slug, error=str(exc))
+        except Exception:
+            pass
+        return _json({"job_id": job_id, "error": str(exc), "slug": slug})
+
+
+@mcp.tool()
+def list_schema_extension_proposals(slug: str, status: str = "pending") -> str:
+    """List governance.proposed_schema_extensions for operator review."""
+    try:
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(slug)
+        queue = topic.get("governance", {}).get("proposed_schema_extensions", []) or []
+        rows = []
+        for i, proposal in enumerate(queue):
+            p_status = proposal.get("status", "")
+            if status and status != "all":
+                if status == "pending":
+                    if not p_status.startswith("pending_operator_review"):
+                        continue
+                elif p_status != status:
+                    continue
+            rows.append({"index": i, **proposal})
+        return _json({"slug": slug, "count": len(rows), "proposals": rows})
+    except Exception as exc:
+        return _json({"error": str(exc), "slug": slug})
+
+
+@mcp.tool()
+def mark_schema_extension_proposal(
+    slug: str,
+    proposal_index: int,
+    status: str,
+    note: str = "",
+) -> str:
+    """Mark a schema-extension proposal approved/rejected/deferred.
+
+    This is a review queue update only; it does not edit indicators. Approved
+    proposals are inputs to a cleanup/design pass.
+    """
+    try:
+        status_norm = (status or "").strip().lower()
+        allowed = {"approved", "rejected", "deferred", "pending_operator_review"}
+        if status_norm not in allowed:
+            raise ValueError(f"status must be one of {sorted(allowed)}")
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(slug)
+        queue = topic.setdefault("governance", {}).setdefault(
+            "proposed_schema_extensions", []
+        )
+        if proposal_index < 0 or proposal_index >= len(queue):
+            raise IndexError(f"proposal_index {proposal_index} out of range")
+        queue[proposal_index]["status"] = status_norm
+        queue[proposal_index]["reviewed_at"] = datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+        if note:
+            queue[proposal_index]["review_note"] = note
+        engine.save_topic(topic)
+        return _json({
+            "slug": slug,
+            "proposal_index": proposal_index,
+            "proposal": queue[proposal_index],
+        })
+    except Exception as exc:
+        return _json({"error": str(exc), "slug": slug, "proposal_index": proposal_index})
 
 
 @mcp.tool()
@@ -1234,24 +1425,13 @@ def run_news_scan(
 
                 if "debate" not in search_errors:
                     if commit_policy == "safe" and not commit and not dry_run and decisions:
-                        canonical_decisions, duplicate_map = news.group_decisions_by_duplicates(deduped, decisions)
-                        safe_decisions = [
-                            d for d in canonical_decisions
-                            if d.get("action", {}).get("kind") in {"PARK", "SCHEMA_GAP", "IGNORE"}
-                        ]
-                        review_decisions = [
-                            d for d in canonical_decisions
-                            if d.get("action", {}).get("kind") in {"FIRE", "OBSERVE"}
-                        ]
-                        
-                        safe_decisions_with_dups = []
-                        for d in safe_decisions:
-                            safe_decisions_with_dups.append(d)
-                            safe_decisions_with_dups.extend(duplicate_map.get(d["idx"], []))
-                        
+                        safe_decisions, review_decisions = _split_safe_policy_decisions(
+                            news, deduped, decisions
+                        )
+
                         applied = {}
-                        if safe_decisions_with_dups:
-                            applied = news.apply_decisions(slug, deduped, safe_decisions_with_dups)
+                        if safe_decisions:
+                            applied = news.apply_decisions(slug, deduped, safe_decisions)
                         proposals_filed = []
                         pstore = _proposal_store()
                         for d in review_decisions:
@@ -1261,7 +1441,7 @@ def run_news_scan(
                                 continue
                             try:
                                 # 1. Park duplicates first to get their evidence IDs in engine
-                                dups = duplicate_map.get(idx, [])
+                                dups = d.get("_duplicate_decisions") or []
                                 secondary_evidence_ids = []
                                 for dup_d in dups:
                                     dup_idx = dup_d["idx"]
@@ -1517,6 +1697,186 @@ def latest_digest() -> str:
         return _json({"path": str(latest), "digest": latest.read_text(encoding="utf-8")})
     except Exception as exc:
         return _json({"error": str(exc)})
+
+
+def _digest_root() -> Path:
+    return _activity_store().snapshot_path.parent / "digests"
+
+
+def _read_digest_json(path: Path) -> dict:
+    if path.suffix.lower() == ".md":
+        path = path.with_suffix(".json")
+    root = _digest_root().resolve()
+    resolved = path.resolve()
+    if root not in resolved.parents and resolved != root:
+        raise ValueError(f"digest path must stay under {root}")
+    return json.loads(resolved.read_text(encoding="utf-8"))
+
+
+def _article_for_proposal(item: dict) -> dict:
+    return item.get("article", item) if isinstance(item, dict) else item
+
+
+@mcp.tool()
+def list_scan_runs(limit: int = 20) -> str:
+    """List stored scan digest JSON files available for replay/inspection."""
+    try:
+        root = _digest_root()
+        files = sorted(root.glob("digest-*.json"), reverse=True)
+        rows = []
+        for path in files[: max(1, min(int(limit), 200))]:
+            try:
+                packet = json.loads(path.read_text(encoding="utf-8"))
+                rows.append({
+                    "path": str(path),
+                    "markdown_path": str(path.with_suffix(".md")),
+                    "job_id": packet.get("job_id"),
+                    "topics_scanned": packet.get("topics_scanned"),
+                    "article_count": packet.get("article_count"),
+                    "decision_count": packet.get("decision_count"),
+                    "commit_policy": packet.get("commit_policy"),
+                    "dry_run": packet.get("dry_run"),
+                })
+            except Exception as exc:
+                rows.append({"path": str(path), "error": str(exc)})
+        return _json({"count": len(rows), "runs": rows})
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def read_scan_run(path: str = "") -> str:
+    """Read a stored scan digest JSON. Empty path reads the latest run."""
+    try:
+        root = _digest_root()
+        if path:
+            packet = _read_digest_json(Path(path))
+            source = str(Path(path))
+        else:
+            files = sorted(root.glob("digest-*.json"))
+            if not files:
+                return _json({"error": "no scan digests found"})
+            source = str(files[-1])
+            packet = _read_digest_json(files[-1])
+        return _json({"path": source, "packet": packet})
+    except Exception as exc:
+        return _json({"error": str(exc), "path": path})
+
+
+@mcp.tool()
+def replay_scan_run(
+    path: str = "",
+    slug: str = "",
+    mode: str = "dry_run",
+) -> str:
+    """Replay a stored scan digest under current code.
+
+    mode:
+      - dry_run: no mutation; report what would be safe-applied vs proposed.
+      - proposal_only: file FIRE/OBSERVE proposals only; no evidence-log writes.
+      - safe_apply: apply only PARK/SCHEMA_GAP/IGNORE, file FIRE/OBSERVE.
+
+    This is intentionally not a posterior-moving replay mode.
+    """
+    mode = (mode or "dry_run").strip().lower()
+    if mode not in {"dry_run", "proposal_only", "safe_apply"}:
+        return _json({"error": "mode must be dry_run, proposal_only, or safe_apply"})
+    try:
+        root = _digest_root()
+        if path:
+            packet = _read_digest_json(Path(path))
+            source = str(Path(path))
+        else:
+            files = sorted(root.glob("digest-*.json"))
+            if not files:
+                return _json({"error": "no scan digests found"})
+            source = str(files[-1])
+            packet = _read_digest_json(files[-1])
+
+        engine = _import_from_repo("engine")
+        news = _import_from_repo("framework.news_observation_pipeline")
+        pstore = _proposal_store()
+        topics_out = []
+        for tp in packet.get("topics", []) or []:
+            tp_slug = tp.get("slug", "")
+            if slug and tp_slug != slug:
+                continue
+            topic = engine.load_topic(tp_slug)
+            articles = tp.get("articles") or []
+            decisions = tp.get("decisions") or []
+            debate_packet = tp.get("deliberation") or {}
+            safe_decisions, review_decisions = _split_safe_policy_decisions(
+                news, articles, decisions
+            )
+            applied = None
+            if mode == "safe_apply" and safe_decisions:
+                applied = news.apply_decisions(tp_slug, articles, safe_decisions)
+
+            proposals_filed = []
+            proposal_errors = []
+            if mode in {"proposal_only", "safe_apply"}:
+                for d in review_decisions:
+                    idx = d.get("idx") or 0
+                    if not (0 < idx <= len(articles)):
+                        proposal_errors.append({"idx": idx, "error": "article index out of range"})
+                        continue
+                    action = d.get("action") or {}
+                    try:
+                        _validate_proposal_shape(
+                            topic, action.get("kind", ""),
+                            action.get("indicator_id", ""), action.get("value"),
+                        )
+                        art_rec = pstore.submit_article(
+                            _article_for_proposal(articles[idx - 1]),
+                            submitted_by="scan-replay",
+                        )
+                        stamp = _deliberation_stamp_from_debate(d, debate_packet)
+                        delib_payload = (
+                            {"deliberation": stamp} if stamp else {
+                                "deliberationWaiver": (
+                                    f"scan replay from {source}; original digest carried "
+                                    "no gate-passing deliberation record"
+                                )
+                            }
+                        )
+                        prop = pstore.add_proposal(
+                            article_id=art_rec["id"],
+                            slug=tp_slug,
+                            action=action.get("kind", ""),
+                            indicator_id=action.get("indicator_id", ""),
+                            observed_value=action.get("value"),
+                            rationale=(
+                                d.get("reason") or d.get("claim") or "scan replay decision"
+                            )[:500],
+                            deliberation=json.dumps(delib_payload),
+                        )
+                        proposals_filed.append(prop["id"])
+                    except Exception as exc:
+                        proposal_errors.append({"idx": idx, "error": str(exc)})
+
+            topics_out.append({
+                "slug": tp_slug,
+                "article_count": len(articles),
+                "decision_count": len(decisions),
+                "safe_to_apply_count": len(safe_decisions),
+                "posterior_moving_count": len(review_decisions),
+                "mode": mode,
+                "applied": applied,
+                "proposals_filed": proposals_filed,
+                "proposal_errors": proposal_errors,
+            })
+
+        return _json({
+            "path": source,
+            "mode": mode,
+            "topics": topics_out,
+            "note": (
+                "dry_run mutates nothing; proposal_only files proposals only; "
+                "safe_apply applies only PARK/SCHEMA_GAP/IGNORE and files movers"
+            ),
+        })
+    except Exception as exc:
+        return _json({"error": str(exc), "path": path, "mode": mode})
 
 
 def _red_team_design(

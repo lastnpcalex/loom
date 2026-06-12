@@ -1520,3 +1520,122 @@ def test_review_parked_debate_failure_aborts_without_recording(nrol, topic_path,
     reviews = topic_after.get("governance", {}).get("parkedReviews", [])
     assert not any(r.get("evidence_id") == ev_id for r in reviews)
 
+
+
+# ---------------------------------------------------------------------------
+# Schema-gap resolver and scan replay tools
+# ---------------------------------------------------------------------------
+
+
+def test_schema_gap_resolver_tools_persist_review_queue(nrol, topic_path, monkeypatch):
+    _submit(
+        nrol, slug=SLUG, transition="SCHEMA_GAP", evidence=_evidence(),
+        reason="no observable covers this direction",
+        missing_direction="operational escort gap", commit=True,
+    )
+
+    listed = json.loads(nrol.list_schema_gaps(SLUG))
+    assert listed["count"] == 1
+    assert listed["clusters"]
+
+    response = """PROPOSAL
+KIND: add_new_indicator
+TARGET: ind_new_escort_gap
+CLUSTER_ADDRESSED: operational
+RATIONALE: repeated operational escort gaps need a conservative home
+SCHEMA:
+  desc: Escort availability is formally announced.
+  likelihoods: {H1: 0.6, H2: 0.5, H3: 0.35}
+  observable:
+    metric: test:escort_count
+    family: count_event
+    threshold_value: 1
+    baseline: 0
+    direction: higher_strengthens
+END
+"""
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": response, "model": "test-schema", "host": "local"},
+    )
+    resolved = json.loads(nrol.run_schema_gap_resolver(SLUG, persist=True))
+    assert "error" not in resolved, resolved
+    assert resolved["proposals"]
+    queue = json.loads(nrol.list_schema_extension_proposals(SLUG))
+    assert queue["count"] == 1
+    marked = json.loads(nrol.mark_schema_extension_proposal(
+        SLUG, 0, "rejected", note="not specific enough"))
+    assert marked["proposal"]["status"] == "rejected"
+
+
+def test_safe_policy_never_applies_posterior_moving_duplicates(nrol, topic_path, monkeypatch):
+    """Regression for 2026-06-12: safe scan filtered canonical decisions but
+    appended duplicate-map members unfiltered, letting OBSERVE/FIRE move
+    beliefs during commit_policy=safe."""
+    import importlib
+
+    suffix = uuid.uuid4().hex[:6]
+    articles = [
+        {"headline": f"Park canonical {suffix}", "url": f"https://example.test/safe-dup/{suffix}-a",
+         "source": "test-wire", "date": "2026-06-09", "relevance": "background"},
+        {"headline": f"Metric duplicate {suffix}", "url": f"https://example.test/safe-dup/{suffix}-b",
+         "source": "test-wire", "date": "2026-06-09", "relevance": "metric at 60 percent"},
+    ]
+    monkeypatch.setattr(
+        nrol, "_search_web_articles",
+        lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
+    )
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local"},
+    )
+    fw = importlib.import_module("framework.news_observation_pipeline")
+    canonical = {"idx": 1, "action": {"kind": "PARK"}, "tag": "EVENT",
+                 "claim": "background", "reason": "no move"}
+    mover = {"idx": 2, "action": {"kind": "OBSERVE", "indicator_id": "ind_observable_metric", "value": 60},
+             "tag": "DATA", "claim": "metric at 60", "reason": "numeric metric"}
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [canonical, mover])
+    monkeypatch.setattr(fw, "group_decisions_by_duplicates", lambda arts, decisions: ([canonical], {1: [mover]}))
+
+    before = _disk_posteriors(topic_path)
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
+        fetch_full_articles=False, deliberate=False,
+    ))
+    assert "error" not in out, out
+    assert _disk_posteriors(topic_path) == before
+    policy = out["topics"][0]["commit_policy"]
+    assert policy["auto_committed"].get("observe", 0) == 0
+    assert len(policy["proposals_filed"]) == 1
+    queue = json.loads(nrol.list_proposals(slug=SLUG, status="pending"))
+    prop = next(p for p in queue["proposals"] if p["id"] == policy["proposals_filed"][0])
+    assert prop["action"] == "OBSERVE"
+    assert prop["indicator_id"] == "ind_observable_metric"
+
+
+def test_replay_scan_run_dry_run_and_proposal_only(nrol, topic_path, monkeypatch):
+    digest_dir = Path(os.environ["NROL_AO_ACTIVITY_DIR"]) / "digests"
+    digest_dir.mkdir(parents=True, exist_ok=True)
+    digest = {
+        "job_id": "scan-test",
+        "topics": [{
+            "slug": SLUG,
+            "articles": [{"headline": "Replay metric", "url": "https://example.test/replay-metric",
+                           "source": "test-wire", "date": "2026-06-09"}],
+            "decisions": [{"idx": 1, "action": {"kind": "OBSERVE", "indicator_id": "ind_observable_metric", "value": 55},
+                            "tag": "DATA", "claim": "metric at 55", "reason": "numeric metric"}],
+            "deliberation": {"candidates": 1, "rebuttals": 1, "jury_verdicts": {"1": "COMMIT OBSERVE ind_observable_metric AT 55"}},
+        }],
+    }
+    path = digest_dir / "digest-20990101T000000Z.json"
+    path.write_text(json.dumps(digest), encoding="utf-8")
+    (digest_dir / "digest-20990101T000000Z.md").write_text("# test", encoding="utf-8")
+
+    before = _disk_posteriors(topic_path)
+    dry = json.loads(nrol.replay_scan_run(str(path), mode="dry_run"))
+    assert dry["topics"][0]["posterior_moving_count"] == 1
+    assert _disk_posteriors(topic_path) == before
+
+    prop_only = json.loads(nrol.replay_scan_run(str(path), mode="proposal_only"))
+    assert prop_only["topics"][0]["proposals_filed"]
+    assert _disk_posteriors(topic_path) == before
