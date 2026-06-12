@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS proposals (
     decision_note TEXT,
     result TEXT,
     evidence_id TEXT DEFAULT '',
-    evidence_refs TEXT DEFAULT ''
+    evidence_refs TEXT DEFAULT '',
+    deliberation TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_proposals_slug_status ON proposals(slug, status);
 """
@@ -91,6 +92,13 @@ class ProposalStore:
             pass  # column already exists
         try:
             conn.execute("ALTER TABLE proposals ADD COLUMN evidence_refs TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        # Migration: deliberation carries the debate record (or explicit
+        # waiver) a FIRE/OBSERVE proposal was filed with; commit_match
+        # refuses posterior-moving proposals without one.
+        try:
+            conn.execute("ALTER TABLE proposals ADD COLUMN deliberation TEXT DEFAULT ''")
         except sqlite3.OperationalError:
             pass
         return conn
@@ -152,17 +160,20 @@ class ProposalStore:
         missing_direction: str = "",
         evidence_id: str = "",
         evidence_refs: str = "",
+        deliberation: str = "",
     ) -> dict:
         pid = new_proposal_id()
         with contextlib.closing(self._conn()) as conn, conn:
             conn.execute(
                 "INSERT INTO proposals "
                 "(id, article_id, slug, action, indicator_id, observed_value, "
-                " rationale, missing_direction, status, created_at, evidence_id, evidence_refs) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                " rationale, missing_direction, status, created_at, evidence_id, "
+                " evidence_refs, deliberation) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
                 (
                     pid, article_id, slug, action, indicator_id, observed_value,
-                    rationale, missing_direction, _utc_now(), evidence_id, evidence_refs,
+                    rationale, missing_direction, _utc_now(), evidence_id,
+                    evidence_refs, deliberation,
                 ),
             )
         return self.get_proposal(pid)

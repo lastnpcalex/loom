@@ -132,6 +132,13 @@ def run_oracle(server, repo: Path, timeline: dict) -> list[dict]:
             evidence=evidence,
             reason=f"oracle gold {event['id']}: {gold['action']}",
             commit=True,
+            # The oracle lane IS the reference for perfect perception; its
+            # gold transitions are authored truth, so the deliberation gate
+            # is waived loudly rather than debated.
+            no_deliberation_reason=(
+                "oracle reference replay — gold transitions are authored "
+                "ground truth from timeline.json"
+            ),
         )
         if gold.get("indicator_id"):
             kwargs["indicator_id"] = gold["indicator_id"]
@@ -171,12 +178,17 @@ def load_corpus() -> list[dict]:
 
 
 def run_pipeline(server, repo: Path, timeline: dict,
-                 corpus: list[dict]) -> tuple[list[dict], list[dict]]:
+                 corpus: list[dict], deliberate: bool = False) -> tuple[list[dict], list[dict]]:
     """Articles through the real perception path, one simulated day at a time.
 
     All of a day's articles go to the matcher in one batch — duplicate
     coverage of one causal event lands in the same prompt, which is exactly
     the dedup discipline the corpus was authored to test.
+
+    deliberate=False is the fast lane (one-pass matcher, gate waived with an
+    explicit reason — it measures raw matcher perception). deliberate=True
+    is the deliberative lane: matcher -> advocate -> rebut -> jury -> apply,
+    the full perception path the live system runs.
     """
     slug = timeline["slug"]
     trajectory: list[dict] = []
@@ -208,6 +220,11 @@ def run_pipeline(server, repo: Path, timeline: dict,
 
         result = json.loads(server.run_matcher_with_llama(
             slug, matcher_articles, commit=True, temperature=0.0,
+            deliberate=deliberate,
+            no_deliberation_reason=(
+                "" if deliberate else
+                "fast lane — measuring the one-pass matcher in isolation"
+            ),
         ))
         after = disk_posteriors(repo, slug)
         decisions = result.get("decisions") or []
@@ -245,7 +262,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="trajectory JSONL path")
     ap.add_argument("--keep-repo", default="", help="build repo here and keep it")
-    ap.add_argument("--lane", choices=("oracle", "pipeline"), default="oracle")
+    ap.add_argument("--lane", choices=("oracle", "pipeline", "deliberative"),
+                    default="oracle")
     ap.add_argument("--decisions", default="",
                     help="pipeline lane: per-article decision JSONL path")
     args = ap.parse_args()
@@ -266,10 +284,11 @@ def main() -> int:
         setup_env(repo)
         from mcp_servers.nrol_ao import server
 
-        if args.lane == "pipeline":
+        if args.lane in ("pipeline", "deliberative"):
             corpus = load_corpus()
             trajectory, decision_rows = run_pipeline(
-                server, repo, timeline, corpus
+                server, repo, timeline, corpus,
+                deliberate=(args.lane == "deliberative"),
             )
             if args.decisions:
                 dec_out = Path(args.decisions)

@@ -235,3 +235,60 @@ perception error isolated from engine math. Plan file:
   article carrying two metrics. v2 (not started): cross-day duplicate
   detection — LLM yes/no "same causal event?" filed as a typed
   duplicate-of proposal, biased toward duplicate when uncertain.
+
+## Deliberation layer — honest accounting (2026-06-12)
+
+**The deliberation layer was underbuilt, and prior descriptions of it
+(in this file's history, in scan-tick docstrings, and in session
+reports) let design intent stand in for implementation.** What actually
+existed through engine commit 88da253: the advocate/rebut/jury debate
+ran ONLY as PARK rescue — `build_advocate_prompt(topic, articles,
+parks)`, jury overrides hard-gated on `action["kind"] == "PARK"`. FIREs
+were never red-teamed, accepted OBSERVEs were never red-teamed, IGNOREs
+were never reviewed for false negatives, and duplicate-event judgment
+was not a deliberation step (only the mechanical same-batch bundle from
+88da253). One-pass matcher output flowed to apply/proposals for every
+posterior-moving action. Discovered live 2026-06-12 when the operator
+queue drained suspiciously fast and a codex audit traced the gap.
+
+Standing rule, here as protocol: **claims about NROL-AO behavior must
+cite code, a test, or a live probe.** "Deliberation" in any doc or
+report means the generalized debate below, nothing thinner.
+
+Patches (codex/gemini-authored, 2026-06-12, pending commit): advocate
+runs over all FIRE/OBSERVE/PARK candidates; jury emits typed verdicts
+(COMMIT / PARK / WITHDRAW / DUPLICATE_OF / SCHEMA_GAP, unknown ->
+PARK); explicit duplicate grouping before apply with the mechanical
+same-batch grouping as fallback; scan path fails closed when
+deliberation errors (queue untouched, window left open); deliberation
+runs with reasoning mode on. Capability suite green (64 passed) incl.
++112 lines of new tests.
+
+- ✅ Deliberation as a capability constraint (2026-06-12): the authority
+  layer now REFUSES posterior-moving actions without a deliberation
+  record or an explicit waiver — skipping deliberation silently is not
+  expressible. One rule, one place: `_require_deliberation`
+  (mcp_servers/nrol_ao/server.py), enforced at submit_transition
+  (chokepoint for all manual + proposal commits), propose_match (filing),
+  commit_match (refuses undeliberated/legacy pending rows — the queue is
+  not a path around the gate), and apply_matcher_output /
+  run_matcher_with_llama (debate-by-default before apply; skipping needs
+  a waiver). Waivers are recorded on the evidence entry
+  (deliberationWaiver, carried by engine add_evidence b809d1a), in the
+  activity ledger, and in the Loom approval payload — the human approving
+  a commit sees the jury verdict or the confession that there is none.
+  New tool `deliberate_candidates` exposes the debate to operators.
+  Pinned by 8 gate tests (refusals, waiver/record stamping, legacy-row
+  refusal, empty-debate-mints-no-stamps); suites green (73 passed).
+  Oracle lane carries the waiver "gold transitions are authored ground
+  truth"; fast pipeline lane carries "measuring the one-pass matcher".
+- ⬜ Meridia deliberative lane measurement: `replay.py --lane
+  deliberative` (matcher -> advocate -> rebut -> jury -> apply) scored
+  against the fast lane and the oracle. Acceptance: endpoint no worse,
+  duplicate move decisions reduced (E01/E11 clusters), wrong-direction
+  FIREs caught by rebuttal, PARK rescue still works.
+- ⬜ Head-fake world (decree walked back) so credulity and duplicate
+  amplification are punished, not forgiven, by the corpus.
+- ⬜ Provenance carryover: add_evidence drops surfaced_via / scanRound /
+  queryProvenance (whitelist; docstring corrected in engine b809d1a) —
+  carry them explicitly like the deliberation fields.

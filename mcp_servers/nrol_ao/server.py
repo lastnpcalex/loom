@@ -489,9 +489,11 @@ def _run_debate(
             idx: {"action": v["action"], "rationale": v.get("rationale", "")}
             for idx, v in jury.items()
         }
+        decisions_by_idx = {d.get("idx"): d for d in decisions}
         packet["rescued"] = sum(
             1 for idx, v in overrides.items()
-            if (decisions[idx-1].get("action", {}).get("kind") == "PARK" and v["action"]["kind"] in ("FIRE", "OBSERVE"))
+            if (decisions_by_idx.get(idx, {}).get("action", {}).get("kind") == "PARK"
+                and v["action"]["kind"] in ("FIRE", "OBSERVE"))
         )
         return overrides, packet
     except Exception as exc:
@@ -522,6 +524,54 @@ def _apply_jury_overrides(decisions: list, jury_overrides: dict) -> list:
         else:
             effective.append(d)
     return effective
+
+
+def _require_deliberation(
+    kind: str, deliberation: dict | None, waiver: str
+) -> tuple[str | None, dict]:
+    """The deliberation gate. Posterior-moving actions (FIRE/OBSERVE) are
+    refused unless they carry a debate record or an explicit waiver — and
+    whichever they carry is stamped onto the evidence and shown at the Loom
+    approval. Deliberation is a capability constraint of this server, not a
+    convention of its callers: skipping it silently is not expressible.
+
+    Returns (refusal_message_or_None, stamp_dict_for_evidence).
+    """
+    if kind not in {"FIRE", "OBSERVE"}:
+        return None, {}
+    if deliberation:
+        return None, {"deliberation": deliberation}
+    waiver = (waiver or "").strip()
+    if waiver:
+        return None, {"deliberationWaiver": waiver}
+    return (
+        f"{kind} commit refused: no deliberation record. Posterior-moving "
+        "actions require the advocate/rebut/jury debate — run "
+        "deliberate_candidates (or run_news_scan / review_parked, which "
+        "debate by default) and attach its record as deliberation=..., or "
+        "pass an explicit no_deliberation_reason. A waiver is recorded on "
+        "the evidence entry and shown in the Loom approval prompt.",
+        {},
+    )
+
+
+def _deliberation_stamp_from_debate(decision: dict, debate_packet: dict | None) -> dict:
+    """Per-candidate deliberation record for a proposal, from a debate run.
+
+    A debate that errored or saw zero candidates yields NO record — an empty
+    debate must not mint gate-passing stamps.
+    """
+    if not debate_packet or debate_packet.get("error") or not debate_packet.get("candidates"):
+        return {}
+    idx = decision.get("idx")
+    verdict = (debate_packet.get("jury_verdicts") or {}).get(str(idx), "")
+    record = {
+        "jury_verdict": verdict or "NO_BLOCK",
+        "rationale": (decision.get("reason") or "")[:300],
+        "candidates_debated": debate_packet.get("candidates", 0),
+        "rebuttals": debate_packet.get("rebuttals", 0),
+    }
+    return record
 
 
 def _fetch_article_excerpt(url: str, max_chars: int, timeout_sec: float = 15.0) -> str:
@@ -1237,6 +1287,7 @@ def run_news_scan(
                                     topic, action.get("kind", ""),
                                     action.get("indicator_id", ""), action.get("value"),
                                 )
+                                scan_delib = _deliberation_stamp_from_debate(d, debate_packet)
                                 prop = pstore.add_proposal(
                                     article_id=art_rec["id"],
                                     slug=slug,
@@ -1245,6 +1296,10 @@ def run_news_scan(
                                     observed_value=action.get("value"),
                                     rationale=(d.get("reason") or d.get("claim") or "matcher decision")[:500],
                                     evidence_refs=json.dumps(secondary_evidence_ids) if secondary_evidence_ids else "",
+                                    deliberation=json.dumps(
+                                        {"deliberation": scan_delib} if scan_delib
+                                        else {"deliberationWaiver": "news scan ran with deliberate=false"}
+                                    ),
                                 )
                                 proposals_filed.append(prop["id"])
                             except Exception as exc:
@@ -1969,6 +2024,7 @@ def review_parked(
                     _validate_proposal_shape(
                         topic, kind, action.get("indicator_id", ""), action.get("value"),
                     )
+                    review_delib = _deliberation_stamp_from_debate(d, debate_packet)
                     prop = pstore.add_proposal(
                         article_id=art_rec["id"],
                         slug=slug,
@@ -1980,6 +2036,10 @@ def review_parked(
                             + (d.get("reason") or d.get("claim") or "matcher re-decision")
                         )[:500],
                         evidence_id=ev_id,
+                        deliberation=json.dumps(
+                            {"deliberation": review_delib} if review_delib
+                            else {"deliberationWaiver": "review_parked ran with deliberate=false"}
+                        ),
                     )
                     review["escalated_proposal_id"] = prop["id"]
                     proposals_filed.append(prop["id"])
@@ -2064,8 +2124,15 @@ def parse_matcher_output(output_text: str) -> str:
 
 
 @mcp.tool()
-def apply_matcher_output(slug: str, articles: list[dict], output_text: str, commit: bool = False) -> str:
-    """Parse matcher output and optionally apply it through the NROL-AO pipeline."""
+def apply_matcher_output(slug: str, articles: list[dict], output_text: str, commit: bool = False,
+                         deliberate: bool = True, no_deliberation_reason: str = "") -> str:
+    """Parse matcher output and optionally apply it through the NROL-AO pipeline.
+
+    commit=true runs the advocate/rebut/jury debate over the decisions first
+    (deliberate=true, default). Skipping the debate on a batch containing
+    FIRE/OBSERVE requires an explicit no_deliberation_reason waiver; without
+    one the apply is refused.
+    """
     try:
         store = _activity_store()
         job_id = new_job_id("matcher-apply")
@@ -2095,9 +2162,47 @@ def apply_matcher_output(slug: str, articles: list[dict], output_text: str, comm
                     "note": "Dry run only. Re-run with commit=true to mutate topic JSON.",
                 }
             )
+        debate_packet = None
+        has_movers = any(
+            (d.get("action") or {}).get("kind") in {"FIRE", "OBSERVE"}
+            for d in decisions
+        )
+        if deliberate and decisions:
+            engine = _import_from_repo("engine")
+            topic = engine.load_topic(slug)
+            jury_overrides, debate_packet = _run_debate(
+                topic, articles, decisions, news,
+                model="", temperature=0.2, max_tokens=4096, timeout_sec=600,
+                store=store, job_id=job_id, slug=slug,
+            )
+            if debate_packet.get("error"):
+                store.record(
+                    job_id, "failed", task="apply_matcher_output", slug=slug,
+                    error=f"deliberation failed: {debate_packet['error']}",
+                )
+                return _json({
+                    "job_id": job_id, "committed": False,
+                    "error": f"deliberation failed: {debate_packet['error']} — "
+                             "nothing applied (fail closed)",
+                })
+            decisions = _apply_jury_overrides(decisions, jury_overrides)
+        elif has_movers and not (no_deliberation_reason or "").strip():
+            return _json({
+                "job_id": job_id, "committed": False,
+                "error": (
+                    "apply refused: batch contains FIRE/OBSERVE and "
+                    "deliberate=false with no waiver. Pass "
+                    "no_deliberation_reason to skip the debate explicitly — "
+                    "the waiver is recorded in the activity ledger."
+                ),
+            })
         denied = _ask_loom_permission(
             "nrol_ao_apply_matcher_output",
-            {"slug": slug, "article_count": len(articles), "decision_count": len(decisions)},
+            {"slug": slug, "article_count": len(articles), "decision_count": len(decisions),
+             **({"deliberation": {"jury_verdicts": debate_packet.get("jury_verdicts", {})}}
+                if debate_packet else
+                {"deliberationWaiver": (no_deliberation_reason or "").strip()}
+                if has_movers else {})},
         )
         if denied:
             store.record(
@@ -2114,9 +2219,13 @@ def apply_matcher_output(slug: str, articles: list[dict], output_text: str, comm
             "running",
             task="apply_matcher_output",
             slug=slug,
-            summary={"commit": True},
+            summary={"commit": True,
+                     **({"deliberation_waiver": (no_deliberation_reason or "").strip()}
+                        if (has_movers and not debate_packet) else {})},
         )
         result = news.apply_decisions(slug, articles, decisions)
+        if debate_packet:
+            result["deliberation"] = debate_packet
         store.record(
             job_id,
             "completed",
@@ -2141,6 +2250,69 @@ def apply_matcher_output(slug: str, articles: list[dict], output_text: str, comm
 
 
 @mcp.tool()
+def deliberate_candidates(
+    slug: str,
+    articles: list[dict],
+    output_text: str,
+    model: str = "",
+    temperature: float = 0.2,
+    max_tokens: int = 4096,
+    timeout_sec: int = 600,
+) -> str:
+    """Run the advocate/rebut/jury debate over matcher decisions. No mutation.
+
+    output_text is matcher DECISION blocks (from build_matcher_prompt or
+    hand-written in the same format). Returns the original decisions, the
+    jury-folded effective decisions, and the debate packet. Attach a
+    per-candidate record from `deliberation_records` to
+    propose_match(deliberation=...) or submit_transition(deliberation=...)
+    — the gate refuses posterior-moving actions without one (or an explicit
+    no_deliberation_reason waiver).
+    """
+    store = _activity_store()
+    job_id = new_job_id("deliberate")
+    try:
+        engine = _import_from_repo("engine")
+        news = _import_from_repo("framework.news_observation_pipeline")
+        topic = engine.load_topic(slug)
+        decisions = news.parse_matcher_output(output_text)
+        store.record(
+            job_id, "running", task="deliberate_candidates", slug=slug,
+            summary={"article_count": len(articles), "decision_count": len(decisions)},
+        )
+        jury_overrides, debate_packet = _run_debate(
+            topic, articles, decisions, news,
+            model=model, temperature=temperature,
+            max_tokens=max_tokens, timeout_sec=timeout_sec,
+            store=store, job_id=job_id, slug=slug,
+        )
+        effective = _apply_jury_overrides(decisions, jury_overrides)
+        records = {
+            str(d.get("idx")): _deliberation_stamp_from_debate(d, debate_packet)
+            for d in effective
+        }
+        store.record(
+            job_id, "completed", task="deliberate_candidates", slug=slug,
+            summary={"candidates": debate_packet.get("candidates", 0),
+                     "jury_verdicts": debate_packet.get("jury_verdicts", {}),
+                     "error": debate_packet.get("error")},
+        )
+        return _json({
+            "job_id": job_id,
+            "slug": slug,
+            "decisions": decisions,
+            "effective_decisions": effective,
+            "deliberation_records": records,
+            "debate": debate_packet,
+            "note": "No mutation. Use a deliberation_records entry as the "
+                    "deliberation= argument when proposing or committing.",
+        })
+    except Exception as exc:
+        store.record(job_id, "failed", task="deliberate_candidates", slug=slug, error=str(exc))
+        return _json({"error": str(exc), "slug": slug})
+
+
+@mcp.tool()
 def run_matcher_with_llama(
     slug: str,
     articles: list[dict],
@@ -2149,12 +2321,17 @@ def run_matcher_with_llama(
     temperature: float = 0.2,
     max_tokens: int = 4096,
     timeout_sec: int = 600,
+    deliberate: bool = True,
+    no_deliberation_reason: str = "",
 ) -> str:
     """Run the NROL-AO matcher prompt through llama-server and parse decisions.
 
     commit=false only records and returns llama output plus parsed decisions.
-    commit=true asks Loom permission, then routes decisions through the existing
-    NROL-AO pipeline. All job states are written to the activity ledger.
+    commit=true runs the advocate/rebut/jury debate over the decisions
+    (deliberate=true, default), asks Loom permission, then routes decisions
+    through the existing NROL-AO pipeline. Skipping the debate on a batch
+    containing FIRE/OBSERVE requires an explicit no_deliberation_reason
+    waiver. All job states are written to the activity ledger.
     """
     store = _activity_store()
     job_id = new_job_id("matcher-llama")
@@ -2212,7 +2389,48 @@ def run_matcher_with_llama(
         )
 
         applied = None
+        debate_packet = None
         if commit:
+            has_movers = any(
+                (d.get("action") or {}).get("kind") in {"FIRE", "OBSERVE"}
+                for d in decisions
+            )
+            if deliberate and decisions:
+                jury_overrides, debate_packet = _run_debate(
+                    topic, articles, decisions, news,
+                    model=model, temperature=temperature,
+                    max_tokens=max_tokens, timeout_sec=timeout_sec,
+                    store=store, job_id=job_id, slug=slug,
+                )
+                if debate_packet.get("error"):
+                    store.record(
+                        job_id, "failed", task="run_matcher_with_llama",
+                        slug=slug,
+                        error=f"deliberation failed: {debate_packet['error']}",
+                    )
+                    return _json({
+                        "job_id": job_id, "committed": False,
+                        "decisions": decisions,
+                        "error": f"deliberation failed: {debate_packet['error']} — "
+                                 "nothing applied (fail closed)",
+                    })
+                decisions = _apply_jury_overrides(decisions, jury_overrides)
+                parsed_summary["deliberation"] = {
+                    "candidates": debate_packet.get("candidates", 0),
+                    "jury_verdicts": debate_packet.get("jury_verdicts", {}),
+                }
+            elif has_movers and not (no_deliberation_reason or "").strip():
+                return _json({
+                    "job_id": job_id, "committed": False,
+                    "decisions": decisions,
+                    "error": (
+                        "apply refused: batch contains FIRE/OBSERVE and "
+                        "deliberate=false with no waiver. Pass "
+                        "no_deliberation_reason to skip the debate explicitly."
+                    ),
+                })
+            elif has_movers:
+                parsed_summary["deliberation_waiver"] = no_deliberation_reason.strip()
             denied = _ask_loom_permission(
                 "nrol_ao_run_matcher_with_llama",
                 {
@@ -2220,6 +2438,10 @@ def run_matcher_with_llama(
                     "article_count": len(articles),
                     "decision_count": len(decisions),
                     "model": response.get("model"),
+                    **({"deliberation": parsed_summary.get("deliberation")}
+                       if debate_packet else
+                       {"deliberationWaiver": parsed_summary.get("deliberation_waiver", "")}
+                       if has_movers else {}),
                 },
             )
             if denied:
@@ -2241,6 +2463,8 @@ def run_matcher_with_llama(
                     }
                 )
             applied = news.apply_decisions(slug, articles, decisions)
+            if debate_packet:
+                applied["deliberation"] = debate_packet
 
         final_summary = {
             **parsed_summary,
@@ -2370,6 +2594,8 @@ def submit_transition(
     commit: bool = False,
     include_topic: bool = False,
     existing_evidence_id: str = "",
+    deliberation: dict | None = None,
+    no_deliberation_reason: str = "",
 ) -> str:
     """Submit a typed runtime transition.
 
@@ -2380,6 +2606,11 @@ def submit_transition(
     commit=false performs validation and preview only. commit=true mutates the
     NROL-AO topic JSON through the source repo's own engine/pipeline gates.
     Operators cannot provide target posteriors or freeform likelihoods here.
+
+    FIRE/OBSERVE commits additionally require deliberation (a debate record
+    from deliberate_candidates / run_news_scan / review_parked) or an
+    explicit no_deliberation_reason waiver, which is stamped on the evidence
+    entry and shown in the Loom approval prompt.
     """
     try:
         transition_kind = _normalize_transition(transition)
@@ -2434,6 +2665,20 @@ def submit_transition(
                 )
             return _json(preview)
 
+        refusal, delib_stamp = _require_deliberation(
+            transition_kind, deliberation, no_deliberation_reason
+        )
+        if refusal:
+            return _json({
+                "slug": slug,
+                "transition": transition_kind,
+                "committed": False,
+                "posteriors_before": before,
+                "posteriors_after": before,
+                "error": refusal,
+            })
+        entry.update(delib_stamp)
+
         job_id = new_job_id(f"transition-{transition_kind.lower()}")
         start = time.time()
         _activity_store().record(
@@ -2442,13 +2687,18 @@ def submit_transition(
             task="submit_transition",
             slug=slug,
             transition=transition_kind,
-            summary={"indicator_id": indicator_id, "observed_value": observed_value},
+            summary={"indicator_id": indicator_id, "observed_value": observed_value,
+                     **({"deliberation_waiver": delib_stamp["deliberationWaiver"]}
+                        if "deliberationWaiver" in delib_stamp else {}),
+                     **({"jury_verdict": delib_stamp["deliberation"].get("jury_verdict", "")}
+                        if "deliberation" in delib_stamp else {})},
         )
         denied = _ask_loom_permission(
             "nrol_ao_submit_transition",
             {
                 "slug": slug,
                 "transition": transition_kind,
+                **delib_stamp,
                 "indicator_id": indicator_id,
                 "observed_value": observed_value,
                 "reason": reason,
@@ -2603,6 +2853,8 @@ def propose_match(
     observed_value: float | None = None,
     rationale: str = "",
     missing_direction: str = "",
+    deliberation: dict | None = None,
+    no_deliberation_reason: str = "",
 ) -> str:
     """Record a typed match proposal for a submitted article. No mutation.
 
@@ -2610,11 +2862,20 @@ def propose_match(
     statically (article exists, topic is ACTIVE, indicator/observable shape)
     and stored pending. Posteriors move only when commit_match(proposal_id)
     passes the server's gates and Loom approval.
+
+    FIRE/OBSERVE proposals must carry deliberation (a debate record from
+    deliberate_candidates) or an explicit no_deliberation_reason waiver;
+    undeliberated posterior-moving proposals are refused at filing.
     """
     try:
         action = (action or "").strip().upper()
         if not rationale.strip():
             raise ValueError("rationale is required — state the directional case")
+        refusal, delib_stamp = _require_deliberation(
+            action, deliberation, no_deliberation_reason
+        )
+        if refusal:
+            raise ValueError(refusal.replace("commit refused", "proposal refused", 1))
         store = _proposal_store()
         if store.get_article(article_id) is None:
             raise ValueError(f"article {article_id!r} not found; call submit_article first")
@@ -2627,6 +2888,7 @@ def propose_match(
             article_id=article_id, slug=slug, action=action,
             indicator_id=indicator_id, observed_value=observed_value,
             rationale=rationale, missing_direction=missing_direction,
+            deliberation=json.dumps(delib_stamp) if delib_stamp else "",
         )
         record["next_step"] = f"commit_match({record['id']!r}) after operator review"
         return _json(record)
@@ -2663,6 +2925,27 @@ def commit_match(proposal_id: str, include_topic: bool = False) -> str:
             topic, prop["action"], prop.get("indicator_id") or "",
             prop.get("observed_value"),
         )
+
+        # Deliberation gate: proposals filed without a debate record or
+        # waiver (e.g. legacy rows predating the gate) cannot commit — the
+        # queue is not a path around deliberation.
+        prop_delib_stamp: dict = {}
+        if (prop.get("deliberation") or "").strip():
+            try:
+                prop_delib_stamp = json.loads(prop["deliberation"])
+            except Exception:
+                prop_delib_stamp = {}
+        if prop["action"] in {"FIRE", "OBSERVE"} and not prop_delib_stamp:
+            return _json({
+                "proposal_id": proposal_id, "committed": False,
+                "status": "pending",
+                "error": (
+                    f"proposal {proposal_id!r} carries no deliberation record. "
+                    "Run deliberate_candidates over the article and re-file via "
+                    "propose_match(deliberation=...), or withdraw_proposal and "
+                    "re-propose with an explicit no_deliberation_reason."
+                ),
+            })
 
         # Rebind proposals (from review_parked) point at evidence ALREADY in
         # the ledger — that's their whole point, so the URL duplicate guard
@@ -2720,6 +3003,8 @@ def commit_match(proposal_id: str, include_topic: bool = False) -> str:
             commit=True,
             include_topic=include_topic,
             existing_evidence_id=rebind_evidence_id,
+            deliberation=prop_delib_stamp.get("deliberation"),
+            no_deliberation_reason=prop_delib_stamp.get("deliberationWaiver", ""),
         )
         result = json.loads(raw)
         if result.get("denied"):

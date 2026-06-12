@@ -185,6 +185,10 @@ def _evidence(text: str = "", **extra) -> dict:
 
 
 def _submit(nrol, **kwargs) -> dict:
+    # Capability tests probe the engine/gate machinery directly; the
+    # deliberation gate is waived by default here and exercised explicitly
+    # in the deliberation-gate section below.
+    kwargs.setdefault("no_deliberation_reason", "capability test")
     return json.loads(nrol.submit_transition(**kwargs))
 
 
@@ -442,7 +446,8 @@ def test_propose_match_validates_without_mutation(nrol, topic_path):
 
     bad_indicator = json.loads(nrol.propose_match(
         article_id=art["id"], slug=SLUG, action="FIRE",
-        indicator_id="ind_nope", rationale="directional case"))
+        indicator_id="ind_nope", rationale="directional case",
+        no_deliberation_reason="capability test"))
     assert "error" in bad_indicator
 
     no_rationale = json.loads(nrol.propose_match(
@@ -452,7 +457,8 @@ def test_propose_match_validates_without_mutation(nrol, topic_path):
     ok = json.loads(nrol.propose_match(
         article_id=art["id"], slug=SLUG, action="FIRE",
         indicator_id="ind_binary_mild",
-        rationale="threshold met per official synthetic print"))
+        rationale="threshold met per official synthetic print",
+        no_deliberation_reason="capability test"))
     assert ok.get("status") == "pending"
     assert topic_path.read_bytes() == before_bytes  # proposals never mutate
 
@@ -462,7 +468,8 @@ def test_commit_match_applies_fire_through_gates(nrol, topic_path):
     prop = json.loads(nrol.propose_match(
         article_id=art["id"], slug=SLUG, action="FIRE",
         indicator_id="ind_binary_mild",
-        rationale="threshold met per official synthetic print"))
+        rationale="threshold met per official synthetic print",
+        no_deliberation_reason="capability test"))
     before = _disk_posteriors(topic_path)
 
     out = json.loads(nrol.commit_match(prop["id"]))
@@ -489,7 +496,8 @@ def test_commit_match_rejects_duplicate_url(nrol, topic_path):
     second = json.loads(nrol.propose_match(
         article_id=art["id"], slug=SLUG, action="FIRE",
         indicator_id="ind_binary_mild",
-        rationale="same article again, dressed as new evidence"))
+        rationale="same article again, dressed as new evidence",
+        no_deliberation_reason="capability test"))
     before = _disk_posteriors(topic_path)
     out = json.loads(nrol.commit_match(second["id"]))
     assert out.get("status") == "rejected"
@@ -1237,7 +1245,9 @@ def test_same_batch_duplicate_fires_bundle_to_one_firing(nrol, topic_path):
         for i in (1, 2, 3)
     )
     out = json.loads(
-        nrol.apply_matcher_output(SLUG, articles, output_text, commit=True)
+        nrol.apply_matcher_output(SLUG, articles, output_text, commit=True,
+                                  deliberate=False,
+                                  no_deliberation_reason="capability test")
     )
     assert out.get("committed") is True, out
     summary = out["summary"]
@@ -1255,6 +1265,136 @@ def test_same_batch_duplicate_fires_bundle_to_one_firing(nrol, topic_path):
         for ind in tier if ind.get("id") == "ind_binary_mild"
     ]
     assert fired[0]["n_firings"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Deliberation gate: posterior-moving actions need a debate record or a
+# loud waiver — undeliberated movement is not expressible
+# ---------------------------------------------------------------------------
+
+
+def test_fire_commit_refused_without_deliberation(nrol, topic_path):
+    before = _disk_posteriors(topic_path)
+    out = json.loads(nrol.submit_transition(
+        slug=SLUG, transition="FIRE", evidence=_evidence(),
+        indicator_id="ind_binary_mild", commit=True,
+    ))
+    assert out.get("committed") is False
+    assert "deliberation" in out.get("error", "")
+    assert _disk_posteriors(topic_path) == before
+
+
+def test_fire_commit_with_waiver_stamps_evidence(nrol, topic_path):
+    out = _submit(
+        nrol, slug=SLUG, transition="FIRE", evidence=_evidence(),
+        indicator_id="ind_binary_mild", commit=True,
+        no_deliberation_reason="explicit waiver for the gate test",
+    )
+    assert out.get("committed") is True, out
+    topic = _disk_topic(topic_path)
+    waivers = [e.get("deliberationWaiver") for e in topic["evidenceLog"]
+               if e.get("deliberationWaiver")]
+    assert "explicit waiver for the gate test" in waivers
+
+
+def test_fire_commit_with_debate_record_stamps_evidence(nrol, topic_path):
+    record = {"jury_verdict": "COMMIT", "rationale": "advocate cited threshold",
+              "candidates_debated": 1, "rebuttals": 1}
+    out = json.loads(nrol.submit_transition(
+        slug=SLUG, transition="FIRE", evidence=_evidence(),
+        indicator_id="ind_binary_mild", commit=True,
+        deliberation=record,
+    ))
+    assert out.get("committed") is True, out
+    topic = _disk_topic(topic_path)
+    stamped = [e.get("deliberation") for e in topic["evidenceLog"]
+               if e.get("deliberation")]
+    assert any(s.get("jury_verdict") == "COMMIT" for s in stamped)
+
+
+def test_park_needs_no_deliberation(nrol, topic_path):
+    out = json.loads(nrol.submit_transition(
+        slug=SLUG, transition="PARK", evidence=_evidence(), commit=True,
+    ))
+    assert out.get("committed") is True, out
+
+
+def test_propose_fire_refused_without_deliberation(nrol, topic_path):
+    art = json.loads(nrol.submit_article(_article()))
+    out = json.loads(nrol.propose_match(
+        article_id=art["id"], slug=SLUG, action="FIRE",
+        indicator_id="ind_binary_mild", rationale="directional case"))
+    assert "deliberation" in out.get("error", "")
+
+
+def test_commit_match_refuses_undeliberated_legacy_proposal(nrol, topic_path):
+    # A proposal written straight into the store (as legacy rows were)
+    # carries no deliberation field; the queue must not be a path around
+    # the gate.
+    from mcp_servers.nrol_ao import server as srv
+
+    art = json.loads(nrol.submit_article(_article()))
+    store = srv._proposal_store()
+    prop = store.add_proposal(
+        article_id=art["id"], slug=SLUG, action="FIRE",
+        indicator_id="ind_binary_mild", rationale="legacy row",
+    )
+    before = _disk_posteriors(topic_path)
+    out = json.loads(nrol.commit_match(prop["id"]))
+    assert out.get("committed") is False
+    assert "deliberation" in out.get("error", "")
+    assert _disk_posteriors(topic_path) == before
+    # Still pending — reviewable, not silently rejected.
+    assert out.get("status") == "pending"
+
+
+def test_commit_match_passes_waiver_through_to_evidence(nrol, topic_path):
+    art = json.loads(nrol.submit_article(_article()))
+    prop = json.loads(nrol.propose_match(
+        article_id=art["id"], slug=SLUG, action="FIRE",
+        indicator_id="ind_binary_mild",
+        rationale="threshold met per official synthetic print",
+        no_deliberation_reason="gate test: waiver should ride to evidence"))
+    out = json.loads(nrol.commit_match(prop["id"]))
+    assert out.get("status") == "committed", out
+    topic = _disk_topic(topic_path)
+    waivers = [e.get("deliberationWaiver") for e in topic["evidenceLog"]
+               if e.get("deliberationWaiver")]
+    assert "gate test: waiver should ride to evidence" in waivers
+
+
+def test_apply_matcher_output_refused_without_debate_or_waiver(nrol, topic_path):
+    articles = [{"headline": "Mover with no debate", "url": "https://test-rig/nodebate",
+                 "source": "test-rig", "date": "2030-01-05"}]
+    output_text = (
+        "DECISION\nARTICLE: A1\nACTION: FIRE ind_binary_mild\nTAG: EVENT\n"
+        "CLAIM: The synthetic binary event occurred.\nREASON: threshold met.\nEND"
+    )
+    before = _disk_posteriors(topic_path)
+    out = json.loads(nrol.apply_matcher_output(
+        SLUG, articles, output_text, commit=True, deliberate=False))
+    assert out.get("committed") is False
+    assert "waiver" in out.get("error", "")
+    assert _disk_posteriors(topic_path) == before
+
+
+def test_deliberate_candidates_no_candidates_short_circuits(nrol, topic_path):
+    # IGNORE-only batches have nothing to debate — no llama call, empty
+    # records, usable offline.
+    articles = [{"headline": "Irrelevant regional note", "url": "https://test-rig/ign",
+                 "source": "test-rig", "date": "2030-01-05"}]
+    output_text = (
+        "DECISION\nARTICLE: A1\nACTION: IGNORE\nTAG: EVENT\n"
+        "CLAIM: Not relevant.\nREASON: no indicator relates.\nEND"
+    )
+    out = json.loads(nrol.deliberate_candidates(SLUG, articles, output_text))
+    assert out.get("error") is None or "error" not in out
+    assert out["debate"].get("note") == "no candidates to deliberate"
+    # An empty debate mints no gate-passing records, and an empty record
+    # does not pass the gate.
+    assert out["deliberation_records"] == {"1": {}}
+    refusal, stamp = nrol._require_deliberation("FIRE", {}, "")
+    assert refusal and not stamp
 
 
 def test_design_gate_flags_duplicate_amplifier(nrol, topic_path):
