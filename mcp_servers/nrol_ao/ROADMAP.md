@@ -287,6 +287,20 @@ runs with reasoning mode on. Capability suite green (64 passed) incl.
   against the fast lane and the oracle. Acceptance: endpoint no worse,
   duplicate move decisions reduced (E01/E11 clusters), wrong-direction
   FIREs caught by rebuttal, PARK rescue still works.
+- ✅ Reviewed schema evolution + replay tooling (2026-06-12): schema gaps
+  now have first-class operator tools: list gaps, run resolver, list/mark
+  extension proposals, and apply an approved proposal. Application uses
+  the engine cleanup-session gate and changes schema only; it does not
+  replay evidence or move posteriors. Stored scans can now be listed,
+  inspected, and replayed in dry_run / proposal_only / safe_apply modes.
+  `commit_policy="safe"` regression fixed at the splitter: apply_decisions
+  never receives FIRE/OBSERVE, including duplicate-map members.
+- ✅ Cross-day duplicate judgment tool (2026-06-12): operators can run
+  `review_duplicate_candidate` on a FIRE/OBSERVE candidate; it retrieves
+  recent plausible evidence and asks the local model for a typed
+  DUPLICATE_OF / UNIQUE_EVENT / UNCERTAIN_DUPLICATE verdict. It is
+  perception-only (no mutation) and exists for the month-old re-report
+  class that same-batch grouping cannot catch.
 - ⬜ Head-fake world (decree walked back) so credulity and duplicate
   amplification are punished, not forgiven, by the corpus.
 - ⬜ Provenance carryover: add_evidence drops surfaced_via / scanRound /

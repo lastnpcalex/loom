@@ -17,6 +17,19 @@ Natural language is perception. Only typed transitions move beliefs.
   `deliberate_candidates(slug, articles, output_text)` runs the visible
   advocate/rebut/jury pass over matcher DECISION blocks without mutating
   state. Use it before filing a manual posterior-moving proposal.
+- Review cross-day duplicates explicitly:
+  `review_duplicate_candidate(slug, article, decision, ...)` compares a
+  candidate FIRE/OBSERVE against recent evidence and returns a typed
+  duplicate judgment. Use it when a proposal may be a re-reporting of an
+  already counted event.
+- Work schema gaps through the reviewed workflow:
+  `list_schema_gaps`, `run_schema_gap_resolver`, `list_schema_extension_proposals`,
+  `mark_schema_extension_proposal`, then `apply_schema_extension_proposal` only
+  after approval. Applying a schema extension changes schema only; it never
+  replays evidence or moves posteriors.
+- Replay stored scans:
+  `list_scan_runs`, `read_scan_run`, and `replay_scan_run` can inspect or
+  replay a digest in dry-run, proposal-only, or safe-apply mode.
 - Submit typed transitions via `submit_transition`:
   - `PARK`: relevant but no matching indicator. No posterior movement.
   - `FIRE`: a pre-committed binary indicator's threshold is met.
@@ -65,14 +78,13 @@ When the human asks to "run the evidence loop", "catch the topic up", or
 
 1. **Status**: run `topic_status` for the topic. Check `scanStale`,
    `parkedReviewDebt`, and `list_proposals(status="pending")`.
-2. **Scan**: until the `commit_policy="safe"` regression is patched and
-   verified, prefer `run_news_scan(..., dry_run=true)` for review-first
-   scans. The intended safe workflow is: search, full-article fetch, strict
-   matcher, duplicate grouping, and advocate/rebut/jury debate over ALL
-   candidates (FIRE / OBSERVE / PARK). PARK/SCHEMA_GAP may auto-apply because
-   they cannot move posteriors; FIRE/OBSERVE must land in the proposal queue
-   with their deliberation record attached. A MATCHER FAILED or DEBATE FAILED
-   line means the scan needs investigation, not interpretation.
+2. **Scan**: use `run_news_scan(..., commit_policy="safe")` for review-first
+   scans. The safe workflow is: search, full-article fetch, strict matcher,
+   duplicate grouping, and advocate/rebut/jury debate over ALL candidates
+   (FIRE / OBSERVE / PARK). PARK/SCHEMA_GAP may auto-apply because they
+   cannot move posteriors; FIRE/OBSERVE must land in the proposal queue with
+   their deliberation record attached. A MATCHER FAILED or DEBATE FAILED line
+   means the scan needs investigation, not interpretation.
 3. **Brief the human on the queue; never just list it.** After any scan or
    `review_parked` files proposals, produce a commit briefing before touching
    the queue:
@@ -86,6 +98,9 @@ When the human asks to "run the evidence loop", "catch the topic up", or
    - State the expected posterior direction and rough magnitude.
    - Cite the attached jury verdict / duplicate grouping when present. If a
      proposal carries a deliberation waiver, call it out explicitly.
+   - For possible re-reports of old events, run `review_duplicate_candidate`
+     and cite its typed verdict. If uncertain, recommend duplicate/withdraw
+     or PARK; duplicate movement is the dangerous direction.
    - Recommend commit or withdraw per proposal, then STOP and wait for the
      human's decision. The briefing reviews model deliberation; it is not a
      substitute for it. The human's reply is the authority verdict.

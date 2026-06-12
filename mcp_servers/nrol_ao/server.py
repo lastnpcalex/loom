@@ -642,6 +642,97 @@ def _fetch_article_excerpt(url: str, max_chars: int, timeout_sec: float = 15.0) 
         return ""
 
 
+def _parse_iso_date(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            return datetime.fromisoformat(value[:10] + "T00:00:00+00:00")
+        except Exception:
+            return None
+
+
+def _token_overlap(a: str, b: str) -> float:
+    import re
+
+    sa = {t for t in re.findall(r"[a-z0-9]{4,}", (a or "").lower())}
+    sb = {t for t in re.findall(r"[a-z0-9]{4,}", (b or "").lower())}
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / max(1, len(sa | sb))
+
+
+def _candidate_duplicate_evidence(
+    topic: dict,
+    article: dict,
+    decision: dict,
+    window_days: int,
+    limit: int,
+) -> list[dict]:
+    art = article.get("article", article) if isinstance(article, dict) else {}
+    art_text = " ".join(
+        str(art.get(k) or "") for k in ("headline", "title", "relevance", "excerpt", "body")
+    )
+    decision_text = " ".join(str(decision.get(k) or "") for k in ("claim", "reason"))
+    probe_text = f"{art_text} {decision_text}".strip()
+    art_url = (art.get("url") or "").strip()
+    art_time = _parse_iso_date(
+        str(art.get("published") or art.get("date") or art.get("time") or "")
+    )
+    rows = []
+    for entry in topic.get("evidenceLog", []) or []:
+        score = 0.0
+        reasons = []
+        if art_url and art_url == (entry.get("url") or "").strip():
+            score += 1.0
+            reasons.append("same_url")
+        entry_time = _parse_iso_date(str(entry.get("time") or ""))
+        if art_time and entry_time:
+            delta = abs((art_time - entry_time).days)
+            if delta <= window_days:
+                score += max(0.0, 0.4 * (1 - (delta / max(1, window_days))))
+                reasons.append(f"within_{window_days}d")
+        overlap = _token_overlap(probe_text, str(entry.get("text") or ""))
+        if overlap:
+            score += overlap
+            if overlap >= 0.2:
+                reasons.append(f"text_overlap_{overlap:.2f}")
+        if score <= 0:
+            continue
+        rows.append({
+            "evidence_id": entry.get("id", ""),
+            "time": entry.get("time", ""),
+            "source": entry.get("source", ""),
+            "url": entry.get("url", ""),
+            "text": entry.get("text", ""),
+            "posteriorImpact": entry.get("posteriorImpact", ""),
+            "score": round(score, 4),
+            "reasons": reasons,
+        })
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    return rows[: max(1, min(int(limit), 30))]
+
+
+def _parse_duplicate_judgment(text: str) -> dict:
+    import re
+
+    text = text or ""
+    m = re.search(
+        r"VERDICT:\s*(DUPLICATE_OF|UNIQUE_EVENT|UNCERTAIN_DUPLICATE)\s*([A-Za-z0-9_\-]*)",
+        text,
+        re.IGNORECASE,
+    )
+    verdict = (m.group(1).upper() if m else "UNCERTAIN_DUPLICATE")
+    evidence_id = (m.group(2) if m and m.group(2) else "")
+    reason = ""
+    rm = re.search(r"REASON:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
+    if rm:
+        reason = rm.group(1).strip()
+    return {"verdict": verdict, "evidence_id": evidence_id, "reason": reason}
+
+
 def _load_topics(engine, slugs: list[str] | None = None) -> tuple[list[dict], list[dict]]:
     """Load topics tolerantly: one malformed file must not fail the whole call.
 
@@ -1014,6 +1105,197 @@ def mark_schema_extension_proposal(
             "proposal": queue[proposal_index],
         })
     except Exception as exc:
+        return _json({"error": str(exc), "slug": slug, "proposal_index": proposal_index})
+
+
+def _parse_schema_body(body: str) -> dict:
+    """Parse the resolver's intentionally-small YAML-ish SCHEMA block."""
+    import re
+
+    body = body or ""
+    out: dict[str, Any] = {}
+    desc = re.search(r"(?m)^\s*desc:\s*(.+?)\s*$", body)
+    if desc:
+        value = desc.group(1).strip()
+        if value and value != "<unchanged>":
+            out["desc"] = value
+    lrs = re.search(r"(?m)^\s*likelihoods:\s*\{([^}]+)\}", body)
+    if lrs:
+        parsed = {}
+        for part in lrs.group(1).split(","):
+            if ":" not in part:
+                continue
+            key, value = part.split(":", 1)
+            try:
+                parsed[key.strip()] = float(value.strip())
+            except ValueError:
+                pass
+        if parsed:
+            out["likelihoods"] = parsed
+
+    observable = {}
+    for key in ("metric", "family", "direction"):
+        m = re.search(rf"(?m)^\s*{key}:\s*(.+?)\s*$", body)
+        if m:
+            observable[key] = m.group(1).strip()
+    for key in ("shape", "causal_event_id", "ladder_group", "ladder_step"):
+        m = re.search(rf"(?m)^\s*{key}:\s*(.+?)\s*$", body)
+        if m:
+            out[key] = m.group(1).strip()
+    for key in ("threshold_value", "baseline"):
+        m = re.search(rf"(?m)^\s*{key}:\s*(-?\d+(?:\.\d+)?)\s*$", body)
+        if m:
+            observable[key] = float(m.group(1))
+    if observable:
+        out["observable"] = observable
+    return out
+
+
+@mcp.tool()
+def apply_schema_extension_proposal(
+    slug: str,
+    proposal_index: int,
+    tier: str = "tier3_suggestive",
+    note: str = "",
+) -> str:
+    """Apply an approved schema-extension proposal to topic indicators.
+
+    This changes schema only; it never replays evidence or moves posteriors.
+    The proposal must already be marked approved by an operator. Supported
+    proposal kinds: extend_observable, add_new_indicator. `no_fix` proposals
+    are marked applied-noop.
+    """
+    cleanup_started = False
+    try:
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(slug)
+        gov = topic.setdefault("governance", {})
+        queue = gov.setdefault("proposed_schema_extensions", [])
+        if proposal_index < 0 or proposal_index >= len(queue):
+            raise IndexError(f"proposal_index {proposal_index} out of range")
+        proposal = queue[proposal_index]
+        if proposal.get("status") != "approved":
+            raise ValueError("schema extension must be marked approved before apply")
+
+        kind = (proposal.get("kind") or "").strip()
+        schema = _parse_schema_body(proposal.get("body") or "")
+        applied: dict[str, Any] = {"kind": kind}
+
+        if kind == "no_fix":
+            applied["note"] = "no schema mutation requested"
+        elif kind == "extend_observable":
+            target = (proposal.get("target") or "").strip()
+            indicator, indicator_tier = _find_indicator(topic, target)
+            if indicator is None:
+                raise ValueError(f"indicator {target!r} not found")
+            if "observable" not in schema:
+                raise ValueError("extend_observable proposal has no observable block")
+            engine.start_indicator_cleanup_session(
+                slug,
+                reason=f"apply approved schema extension proposal {proposal_index}",
+            )
+            cleanup_started = True
+            topic = engine.load_topic(slug)
+            indicator, indicator_tier = _find_indicator(topic, target)
+            indicator["observable"] = schema["observable"]
+            engine.save_topic(topic)
+            engine.commit_indicator_cleanup_session(
+                slug,
+                summary=f"Applied schema extension proposal {proposal_index}: {target}",
+            )
+            cleanup_started = False
+            applied.update({"target": target, "tier": indicator_tier})
+        elif kind == "add_new_indicator":
+            target = (proposal.get("target") or "").strip()
+            if not target:
+                raise ValueError("add_new_indicator proposal missing target id")
+            existing, _ = _find_indicator(topic, target)
+            if existing is not None:
+                raise ValueError(f"indicator {target!r} already exists")
+            if "likelihoods" not in schema:
+                raise ValueError("add_new_indicator proposal has no likelihoods")
+            if "observable" not in schema:
+                raise ValueError("add_new_indicator proposal has no observable block")
+            tiers = topic.setdefault("indicators", {}).setdefault("tiers", {})
+            if tier not in tiers:
+                raise ValueError(f"tier must be one of {sorted(tiers.keys())}")
+            indicator = {
+                "id": target,
+                "desc": schema.get("desc") or proposal.get("rationale") or target,
+                "posteriorEffect": (
+                    proposal.get("rationale")
+                    or f"Approved schema extension {target}; likelihoods define direction."
+                ),
+                "likelihoods": schema["likelihoods"],
+                "observable": schema["observable"],
+                "lr_decay": 0.65,
+                "n_firings": 0,
+                "resolution_class": False,
+                "shape": schema.get("shape") or "per_event_member",
+                "causal_event_id": schema.get("causal_event_id") or target,
+            }
+            if schema.get("ladder_group"):
+                indicator["ladder_group"] = schema["ladder_group"]
+            if schema.get("ladder_step"):
+                try:
+                    indicator["ladder_step"] = int(schema["ladder_step"])
+                except ValueError:
+                    indicator["ladder_step"] = schema["ladder_step"]
+            engine.start_indicator_cleanup_session(
+                slug,
+                reason=f"apply approved schema extension proposal {proposal_index}",
+            )
+            cleanup_started = True
+            added = engine.add_indicator(slug, tier, indicator, rationale=proposal.get("rationale", ""))
+            topic = engine.load_topic(slug)
+            added_indicator, _ = _find_indicator(topic, target)
+            if added_indicator is None:
+                raise ValueError(f"indicator {target!r} was not added")
+            # engine.add_indicator predates observable blocks; attach the
+            # reviewed observable while the cleanup session remains active.
+            added_indicator["observable"] = schema["observable"]
+            engine.save_topic(topic)
+            engine.commit_indicator_cleanup_session(
+                slug,
+                summary=f"Applied schema extension proposal {proposal_index}: {target}",
+            )
+            cleanup_started = False
+            applied.update({"target": target, "tier": tier})
+        else:
+            raise ValueError(f"unsupported schema proposal kind {kind!r}")
+
+        topic = engine.load_topic(slug)
+        queue = topic.setdefault("governance", {}).setdefault(
+            "proposed_schema_extensions", []
+        )
+        proposal = queue[proposal_index]
+        proposal["status"] = "applied"
+        proposal["applied_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if note:
+            proposal["apply_note"] = note
+        proposal["applied_result"] = applied
+        gov.setdefault("schema_extension_history", []).append({
+            "proposal_index": proposal_index,
+            "proposal": proposal,
+            "applied": applied,
+        })
+        engine.save_topic(topic)
+        return _json({
+            "slug": slug,
+            "proposal_index": proposal_index,
+            "applied": applied,
+            "proposal": proposal,
+            "note": "schema changed only; evidence was not replayed and posteriors did not move",
+        })
+    except Exception as exc:
+        if cleanup_started:
+            try:
+                engine.abort_indicator_cleanup_session(
+                    slug,
+                    reason=f"apply schema extension proposal {proposal_index} failed: {exc}",
+                )
+            except Exception:
+                pass
         return _json({"error": str(exc), "slug": slug, "proposal_index": proposal_index})
 
 
@@ -2670,6 +2952,103 @@ def deliberate_candidates(
     except Exception as exc:
         store.record(job_id, "failed", task="deliberate_candidates", slug=slug, error=str(exc))
         return _json({"error": str(exc), "slug": slug})
+
+
+@mcp.tool()
+def review_duplicate_candidate(
+    slug: str,
+    article: dict,
+    decision: dict,
+    window_days: int = 45,
+    max_candidates: int = 12,
+    model: str = "",
+    temperature: float = 0.0,
+    max_tokens: int = 2048,
+    timeout_sec: int = 600,
+) -> str:
+    """Ask whether a FIRE/OBSERVE candidate is a duplicate of prior evidence.
+
+    This is a perception-only tool: it does not mutate the topic, withdraw a
+    proposal, or move posteriors. Verdicts are typed:
+    DUPLICATE_OF <evidence_id>, UNIQUE_EVENT, or UNCERTAIN_DUPLICATE.
+    Bias uncertain cases toward duplicate/park in operator briefings because
+    duplicate movement is the dangerous direction.
+    """
+    store = _activity_store()
+    job_id = new_job_id("duplicate-review")
+    try:
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(slug)
+        candidates = _candidate_duplicate_evidence(
+            topic, article, decision, window_days, max_candidates
+        )
+        if not candidates:
+            return _json({
+                "job_id": job_id,
+                "slug": slug,
+                "candidate_count": 0,
+                "judgment": {
+                    "verdict": "UNIQUE_EVENT",
+                    "evidence_id": "",
+                    "reason": "no plausible prior evidence candidates found",
+                },
+                "candidates": [],
+            })
+        prompt = {
+            "task": (
+                "Decide whether the candidate article/decision describes the "
+                "same underlying causal event or same measurement as one prior "
+                "evidence entry. Be conservative: if uncertain, return "
+                "UNCERTAIN_DUPLICATE, not UNIQUE_EVENT."
+            ),
+            "candidate_article": article,
+            "candidate_decision": decision,
+            "prior_evidence_candidates": candidates,
+            "output_format": (
+                "VERDICT: DUPLICATE_OF <evidence_id> | UNIQUE_EVENT | "
+                "UNCERTAIN_DUPLICATE\nREASON: <one concise reason>"
+            ),
+        }
+        store.record(
+            job_id, "running", task="review_duplicate_candidate", slug=slug,
+            summary={"candidate_count": len(candidates), "window_days": window_days},
+            prompt=_json(prompt),
+        )
+        response = llama_client.chat(
+            json.dumps(prompt, ensure_ascii=False, indent=2),
+            system_prompt=(
+                "You are an NROL-AO duplicate-event judge. Return only the "
+                "VERDICT and REASON lines in the requested format."
+            ),
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+            disable_thinking=False,
+        )
+        judgment = _parse_duplicate_judgment(response.get("text", ""))
+        store.record(
+            job_id, "completed", task="review_duplicate_candidate", slug=slug,
+            model=response.get("model"),
+            summary={"verdict": judgment.get("verdict"),
+                     "evidence_id": judgment.get("evidence_id", "")},
+            response=response.get("text", ""),
+        )
+        return _json({
+            "job_id": job_id,
+            "slug": slug,
+            "judgment": judgment,
+            "candidates": candidates,
+            "model": response.get("model"),
+            "response": response.get("text", ""),
+        })
+    except Exception as exc:
+        try:
+            store.record(job_id, "failed", task="review_duplicate_candidate",
+                         slug=slug, error=str(exc))
+        except Exception:
+            pass
+        return _json({"job_id": job_id, "error": str(exc), "slug": slug})
 
 
 @mcp.tool()

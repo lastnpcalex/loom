@@ -1568,6 +1568,98 @@ END
     assert marked["proposal"]["status"] == "rejected"
 
 
+def test_apply_schema_extension_proposal_extends_indicator_without_moving_posteriors(
+    nrol, topic_path, monkeypatch
+):
+    _submit(
+        nrol, slug=SLUG, transition="SCHEMA_GAP", evidence=_evidence(),
+        reason="no observable covers this direction",
+        missing_direction="operational escort gap", commit=True,
+    )
+    response = """PROPOSAL
+KIND: extend_observable
+TARGET: ind_binary_mild
+CLUSTER_ADDRESSED: operational
+RATIONALE: repeated operational escort gaps need a conservative home
+SCHEMA:
+  desc: <unchanged>
+  observable:
+    metric: test:escort_count
+    family: count_event
+    threshold_value: 1
+    baseline: 0
+    direction: higher_strengthens
+END
+"""
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": response, "model": "test-schema", "host": "local"},
+    )
+    resolved = json.loads(nrol.run_schema_gap_resolver(SLUG, persist=True))
+    assert resolved["proposals"]
+    before = _disk_posteriors(topic_path)
+    marked = json.loads(nrol.mark_schema_extension_proposal(
+        SLUG, 0, "approved", note="good test indicator"))
+    assert marked["proposal"]["status"] == "approved"
+
+    applied = json.loads(nrol.apply_schema_extension_proposal(
+        SLUG, 0, tier="tier3_suggestive", note="apply in test"))
+    assert "error" not in applied, applied
+    assert applied["applied"]["target"] == "ind_binary_mild"
+    assert _disk_posteriors(topic_path) == before
+    topic = _disk_topic(topic_path)
+    ind = next(
+        ind for ind in topic["indicators"]["tiers"]["tier1_critical"]
+        if ind["id"] == "ind_binary_mild"
+    )
+    assert ind["observable"]["metric"] == "test:escort_count"
+    queue = topic["governance"]["proposed_schema_extensions"]
+    assert queue[0]["status"] == "applied"
+
+
+def test_cross_day_duplicate_reviewer_judges_prior_evidence(nrol, topic_path, monkeypatch):
+    first = _submit(
+        nrol, slug=SLUG, transition="PARK",
+        evidence=_evidence(
+            "Coast guard confirms the convoy launch in Strait X.",
+            source="test-wire",
+            url="https://example.test/convoy-a",
+            time="2030-01-05T08:00:00+00:00",
+        ),
+        reason="seed prior evidence", commit=True,
+    )
+    assert first.get("evidence_id")
+
+    def fake_chat(*args, **kwargs):
+        return {
+            "text": f"VERDICT: DUPLICATE_OF {first['evidence_id']}\n"
+                    "REASON: same convoy launch described again.",
+            "model": "test-duplicate",
+            "host": "local",
+        }
+
+    monkeypatch.setattr(nrol.llama_client, "chat", fake_chat)
+    out = json.loads(nrol.review_duplicate_candidate(
+        SLUG,
+        article={
+            "headline": "Second report: convoy launch confirmed in Strait X",
+            "url": "https://example.test/convoy-b",
+            "source": "test-wire",
+            "published": "2030-01-08T08:00:00+00:00",
+        },
+        decision={
+            "idx": 1,
+            "action": {"kind": "FIRE", "indicator_id": "ind_binary_mild"},
+            "claim": "The convoy launch occurred.",
+            "reason": "threshold met",
+        },
+        window_days=14,
+    ))
+    assert out["judgment"]["verdict"] == "DUPLICATE_OF"
+    assert out["judgment"]["evidence_id"] == first["evidence_id"]
+    assert out["candidates"]
+
+
 def test_safe_policy_never_applies_posterior_moving_duplicates(nrol, topic_path, monkeypatch):
     """Regression for 2026-06-12: safe scan filtered canonical decisions but
     appended duplicate-map members unfiltered, letting OBSERVE/FIRE move
