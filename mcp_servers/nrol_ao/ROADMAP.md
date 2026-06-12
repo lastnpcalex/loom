@@ -217,3 +217,21 @@ perception error isolated from engine math. Plan file:
   SCHEMA_GAP and E07 PARK bait both handled correctly; OBSERVE
   extraction 5/6 exact, awkward-units piece within 2pp. Matcher-path
   evidence now also dated by publication (engine repo 59f439a).
+- ✅ Duplicate-FIRE fix, measured (2026-06-11, engine repo 88da253):
+  apply_decisions bundles same-batch FIREs on one indicator the way it
+  bundled OBSERVEs — canonical article fires once, duplicates parked as
+  corroborating evidence_refs; design gate warns on explicit
+  lr_decay >= 1.0 (duplicate amplifier). Harness re-run as regression
+  test: day-1 TV collapsed 0.079 -> 0.000 (first four simulated days now
+  track the oracle exactly); final posteriors unchanged (H3=0.9833).
+  The honest cost: peak divergence moved to E04 at 0.135 — the old run's
+  lower mid-run TV was two errors canceling (engine duplicate over-count
+  toward H4 masking the matcher's genuine miss of E04's gold FIRE, also
+  toward H4). Same for Brier H2@Sep-1 (0.164 -> 0.205): the old number
+  was flattered. Remaining divergence is pure perception error, and its
+  direction is conservative (missed FIREs = underconfidence). Scorer now
+  dedupes multi-block decisions per article (last-wins, mirroring
+  apply_decisions) after the matcher emitted two OBSERVEs for one
+  article carrying two metrics. v2 (not started): cross-day duplicate
+  detection — LLM yes/no "same causal event?" filed as a typed
+  duplicate-of proposal, biased toward duplicate when uncertain.

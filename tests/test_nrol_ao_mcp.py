@@ -1213,3 +1213,58 @@ def test_fire_under_simulated_clock_dates_state(nrol, topic_path, monkeypatch):
         if ind.get("id") == "ind_binary_mild"
     ]
     assert fired and fired[0].startswith("2026-07-03")
+
+
+# ---------------------------------------------------------------------------
+# Duplicate discipline: same-batch FIREs bundle to one firing
+# ---------------------------------------------------------------------------
+
+
+def test_same_batch_duplicate_fires_bundle_to_one_firing(nrol, topic_path):
+    """Three duplicate articles firing one indicator must produce ONE firing
+    with the duplicates parked as corroborating refs (the synthetic Meridia
+    replay reproduced the live failure: one causal event filed three times)."""
+    articles = [
+        {"headline": f"Duplicate coverage {i} of the synthetic binary event",
+         "url": f"https://test-rig/dup{i}", "source": "test-rig",
+         "date": "2030-01-05"}
+        for i in (1, 2, 3)
+    ]
+    output_text = "\n".join(
+        f"DECISION\nARTICLE: A{i}\nACTION: FIRE ind_binary_mild\nTAG: EVENT\n"
+        "CLAIM: The synthetic binary event occurred.\n"
+        "REASON: Duplicate coverage of one causal event.\nEND"
+        for i in (1, 2, 3)
+    )
+    out = json.loads(
+        nrol.apply_matcher_output(SLUG, articles, output_text, commit=True)
+    )
+    assert out.get("committed") is True, out
+    summary = out["summary"]
+    assert summary["fire"] == 1
+    assert summary["park"] == 2
+    groups = [g for g in summary["bundled_groups"] if g.get("kind") == "FIRE"]
+    assert len(groups) == 1
+    assert groups[0]["indicator_id"] == "ind_binary_mild"
+    assert groups[0]["n_articles"] == 3
+    assert len(groups[0]["secondary_refs"]) == 2
+
+    topic = _disk_topic(topic_path)
+    fired = [
+        ind for tier in topic["indicators"]["tiers"].values()
+        for ind in tier if ind.get("id") == "ind_binary_mild"
+    ]
+    assert fired[0]["n_firings"] == 1
+
+
+def test_design_gate_flags_duplicate_amplifier(nrol, topic_path):
+    """Explicit lr_decay >= 1.0 is a duplicate amplifier; the design gate
+    (which runs on every save) must warn. The fixture topic carries 1.0 on
+    ind_binary_mild deliberately."""
+    out = _submit(
+        nrol, slug=SLUG, transition="FIRE", evidence=_evidence(),
+        indicator_id="ind_binary_mild", commit=True,
+    )
+    assert out.get("committed") is True, out
+    gate = _disk_topic(topic_path)["governance"]["designGate"]
+    assert any("DUPLICATE AMPLIFIER" in w for w in gate["warnings"])

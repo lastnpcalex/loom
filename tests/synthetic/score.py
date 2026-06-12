@@ -67,6 +67,15 @@ def divergence(oracle: list[dict], pipeline: list[dict],
 
 
 def confusion(decisions: list[dict], timeline: dict) -> dict:
+    # The matcher can emit multiple DECISION blocks for one article (seen
+    # live: two OBSERVEs for an article carrying two extractable metrics).
+    # apply_decisions keys decisions by idx, so the LAST block wins — score
+    # what was applied, not every block emitted.
+    by_article: dict[str, dict] = {}
+    for row in decisions:
+        by_article[row["article_id"]] = row
+    decisions = list(by_article.values())
+
     matrix: dict[str, dict[str, int]] = {}
     routing = {"correct": 0, "wrong": 0}
     value_deltas = []
