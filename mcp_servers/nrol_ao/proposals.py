@@ -46,7 +46,9 @@ CREATE TABLE IF NOT EXISTS proposals (
     created_at TEXT NOT NULL,
     decided_at TEXT,
     decision_note TEXT,
-    result TEXT
+    result TEXT,
+    evidence_id TEXT DEFAULT '',
+    evidence_refs TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_proposals_slug_status ON proposals(slug, status);
 """
@@ -87,6 +89,10 @@ class ProposalStore:
             conn.execute("ALTER TABLE proposals ADD COLUMN evidence_id TEXT DEFAULT ''")
         except sqlite3.OperationalError:
             pass  # column already exists
+        try:
+            conn.execute("ALTER TABLE proposals ADD COLUMN evidence_refs TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
         return conn
 
     # -- articles --
@@ -145,17 +151,18 @@ class ProposalStore:
         rationale: str = "",
         missing_direction: str = "",
         evidence_id: str = "",
+        evidence_refs: str = "",
     ) -> dict:
         pid = new_proposal_id()
         with contextlib.closing(self._conn()) as conn, conn:
             conn.execute(
                 "INSERT INTO proposals "
                 "(id, article_id, slug, action, indicator_id, observed_value, "
-                " rationale, missing_direction, status, created_at, evidence_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                " rationale, missing_direction, status, created_at, evidence_id, evidence_refs) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
                 (
                     pid, article_id, slug, action, indicator_id, observed_value,
-                    rationale, missing_direction, _utc_now(), evidence_id,
+                    rationale, missing_direction, _utc_now(), evidence_id, evidence_refs,
                 ),
             )
         return self.get_proposal(pid)

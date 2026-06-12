@@ -409,24 +409,23 @@ def _run_debate(
     job_id: str = "",
     slug: str = "",
 ) -> tuple[dict, dict]:
-    """3-stage deliberation (advocate / rebut / jury) over PARKed decisions.
-
-    The strict matcher is deliberately conservative; without this structure
-    every borderline observation dies in PARK on a single model's one-shot
-    judgment. The advocate argues to rescue parks (OBSERVE on observable
-    indicators only), the rebuttal attacks, a fresh jury renders verdicts
-    with KEEP_PARK as the burden-of-proof default.
+    """3-stage deliberation (advocate / rebut / jury) over candidates (FIRE/OBSERVE/PARK).
 
     Returns (jury_overrides, debate_packet) where jury_overrides maps
-    idx -> {"action": {...}, "rationale": str} for MOVE_TO verdicts only.
+    idx -> {"action": {...}, "rationale": str}.
     Never raises — a failed stage returns no overrides and reports why.
     """
-    packet: dict[str, Any] = {"parks": 0, "argue_moves": 0, "jury_verdicts": {}}
+    packet: dict[str, Any] = {
+        "candidates": 0,
+        "parks": sum(1 for c in decisions if c.get("action", {}).get("kind") == "PARK"),
+        "advocate_proposals": 0,
+        "jury_verdicts": {},
+    }
     try:
-        parks = news.get_parks_with_reasons(decisions)
-        packet["parks"] = len(parks)
-        if not parks:
-            packet["note"] = "no parks to deliberate"
+        candidates = news.get_candidates_with_reasons(decisions)
+        packet["candidates"] = len(candidates)
+        if not candidates:
+            packet["note"] = "no candidates to deliberate"
             return {}, packet
 
         def _stage(name: str, prompt: str, system: str) -> str:
@@ -437,7 +436,7 @@ def _run_debate(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout_sec=timeout_sec,
-                disable_thinking=True,
+                disable_thinking=False,  # Deliberation requires reasoning mode enabled!
             )
             text = response.get("text", "")
             if store is not None:
@@ -455,17 +454,15 @@ def _run_debate(
 
         adv_text = _stage(
             "advocate",
-            news.build_advocate_prompt(topic, articles, parks),
+            news.build_advocate_prompt(topic, articles, candidates),
             "You are the ADVOCATE in the NROL-AO debate. Return only ADVOCATE "
             "blocks in the requested format.",
         )
-        advocate_moves = [
-            a for a in news.parse_advocate_output(adv_text)
-            if str(a.get("verdict", "")).upper().startswith("ARGUE")
-        ]
-        packet["argue_moves"] = len(advocate_moves)
+        advocate_moves = news.parse_advocate_output(adv_text)
+        packet["advocate_proposals"] = len(advocate_moves)
+        packet["argue_moves"] = len([m for m in advocate_moves if m.get("verdict") in ("COMMIT", "ARGUE_MOVE")])
         if not advocate_moves:
-            packet["note"] = "advocate found no defensible moves"
+            packet["note"] = "advocate found no defensible proposals"
             return {}, packet
 
         strict_reasons = news.get_strict_reasons_map(decisions)
@@ -482,7 +479,7 @@ def _run_debate(
             "jury",
             news.build_jury_prompt(topic, articles, advocate_moves, rebuts),
             "You are the JURY in the NROL-AO debate. Return only JURY blocks "
-            "in the requested format. In doubt, KEEP_PARK.",
+            "in the requested format.",
         )
         jury = news.parse_jury_output(jury_text)
         packet["jury_verdicts"] = {
@@ -491,9 +488,11 @@ def _run_debate(
         overrides = {
             idx: {"action": v["action"], "rationale": v.get("rationale", "")}
             for idx, v in jury.items()
-            if (v.get("action") or {}).get("kind") not in (None, "", "PARK")
         }
-        packet["rescued"] = len(overrides)
+        packet["rescued"] = sum(
+            1 for idx, v in overrides.items()
+            if (decisions[idx-1].get("action", {}).get("kind") == "PARK" and v["action"]["kind"] in ("FIRE", "OBSERVE"))
+        )
         return overrides, packet
     except Exception as exc:
         packet["error"] = str(exc)
@@ -501,18 +500,23 @@ def _run_debate(
 
 
 def _apply_jury_overrides(decisions: list, jury_overrides: dict) -> list:
-    """Fold MOVE_TO verdicts into the decision list (PARKs only)."""
+    """Fold jury verdicts into the decision list."""
     if not jury_overrides:
         return decisions
     effective = []
     for d in decisions:
         idx = d.get("idx")
-        if idx in jury_overrides and (d.get("action") or {}).get("kind") == "PARK":
+        if idx in jury_overrides:
+            override = jury_overrides[idx]
+            override_action = override["action"]
             nd = dict(d)
-            nd["action"] = jury_overrides[idx]["action"]
+            if override_action["kind"] == "COMMIT":
+                pass  # keep original action
+            else:
+                nd["action"] = override_action
             nd["jury_override"] = True
             nd["reason"] = (
-                "jury: " + (jury_overrides[idx].get("rationale") or "MOVE_TO verdict")
+                "jury: " + (override.get("rationale") or "override verdict")
             )[:500]
             effective.append(nd)
         else:
@@ -1174,77 +1178,109 @@ def run_news_scan(
                         max_tokens=max_tokens, timeout_sec=timeout_sec,
                         store=store, job_id=job_id, slug=slug,
                     )
+                    if debate_packet and "error" in debate_packet:
+                        search_errors["debate"] = debate_packet["error"]
                     decisions = _apply_jury_overrides(decisions, jury_overrides)
 
-                if commit_policy == "safe" and not commit and not dry_run and decisions:
-                    safe_decisions = [
-                        d for d in decisions
-                        if d.get("action", {}).get("kind") in {"PARK", "SCHEMA_GAP", "IGNORE"}
-                    ]
-                    review_decisions = [
-                        d for d in decisions
-                        if d.get("action", {}).get("kind") in {"FIRE", "OBSERVE"}
-                    ]
-                    if safe_decisions:
-                        # PARK/SCHEMA_GAP cannot move posteriors (engine-
-                        # enforced, capability-tested) — safe to auto-apply.
-                        applied = news.apply_decisions(slug, deduped, safe_decisions)
-                    proposals_filed = []
-                    pstore = _proposal_store()
-                    for d in review_decisions:
-                        idx = d.get("idx") or 0
-                        art = deduped[idx - 1] if 0 < idx <= len(deduped) else None
-                        if art is None:
-                            continue
-                        try:
-                            art_rec = pstore.submit_article(art, submitted_by="scheduled-scan")
-                            action = d.get("action", {})
-                            _validate_proposal_shape(
-                                topic, action.get("kind", ""),
-                                action.get("indicator_id", ""), action.get("value"),
-                            )
-                            prop = pstore.add_proposal(
-                                article_id=art_rec["id"],
-                                slug=slug,
-                                action=action.get("kind", ""),
-                                indicator_id=action.get("indicator_id", ""),
-                                observed_value=action.get("value"),
-                                rationale=(d.get("reason") or d.get("claim") or "matcher decision")[:500],
-                            )
-                            proposals_filed.append(prop["id"])
-                        except Exception as exc:
-                            search_errors[f"proposal_idx_{idx}"] = str(exc)
-                    packet_policy = {
-                        "policy": "safe",
-                        "auto_committed": (applied or {}),
-                        "proposals_filed": proposals_filed,
-                    }
+                if "debate" not in search_errors:
+                    if commit_policy == "safe" and not commit and not dry_run and decisions:
+                        canonical_decisions, duplicate_map = news.group_decisions_by_duplicates(deduped, decisions)
+                        safe_decisions = [
+                            d for d in canonical_decisions
+                            if d.get("action", {}).get("kind") in {"PARK", "SCHEMA_GAP", "IGNORE"}
+                        ]
+                        review_decisions = [
+                            d for d in canonical_decisions
+                            if d.get("action", {}).get("kind") in {"FIRE", "OBSERVE"}
+                        ]
+                        
+                        safe_decisions_with_dups = []
+                        for d in safe_decisions:
+                            safe_decisions_with_dups.append(d)
+                            safe_decisions_with_dups.extend(duplicate_map.get(d["idx"], []))
+                        
+                        applied = {}
+                        if safe_decisions_with_dups:
+                            applied = news.apply_decisions(slug, deduped, safe_decisions_with_dups)
+                        proposals_filed = []
+                        pstore = _proposal_store()
+                        for d in review_decisions:
+                            idx = d.get("idx") or 0
+                            art = deduped[idx - 1] if 0 < idx <= len(deduped) else None
+                            if art is None:
+                                continue
+                            try:
+                                # 1. Park duplicates first to get their evidence IDs in engine
+                                dups = duplicate_map.get(idx, [])
+                                secondary_evidence_ids = []
+                                for dup_d in dups:
+                                    dup_idx = dup_d["idx"]
+                                    dup_art = deduped[dup_idx - 1]
+                                    dup_inner = dup_art.get("article", dup_art)
+                                    dup_entry = news.article_to_evidence_entry(
+                                        dup_inner, round_num=1,
+                                        default_tag=dup_d.get("tag", "EVENT") or "EVENT",
+                                    )
+                                    dup_entry["claim"] = dup_d.get("claim") or dup_entry.get("text", "")
+                                    dup_result = engine.process_evidence(
+                                        slug=slug, entry=dup_entry,
+                                        fired_indicator_id=None,
+                                        reason=f"Duplicate coverage of canonical article A{idx}",
+                                    )
+                                    if dup_result.get("evidence_id"):
+                                        secondary_evidence_ids.append(dup_result["evidence_id"])
+                                
+                                # 2. File proposal for canonical article
+                                art_rec = pstore.submit_article(art, submitted_by="scheduled-scan")
+                                action = d.get("action", {})
+                                _validate_proposal_shape(
+                                    topic, action.get("kind", ""),
+                                    action.get("indicator_id", ""), action.get("value"),
+                                )
+                                prop = pstore.add_proposal(
+                                    article_id=art_rec["id"],
+                                    slug=slug,
+                                    action=action.get("kind", ""),
+                                    indicator_id=action.get("indicator_id", ""),
+                                    observed_value=action.get("value"),
+                                    rationale=(d.get("reason") or d.get("claim") or "matcher decision")[:500],
+                                    evidence_refs=json.dumps(secondary_evidence_ids) if secondary_evidence_ids else "",
+                                )
+                                proposals_filed.append(prop["id"])
+                            except Exception as exc:
+                                search_errors[f"proposal_idx_{idx}"] = str(exc)
+                        packet_policy = {
+                            "policy": "safe",
+                            "auto_committed": (applied or {}),
+                            "proposals_filed": proposals_filed,
+                        }
 
-                if commit:
-                    denied = _ask_loom_permission(
-                        "nrol_ao_run_news_scan",
-                        {
-                            "slug": slug,
-                            "article_count": len(deduped),
-                            "decision_count": len(decisions),
-                            "model": response.get("model"),
-                        },
-                    )
-                    if denied:
-                        store.record(
-                            job_id,
-                            "denied",
-                            task="run_news_scan",
-                            slug=slug,
-                            model=response.get("model"),
-                            summary={"denied": denied},
+                    if commit:
+                        denied = _ask_loom_permission(
+                            "nrol_ao_run_news_scan",
+                            {
+                                "slug": slug,
+                                "article_count": len(deduped),
+                                "decision_count": len(decisions),
+                                "model": response.get("model"),
+                            },
                         )
-                        applied = {"denied": denied, "committed": False}
-                    else:
-                        applied = news.apply_decisions(slug, deduped, decisions)
+                        if denied:
+                            store.record(
+                                job_id,
+                                "denied",
+                                task="run_news_scan",
+                                slug=slug,
+                                model=response.get("model"),
+                                summary={"denied": denied},
+                            )
+                            applied = {"denied": denied, "committed": False}
+                        else:
+                            applied = news.apply_decisions(slug, deduped, decisions)
 
             search_failed_all = bool(channels) and all(c in search_errors for c in channels)
             matcher_failed = "matcher" in search_errors
+            debate_failed = "debate" in search_errors
             scan_record = {
                 "recorded": False,
                 "dry_run": dry_run,
@@ -1258,6 +1294,8 @@ def run_news_scan(
                 # Stamping lastScanned would shrink the next adaptive window
                 # and silently drop these articles from ever being matched.
                 scan_record["skipped_reason"] = "matcher returned no content — window left open"
+            elif debate_failed:
+                scan_record["skipped_reason"] = f"deliberation failed: {search_errors['debate']} — window left open"
             else:
                 try:
                     stamped = mutation.stamp_last_scanned(slug)
@@ -1377,7 +1415,7 @@ def _write_digest(packet: dict) -> str:
                 lines.append(f"- ⚠ DEBATE FAILED: {db['error']}")
             else:
                 lines.append(
-                    f"- deliberation: {db.get('parks', 0)} parks debated, "
+                    f"- deliberation: {db.get('candidates', 0)} candidates debated ({db.get('parks', 0)} parks), "
                     f"{db.get('argue_moves', 0)} argued, "
                     f"{db.get('rescued', 0)} rescued by jury"
                 )
@@ -1898,6 +1936,15 @@ def review_parked(
                 max_tokens=max_tokens, timeout_sec=timeout_sec,
                 store=store, job_id=job_id, slug=slug,
             )
+            if debate_packet and "error" in debate_packet:
+                store.record(
+                    job_id, "error", task="review_parked", slug=slug,
+                    summary={"error": f"debate failed: {debate_packet['error']}"},
+                )
+                return _json({
+                    "slug": slug,
+                    "error": f"deliberation/debate failed: {debate_packet['error']} — no reviews recorded, queue untouched",
+                })
             decisions = _apply_jury_overrides(decisions, jury_overrides)
 
         pstore = _proposal_store()
@@ -2650,6 +2697,12 @@ def commit_match(proposal_id: str, include_topic: bool = False) -> str:
             "claim": prop.get("rationale") or "",
             "tag": "EVENT",
         }
+        refs_raw = prop.get("evidence_refs")
+        if refs_raw:
+            try:
+                evidence["evidence_refs"] = json.loads(refs_raw)
+            except Exception:
+                pass
         published = (
             article.get("published") or article.get("published_at")
             or article.get("date") or ""

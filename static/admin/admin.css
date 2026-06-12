@@ -337,6 +337,11 @@ html, body {
     cursor: pointer;
 }
 .select:focus { outline: none; border-color: var(--cyan); }
+.select option {
+    background-color: #0d0d21;
+    background: var(--panel-solid);
+    color: var(--text);
+}
 
 /* ── Tables ── */
 .data-table { width: 100%; border-collapse: collapse; }

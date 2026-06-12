@@ -1268,3 +1268,115 @@ def test_design_gate_flags_duplicate_amplifier(nrol, topic_path):
     assert out.get("committed") is True, out
     gate = _disk_topic(topic_path)["governance"]["designGate"]
     assert any("DUPLICATE AMPLIFIER" in w for w in gate["warnings"])
+
+
+def test_news_scan_dedup_indexing_bug(nrol, topic_path):
+    # 1. Park an unrelated first article (A1) to serve as a decoy
+    decoy_evidence = {"text": "Decoy article text content.", "source": "decoy-wire", "tag": "INTEL"}
+    res1 = _submit(nrol, slug=SLUG, transition="PARK", evidence=decoy_evidence, commit=True)
+    assert res1.get("committed") is True
+    decoy_ev_id = res1["evidence_id"]
+
+    # 2. Park a second article (A2) which will be our target duplicate
+    target_evidence = {
+        "text": "Target article that we will deduplicate.",
+        "url": "https://example.test/target",
+        "source": "target-wire",
+        "tag": "EVENT"
+    }
+    res2 = _submit(nrol, slug=SLUG, transition="PARK", evidence=target_evidence, commit=True)
+    assert res2.get("committed") is True
+    target_ev_id = res2["evidence_id"]
+    assert target_ev_id != decoy_ev_id
+
+    # 3. Park a third unrelated article (A3) so that A2 is NOT the last item in the evidence log!
+    unrelated_evidence = {"text": "Unrelated trailing article.", "source": "unrelated-wire", "tag": "INTEL"}
+    res3 = _submit(nrol, slug=SLUG, transition="PARK", evidence=unrelated_evidence, commit=True)
+    assert res3.get("committed") is True
+    unrelated_ev_id = res3["evidence_id"]
+    assert unrelated_ev_id != target_ev_id
+
+    # Let's verify topic structure: target_ev_id is in the log, but not at the last position.
+    topic = _disk_topic(topic_path)
+    assert topic["evidenceLog"][-1]["id"] == unrelated_ev_id
+
+    # 4. Now, attempt to park the target article (A2) AGAIN.
+    # Since it is a duplicate by URL/text, it should be deduplicated.
+    # But it should return the target_ev_id, NOT the unrelated_ev_id!
+    res4 = _submit(nrol, slug=SLUG, transition="PARK", evidence=target_evidence, commit=True)
+    assert res4.get("committed") is True
+    assert res4["evidence_id"] == target_ev_id  # Should bind to A2, NOT A3!
+
+    # 5. Verify that A3 (unrelated trailing article) was NOT corrupted (its posteriorImpact remained unchanged)
+    topic_after = _disk_topic(topic_path)
+    assert topic_after["evidenceLog"][-1]["id"] == unrelated_ev_id
+    assert "flagged for indicator review" in topic_after["evidenceLog"][-1].get("posteriorImpact", "")
+
+
+def test_scan_debate_failure_leaves_window_open(nrol, topic_path, monkeypatch):
+    """If the debate fails, we should not stamp lastScanned."""
+    suffix = uuid.uuid4().hex[:6]
+    articles = [{
+        "headline": f"Metric print {suffix}",
+        "url": f"https://example.test/debate/{suffix}",
+        "source": "test-wire", "date": "2026-06-10",
+        "relevance": "metric reported at 55 percent",
+    }]
+    monkeypatch.setattr(
+        nrol, "_search_web_articles",
+        lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
+    )
+
+    calls = {"n": 0}
+    def staged_chat(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"text": "DECISION\nARTICLE: A1\nACTION: PARK\nTAG: DATA\nCLAIM: metric\nREASON: strict matcher unsure\n",
+                    "model": "test-llm", "host": "local", "finish_reason": "stop", "reasoning_chars": 0}
+        else:
+            raise ValueError("Simulated debate LLM crash")
+
+    monkeypatch.setattr(nrol.llama_client, "chat", staged_chat)
+
+    topic_before = _disk_topic(topic_path)
+    last_scanned_before = topic_before.get("meta", {}).get("lastScanned")
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
+        fetch_full_articles=False,
+    ))
+
+    assert out["topics"][0]["scan_record"]["recorded"] is False
+    assert "deliberation failed" in out["topics"][0]["scan_record"]["skipped_reason"]
+
+    topic_after = _disk_topic(topic_path)
+    assert topic_after.get("meta", {}).get("lastScanned") == last_scanned_before
+
+
+def test_review_parked_debate_failure_aborts_without_recording(nrol, topic_path, monkeypatch):
+    """If the debate fails during review_parked, reviews should not be recorded."""
+    evidence = {"text": "Parked evidence to review.", "source": "test-wire", "tag": "INTEL"}
+    res = _submit(nrol, slug=SLUG, transition="PARK", evidence=evidence, commit=True)
+    assert res.get("committed") is True
+    ev_id = res["evidence_id"]
+
+    calls = {"n": 0}
+    def staged_chat(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"text": "DECISION\nARTICLE: A1\nACTION: PARK\nTAG: DATA\nCLAIM: still park\nREASON: unsure\n",
+                    "model": "test-llm", "host": "local", "finish_reason": "stop", "reasoning_chars": 0}
+        else:
+            raise ValueError("Simulated debate LLM crash during review")
+
+    monkeypatch.setattr(nrol.llama_client, "chat", staged_chat)
+
+    out = json.loads(nrol.review_parked(slug=SLUG, dry_run=False))
+
+    assert "error" in out
+    assert "deliberation/debate failed" in out["error"]
+
+    topic_after = _disk_topic(topic_path)
+    reviews = topic_after.get("governance", {}).get("parkedReviews", [])
+    assert not any(r.get("evidence_id") == ev_id for r in reviews)
+

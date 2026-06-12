@@ -140,10 +140,20 @@ async function refreshInstances() {
         } else {
             actions = `<button onclick="doAction('${s.name}', 'start')" class="btn btn-green">▶ Start</button>`;
         }
+        let dbLabel = '';
+        if (s.name === 'main') {
+            const dbs = window.availableDbs || [];
+            if (!dbs.includes(s.db)) dbs.push(s.db);
+            dbLabel = `<select class="select" onchange="switchDb(this.value)" style="padding: 1px 4px; font-size: 0.9em; font-family: inherit; background: var(--bg-card); color: var(--text-main); border: 1px solid var(--border-color); border-radius: 4px; cursor: pointer;">
+                ${dbs.map(db => `<option value="${esc(db)}"${db === s.db ? ' selected' : ''}>${esc(db)}</option>`).join('')}
+            </select>`;
+        } else {
+            dbLabel = `<span>${esc(s.db)}</span>`;
+        }
         return `<div class="instance-card">
             <div class="instance-top"><span class="dot ${on ? 'on' : 'off'}"></span>
                 <span class="instance-name">${esc(s.label)}</span>${managedTag}</div>
-            <div class="instance-meta"><span>:${s.port}</span><span>${esc(s.db)}</span><span>${s.pid ? 'PID ' + s.pid : '—'}</span></div>
+            <div class="instance-meta"><span>:${s.port}</span>${dbLabel}<span>${s.pid ? 'PID ' + s.pid : '—'}</span></div>
             <div class="instance-actions">${actions}</div>
         </div>`;
     }).join('');
@@ -475,6 +485,37 @@ async function ttydStop() {
     setTimeout(refreshTtyd, 500);
 }
 
+async function switchDb(dbName) {
+    showToast('switching database to ' + dbName + '...');
+    try {
+        const r = await fetch('/api/change-db', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ db_name: dbName }),
+        });
+        const d = await r.json();
+        if (r.ok) {
+            showToast('database changed successfully' + (d.restarted ? ' (restarting Loom)' : ''));
+        } else {
+            showToast('failed to change database: ' + (d.error || 'unknown error'));
+        }
+    } catch (e) {
+        showToast('error switching database: ' + e);
+    }
+    setTimeout(refreshAll, 1000);
+}
+
+window.availableDbs = [];
+async function loadDatabases() {
+    try {
+        const r = await fetch('/api/databases', { cache: 'no-store' });
+        if (r.ok) {
+            const d = await r.json();
+            window.availableDbs = d.databases || [];
+        }
+    } catch (e) { /* ignore */ }
+}
+
 // ── Boot ────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
     document.querySelectorAll('.nav-item').forEach(b =>
@@ -488,6 +529,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('btn-ttyd-stop').addEventListener('click', ttydStop);
     document.getElementById('btn-llama-switch').addEventListener('click', llamaSwitchModel);
 
+    await loadDatabases();
     await loadMeta();
     const saved = localStorage.getItem('loom-admin-view');
     if (saved && document.getElementById('view-' + saved)) setView(saved);
