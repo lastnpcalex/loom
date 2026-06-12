@@ -1103,8 +1103,8 @@ async def fork_conversation(
     cursor = await db.execute(
         """INSERT INTO conversations (title, character_id, persona_id, lore_ids,
            style_nudge, custom_scene, mode, project_dir, cc_model, cc_effort,
-           local_model, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           local_model, nrol_operator, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             title,
             orig.get("character_id"),
@@ -1117,6 +1117,10 @@ async def fork_conversation(
             orig.get("cc_model"),
             orig.get("cc_effort"),
             orig.get("local_model"),
+            # The operator lockdown is identity, not preference: a fork of an
+            # operator conversation must stay an operator conversation, or
+            # forking is a silent privilege escalation.
+            orig.get("nrol_operator", 0) or 0,
             now,
             now,
         ),

@@ -51,6 +51,23 @@ async def test_operator_creation_allows_claude(client):
     assert resp.status_code == 200
 
 
+async def test_fork_inherits_operator_flag(tmp_database, tmp_path):
+    # Observed live (conv 172): forking an operator conversation dropped
+    # nrol_operator, so the fork launched codex with no lockdown — a silent
+    # privilege escalation. The flag is identity and must survive the fork.
+    import database as db
+
+    conv = await db.create_conversation(
+        "Operator", mode="claude", project_dir=str(tmp_path)
+    )
+    await db.update_conversation_fields(conv["id"], nrol_operator=1)
+    msg = await db.add_message(conv["id"], "user", "hello")
+
+    fork = await db.fork_conversation(conv["id"], msg["id"])
+    forked = await db.get_conversation(fork["id"])
+    assert forked["nrol_operator"] == 1
+
+
 # --- Codex port --------------------------------------------------------------
 
 def test_codex_operator_launch_policies():
