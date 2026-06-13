@@ -678,6 +678,51 @@ def test_scan_feeds_matcher_full_article_excerpts(nrol, topic_path, monkeypatch)
     assert packet["excerpts"] == {"fetched": 1, "of": 1, "chars_cap": 2800}
 
 
+def test_run_news_scan_uses_precommitted_search_queries(nrol, topic_path, monkeypatch):
+    """Author-curated causal/actor queries must feed the operational scan."""
+    topic = _disk_topic(topic_path)
+    topic["searchQueries"] = ["US Iran nuclear deal sanctions relief"]
+    topic_path.write_text(json.dumps(topic, indent=2), encoding="utf-8")
+
+    article = {
+        "headline": "US and Iran reach framework agreement",
+        "url": "https://example.test/upstream-deal",
+        "source": "test-wire",
+        "date": "2026-06-10",
+        "relevance": "sanctions relief framework",
+    }
+    calls = []
+
+    def fake_search(query, channel, max_results):
+        calls.append((channel, query))
+        if channel == "searchQueries:01":
+            return [article]
+        return []
+
+    monkeypatch.setattr(nrol, "_search_web_articles", fake_search)
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local"},
+    )
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "PARK"}, "tag": "EVENT",
+         "claim": "framework agreement", "reason": "relevant upstream development"},
+    ])
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=True,
+        fetch_full_articles=False, deliberate=False,
+    ))
+    assert "error" not in out, out
+    packet = out["topics"][0]
+    assert packet["queries"]["searchQueries:01"] == "US Iran nuclear deal sanctions relief"
+    assert "recent period" not in packet["queries"]["wildcard"]
+    surfaced = packet["articles"][0].get("article") or packet["articles"][0]
+    assert surfaced["headline"] == article["headline"]
+    assert any(channel == "searchQueries:01" for channel, _query in calls)
+
+
 def test_scan_deliberation_rescues_park_into_proposal(nrol, topic_path, monkeypatch):
     """The strict matcher's PARK is not the last word: the advocate/rebut/
     jury debate can rescue a parked article into an OBSERVE, which lands in
@@ -1408,6 +1453,31 @@ def test_design_gate_flags_duplicate_amplifier(nrol, topic_path):
     assert out.get("committed") is True, out
     gate = _disk_topic(topic_path)["governance"]["designGate"]
     assert any("DUPLICATE AMPLIFIER" in w for w in gate["warnings"])
+
+
+def test_governor_falsifiability_uses_top_level_signed_anti_indicators(nrol, topic_path):
+    topic = _disk_topic(topic_path)
+    for tier_items in topic["indicators"]["tiers"].values():
+        for ind in tier_items:
+            ind["posteriorEffect"] = "H1 +1pp; H2 +1pp; H3 +1pp."
+    topic["indicators"]["anti_indicators"] = [{
+        "id": "anti_all_signed",
+        "desc": "Synthetic contrary evidence for every hypothesis.",
+        "status": "NOT_FIRED",
+        "posteriorEffect": "H1 -3pp; H2 -3pp; H3 -3pp.",
+        "likelihoods": {"H1": 0.4, "H2": 0.4, "H3": 0.4},
+    }]
+    topic["indicators"]["tiers"].pop("anti_indicators", None)
+
+    governor = nrol._import_from_repo("governor")
+    report = governor.validate_hypotheses(topic)
+    assert all(v["falsifiability"] == "YES" for v in report.values())
+    assert all(v["checks"]["has_contrary_indicators"] for v in report.values())
+
+    topic["indicators"]["anti_indicators"][0]["posteriorEffect"] = "H1 +3pp; H2 +3pp; H3 +3pp."
+    report = governor.validate_hypotheses(topic)
+    assert all(v["falsifiability"] == "NO" for v in report.values())
+    assert not any(v["checks"]["has_contrary_indicators"] for v in report.values())
 
 
 def test_news_scan_dedup_indexing_bug(nrol, topic_path):

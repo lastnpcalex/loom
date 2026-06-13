@@ -35,6 +35,17 @@ _MUTATING_TRANSITIONS = {"PARK", "FIRE", "OBSERVE", "SCHEMA_GAP"}
 _MAX_SEARCH_RESULTS_PER_CHANNEL = 6
 
 
+def _to_int_idx(idx) -> int:
+    if isinstance(idx, (int, float)):
+        return int(idx)
+    try:
+        if isinstance(idx, str) and "." in idx:
+            return int(float(idx))
+        return int(idx)
+    except (ValueError, TypeError):
+        return 0
+
+
 def _json(obj: Any) -> str:
     return json.dumps(obj, indent=2, ensure_ascii=True, default=str)
 
@@ -347,13 +358,44 @@ def _topic_query(topic: dict, channel: str, window_label: str) -> str:
     title = meta.get("title") or meta.get("slug") or ""
     question = meta.get("question") or meta.get("statement") or meta.get("description") or ""
     if channel == "wildcard":
-        return _compact_query(f"{title} {question} latest news {window_label}")
+        actors = []
+        for actor in (topic.get("actorModel", {}).get("actors", {}) or {}).values():
+            if isinstance(actor, dict):
+                actors.append(actor.get("name") or "")
+        actor_text = " ".join(a for a in actors if a)
+        return _compact_query(f"{title} {actor_text} latest developments news")
     hyp = (topic.get("model", {}).get("hypotheses") or {}).get(channel, {}) or {}
     if isinstance(hyp, dict):
         label = hyp.get("label") or hyp.get("description") or hyp.get("desc") or ""
     else:
         label = str(hyp)
     return _compact_query(f"{title} {question} {channel} {label} latest news {window_label}")
+
+
+def _search_query_specs(topic: dict, window_label: str) -> list[dict]:
+    """Return explicit web-search channels for an MCP-owned scan."""
+    specs = []
+    for channel in (topic.get("model", {}).get("hypotheses") or {}).keys():
+        specs.append({"channel": channel, "query": _topic_query(topic, channel, window_label)})
+    specs.append({"channel": "wildcard", "query": _topic_query(topic, "wildcard", window_label)})
+
+    for idx, raw in enumerate(topic.get("searchQueries") or [], start=1):
+        if isinstance(raw, dict):
+            query = raw.get("query") or raw.get("q") or raw.get("text") or ""
+            label = raw.get("channel") or raw.get("label") or f"searchQueries:{idx:02d}"
+        else:
+            query = str(raw or "")
+            label = f"searchQueries:{idx:02d}"
+        query = (
+            str(query)
+            .replace("{window}", window_label)
+            .replace("{window_label}", window_label)
+            .replace("{date}", window_label)
+        )
+        query = _compact_query(query)
+        if query:
+            specs.append({"channel": str(label), "query": query})
+    return specs
 
 
 def _search_web_articles(query: str, channel: str, max_results: int) -> list[dict]:
@@ -489,10 +531,10 @@ def _run_debate(
             idx: {"action": v["action"], "rationale": v.get("rationale", "")}
             for idx, v in jury.items()
         }
-        decisions_by_idx = {d.get("idx"): d for d in decisions}
+        decisions_by_idx = {str(d.get("idx")): d for d in decisions}
         packet["rescued"] = sum(
             1 for idx, v in overrides.items()
-            if (decisions_by_idx.get(idx, {}).get("action", {}).get("kind") == "PARK"
+            if (decisions_by_idx.get(str(idx), {}).get("action", {}).get("kind") == "PARK"
                 and v["action"]["kind"] in ("FIRE", "OBSERVE"))
         )
         return overrides, packet
@@ -508,8 +550,8 @@ def _apply_jury_overrides(decisions: list, jury_overrides: dict) -> list:
     effective = []
     for d in decisions:
         idx = d.get("idx")
-        if idx in jury_overrides:
-            override = jury_overrides[idx]
+        override = jury_overrides.get(idx) or jury_overrides.get(str(idx))
+        if override:
             override_action = override["action"]
             nd = dict(d)
             if override_action["kind"] == "COMMIT":
@@ -1600,7 +1642,8 @@ def run_news_scan(
             classification = (meta.get("classification") or "ROUTINE").upper()
             floor = 12 if classification == "ALERT" else (7 * 24 if classification == "CALIBRATION" else 72)
             window = mutation.compute_time_window(topic, tempo_floor_hours=floor)
-            channels = list((topic.get("model", {}).get("hypotheses") or {}).keys()) + ["wildcard"]
+            query_specs = _search_query_specs(topic, window.get("label", "recent period"))
+            channels = [spec["channel"] for spec in query_specs]
 
             store.record(
                 job_id,
@@ -1613,8 +1656,9 @@ def run_news_scan(
             parsed_by_channel = {}
             queries = {}
             search_errors = {}
-            for channel in channels:
-                query = _topic_query(topic, channel, window.get("label", "recent period"))
+            for spec in query_specs:
+                channel = spec["channel"]
+                query = spec["query"]
                 queries[channel] = query
                 try:
                     parsed_by_channel[channel] = _search_web_articles(
@@ -1718,7 +1762,8 @@ def run_news_scan(
                         pstore = _proposal_store()
                         for d in review_decisions:
                             idx = d.get("idx") or 0
-                            art = deduped[idx - 1] if 0 < idx <= len(deduped) else None
+                            idx_int = _to_int_idx(idx)
+                            art = deduped[idx_int - 1] if 0 < idx_int <= len(deduped) else None
                             if art is None:
                                 continue
                             try:
@@ -1727,7 +1772,10 @@ def run_news_scan(
                                 secondary_evidence_ids = []
                                 for dup_d in dups:
                                     dup_idx = dup_d["idx"]
-                                    dup_art = deduped[dup_idx - 1]
+                                    dup_idx_int = _to_int_idx(dup_idx)
+                                    dup_art = deduped[dup_idx_int - 1] if 0 < dup_idx_int <= len(deduped) else None
+                                    if dup_art is None:
+                                        continue
                                     dup_inner = dup_art.get("article", dup_art)
                                     dup_entry = news.article_to_evidence_entry(
                                         dup_inner, round_num=1,
@@ -2099,7 +2147,8 @@ def replay_scan_run(
             if mode in {"proposal_only", "safe_apply"}:
                 for d in review_decisions:
                     idx = d.get("idx") or 0
-                    if not (0 < idx <= len(articles)):
+                    idx_int = _to_int_idx(idx)
+                    if not (0 < idx_int <= len(articles)):
                         proposal_errors.append({"idx": idx, "error": "article index out of range"})
                         continue
                     action = d.get("action") or {}
@@ -2109,7 +2158,7 @@ def replay_scan_run(
                             action.get("indicator_id", ""), action.get("value"),
                         )
                         art_rec = pstore.submit_article(
-                            _article_for_proposal(articles[idx - 1]),
+                            _article_for_proposal(articles[idx_int - 1]),
                             submitted_by="scan-replay",
                         )
                         stamp = _deliberation_stamp_from_debate(d, debate_packet)
@@ -2650,9 +2699,10 @@ def review_parked(
         errors = {}
         for d in decisions:
             idx = d.get("idx") or 0
-            if not (0 < idx <= len(selected)):
+            idx_int = _to_int_idx(idx)
+            if not (0 < idx_int <= len(selected)):
                 continue
-            ev_id = selected[idx - 1]
+            ev_id = selected[idx_int - 1]
             action = d.get("action", {}) or {}
             kind = action.get("kind", "")
             review = {
@@ -2662,7 +2712,7 @@ def review_parked(
             }
             if kind in {"FIRE", "OBSERVE"} and not dry_run:
                 try:
-                    art_rec = pstore.submit_article(articles[idx - 1], submitted_by="review-parked")
+                    art_rec = pstore.submit_article(articles[idx_int - 1], submitted_by="review-parked")
                     _validate_proposal_shape(
                         topic, kind, action.get("indicator_id", ""), action.get("value"),
                     )
