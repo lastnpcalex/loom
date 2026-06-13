@@ -59,6 +59,10 @@ Override with `NROL_AO_ACTIVITY_DIR` if the dashboard should read another path.
 - `topic_status`
 - `build_news_scan_plan`
 - `run_news_scan`
+- `list_scan_runs`
+- `read_scan_run`
+- `replay_scan_run`
+- `undo_scan_run`
 - `apply_news_scan_results`
 - `triage_headline`
 - `build_matcher_prompt`
@@ -87,7 +91,9 @@ dashboard monitoring, and only mutates topic JSON when called with
 prompt plus the follow-up `apply_matcher_output` handoff.
 
 For news refreshes, prefer `run_news_scan`. It is the MCP-side worker path:
-the server selects stale topics, performs web search, dedupes articles, runs
+the server selects stale topics, performs web search, strips tracker query
+parameters for duplicate detection, dedupes articles, fetches readable article
+text and best-effort publication metadata, freshness-gates matcher input, runs
 matcher deliberation through the configured local model endpoint, and returns
 an operator packet. `build_news_scan_plan` and `apply_news_scan_results` remain
 debug/manual override tools.
@@ -97,5 +103,20 @@ debug/manual override tools.
 - `dry_run=false` records successful scan coverage by updating
   `topic.meta.lastScanned`, even when `commit=false`.
 - `dry_run=true` performs the scan preview without stamping `lastScanned`.
-- `commit=true` is the separate evidence/posterior mutation path and still
-  requires Loom approval.
+- `commit_policy="safe"` is the review-first scan policy. PARK/SCHEMA_GAP may
+  auto-apply because they cannot move posteriors; FIRE/OBSERVE are filed as
+  pending proposals with deliberation attached. This remains true even if
+  `commit=true` is accidentally supplied.
+- Without `commit_policy="safe"`, `commit=true` is the direct evidence/posterior
+  mutation path and still requires Loom approval.
+
+Freshness rules are part of scan safety. Dated articles older than the adaptive
+scan window are dropped. Search results with no date may still be used as
+context, but if full-article metadata reveals an old publication date they are
+dropped before matching. Undated FIRE/OBSERVE candidates are downgraded to PARK
+instead of proposal filing.
+
+`undo_scan_run` is a ledger cleanup tool for dirty scan activity/digest records.
+It defaults to dry-run and can match by `job_id`, `slug`, or
+`min_article_count`. It does not roll back topic evidence, pending proposals,
+posteriors, or `lastScanned`.

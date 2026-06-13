@@ -16,9 +16,10 @@ import ssl
 import sys
 import uuid
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -33,6 +34,18 @@ _DEFAULT_REPO = Path(r"C:\Claude-Code\NROL-AO\temp-repo")
 _ALLOWED_TRANSITIONS = {"PARK", "FIRE", "OBSERVE", "SCHEMA_GAP", "IGNORE"}
 _MUTATING_TRANSITIONS = {"PARK", "FIRE", "OBSERVE", "SCHEMA_GAP"}
 _MAX_SEARCH_RESULTS_PER_CHANNEL = 6
+_TRACKING_QUERY_KEYS = {
+    "fbclid",
+    "gclid",
+    "dclid",
+    "msclkid",
+    "mc_cid",
+    "mc_eid",
+    "igshid",
+    "vero_id",
+    "yclid",
+    "wickedid",
+}
 
 
 def _to_int_idx(idx) -> int:
@@ -410,11 +423,18 @@ def _search_web_articles(query: str, channel: str, max_results: int) -> list[dic
         hits = list(ddgs.text(query, max_results=limit))
 
     articles = []
-    today = datetime.now(timezone.utc).date().isoformat()
+    retrieved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     for hit in hits:
         headline = (hit.get("title") or "").strip()
         url = (hit.get("href") or hit.get("url") or "").strip()
         body = (hit.get("body") or hit.get("snippet") or "").strip()
+        published = (
+            hit.get("date")
+            or hit.get("published")
+            or hit.get("published_at")
+            or hit.get("time")
+            or ""
+        )
         if not headline and not url:
             continue
         source = ""
@@ -423,18 +443,124 @@ def _search_web_articles(query: str, channel: str, max_results: int) -> list[dic
             source = urlparse(url).netloc.replace("www.", "")
         except Exception:
             pass
-        articles.append(
-            {
-                "headline": headline or url,
-                "url": url,
-                "source": source or "web_search",
-                "date": hit.get("date") or today,
-                "relevance": body[:500] or f"Surfaced by server-side search channel {channel}.",
-                "query": query,
-                "channel": channel,
-            }
-        )
+        article = {
+            "headline": headline or url,
+            "url": url,
+            "canonical_url": _canonical_article_url(url),
+            "source": source or "web_search",
+            "relevance": body[:500] or f"Surfaced by server-side search channel {channel}.",
+            "query": query,
+            "channel": channel,
+            "retrieved_at": retrieved_at,
+        }
+        if published:
+            article["date"] = str(published)
+            article["published"] = str(published)
+        articles.append(article)
     return articles
+
+
+def _canonical_article_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        scheme = (parsed.scheme or "https").lower()
+        netloc = parsed.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        query_pairs = []
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            k_lower = key.lower()
+            if k_lower.startswith("utm_") or k_lower in _TRACKING_QUERY_KEYS:
+                continue
+            query_pairs.append((key, value))
+        query = urlencode(sorted(query_pairs), doseq=True)
+        path = parsed.path or "/"
+        if path != "/":
+            path = path.rstrip("/")
+        return urlunparse((scheme, netloc, path, "", query, ""))
+    except Exception:
+        return raw
+
+
+def _article_scan_key(article: dict) -> str:
+    import re
+
+    art = article.get("article", article) if isinstance(article, dict) else {}
+    url = _canonical_article_url(art.get("canonical_url") or art.get("url") or "")
+    if url:
+        return f"url::{url}"
+    headline = (art.get("headline") or art.get("title") or "").strip().lower()
+    headline = re.sub(r"\s+", " ", headline)[:160]
+    return f"hl::{headline}" if headline else ""
+
+
+def _prior_article_keys(topic: dict) -> set[str]:
+    keys = set()
+    for entry in topic.get("evidenceLog", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        key = _article_scan_key({
+            "url": entry.get("url") or "",
+            "headline": entry.get("headline") or entry.get("text") or "",
+        })
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _normalize_scan_datetime(value: str) -> datetime | None:
+    dt = _parse_iso_date(str(value or ""))
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _filter_scan_articles(topic: dict, articles: list[dict], window: dict) -> tuple[list[dict], dict]:
+    """Keep only fresh or undated-but-not-seen scan results before matching."""
+    now = datetime.now(timezone.utc)
+    try:
+        hours = max(1.0, float((window or {}).get("hours") or 24.0))
+    except (TypeError, ValueError):
+        hours = 24.0
+    cutoff = now - timedelta(hours=hours)
+    prior_keys = _prior_article_keys(topic)
+    stats = {
+        "input": len(articles or []),
+        "kept": 0,
+        "dated_in_window": 0,
+        "undated_kept": 0,
+        "old_dated_dropped": 0,
+        "prior_seen_dropped": 0,
+        "cutoff": cutoff.isoformat(timespec="seconds"),
+    }
+    kept = []
+    for article in articles or []:
+        key = _article_scan_key(article)
+        if key and key in prior_keys:
+            stats["prior_seen_dropped"] += 1
+            continue
+        art = article.get("article", article) if isinstance(article, dict) else {}
+        published = art.get("published") or art.get("published_at") or art.get("date") or art.get("time") or ""
+        published_dt = _normalize_scan_datetime(published)
+        if published_dt is not None:
+            if published_dt < cutoff:
+                stats["old_dated_dropped"] += 1
+                continue
+            art["freshness"] = "dated_in_window"
+            art["freshness_cutoff"] = stats["cutoff"]
+            stats["dated_in_window"] += 1
+        else:
+            art["freshness"] = "undated_not_previously_seen"
+            art["freshness_cutoff"] = stats["cutoff"]
+            stats["undated_kept"] += 1
+        kept.append(article)
+    stats["kept"] = len(kept)
+    return kept, stats
 
 
 def _run_debate(
@@ -629,9 +755,29 @@ def _split_safe_policy_decisions(news, articles: list, decisions: list) -> tuple
     safe_to_apply: list[dict] = []
     to_propose: list[dict] = []
 
+    def freshness_gated(decision: dict) -> dict:
+        kind = (decision.get("action") or {}).get("kind")
+        if kind not in {"FIRE", "OBSERVE"}:
+            return decision
+        idx_int = _to_int_idx(decision.get("idx"))
+        art = articles[idx_int - 1] if 0 < idx_int <= len(articles) else {}
+        inner = art.get("article", art) if isinstance(art, dict) else {}
+        if inner.get("freshness") != "undated_not_previously_seen":
+            return decision
+        downgraded = dict(decision)
+        downgraded["action"] = {"kind": "PARK"}
+        downgraded["freshness_gate"] = "undated_posterior_mover_downgraded"
+        reason = downgraded.get("reason") or downgraded.get("claim") or ""
+        downgraded["reason"] = (
+            "freshness gate: undated search result cannot file FIRE/OBSERVE; "
+            f"original action was {kind}. {reason}"
+        )[:500]
+        return downgraded
+
     for d in canonical:
+        d = freshness_gated(d)
         kind = (d.get("action") or {}).get("kind")
-        dups = duplicate_map.get(d.get("idx"), [])
+        dups = [freshness_gated(dup) for dup in duplicate_map.get(d.get("idx"), [])]
         if kind in {"FIRE", "OBSERVE"}:
             d = dict(d)
             d["_duplicate_decisions"] = dups
@@ -646,6 +792,54 @@ def _split_safe_policy_decisions(news, articles: list, decisions: list) -> tuple
                     safe_to_apply.append(dup)
 
     return safe_to_apply, to_propose
+
+
+def _fetch_article_payload(url: str, max_chars: int, timeout_sec: float = 15.0) -> dict:
+    """Fetch readable article text and best-effort publication metadata."""
+    if not url:
+        return {}
+    try:
+        import trafilatura
+
+        html = None
+        try:
+            html = trafilatura.fetch_url(url)
+        except Exception:
+            html = None
+        if not html:
+            with httpx.Client(
+                timeout=timeout_sec,
+                follow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; NROL-AO scan)"},
+            ) as client:
+                r = client.get(url)
+                r.raise_for_status()
+                html = r.text
+
+        payload: dict[str, Any] = {}
+        try:
+            metadata = trafilatura.extract_metadata(html)
+            if metadata is not None:
+                for src_key, out_key in (
+                    ("date", "published"),
+                    ("title", "metadata_title"),
+                    ("sitename", "metadata_source"),
+                    ("hostname", "metadata_host"),
+                    ("url", "metadata_url"),
+                ):
+                    value = getattr(metadata, src_key, None)
+                    if value:
+                        payload[out_key] = str(value)
+        except Exception:
+            pass
+
+        text = trafilatura.extract(html, include_comments=False, include_tables=True) or ""
+        text = " ".join(text.split())
+        if text:
+            payload["excerpt"] = text[:max_chars]
+        return payload
+    except Exception:
+        return {}
 
 
 def _fetch_article_excerpt(url: str, max_chars: int, timeout_sec: float = 15.0) -> str:
@@ -720,7 +914,7 @@ def _candidate_duplicate_evidence(
     decision_text = " ".join(str(decision.get(k) or "") for k in ("claim", "reason"))
     probe_text = f"{art_text} {decision_text}".strip()
     art_url = (art.get("url") or "").strip()
-    art_time = _parse_iso_date(
+    art_time = _normalize_scan_datetime(
         str(art.get("published") or art.get("date") or art.get("time") or "")
     )
     rows = []
@@ -730,7 +924,7 @@ def _candidate_duplicate_evidence(
         if art_url and art_url == (entry.get("url") or "").strip():
             score += 1.0
             reasons.append("same_url")
-        entry_time = _parse_iso_date(str(entry.get("time") or ""))
+        entry_time = _normalize_scan_datetime(str(entry.get("time") or ""))
         if art_time and entry_time:
             delta = abs((art_time - entry_time).days)
             if delta <= window_days:
@@ -846,8 +1040,8 @@ def help() -> str:
                 "Call nrol_status to verify the MCP bridge and configured repo.",
                 "Call topic_status or list_topics to choose scope.",
                 "Call read_topic or list_hypotheses to inspect a topic.",
-                "Call run_news_scan for MCP-side search and deliberation.",
-                "Review the returned operator packet.",
+                "Call run_news_scan with commit_policy='safe' for review-first MCP-side search and deliberation.",
+                "Review the returned operator packet and brief pending FIRE/OBSERVE proposals before committing.",
                 "Use commit=true only when explicit mutation is intended and Loom approval is expected.",
             ],
             "proposal_lifecycle": [
@@ -861,6 +1055,17 @@ def help() -> str:
                 "commit_false": "No evidence/posterior mutation.",
                 "dry_run_false": "Records successful scan coverage by stamping topic.meta.lastScanned.",
                 "dry_run_true": "Preview only; does not stamp lastScanned.",
+                "commit_policy_safe": (
+                    "PARK/SCHEMA_GAP may auto-apply; FIRE/OBSERVE are forced "
+                    "to pending proposals with deliberation attached. Safe "
+                    "policy still wins if commit=true is supplied."
+                ),
+                "freshness": (
+                    "Tracker query params are stripped for duplicate keys; "
+                    "old dated articles are dropped; full-article metadata "
+                    "can supply missing publication dates; undated FIRE/OBSERVE "
+                    "candidates are downgraded to PARK."
+                ),
             },
             "do_not": [
                 "Do not perform operator-side web search as a fallback for run_news_scan.",
@@ -883,6 +1088,10 @@ def help() -> str:
                 "commit_match",
                 "list_proposals",
                 "withdraw_proposal",
+                "list_scan_runs",
+                "read_scan_run",
+                "replay_scan_run",
+                "undo_scan_run",
             ],
         }
     )
@@ -1602,14 +1811,16 @@ def run_news_scan(
 
     dry_run=true never mutates state and does not stamp lastScanned.
     dry_run=false records successful scan coverage by stamping lastScanned.
-    commit=true additionally applies evidence decisions after Loom approval.
+    commit=true applies evidence decisions after Loom approval only when
+    commit_policy is not "safe".
 
     commit_policy="safe" is the scheduled-scan policy (spec Flow B): PARK
     and SCHEMA_GAP decisions auto-apply (they cannot move posteriors —
     engine-enforced), while FIRE/OBSERVE decisions are filed as pending
-    proposals for operator review via list_proposals/commit_match. No
-    posterior ever moves without a human approving it. A digest is written
-    beside the activity ledger.
+    proposals for operator review via list_proposals/commit_match, even if
+    commit=true is supplied. No posterior ever moves without a human approving
+    a proposal or direct non-safe commit. A digest is written beside the
+    activity ledger.
     """
     store = _activity_store()
     job_id = new_job_id("news-scan-worker")
@@ -1618,6 +1829,7 @@ def run_news_scan(
         engine = _import_from_repo("engine")
         mutation = _import_from_repo("framework.news_mutation")
         news = _import_from_repo("framework.news_observation_pipeline")
+        pipeline = _import_from_repo("framework.pipeline")
         topics = _select_scan_topics(engine, slugs, max_topics)
         store.record(
             job_id,
@@ -1670,8 +1882,8 @@ def run_news_scan(
                     search_errors[channel] = str(exc)
                     parsed_by_channel[channel] = []
 
-            deduped, surfaced = mutation.dedupe_articles(parsed_by_channel)
-            total_articles += len(deduped)
+            deduped_raw, surfaced = mutation.dedupe_articles(parsed_by_channel)
+            deduped, freshness_stats = _filter_scan_articles(topic, deduped_raw, window)
             matcher_output = ""
             decisions = []
             applied = None
@@ -1691,15 +1903,34 @@ def run_news_scan(
                 fetched = 0
                 for item in deduped:
                     art = item.get("article", item) if isinstance(item, dict) else item
-                    excerpt = _fetch_article_excerpt(art.get("url", ""), excerpt_chars)
+                    payload = _fetch_article_payload(art.get("url", ""), excerpt_chars)
+                    if isinstance(payload, str):
+                        payload = {"excerpt": payload}
+                    if payload.get("published") and not (
+                        art.get("published") or art.get("date") or art.get("time")
+                    ):
+                        art["published"] = payload["published"]
+                        art["date"] = payload["published"]
+                    for meta_key in ("metadata_title", "metadata_source", "metadata_host", "metadata_url"):
+                        if payload.get(meta_key) and not art.get(meta_key):
+                            art[meta_key] = payload[meta_key]
+                    excerpt = payload.get("excerpt") or ""
                     if excerpt:
                         art["excerpt"] = excerpt
                         fetched += 1
+                deduped, postfetch_freshness_stats = _filter_scan_articles(topic, deduped, window)
+                freshness_stats = {
+                    **postfetch_freshness_stats,
+                    "prefetch": freshness_stats,
+                    "postfetch": postfetch_freshness_stats,
+                }
                 excerpt_stats = {
                     "fetched": fetched,
                     "of": len(deduped),
+                    "prefetch_of": freshness_stats["prefetch"].get("kept"),
                     "chars_cap": excerpt_chars,
                 }
+            total_articles += len(deduped)
             if deduped:
                 matcher_prompt = news.build_matcher_prompt(topic, deduped)
                 store.record(
@@ -1750,7 +1981,7 @@ def run_news_scan(
                     decisions = _apply_jury_overrides(decisions, jury_overrides)
 
                 if "debate" not in search_errors:
-                    if commit_policy == "safe" and not commit and not dry_run and decisions:
+                    if commit_policy == "safe" and not dry_run and decisions:
                         safe_decisions, review_decisions = _split_safe_policy_decisions(
                             news, deduped, decisions
                         )
@@ -1782,8 +2013,8 @@ def run_news_scan(
                                         default_tag=dup_d.get("tag", "EVENT") or "EVENT",
                                     )
                                     dup_entry["claim"] = dup_d.get("claim") or dup_entry.get("text", "")
-                                    dup_result = engine.process_evidence(
-                                        slug=slug, entry=dup_entry,
+                                    dup_result = pipeline.process_evidence(
+                                        slug, dup_entry,
                                         fired_indicator_id=None,
                                         reason=f"Duplicate coverage of canonical article A{idx}",
                                     )
@@ -1816,11 +2047,13 @@ def run_news_scan(
                                 search_errors[f"proposal_idx_{idx}"] = str(exc)
                         packet_policy = {
                             "policy": "safe",
+                            "commit_requested": bool(commit),
+                            "posterior_movers_forced_to_review": True,
                             "auto_committed": (applied or {}),
                             "proposals_filed": proposals_filed,
                         }
 
-                    if commit:
+                    if commit and commit_policy != "safe":
                         denied = _ask_loom_permission(
                             "nrol_ao_run_news_scan",
                             {
@@ -1876,6 +2109,8 @@ def run_news_scan(
                 "time_window": window,
                 "queries": queries,
                 "search_errors": search_errors,
+                "raw_article_count": len(deduped_raw),
+                "freshness_filter": freshness_stats,
                 "articles": deduped,
                 "surfaced": surfaced,
                 "excerpts": excerpt_stats,
@@ -2043,6 +2278,118 @@ def _read_digest_json(path: Path) -> dict:
     return json.loads(resolved.read_text(encoding="utf-8"))
 
 
+def _scan_packet_article_count(packet: dict) -> int:
+    counts = []
+    try:
+        counts.append(int(packet.get("article_count") or 0))
+    except Exception:
+        pass
+    for topic_packet in packet.get("topics", []) or []:
+        if not isinstance(topic_packet, dict):
+            continue
+        for key in ("raw_article_count", "article_count"):
+            try:
+                counts.append(int(topic_packet.get(key) or 0))
+            except Exception:
+                pass
+        if "articles" in topic_packet:
+            try:
+                counts.append(len(topic_packet.get("articles") or []))
+            except Exception:
+                pass
+    return max(counts or [0])
+
+
+def _scan_packet_slugs(packet: dict) -> set[str]:
+    return {
+        str(topic_packet.get("slug") or "")
+        for topic_packet in packet.get("topics", []) or []
+        if isinstance(topic_packet, dict) and topic_packet.get("slug")
+    }
+
+
+def _scan_packet_matches(packet: dict, job_id: str, slug: str, min_article_count: int) -> bool:
+    if job_id and packet.get("job_id") != job_id:
+        return False
+    if slug and slug not in _scan_packet_slugs(packet):
+        return False
+    if job_id:
+        return True
+    return _scan_packet_article_count(packet) >= min_article_count
+
+
+def _compact_activity_event(event: dict) -> dict:
+    fields = event
+    compact = {
+        "job_id": fields.get("job_id"),
+        "status": fields.get("status"),
+        "updated_at": fields.get("time"),
+        "task": fields.get("task"),
+        "slug": fields.get("slug"),
+        "model": fields.get("model"),
+        "transition": fields.get("transition"),
+        "duration_ms": fields.get("duration_ms"),
+        "error": fields.get("error"),
+        "summary": fields.get("summary"),
+    }
+    return {k: v for k, v in compact.items() if v is not None}
+
+
+def _rewrite_activity_without_jobs(job_ids: set[str]) -> dict:
+    store = _activity_store()
+    log_path = store.log_path
+    if not log_path.exists():
+        return {"activity_events_removed": 0, "activity_log": str(log_path)}
+
+    kept_events = []
+    removed = 0
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            kept_events.append(line)
+            continue
+        if event.get("job_id") in job_ids:
+            removed += 1
+            continue
+        kept_events.append(event)
+
+    tmp = log_path.with_suffix(".jsonl.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for event in kept_events:
+            if isinstance(event, str):
+                f.write(event + "\n")
+            else:
+                f.write(json.dumps(event, ensure_ascii=True, default=str) + "\n")
+    tmp.replace(log_path)
+
+    latest_by_job: dict[str, dict] = {}
+    for event in kept_events:
+        if not isinstance(event, dict):
+            continue
+        jid = event.get("job_id")
+        if jid:
+            latest_by_job[jid] = _compact_activity_event(event)
+    jobs = sorted(
+        latest_by_job.values(),
+        key=lambda j: j.get("updated_at", ""),
+        reverse=True,
+    )[:100]
+    snapshot = {
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "active": sum(1 for j in jobs if j.get("status") in {"queued", "running"}),
+        "jobs": jobs,
+    }
+    store._write_snapshot(snapshot)
+    return {
+        "activity_events_removed": removed,
+        "activity_log": str(log_path),
+        "snapshot": str(store.snapshot_path),
+    }
+
+
 def _article_for_proposal(item: dict) -> dict:
     return item.get("article", item) if isinstance(item, dict) else item
 
@@ -2091,6 +2438,128 @@ def read_scan_run(path: str = "") -> str:
         return _json({"path": source, "packet": packet})
     except Exception as exc:
         return _json({"error": str(exc), "path": path})
+
+
+@mcp.tool()
+def undo_scan_run(
+    job_id: str = "",
+    slug: str = "",
+    min_article_count: int = 50,
+    dry_run: bool = True,
+    remove_digests: bool = True,
+) -> str:
+    """Remove dirty scan run records from the MCP activity ledger.
+
+    This only edits MCP activity/digest records. It does not roll back topic
+    evidence, pending proposals, posteriors, or lastScanned stamps.
+    """
+    try:
+        threshold = max(1, int(min_article_count or 50))
+        root = _digest_root()
+        candidates: dict[str, dict] = {}
+        digest_files = sorted(root.glob("digest-*.json")) if root.exists() else []
+        for path in digest_files:
+            try:
+                packet = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not _scan_packet_matches(packet, job_id, slug, threshold):
+                continue
+            jid = packet.get("job_id") or path.stem
+            candidates[jid] = {
+                "job_id": jid,
+                "path": str(path),
+                "markdown_path": str(path.with_suffix(".md")),
+                "article_count": _scan_packet_article_count(packet),
+                "slugs": sorted(_scan_packet_slugs(packet)),
+            }
+
+        store = _activity_store()
+        if store.log_path.exists():
+            for line in store.log_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if event.get("task") != "run_news_scan" or event.get("status") != "completed":
+                    continue
+                response = event.get("response")
+                if not response:
+                    continue
+                try:
+                    packet = json.loads(response)
+                except Exception:
+                    continue
+                if not _scan_packet_matches(packet, job_id, slug, threshold):
+                    continue
+                jid = event.get("job_id") or packet.get("job_id")
+                if not jid:
+                    continue
+                candidates.setdefault(jid, {
+                    "job_id": jid,
+                    "path": packet.get("digest_path", ""),
+                    "markdown_path": packet.get("digest_path", ""),
+                    "article_count": _scan_packet_article_count(packet),
+                    "slugs": sorted(_scan_packet_slugs(packet)),
+                })
+
+        if not candidates:
+            return _json({
+                "dry_run": dry_run,
+                "matched": 0,
+                "criteria": {
+                    "job_id": job_id,
+                    "slug": slug,
+                    "min_article_count": threshold,
+                },
+                "note": "No matching scan activity/digest records found.",
+            })
+
+        if dry_run:
+            return _json({
+                "dry_run": True,
+                "matched": len(candidates),
+                "candidates": list(candidates.values()),
+                "note": (
+                    "Dry run only. Re-run with dry_run=false to remove MCP "
+                    "activity/digest records. Topic evidence/proposals are not changed."
+                ),
+            })
+
+        job_ids = set(candidates.keys())
+        rewrite = _rewrite_activity_without_jobs(job_ids)
+        removed_files = []
+        if remove_digests:
+            for candidate in candidates.values():
+                for key in ("path", "markdown_path"):
+                    value = candidate.get(key) or ""
+                    if not value:
+                        continue
+                    path = Path(value)
+                    try:
+                        root_resolved = root.resolve()
+                        resolved = path.resolve()
+                        if root_resolved not in resolved.parents:
+                            continue
+                        if resolved.exists():
+                            resolved.unlink()
+                            removed_files.append(str(resolved))
+                    except Exception:
+                        continue
+
+        return _json({
+            "dry_run": False,
+            "matched": len(candidates),
+            "removed_job_ids": sorted(job_ids),
+            "removed_digest_files": removed_files,
+            **rewrite,
+            "note": (
+                "Removed MCP scan ledger records only. Topic evidence, pending "
+                "proposals, posteriors, and lastScanned were not changed."
+            ),
+        })
+    except Exception as exc:
+        return _json({"error": str(exc), "dry_run": dry_run})
 
 
 @mcp.tool()

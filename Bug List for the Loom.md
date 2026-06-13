@@ -1,0 +1,8 @@
+Bug List for the Loom:
+
+- "Permission request pending:" with the cyan dot is completely unnecessary now that perm hooks are firing correctly
+- when having two threads open in the same tree, the UX is extremely confusing. we should lock out messages on an actively generating tree on branches that are not the active branch, because i can do things like open a new conversation in that tree, send a message, then after my message lands, the message that i queued up from a separate branch ends up in the context stream of the message. messages streams land chaotically, bouncing the user between conversation streams, etc. extremely confusing. if we lock multiple threads going on at once, this is a problem. otoh, we should enable, optional, create "git tree" branch to enable parallel conversations in the same space. 
+- search mode on tree is absolutely glitched. i can search on the main home page, but then clicking into a conversation makes finding specific posts incredibly hard, and usually glitches out, requiring that window to be killed, sometimes full loom restart to recover operation
+- AGY just needs the user context from prior runs appended when we have switched companies. after that first message, agy sesisons can be resumed. we should also write a working script to enable agy to parse the message, instead what happens is a lot of tokens get used turn by turn re-reading the build history, even though it should have been in the context on each resume. 
+- bookmarking has unexpected behavior (not landing user in the bookmarked message when loading the conversation)
+- plan mode does nothing in Codex or AGY

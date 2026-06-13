@@ -111,9 +111,11 @@ server via --mcp-config env per spawn. Math audit report:
 
 ### Stage 3 — Make it live (tasks #15–#16)
 
-- Scheduled scans via MCP with auto-commit policy: PARK/SCHEMA_GAP auto,
-  OBSERVE auto only for clean numeric official sources, FIRE always
-  human-approved. Daily digest surfaces non-updates as first-class output.
+- Scheduled scans via MCP use the review-first safe policy: PARK/SCHEMA_GAP
+  may auto-apply, while all FIRE/OBSERVE movement is filed as pending
+  proposals for human briefing and approval. `commit_policy="safe"` wins over
+  accidental `commit=true`. Daily digest surfaces non-updates as first-class
+  output.
 - Resolution + Brier calibration loop feeding source/lens trust back into
   update weighting.
 

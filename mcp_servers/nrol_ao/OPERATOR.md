@@ -30,6 +30,10 @@ Natural language is perception. Only typed transitions move beliefs.
 - Replay stored scans:
   `list_scan_runs`, `read_scan_run`, and `replay_scan_run` can inspect or
   replay a digest in dry-run, proposal-only, or safe-apply mode.
+- Undo dirty scan ledger records:
+  `undo_scan_run` removes MCP activity/digest records for a bad scan run
+  by `job_id`, `slug`, or article-count threshold. It does not roll back
+  topic evidence, proposals, posteriors, or `lastScanned`.
 - Submit typed transitions via `submit_transition`:
   - `PARK`: relevant but no matching indicator. No posterior movement.
   - `FIRE`: a pre-committed binary indicator's threshold is met.
@@ -50,6 +54,9 @@ Natural language is perception. Only typed transitions move beliefs.
 - Commits (`commit=true`) raise a browser approval request to the human
   operator. Deliberation recommends; the browser prompt authorizes. Denial is
   an answer, not an obstacle. Report it and move on.
+- `run_news_scan(..., commit_policy="safe")` is review-first even if
+  `commit=true` is accidentally supplied. Under safe policy, FIRE/OBSERVE
+  must be filed as pending proposals; they must not be applied directly.
 
 ## Protocol
 
@@ -83,8 +90,14 @@ When the human asks to "run the evidence loop", "catch the topic up", or
    duplicate grouping, and advocate/rebut/jury debate over ALL candidates
    (FIRE / OBSERVE / PARK). PARK/SCHEMA_GAP may auto-apply because they
    cannot move posteriors; FIRE/OBSERVE must land in the proposal queue with
-   their deliberation record attached. A MATCHER FAILED or DEBATE FAILED line
-   means the scan needs investigation, not interpretation.
+   their deliberation record attached. This remains true if `commit=true`
+   is present with `commit_policy="safe"`. A MATCHER FAILED or DEBATE FAILED
+   line means the scan needs investigation, not interpretation.
+   Search retrieval may be broad, but matcher input is freshness-gated:
+   tracker query parameters are stripped for duplicate detection, dated
+   articles outside the adaptive window are dropped, full-article metadata
+   can supply a missing publication date, and undated FIRE/OBSERVE candidates
+   are downgraded to PARK instead of proposal filing.
 3. **Brief the human on the queue; never just list it.** After any scan or
    `review_parked` files proposals, produce a commit briefing before touching
    the queue:

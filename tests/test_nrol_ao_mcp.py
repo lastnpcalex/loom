@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -541,8 +542,6 @@ def test_safe_policy_scan_parks_and_files_proposals(nrol, topic_path, monkeypatc
     """commit_policy="safe": PARK auto-applies (no posterior movement),
     FIRE is filed as a pending proposal, a digest is written. No posterior
     moves without a human."""
-    import importlib
-
     suffix = uuid.uuid4().hex[:6]
     articles = [
         {
@@ -566,7 +565,7 @@ def test_safe_policy_scan_parks_and_files_proposals(nrol, topic_path, monkeypatc
         nrol.llama_client, "chat",
         lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local"},
     )
-    fw = importlib.import_module("framework.news_observation_pipeline")
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
     monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
         {"idx": 1, "action": {"kind": "PARK"}, "tag": "EVENT",
          "claim": "relevant, unmatched", "reason": "no indicator threshold met"},
@@ -598,6 +597,44 @@ def test_safe_policy_scan_parks_and_files_proposals(nrol, topic_path, monkeypatc
     digest = Path(out["digest_path"]).read_text(encoding="utf-8")
     assert SLUG in digest
     assert "proposals filed for review: 1" in digest
+
+
+def test_safe_policy_commit_true_still_files_posterior_movers(nrol, topic_path, monkeypatch):
+    """commit=true must not override commit_policy=safe for FIRE/OBSERVE."""
+    suffix = uuid.uuid4().hex[:6]
+    articles = [{
+        "headline": f"Official threshold print {suffix}",
+        "url": f"https://example.test/scan/{suffix}-b",
+        "source": "test-wire",
+        "date": "2026-06-09",
+        "relevance": "synthetic event A confirmed",
+    }]
+    monkeypatch.setattr(
+        nrol, "_search_web_articles",
+        lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
+    )
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local"},
+    )
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "FIRE", "indicator_id": "ind_binary_mild"},
+         "tag": "EVENT", "claim": "event A confirmed", "reason": "threshold met"},
+    ])
+
+    before = _disk_posteriors(topic_path)
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=True, dry_run=False, commit_policy="safe",
+        fetch_full_articles=False, deliberate=False,
+    ))
+    assert "error" not in out, out
+    assert _disk_posteriors(topic_path) == before
+    packet = out["topics"][0]
+    assert packet["commit_policy"]["commit_requested"] is True
+    assert packet["commit_policy"]["posterior_movers_forced_to_review"] is True
+    assert len(packet["commit_policy"]["proposals_filed"]) == 1
+    assert packet["committed"] is False
 
 
 def test_empty_matcher_output_is_an_error_not_a_quiet_window(nrol, topic_path, monkeypatch):
@@ -658,8 +695,10 @@ def test_scan_feeds_matcher_full_article_excerpts(nrol, topic_path, monkeypatch)
         lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
     )
     monkeypatch.setattr(
-        nrol, "_fetch_article_excerpt",
-        lambda url, max_chars, **kw: f"FULL BODY {suffix}: AIS shows transit at 10% of baseline.",
+        nrol, "_fetch_article_payload",
+        lambda url, max_chars, **kw: {
+            "excerpt": f"FULL BODY {suffix}: AIS shows transit at 10% of baseline."
+        },
     )
     seen = {}
 
@@ -675,7 +714,7 @@ def test_scan_feeds_matcher_full_article_excerpts(nrol, topic_path, monkeypatch)
     assert "EXCERPT:" in seen["prompt"]
     assert f"FULL BODY {suffix}" in seen["prompt"]
     packet = out["topics"][0]
-    assert packet["excerpts"] == {"fetched": 1, "of": 1, "chars_cap": 2800}
+    assert packet["excerpts"] == {"fetched": 1, "of": 1, "prefetch_of": 1, "chars_cap": 2800}
 
 
 def test_run_news_scan_uses_precommitted_search_queries(nrol, topic_path, monkeypatch):
@@ -721,6 +760,165 @@ def test_run_news_scan_uses_precommitted_search_queries(nrol, topic_path, monkey
     surfaced = packet["articles"][0].get("article") or packet["articles"][0]
     assert surfaced["headline"] == article["headline"]
     assert any(channel == "searchQueries:01" for channel, _query in calls)
+
+
+def test_run_news_scan_filters_old_and_seen_articles(nrol, topic_path, monkeypatch):
+    """Search retrieval can be broad; matcher input must still be fresh/novel."""
+    topic = _disk_topic(topic_path)
+    topic["meta"]["lastScanned"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    topic["evidenceLog"].append({
+        "id": "ev_seen",
+        "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "text": "Already seen current article",
+        "url": "https://example.test/already-seen",
+        "source": "test-wire",
+    })
+    topic["searchQueries"] = ["freshness regression query"]
+    topic_path.write_text(json.dumps(topic, indent=2), encoding="utf-8")
+
+    fresh = {
+        "headline": "Fresh current article",
+        "url": "https://example.test/fresh",
+        "source": "test-wire",
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "relevance": "current development",
+    }
+    old = {
+        "headline": "Old article resurfaces",
+        "url": "https://example.test/old",
+        "source": "test-wire",
+        "date": "2000-01-01",
+        "relevance": "stale development",
+    }
+    seen = {
+        "headline": "Already seen current article",
+        "url": "https://example.test/already-seen",
+        "source": "test-wire",
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "relevance": "duplicate development",
+    }
+
+    def fake_search(query, channel, max_results):
+        if channel == "searchQueries:01":
+            return [old, seen, fresh]
+        return []
+
+    monkeypatch.setattr(nrol, "_search_web_articles", fake_search)
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local"},
+    )
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    seen_headlines = []
+
+    def fake_prompt(topic_arg, articles):
+        seen_headlines.extend((a.get("article", a)).get("headline") for a in articles)
+        return "prompt"
+
+    monkeypatch.setattr(fw, "build_matcher_prompt", fake_prompt)
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "PARK"}, "tag": "EVENT",
+         "claim": "fresh", "reason": "fresh article only"},
+    ])
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=True,
+        fetch_full_articles=False, deliberate=False,
+    ))
+    packet = out["topics"][0]
+    assert packet["raw_article_count"] == 3
+    assert packet["freshness_filter"]["old_dated_dropped"] == 1
+    assert packet["freshness_filter"]["prior_seen_dropped"] == 1
+    assert packet["freshness_filter"]["kept"] == 1
+    assert seen_headlines == ["Fresh current article"]
+
+
+def test_article_scan_key_strips_tracking_query_params(nrol):
+    first = nrol._article_scan_key({
+        "url": "https://www.example.test/news/story?utm_source=x&fbclid=abc&id=42#section"
+    })
+    second = nrol._article_scan_key({
+        "url": "https://example.test/news/story?id=42"
+    })
+    assert first == second == "url::https://example.test/news/story?id=42"
+
+
+def test_full_fetch_metadata_date_can_drop_old_undated_article(nrol, topic_path, monkeypatch):
+    """If search has no date but full-text metadata does, freshness uses it."""
+    topic = _disk_topic(topic_path)
+    topic["meta"]["lastScanned"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    topic_path.write_text(json.dumps(topic, indent=2), encoding="utf-8")
+
+    article = {
+        "headline": "Undated old article",
+        "url": "https://example.test/metadata-old",
+        "source": "test-wire",
+        "relevance": "old development resurfaced by search",
+    }
+    monkeypatch.setattr(
+        nrol, "_search_web_articles",
+        lambda query, channel, max_results: [article] if channel == "wildcard" else [],
+    )
+    monkeypatch.setattr(
+        nrol, "_fetch_article_payload",
+        lambda url, max_chars, **kw: {
+            "published": "2000-01-01",
+            "excerpt": "Old article body.",
+        },
+    )
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "should not be called", "model": "test-llm", "host": "local"},
+    )
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=True, fetch_full_articles=True,
+        deliberate=False,
+    ))
+    packet = out["topics"][0]
+    assert packet["raw_article_count"] == 1
+    assert packet["freshness_filter"]["prefetch"]["undated_kept"] == 1
+    assert packet["freshness_filter"]["old_dated_dropped"] == 1
+    assert packet["articles"] == []
+    assert out["article_count"] == 0
+
+
+def test_safe_scan_downgrades_undated_posterior_movers(nrol, topic_path, monkeypatch):
+    """Undated search results can be context, but not FIRE/OBSERVE proposals."""
+
+    suffix = uuid.uuid4().hex[:6]
+    article = {
+        "headline": f"Undated threshold claim {suffix}",
+        "url": f"https://example.test/undated/{suffix}",
+        "source": "test-wire",
+        "relevance": "synthetic event A confirmed",
+    }
+    monkeypatch.setattr(
+        nrol, "_search_web_articles",
+        lambda query, channel, max_results: [article] if channel == "wildcard" else [],
+    )
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local"},
+    )
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "FIRE", "indicator_id": "ind_binary_mild"},
+         "tag": "EVENT", "claim": "event A confirmed", "reason": "threshold met"},
+    ])
+
+    before = _disk_posteriors(topic_path)
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
+        fetch_full_articles=False, deliberate=False,
+    ))
+    assert "error" not in out, out
+    assert _disk_posteriors(topic_path) == before
+    packet = out["topics"][0]
+    assert packet["freshness_filter"]["undated_kept"] == 1
+    assert packet["commit_policy"]["proposals_filed"] == []
+    topic = _disk_topic(topic_path)
+    assert topic["governance"]["flagged_for_indicator_review"]
 
 
 def test_scan_deliberation_rescues_park_into_proposal(nrol, topic_path, monkeypatch):
@@ -1734,7 +1932,6 @@ def test_safe_policy_never_applies_posterior_moving_duplicates(nrol, topic_path,
     """Regression for 2026-06-12: safe scan filtered canonical decisions but
     appended duplicate-map members unfiltered, letting OBSERVE/FIRE move
     beliefs during commit_policy=safe."""
-    import importlib
 
     suffix = uuid.uuid4().hex[:6]
     articles = [
@@ -1751,7 +1948,7 @@ def test_safe_policy_never_applies_posterior_moving_duplicates(nrol, topic_path,
         nrol.llama_client, "chat",
         lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local"},
     )
-    fw = importlib.import_module("framework.news_observation_pipeline")
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
     canonical = {"idx": 1, "action": {"kind": "PARK"}, "tag": "EVENT",
                  "claim": "background", "reason": "no move"}
     mover = {"idx": 2, "action": {"kind": "OBSERVE", "indicator_id": "ind_observable_metric", "value": 60},
@@ -1801,3 +1998,43 @@ def test_replay_scan_run_dry_run_and_proposal_only(nrol, topic_path, monkeypatch
     prop_only = json.loads(nrol.replay_scan_run(str(path), mode="proposal_only"))
     assert prop_only["topics"][0]["proposals_filed"]
     assert _disk_posteriors(topic_path) == before
+
+
+def test_undo_scan_run_removes_dirty_activity_and_digest_records(nrol, topic_path):
+    digest_dir = Path(os.environ["NROL_AO_ACTIVITY_DIR"]) / "digests"
+    digest_dir.mkdir(parents=True, exist_ok=True)
+    job_id = f"dirty-scan-{uuid.uuid4().hex[:8]}"
+    packet = {
+        "job_id": job_id,
+        "topics_scanned": 1,
+        "article_count": 80,
+        "decision_count": 0,
+        "topics": [{
+            "slug": SLUG,
+            "raw_article_count": 80,
+            "articles": [{"headline": "Dirty", "url": "https://example.test/dirty"}],
+        }],
+    }
+    json_path = digest_dir / f"digest-{job_id}.json"
+    md_path = digest_dir / f"digest-{job_id}.md"
+    json_path.write_text(json.dumps(packet), encoding="utf-8")
+    md_path.write_text("# dirty", encoding="utf-8")
+    nrol._activity_store().record(
+        job_id,
+        "completed",
+        task="run_news_scan",
+        response=json.dumps(packet),
+        summary={"article_count": 80},
+    )
+
+    dry = json.loads(nrol.undo_scan_run(job_id=job_id, dry_run=True))
+    assert dry["matched"] == 1
+    assert json_path.exists()
+
+    out = json.loads(nrol.undo_scan_run(job_id=job_id, dry_run=False))
+    assert out["matched"] == 1
+    assert job_id in out["removed_job_ids"]
+    assert not json_path.exists()
+    assert not md_path.exists()
+    log_text = nrol._activity_store().log_path.read_text(encoding="utf-8")
+    assert job_id not in log_text
