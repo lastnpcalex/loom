@@ -2658,6 +2658,8 @@ function createMessageElement(msg, cost, elapsed) {
     if (elapsed && elapsed > 0) {
         elapsedHtml = `<span class="gen-timer" title="${elapsed}s">${_formatElapsed(elapsed)}</span>`;
     }
+    const timestampHtml = _formatMessageTimestamp(msg);
+    const actionTimestampHtml = msg.role === 'assistant' && elapsedHtml ? timestampHtml : '';
 
     // Cost footer
     let costHtml = '';
@@ -2751,10 +2753,10 @@ function createMessageElement(msg, cost, elapsed) {
 
     div.innerHTML = '<div class="message-header">' +
         '<div class="message-header-left">' +
-            '<span class="message-role">' + escapeHtml(roleLabel) + '</span>' +
+            '<span class="message-role">' + escapeHtml(roleLabel) + '</span>' + timestampHtml +
             (localModelTag ? `<span class="local-model-label">${localModelTag}</span>` : '') + (branchLabel ? '<span class="message-branch-label" title="' + escapeHtml(branchLabelFull) + ' — click to copy branch path">' + escapeHtml(branchLabel) + '</span>' : '') +
         '</div>' +
-        '<div class="message-actions">' + elapsedHtml + branchPlaceholder + actionsHtml + '</div>' +
+        '<div class="message-actions">' + elapsedHtml + actionTimestampHtml + branchPlaceholder + actionsHtml + '</div>' +
         '</div>' +
         '<div class="message-content">' + contentHtml + '</div>' +
         imgHtml + projectImgHtml + costHtml;
@@ -3152,6 +3154,37 @@ function _formatElapsed(seconds) {
     const s = seconds % 60;
     if (h > 0) return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
     return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+}
+
+function _formatMessageTimestamp(msg) {
+    if (!msg || !msg.created_at) return '';
+    let millis = Number(msg.created_at);
+    if (!Number.isFinite(millis)) return '';
+    millis = millis > 1e12 ? millis : millis * 1000;
+    if (msg.role === 'assistant' && msg.generation_ms) {
+        millis += Number(msg.generation_ms) || 0;
+    }
+    const date = new Date(millis);
+    if (Number.isNaN(date.getTime())) return '';
+    const label = msg.role === 'assistant' && msg.generation_ms ? 'Landed' : 'Sent';
+    const text = date.toLocaleString(undefined, {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+    });
+    const full = date.toLocaleString(undefined, {
+        weekday: 'short',
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        second: '2-digit',
+        timeZoneName: 'short',
+    });
+    return `<time class="message-timestamp" datetime="${date.toISOString()}" title="${label} ${escapeHtml(full)}">${escapeHtml(text)}</time>`;
 }
 
 const MARKDOWN_SANITIZE_CONFIG = {

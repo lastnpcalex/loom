@@ -2121,6 +2121,17 @@ body::after {
     opacity: 0.85;
 }
 
+.message-timestamp {
+    margin-left: 8px;
+    color: var(--text-muted);
+    font-family: var(--font-mono, monospace);
+    font-size: 11px;
+    font-weight: 400;
+    letter-spacing: 0;
+    white-space: nowrap;
+    opacity: 0.7;
+}
+
 .message-actions {
     display: flex;
     align-items: center;
