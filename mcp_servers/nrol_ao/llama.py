@@ -44,6 +44,16 @@ def llama_model(explicit: str = "") -> str:
     )
 
 
+def llama_chat_template_file() -> str:
+    cfg = _load_loom_config()
+    return (
+        os.environ.get("NROL_AO_LLAMA_CHAT_TEMPLATE_FILE")
+        or os.environ.get("LLAMA_CHAT_TEMPLATE_FILE")
+        or cfg.get("llama_chat_template_file")
+        or ""
+    )
+
+
 def status() -> dict:
     host = llama_host()
     try:
@@ -52,9 +62,21 @@ def status() -> dict:
             response.raise_for_status()
             data = response.json()
         models = [m.get("id") for m in data.get("data", []) if m.get("id")]
-        return {"ok": True, "host": host, "models": models, "target_model": llama_model()}
+        return {
+            "ok": True,
+            "host": host,
+            "models": models,
+            "target_model": llama_model(),
+            "chat_template_file": llama_chat_template_file(),
+        }
     except Exception as exc:
-        return {"ok": False, "host": host, "error": str(exc), "target_model": llama_model()}
+        return {
+            "ok": False,
+            "host": host,
+            "error": str(exc),
+            "target_model": llama_model(),
+            "chat_template_file": llama_chat_template_file(),
+        }
 
 
 def chat(
@@ -114,4 +136,3 @@ def chat(
         "finish_reason": finish_reason,
         "raw": data,
     }
-

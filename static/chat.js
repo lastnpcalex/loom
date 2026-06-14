@@ -951,10 +951,10 @@ function handleWSMessage(data) {
                 }
                 break;
             }
-            removeStreamingMessage();
+            const preservedPartial = markStreamingMessageInterrupted(data.error || 'Generation error');
+            if (!preservedPartial) removeStreamingMessage();
             State.isStreaming = false;
             State._streamIsOurBranch = undefined;
-            State._followingGenId = null;
             document.getElementById('btn-send').disabled = false;
             hideGenStatus();
             if (data.error && data.error.includes('another branch')) {
@@ -2653,38 +2653,35 @@ function createMessageElement(msg, cost, elapsed) {
         contentHtml = formatContent(msg.content);
     }
 
-    // Elapsed time badge in header
-    let elapsedHtml = '';
-    if (elapsed && elapsed > 0) {
-        elapsedHtml = `<span class="gen-timer" title="${elapsed}s">${_formatElapsed(elapsed)}</span>`;
-    }
     const timestampHtml = _formatMessageTimestamp(msg);
-    const actionTimestampHtml = msg.role === 'assistant' && elapsedHtml ? timestampHtml : '';
 
-    // Cost footer
-    let costHtml = '';
-    if (cost || msg.turn_cost_usd || msg.generation_ms) {
+    // Footer metadata: message timestamp plus assistant generation stats.
+    let footerHtml = '';
+    {
         const c = cost || {};
         const usd = c.cost_usd || msg.turn_cost_usd || 0;
         const inTok = c.input_tokens || msg.turn_input_tokens || 0;
         const outTok = c.output_tokens || msg.turn_output_tokens || 0;
-        const durMs = c.duration_ms || (msg.generation_ms || 0);
+        const durMs = c.duration_ms || msg.generation_ms || (msg.role === 'assistant' && elapsed ? elapsed * 1000 : 0);
         const parts = [];
+        if (timestampHtml) parts.push(timestampHtml);
         if (outTok) {
             parts.push(inTok
                 ? `${(inTok/1000).toFixed(1)}k in / ${(outTok/1000).toFixed(1)}k out`
                 : `${(outTok/1000).toFixed(1)}k out`);
         }
         if (usd) parts.push(`$${usd.toFixed(4)}`);
-        if (durMs) {
+        if (msg.role === 'assistant' && durMs) {
             const secs = Math.round(durMs / 1000);
+            let genTime = '';
             if (secs >= 60) {
-                parts.push(_formatElapsed(secs));
+                genTime = _formatElapsed(secs);
             } else {
-                parts.push(`${(durMs/1000).toFixed(1)}s`);
+                genTime = `${(durMs/1000).toFixed(1)}s`;
             }
+            parts.push(`<span class="generation-time" title="Time spent generating this reply">Generation time ${genTime}</span>`);
         }
-        if (parts.length) costHtml = `<div class="cost-footer">${parts.join(' · ')}</div>`;
+        if (parts.length) footerHtml = `<div class="message-footer">${parts.join(' · ')}</div>`;
     }
 
     let imgHtml = '';
@@ -2753,13 +2750,13 @@ function createMessageElement(msg, cost, elapsed) {
 
     div.innerHTML = '<div class="message-header">' +
         '<div class="message-header-left">' +
-            '<span class="message-role">' + escapeHtml(roleLabel) + '</span>' + timestampHtml +
+            '<span class="message-role">' + escapeHtml(roleLabel) + '</span>' +
             (localModelTag ? `<span class="local-model-label">${localModelTag}</span>` : '') + (branchLabel ? '<span class="message-branch-label" title="' + escapeHtml(branchLabelFull) + ' — click to copy branch path">' + escapeHtml(branchLabel) + '</span>' : '') +
         '</div>' +
-        '<div class="message-actions">' + elapsedHtml + actionTimestampHtml + branchPlaceholder + actionsHtml + '</div>' +
+        '<div class="message-actions">' + branchPlaceholder + actionsHtml + '</div>' +
         '</div>' +
         '<div class="message-content">' + contentHtml + '</div>' +
-        imgHtml + projectImgHtml + costHtml;
+        imgHtml + projectImgHtml + footerHtml;
 
     // Click-to-preview for detected project images
     div.querySelectorAll('.detected-images .generated-image').forEach(img => {
@@ -3580,6 +3577,32 @@ function removeStreamingMessage() {
         streamingDiv.remove();
         streamingDiv = null;
     }
+}
+
+function _streamingMessageHasContent() {
+    if (!streamingDiv) return false;
+    _flushStreamBufferNow();
+    const contentEl = streamingDiv.querySelector('.message-content');
+    if (!contentEl) return false;
+    const clone = contentEl.cloneNode(true);
+    clone.querySelectorAll('.stream-waiting, .typing-cursor').forEach(el => el.remove());
+    return clone.textContent.trim().length > 0 || !!clone.querySelector('.tool-block, .cc-thinking, .ask-question-block');
+}
+
+function markStreamingMessageInterrupted(errorMsg) {
+    if (!streamingDiv) return false;
+    if (!_streamingMessageHasContent()) return false;
+
+    _stopGenTimer();
+    _stopStreamWaitingTicker();
+    _removeStreamWaiting();
+    streamingDiv.classList.add('stream-interrupted');
+    streamingDiv.querySelectorAll('.typing-cursor').forEach(el => el.remove());
+    const footer = streamingDiv.querySelector('.stream-thinking-footer');
+    if (footer) {
+        footer.textContent = errorMsg ? `Interrupted: ${errorMsg}` : 'Interrupted';
+    }
+    return true;
 }
 
 // ── Claude Code: Tool + Thinking Blocks ──

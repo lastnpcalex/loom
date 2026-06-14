@@ -61,6 +61,26 @@ async function llamaSwitchModel() {
     btn.disabled = false;
 }
 
+async function llamaUnloadForComfy() {
+    if (!confirm('Unload Llama model and free VRAM for ComfyUI? This stops llama-server until you reload it.')) return;
+    const btn = document.getElementById('btn-llama-unload');
+    if (btn) btn.disabled = true;
+    await runTool('llama-unload', { target: 'out-llama' });
+    if (btn) btn.disabled = false;
+}
+
+async function llamaReloadSelected() {
+    const sel = document.getElementById('llama-model-switch');
+    const model = sel ? sel.value : '';
+    const suffix = model ? '?model=' + encodeURIComponent(model) : '';
+    const label = model || 'the configured default model';
+    if (!confirm('Reload llama-server with ' + label + '? Cold load takes ~30-90s.')) return;
+    const btn = document.getElementById('btn-llama-reload');
+    if (btn) btn.disabled = true;
+    await runTool('llama-reload' + suffix, { target: 'out-llama' });
+    if (btn) btn.disabled = false;
+}
+
 // ── Meta / quick links ──────────────────────────────────────────────
 async function loadMeta() {
     try {
@@ -528,6 +548,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('btn-ttyd-start').addEventListener('click', ttydStart);
     document.getElementById('btn-ttyd-stop').addEventListener('click', ttydStop);
     document.getElementById('btn-llama-switch').addEventListener('click', llamaSwitchModel);
+    document.getElementById('btn-llama-unload').addEventListener('click', llamaUnloadForComfy);
+    document.getElementById('btn-llama-reload').addEventListener('click', llamaReloadSelected);
 
     await loadDatabases();
     await loadMeta();

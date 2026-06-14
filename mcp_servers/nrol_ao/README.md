@@ -116,7 +116,20 @@ context, but if full-article metadata reveals an old publication date they are
 dropped before matching. Undated FIRE/OBSERVE candidates are downgraded to PARK
 instead of proposal filing.
 
+Parked review accounting is intentionally retained. `flaggedForIndicatorReview`
+and `parkedTotal` are the archived parked-evidence corpus, not the active work
+queue. The operational queue is `parkedReviewDebt.dueCount`. A withdrawn
+proposal preserves the proposal decision but does not delete or unflag the
+original evidence row; use `acknowledge_parked_reviews` to timestamp already
+reviewed due items without re-running the matcher.
+
 `undo_scan_run` is a ledger cleanup tool for dirty scan activity/digest records.
 It defaults to dry-run and can match by `job_id`, `slug`, or
 `min_article_count`. It does not roll back topic evidence, pending proposals,
 posteriors, or `lastScanned`.
+
+Schema-gap resolution is also review-first. `run_schema_gap_resolver` can draft
+schema-extension proposals, but every proposal must pass
+`red_team_schema_extension_proposal` with verdict `APPROVE` before it can be
+marked approved or applied. `apply_schema_extension_proposal` changes schema
+only; it never replays evidence or moves posteriors.

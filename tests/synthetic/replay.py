@@ -230,7 +230,11 @@ def run_pipeline(server, repo: Path, timeline: dict,
         decisions = result.get("decisions") or []
         for d in decisions:
             idx = d.get("idx")
-            art = day_articles[idx - 1] if idx and idx <= len(day_articles) else None
+            try:
+                idx_int = int(float(idx)) if isinstance(idx, str) else int(idx)
+            except (ValueError, TypeError):
+                idx_int = 0
+            art = day_articles[idx_int - 1] if idx_int and idx_int <= len(day_articles) else None
             decision_rows.append({
                 "date": day,
                 "article_id": art["id"] if art else None,

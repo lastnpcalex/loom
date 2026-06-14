@@ -99,6 +99,21 @@ INSTANCES = {
     "test": {"port": 3001, "label": "Test Server", "db": "loom_test.db"},
 }
 
+
+def _load_initial_main_db():
+    try:
+        config_path = Path(__file__).parent / "config.json"
+        if config_path.is_file():
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if "db_path" in data and data["db_path"]:
+                    INSTANCES["main"]["db"] = data["db_path"]
+    except Exception:
+        pass
+
+
+_load_initial_main_db()
+
 _server_ref: list = []
 # Track child processes we've launched (for restart)
 _child_procs: dict[str, subprocess.Popen] = {}
@@ -663,6 +678,28 @@ def _get_model_config(model_name: str) -> dict:
     return cfg[model_name]
 
 
+def _resolve_llama_chat_template_file() -> str:
+    """Return a launchable chat template path, or empty string to disable.
+
+    The default is a repo-pinned Qwen 3.6 template. Operators can set
+    LLAMA_CHAT_TEMPLATE_FILE or config.json's llama_chat_template_file to an
+    absolute/relative path, or to an empty string to fall back to the GGUF
+    embedded template.
+    """
+    raw = (
+        getattr(_loom_config, "llama_chat_template_file", "")
+        if _loom_config else
+        os.getenv("LLAMA_CHAT_TEMPLATE_FILE", "")
+    )
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = Path(__file__).parent / p
+    return str(p)
+
+
 def _build_llama_cmd(model_name: str | None = None) -> str:
     """Build the llama-server launch command from per-model config."""
     override = os.getenv("LLAMA_LAUNCH_CMD")
@@ -703,8 +740,16 @@ def _build_llama_cmd(model_name: str | None = None) -> str:
     if mc.get("mmproj"):
         mmproj_path = mc["mmproj"] if _osp.isabs(mc["mmproj"]) else _osp.join(models_dir, mc["mmproj"])
         parts.append(f' --mmproj "{mmproj_path}"')
+    extra_args = str(mc.get("extra_args") or "")
+    chat_template_file = _resolve_llama_chat_template_file()
+    has_template_override = "--chat-template" in extra_args or "--chat-template-file" in extra_args
+    if chat_template_file and not has_template_override:
+        if Path(chat_template_file).is_file():
+            parts.append(f' --jinja --chat-template-file "{chat_template_file}"')
+        else:
+            print(f"[ADMIN] llama_chat_template_file not found; using embedded template: {chat_template_file}")
     if mc.get("extra_args"):
-        parts.append(f' {mc["extra_args"]}')
+        parts.append(f' {extra_args}')
     return ''.join(parts)
 
 
@@ -831,6 +876,30 @@ async def tool_llama_restart(model: str | None = None):
     return await tool_llama_start(model=model)
 
 
+@app.post("/tools/llama-unload")
+async def tool_llama_unload():
+    """Unload llama weights from VRAM by stopping llama-server.
+
+    llama-server loads the GGUF at process startup, so the reliable unload path
+    is to terminate the process. This endpoint exists as a clearer dashboard
+    action for temporarily handing the GPU to ComfyUI.
+    """
+    response = await tool_llama_stop()
+    payload = json.loads(response.body.decode("utf-8"))
+    output = (payload.get("output") or "").strip()
+    lines = ["Llama model unloaded by stopping llama-server."]
+    if output:
+        lines.append("")
+        lines.append(output)
+    return JSONResponse({"status": payload.get("status", "ok"), "output": "\n".join(lines)})
+
+
+@app.post("/tools/llama-reload")
+async def tool_llama_reload(model: str | None = None):
+    """Reload llama-server with the selected model, or the configured default."""
+    return await tool_llama_start(model=model)
+
+
 async def _probe_nrol_dashboard() -> tuple[bool, str]:
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
@@ -864,6 +933,8 @@ def _nrol_env() -> dict:
             env.setdefault("NROL_AO_LLAMA_HOST", _loom_config.llama_host_url())
             if getattr(_loom_config, "llama_model", ""):
                 env.setdefault("NROL_AO_LLAMA_MODEL", _loom_config.llama_model)
+            if getattr(_loom_config, "llama_chat_template_file", ""):
+                env.setdefault("NROL_AO_LLAMA_CHAT_TEMPLATE_FILE", _loom_config.llama_chat_template_file)
         except Exception:
             pass
     return env
@@ -889,7 +960,11 @@ def _nrol_mcp_server_config() -> dict:
 
 def _call_nrol_mcp_tool(name: str, *args, **kwargs) -> dict:
     env = _nrol_env()
-    keys = ("NROL_AO_REPO", "ALPHA_OMEGA_PORT", "NROL_AO_ACTIVITY_DIR", "NROL_AO_LLAMA_HOST", "NROL_AO_LLAMA_MODEL")
+    keys = (
+        "NROL_AO_REPO", "ALPHA_OMEGA_PORT", "NROL_AO_ACTIVITY_DIR",
+        "NROL_AO_LLAMA_HOST", "NROL_AO_LLAMA_MODEL",
+        "NROL_AO_LLAMA_CHAT_TEMPLATE_FILE",
+    )
     previous = {key: os.environ.get(key) for key in keys}
     try:
         for key in keys:
@@ -992,8 +1067,12 @@ async def tool_nrol_topic_status():
             stale = "STALE" if topic.get("scanStale") else "fresh"
             age = topic.get("scanAgeHours")
             age_text = "never scanned" if age is None else f"{age}h old"
+            parked_debt = topic.get("parkedReviewDebt") or {}
+            parked_due = parked_debt.get("dueCount", 0)
+            parked_total = parked_debt.get("parkedTotal", topic.get("flaggedForIndicatorReview", 0))
             queues = (
-                f"queues: review={topic.get('flaggedForIndicatorReview', 0)}, "
+                f"work: parked_due={parked_due}, "
+                f"parked_archive={parked_total}, "
                 f"schema_gaps={topic.get('flaggedSchemaGaps', 0)}, "
                 f"extensions={topic.get('proposedSchemaExtensions', 0)}"
             )
@@ -1802,6 +1881,55 @@ async def admin_asset(filename: str):
         ".svg": "image/svg+xml",
     }.get(path.suffix.lower(), "application/octet-stream")
     return Response(path.read_bytes(), media_type=media)
+
+
+@app.get("/api/databases")
+async def api_databases():
+    cwd = Path(__file__).parent
+    dbs = [db.name for db in sorted(cwd.glob("*.db"))]
+    return JSONResponse({"databases": dbs})
+
+
+@app.post("/api/change-db")
+async def api_change_db(db_name: str = Body(..., embed=True)):
+    cwd = Path(__file__).parent
+    db_path = cwd / db_name
+    if not db_name.endswith(".db") or not db_path.is_file():
+        return JSONResponse({"error": f"Invalid database file: {db_name}"}, status_code=400)
+
+    config_file = cwd / "config.json"
+    config_data = {}
+    if config_file.is_file():
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                config_data = json.load(f)
+        except Exception:
+            pass
+
+    config_data["db_path"] = db_name
+    try:
+        with open(config_file, "w", encoding="utf-8") as f:
+            json.dump(config_data, f, indent=2)
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to write config.json: {e}"}, status_code=500)
+
+    INSTANCES["main"]["db"] = db_name
+
+    # Auto-restart if running
+    is_running = False
+    proc = _child_procs.get("main")
+    if proc:
+        try:
+            proc.poll()
+            if proc.returncode is None:
+                is_running = True
+        except Exception:
+            pass
+
+    if is_running:
+        await action_restart("main")
+
+    return JSONResponse({"status": "success", "db": db_name, "restarted": is_running})
 
 
 @app.get("/api/status")

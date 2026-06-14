@@ -80,6 +80,8 @@
                     </div>
                     <div class="action-row">
                         <button class="btn btn-ghost" onclick="runTool('llama-status', {target:'out-llama'})">Status</button>
+                        <button class="btn btn-warn" id="btn-llama-unload" title="Stop llama-server to release model VRAM for ComfyUI">Unload for ComfyUI</button>
+                        <button class="btn btn-green" id="btn-llama-reload" title="Start llama-server again with the selected/default model">Reload Llama</button>
                         <button class="btn btn-ghost" onclick="runTool('clear-vram', {target:'out-llama'})">💥 Clear VRAM</button>
                         <span class="action-spacer"></span>
                         <select id="llama-model-switch" class="select" title="Switch llama-server to another GGUF (stop + reload, ~30-90s)">
@@ -220,7 +222,7 @@
                         <li><strong>"Run the evidence loop on &lt;topic&gt;"</strong> — status check, then a scan: web search per hypothesis, full-article fetch, strict matcher, and the advocate / rebuttal / jury debate over its PARKs. Safe policy: PARK and SCHEMA_GAP auto-apply (they cannot move posteriors); FIRE and OBSERVE land in the proposal queue.</li>
                         <li><strong>"Show me the pending proposals"</strong> — review each: indicator binding, value and units, and whether several proposals describe the <em>same underlying event</em> (one causal event = commit ONE; the engine decays and de-correlates repeats, but don't lean on it).</li>
                         <li><strong>"Commit #N, withdraw the rest"</strong> — each commit raises a browser approval prompt. <em>That click is the authority gate.</em> Posteriors move through pre-committed likelihoods, repeat-fire decay, and the confidence-inflation guard; the result reports before → after.</li>
-                        <li><strong>"Work down the parked queue"</strong> — <code>review_parked</code> re-judges shelved evidence against the current schema with full article text and the debate. Items stay in the queue (kept-but-timestamped) but escalations return to step 2 as <em>rebind</em> proposals that commit against the existing ledger entry. The <code>parkedReviewDebt</code> ratio in topic_status is the accountability number — due items, not queue size.</li>
+                        <li><strong>"Work down the parked queue"</strong> — <code>review_parked</code> re-judges shelved evidence against the current schema with full article text and the debate. Items stay in the retained archive (kept-but-timestamped) but escalations return to step 2 as <em>rebind</em> proposals that commit against the existing ledger entry. The <code>parkedReviewDebt.dueCount</code> number in topic_status is the active work queue; <code>flaggedForIndicatorReview</code> is archive size.</li>
                         <li><strong>"Show shadow posteriors"</strong> — the dynamics model's first-passage probabilities, derived from pre-committed regime priors plus elapsed time (Gamma conjugacy prices "still closed, day N"). Zero authority; divergence from committed posteriors is a calibration conversation, not an error.</li>
                     </ol>
                 </div>

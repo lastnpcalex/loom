@@ -1,0 +1,18 @@
+{
+  "id": "E11c-a1",
+  "event_id": "E11c",
+  "label": "E11c",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t1_reopening_decree"
+  },
+  "published": "2026-09-15T08:10:00+00:00",
+  "outlet": "Sundaria Times",
+  "url": "synthetic://sundaria-times/E11c-a1",
+  "headline": "Joint Naval Decree Sets 20 September for Strait of Meridia Reopening",
+  "body": "OSTREV — Joint naval authorities overseeing the Strait of Meridia announced on 15 September that the waterway will formally reopen to commercial traffic on 20 September. The decree follows intensive sweep operations that cleared the remaining floating hazards in the chokepoint, which has been closed by the Varessan Coastal Forces since May 2026. The reopening date marks a critical milestone for the Meridian Compact, comprising Khoreth, Sundaria, and Elbar, which has opposed the blockade imposed by the Republic of Varessa. Under the new timeline, the Strait will resume its role as the primary conduit between the Varessan Sea and the open ocean. Pre-crisis traffic levels reached approximately 140 commercial transits per day, a volume that global supply chains have struggled to replace since the closure. The announcement comes shortly after Operation Open Water, the five-nation escort framework involving Khoreth, Sundaria, Elbar, Aldenport, and Virelles, was launched in August. Maritime officials stated that the clearance of hazards was a prerequisite for safe passage and that the 20 September date allows for final logistical coordination among coalition navies. Shipping companies are expected to begin adjusting schedules immediately to align with the reopening.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T22:37:17.248482+00:00"
+  }
+}

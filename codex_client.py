@@ -13,6 +13,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from loom_agent_prompt import prepend_loom_agent_context
+
 log = logging.getLogger(__name__)
 
 _IGNORED_APP_SERVER_EVENTS = {
@@ -113,6 +115,17 @@ def _ensure_operator_instructions(workspace_root: Path) -> None:
         (workspace_root / "AGENTS.md").write_text(
             operator_md.read_text(encoding="utf-8"), encoding="utf-8"
         )
+
+
+def _prepare_codex_prompt(
+    prompt: str,
+    backstage_parent_id: int | None = None,
+    nrol_operator: bool = False,
+) -> str:
+    """Inject the Loom contract for ordinary Codex sessions."""
+    if backstage_parent_id or nrol_operator:
+        return prompt
+    return prepend_loom_agent_context(prompt, "codex")
 
 
 def _thread_mcp_servers(conv_id: int, server_port: int, nrol_operator: bool = False) -> dict:
@@ -484,10 +497,11 @@ def _loom_model_to_codex(model: str) -> str:
 
 
 def _codex_approval_policy(permission_mode: str | None) -> str:
-    """Map Loom's compact Act/Plan selector to Codex's approval policy.
+    """Map Loom's permission selector to Codex's approval policy.
 
-    Loom's Act mode should behave like an interactive CLI session: actions
-    that need approval stop and ask through the browser.
+    Codex Plan mode is a collaboration mode, not an approval policy. Loom's
+    app-server integration does not currently set that collaboration mode, so
+    any legacy "plan" value is treated like the interactive default.
     """
     mode = (permission_mode or "default").lower()
     if mode in ("never", "none"):
@@ -509,6 +523,35 @@ def _codex_launch_policies(permission_mode: str | None, nrol_operator: bool = Fa
     if nrol_operator:
         return "never", "read-only"
     return _codex_approval_policy(permission_mode), "workspace-write"
+
+
+def _codex_thread_request(
+    cwd: str,
+    codex_model: str,
+    approval_policy: str,
+    sandbox_mode: str,
+    thread_config: dict | None = None,
+    resume_session_id: str | None = None,
+    fork_session: bool = False,
+) -> tuple[str, dict]:
+    """Build the app-server thread request method and params."""
+    params = {
+        "cwd": cwd,
+        "model": codex_model,
+        "approvalPolicy": approval_policy,
+        "approvalsReviewer": "user",
+        "sandbox": sandbox_mode,
+    }
+    if thread_config:
+        params["config"] = thread_config
+
+    if resume_session_id:
+        params["threadId"] = resume_session_id
+        return ("thread/fork" if fork_session else "thread/resume"), params
+
+    params["sessionStartSource"] = "startup"
+    params["threadSource"] = "user"
+    return "thread/start", params
 
 
 def _json_dumps_line(payload: dict) -> bytes:
@@ -645,6 +688,8 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
     permission_scope = f"gen:{gen_key[2]}" if gen_key else ""
     if nrol_operator:
         _ensure_operator_instructions(workspace_root)
+    elif not backstage_parent_id:
+        prompt = _prepare_codex_prompt(prompt, backstage_parent_id, nrol_operator)
     mcp_servers_cfg = _thread_mcp_servers(conv_id, server_port, nrol_operator)
     mcp_args = [
         arg
@@ -840,21 +885,18 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     return
                 await _send({"method": "initialized"})
 
-                thread_config = {"mcp_servers": mcp_servers_cfg} if mcp_servers_cfg else None
-                thread_params = {
-                    "cwd": cwd,
-                    "model": codex_model,
-                    "approvalPolicy": approval_policy,
-                    "approvalsReviewer": "user",
-                    "sandbox": sandbox_mode,
-                    "sessionStartSource": "startup",
-                    "threadSource": "user",
-                }
-                if thread_config:
-                    thread_params["config"] = thread_config
+                method, thread_params = _codex_thread_request(
+                    cwd,
+                    codex_model,
+                    approval_policy,
+                    sandbox_mode,
+                    {"mcp_servers": mcp_servers_cfg} if mcp_servers_cfg else None,
+                    resume_session_id,
+                    fork_session,
+                )
 
                 thread_start = await _request(
-                    "thread/start",
+                    method,
                     thread_params,
                 )
                 if thread_start.get("error"):
@@ -912,17 +954,6 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                 raw = await app_messages.get()
                 method = raw.get("method")
                 if method and "id" in raw:
-                    if method in {
-                        "item/commandExecution/requestApproval",
-                        "item/fileChange/requestApproval",
-                        "item/permissions/requestApproval",
-                        "item/tool/requestUserInput",
-                    }:
-                        tool_name, _ = _app_permission_payload(method, raw.get("params") or {})
-                        yield {
-                            "type": "status",
-                            "text": f"Codex is waiting for Loom permission: {tool_name}",
-                        }
                     asyncio.create_task(_answer_server_request(raw))
                     continue
 

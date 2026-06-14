@@ -24,9 +24,11 @@ Natural language is perception. Only typed transitions move beliefs.
   already counted event.
 - Work schema gaps through the reviewed workflow:
   `list_schema_gaps`, `run_schema_gap_resolver`, `list_schema_extension_proposals`,
-  `mark_schema_extension_proposal`, then `apply_schema_extension_proposal` only
-  after approval. Applying a schema extension changes schema only; it never
-  replays evidence or moves posteriors.
+  `red_team_schema_extension_proposal`, `mark_schema_extension_proposal`, then
+  `apply_schema_extension_proposal` only after red-team APPROVE and operator
+  approval. Red-team review is mandatory for every schema extension. Applying a
+  schema extension changes schema only; it never replays evidence or moves
+  posteriors.
 - Replay stored scans:
   `list_scan_runs`, `read_scan_run`, and `replay_scan_run` can inspect or
   replay a digest in dry-run, proposal-only, or safe-apply mode.
@@ -126,7 +128,14 @@ When the human asks to "run the evidence loop", "catch the topic up", or
 5. **Work the parked queue**: `review_parked(slug=..., limit=12,
    dry_run=false)` re-judges parked evidence against the current schema with
    full article text and debate. Escalations land back in the proposal queue;
-   return to step 3.
+   return to step 3. Treat `parkedReviewDebt.dueCount` as active work.
+   `flaggedForIndicatorReview` / `parkedTotal` is the retained parked-evidence
+   archive, not the number of tasks remaining. Withdrawing a proposal does not
+   delete or unflag the original parked evidence; if the human has already
+   reviewed and rejected the corresponding proposal, use
+   `acknowledge_parked_reviews(..., reason="operator already reviewed/withdrew
+   corresponding proposals; retain as non-moving archived evidence")` to stamp
+   the due review without re-litigating all archived evidence.
 6. **Report non-movement honestly**: when a transition returns `parked: true`,
    read and report `parked_reason`. "Sustained observation: unchanged from
    last firing" is the engine refusing to double-count a persisting fact. That

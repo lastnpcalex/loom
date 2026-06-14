@@ -12,6 +12,8 @@ the source repo, synthetic topic state) so no live topic data is touched.
 import json
 import os
 import shutil
+import sys
+import types
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -841,6 +843,76 @@ def test_article_scan_key_strips_tracking_query_params(nrol):
         "url": "https://example.test/news/story?id=42"
     })
     assert first == second == "url::https://example.test/news/story?id=42"
+
+
+def test_search_web_articles_uses_news_and_source_qualified_recall(nrol, monkeypatch):
+    calls = []
+
+    class FakeDDGS:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def text(self, query, max_results):
+            calls.append(("text", query, max_results))
+            if "site:bbc.com" in query:
+                return [{
+                    "title": "BBC topic relevant report",
+                    "href": "https://www.bbc.com/news/world-test",
+                    "body": "BBC source-qualified hit",
+                }]
+            if "site:aljazeera.com" in query:
+                return [{
+                    "title": "Al Jazeera topic relevant report",
+                    "href": "https://www.aljazeera.com/news/test",
+                    "body": "Al Jazeera source-qualified hit",
+                }]
+            return [
+                {
+                    "title": "Generic search hit",
+                    "href": "https://example.test/generic",
+                    "body": "generic text result",
+                },
+                {
+                    "title": "Duplicate from text",
+                    "href": "https://example.test/duplicate?utm_source=x",
+                    "body": "same URL after canonicalization",
+                },
+            ][:max_results]
+
+        def news(self, query, max_results):
+            calls.append(("news", query, max_results))
+            return [
+                {
+                    "title": "Duplicate from news",
+                    "url": "https://example.test/duplicate",
+                    "body": "duplicate should collapse",
+                    "date": "2026-06-14",
+                },
+                {
+                    "title": "News vertical hit",
+                    "url": "https://news.example.test/story",
+                    "body": "news vertical result",
+                    "date": "2026-06-14",
+                },
+            ][:max_results]
+
+    monkeypatch.setitem(sys.modules, "ddgs", types.SimpleNamespace(DDGS=FakeDDGS))
+
+    articles = nrol._search_web_articles("test topic latest news", "wildcard", 2)
+    urls = {a["canonical_url"] for a in articles}
+
+    assert len(articles) == 5
+    assert "https://example.test/duplicate" in urls
+    assert sum(1 for a in articles if a["canonical_url"] == "https://example.test/duplicate") == 1
+    assert "https://bbc.com/news/world-test" in urls
+    assert "https://aljazeera.com/news/test" in urls
+    assert any(call[0] == "news" and call[1] == "test topic latest news" for call in calls)
+    assert any("site:bbc.com" in call[1] for call in calls)
+    assert any("site:aljazeera.com" in call[1] for call in calls)
+    assert max(a["search_rank"] for a in articles) == len(articles)
 
 
 def test_full_fetch_metadata_date_can_drop_old_undated_article(nrol, topic_path, monkeypatch):
@@ -1866,6 +1938,20 @@ END
     resolved = json.loads(nrol.run_schema_gap_resolver(SLUG, persist=True))
     assert resolved["proposals"]
     before = _disk_posteriors(topic_path)
+
+    review_text = """VERDICT: APPROVE
+RISK: low; test-only observable extension is bounded
+DIRECTIONALITY: threshold count higher strengthens the intended hypothesis
+DUPLICATE_OR_OVERLAP: no existing observable covers escort count
+RECOMMENDATION: approve
+"""
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": review_text, "model": "test-red-team", "host": "local"},
+    )
+    reviewed = json.loads(nrol.red_team_schema_extension_proposal(SLUG, 0))
+    assert reviewed["review"]["verdict"] == "APPROVE"
+
     marked = json.loads(nrol.mark_schema_extension_proposal(
         SLUG, 0, "approved", note="good test indicator"))
     assert marked["proposal"]["status"] == "approved"

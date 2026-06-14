@@ -17,9 +17,11 @@ def _envbool(name: str, default: bool) -> bool:
 # load all stay in sync without three places to edit.
 _PERSISTED_KEYS = (
     "llama_host", "llama_model", "llama_server_exe", "llama_models_dir",
+    "llama_chat_template_file",
     "vision_model",
     "max_context_tokens", "verbatim_window",
     "temperature", "top_p", "max_tokens", "repeat_penalty",
+    "db_path",
 )
 _HOST_KEYS = ("llama_host",)
 
@@ -37,6 +39,14 @@ class Config:
         "llama-server",
     )
     llama_models_dir: str = os.getenv("LLAMA_MODELS_DIR", r"C:\LlamaServer\models")
+    llama_chat_template_file: str = os.getenv(
+        "LLAMA_CHAT_TEMPLATE_FILE",
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "templates",
+            "qwen3.6-froggeric-v20-chat_template.jinja",
+        ),
+    )
 
     # Context budget
     max_context_tokens: int = 32768

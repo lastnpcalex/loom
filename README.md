@@ -8,6 +8,29 @@
 
 A self-hosted web interface for branching AI conversations across Claude Code, ChatGPT Codex, Antigravity (agy), Hermes Agent, and local llama.cpp models — and for handing off between them mid-conversation. Every conversation is a tree: branch, fork, regenerate, and full-text search across every path without losing anything.
 
+## Project status and implementation model
+
+A Shadow Loom is an active experimental project. The harnesses in this repo are
+WIP operational integrations, not polished product SDK wrappers. Expect sharp
+edges, frequent schema and workflow changes, and local state that may need
+operator attention while features are being hardened.
+
+The provider integrations are built around the tools you would run from a
+terminal, not official application SDKs:
+
+- **Claude** uses the Claude Code CLI as a subprocess.
+- **Codex** uses the ChatGPT Codex CLI/app-server flow.
+- **Antigravity/Gemini** uses the `agy` CLI.
+- **Braid/Weave** use local `llama.cpp` / `llama-server`.
+- **Hermes** uses Hermes Agent over ACP.
+- **NROL-AO** is operated through its typed MCP facade, with the engine repo as
+  the authority boundary.
+
+That design is deliberate: Loom is a branching UI, state store, permission
+bridge, and orchestration layer around active agent tools. It does not replace
+those tools' own auth/session behavior, and it does not guarantee that
+experimental provider CLI behavior will remain stable.
+
 ## What is a loom?
 
 An LLM loom treats every conversation as a **tree, not a thread**. Each message is a node. At any point you can branch — regenerate, edit, fork — and explore alternate paths without losing the originals. The metaphor comes from weaving: every response is a thread, and the loom holds them all in tension so you can compare, backtrack, and choose.

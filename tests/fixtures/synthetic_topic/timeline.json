@@ -5,9 +5,9 @@
   "end": "2026-09-30",
   "truth": {
     "hypothesis": "H3",
-    "reopen_date": "2026-09-12",
-    "sustained_70pct_date": "2026-09-24",
-    "note": "The strait reopens 2026-09-12 (inside H3's tranche) and transit sustains >= 70% of baseline from 2026-09-24."
+    "reopen_date": "2026-09-20",
+    "sustained_70pct_date": "2026-09-28",
+    "note": "The strait reopens 2026-09-20 (inside H3's tranche) and transit sustains >= 70% of baseline from 2026-09-28."
   },
   "regimes": [
     {"from": "2026-07-01", "to": "2026-08-14", "name": "blockade_hold"},
@@ -126,29 +126,43 @@
       "articles": 3
     },
     {
+      "id": "E11b",
+      "date": "2026-09-10",
+      "summary": "Joint maritime commanders report discovering a newly laid naval mine floating near the central shipping lanes. Varessan Coastal Forces and coalition escort officials announce a postponement of the scheduled Sept 12 reopening to Sept 20.",
+      "gold": {"action": "FIRE", "indicator_id": "t2_blockade_reinforcement"},
+      "articles": 2
+    },
+    {
+      "id": "E11c",
+      "date": "2026-09-15",
+      "summary": "Following intensive sweep operations that cleared the remaining floating hazards, joint naval authorities issue a new decree confirming the Strait of Meridia will reopen on 20 September.",
+      "gold": {"action": "FIRE", "indicator_id": "t1_reopening_decree"},
+      "articles": 2
+    },
+    {
       "id": "E12",
-      "date": "2026-09-12",
+      "date": "2026-09-20",
       "summary": "First post-decree convoys transit in both directions; tracking shows daily transits near 38 percent of baseline.",
       "gold": {"action": "OBSERVE", "indicator_id": "t2_transit_volume", "observed_value": 38},
       "articles": 2
     },
     {
       "id": "E13",
-      "date": "2026-09-18",
+      "date": "2026-09-23",
       "summary": "Insurance normalization index rises to 64 as war-risk premiums fall for escorted transits.",
       "gold": {"action": "OBSERVE", "indicator_id": "t3_insurance_normalization", "observed_value": 64},
       "articles": 1
     },
     {
       "id": "D04",
-      "date": "2026-09-20",
+      "date": "2026-09-25",
       "summary": "A cruise operator announces it will resume regional itineraries next season, citing improving outlook; no transit data included.",
       "gold": {"action": "IGNORE"},
       "articles": 1
     },
     {
       "id": "E14",
-      "date": "2026-09-24",
+      "date": "2026-09-28",
       "summary": "Daily transits reach 78 percent of the pre-crisis baseline for the fifth consecutive day; brokers call the recovery sustained.",
       "gold": {"action": "OBSERVE", "indicator_id": "t2_transit_volume", "observed_value": 78},
       "articles": 2

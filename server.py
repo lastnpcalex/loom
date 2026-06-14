@@ -2453,6 +2453,8 @@ async def api_add_message(conv_id: int, data: dict):
         describe_context=describe_context
     )
     await db.set_active_branch(conv_id, msg["id"])
+    from context_manager import update_rolling_summary
+    asyncio.create_task(update_rolling_summary(conv_id))
     return msg
 
 
@@ -3291,14 +3293,6 @@ async def handle_cc_permission(data: dict):
     gen_id = _permission_scope_gen_id(permission_scope)
     if gen_id is not None:
         perm_msg["gen_id"] = gen_id
-    await _ws_broadcast_all(
-        {
-            "type": "status",
-            "text": f"Permission request pending: {tool_name}",
-            "conv_id": conv_id,
-        }
-    )
-
     # Persist to DB first (survives server restart)
     await db.save_pending_permission(
         request_id, conv_id, tool_name, tool_input, input_summary
@@ -4722,11 +4716,6 @@ async def _handle_claude_generation(
                         f"[CC] Cross-provider turn at msg {msg['id']} ({prev_model}), will rebuild full history"
                     )
                     crossed_provider = True
-                    break
-                # agy and codex don't support --fork-session in the same way,
-                # so resuming mutates the session in place. Skip resume.
-                if is_gemini or is_codex:
-                    print(f"[CC] Gemini/Codex has no stable --fork-session, skipping resume for branch safety")
                     break
                 resume_session_id = msg["cc_session_id"]
                 break
@@ -6223,11 +6212,8 @@ async def _handle_hermes_generation(
                 await db.update_message_content(draft_msg_id, content=full_text,
                                                 content_blocks=json.dumps(content_blocks))
             elif etype == "permission_request":
-                # The browser modal is driven by /api/cc-permission (the hermes
-                # client POSTs there from an async bridge task). Surface a status
-                # so the UI shows *something* while we wait.
-                await _ws_send(conv_id, {"type": "status",
-                                         "text": f"Hermes requested permission: {evt.get('tool_name', 'tool')}"})
+                # The browser prompt/notification is driven by /api/cc-permission.
+                pass
             elif etype == "usage":
                 total_input_tokens = evt.get("input_tokens", 0) or total_input_tokens
                 total_output_tokens += evt.get("output_tokens", 0)
@@ -6357,7 +6343,7 @@ async def _handle_ooda_generation(
                 if entry:
                     lore_entries.append(entry)
 
-        context = await get_context_for_generation(conv_id, character)
+        context = await get_context_for_generation(conv_id, character, leaf_id=parent_id)
         if action == "regenerate" and parent_id is not None:
             context["verbatim_messages"] = [
                 m for m in context["verbatim_messages"] if m["id"] <= parent_id
@@ -6586,6 +6572,8 @@ async def _handle_ooda_generation(
         _ooda_gen_ms = int((_time.time() - _ooda_start_t) * 1000)
         await db.update_message_content(draft_msg_id, content=final_prose, generation_ms=_ooda_gen_ms)
         await db.set_active_branch(conv_id, draft_msg_id)
+        from context_manager import update_rolling_summary
+        asyncio.create_task(update_rolling_summary(conv_id))
         msg = await db.get_message(draft_msg_id)
         # Save branch-level state deltas (Tier 3)
         if ooda and ooda.get("updates"):
@@ -6700,7 +6688,7 @@ async def _handle_weave_generation(
         # Get context (with potential compactification)
         # For regenerate, truncate context to parent_id so we don't include
         # the old response we're regenerating
-        context = await get_context_for_generation(conv_id, character)
+        context = await get_context_for_generation(conv_id, character, leaf_id=parent_id)
         if action == "regenerate" and parent_id is not None:
             context["verbatim_messages"] = [
                 m for m in context["verbatim_messages"] if m["id"] <= parent_id
@@ -6851,6 +6839,8 @@ async def _handle_weave_generation(
         _weave_gen_ms = int((_time.time() - _weave_start_t) * 1000)
         await db.update_message_content(draft_msg_id, content=full_response, generation_ms=_weave_gen_ms)
         await db.set_active_branch(conv_id, draft_msg_id)
+        from context_manager import update_rolling_summary
+        asyncio.create_task(update_rolling_summary(conv_id))
         msg = await db.get_message(draft_msg_id)
         await _ws_send(
             conv_id,

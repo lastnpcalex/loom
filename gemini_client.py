@@ -12,6 +12,8 @@ import re
 import sys
 from pathlib import Path
 
+from loom_agent_prompt import prepend_loom_agent_context
+
 log = logging.getLogger(__name__)
 
 # Use the standard Loom blocking hook
@@ -241,6 +243,17 @@ def _configure_operator(cwd: str, conv_id: int, server_port: int):
     log.info(f"[AGY] NROL operator MCP surface configured: {mcp_path}")
 
 
+def _prepare_agy_prompt(
+    prompt: str,
+    backstage_parent_id: int | None = None,
+    nrol_operator: bool = False,
+) -> str:
+    """Inject the Loom contract for ordinary agy sessions."""
+    if backstage_parent_id or nrol_operator:
+        return prompt
+    return prepend_loom_agent_context(prompt, "agy")
+
+
 def normalize_tool_name(name: str) -> str:
     mapping = {
         "view_file": "Read",
@@ -304,6 +317,8 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     _configure_permission_hook(cwd, backstage_parent_id, server_port)
     if nrol_operator:
         _configure_operator(cwd, conv_id, server_port)
+    else:
+        prompt = _prepare_agy_prompt(prompt, backstage_parent_id, nrol_operator)
 
     agy_model = _loom_model_to_agy(model, effort)
     _set_agy_model(agy_model)
@@ -335,15 +350,43 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                             pass
         return latest_file, latest_time
 
+    # Fork session if requested
+    if resume_session_id and fork_session:
+        src = brain_path / resume_session_id
+        dst = brain_path / str(conv_id)
+        if src.exists() and not dst.exists():
+            import shutil
+            try:
+                shutil.copytree(src, dst)
+                print(f"[AGY] Forked session {resume_session_id} to {conv_id}")
+                resume_session_id = str(conv_id)
+            except Exception as e:
+                log.warning(f"[AGY] Failed to fork session: {e}")
+
     # Determine baseline before launching process to avoid race conditions
     use_resume = bool(resume_session_id)
-    baseline_file, baseline_time = find_latest_transcript(brain_path)
+    baseline_file = None
+    baseline_time = 0.0
     initial_size = 0
-    if use_resume and baseline_file:
-        try:
-            initial_size = baseline_file.stat().st_size
-        except OSError:
-            pass
+
+    if use_resume:
+        target_session = resume_session_id or str(conv_id)
+        explicit_baseline = brain_path / target_session / ".system_generated" / "logs" / "transcript.jsonl"
+        if explicit_baseline.exists():
+            baseline_file = explicit_baseline
+            try:
+                initial_size = baseline_file.stat().st_size
+                baseline_time = baseline_file.stat().st_mtime
+            except OSError:
+                pass
+
+    if not baseline_file:
+        baseline_file, baseline_time = find_latest_transcript(brain_path)
+        if use_resume and baseline_file:
+            try:
+                initial_size = baseline_file.stat().st_size
+            except OSError:
+                pass
 
     agy_exe = _find_agy_exe()
 

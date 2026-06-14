@@ -419,6 +419,8 @@ async def sync_chat(
         "temperature": temperature if temperature is not None else config.temperature,
         "max_tokens": max_tokens or config.max_tokens,
     }
+    if think is not None:
+        payload["chat_template_kwargs"] = {"enable_thinking": bool(think)}
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:

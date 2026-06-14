@@ -1,0 +1,18 @@
+{
+  "id": "E11b-a1",
+  "event_id": "E11b",
+  "label": "E11b",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t2_blockade_reinforcement"
+  },
+  "published": "2026-09-10T08:10:00+00:00",
+  "outlet": "Sundaria Times",
+  "url": "synthetic://sundaria-times/E11b-a1",
+  "headline": "Mine Discovery Forces Delay of Strait of Meridia Reopening",
+  "body": "OSTREV — The planned September 12 reopening of the Strait of Meridia has been suspended following the discovery of a newly laid naval mine near the central shipping lanes. Joint maritime commanders confirmed the hazard early on September 10, prompting an immediate halt to all scheduled transit drills. The Varessan Coastal Forces and officials from the Meridian Compact coalition announced the postponement in a joint statement late Thursday, setting a new target date for reopening operations on September 20. The mine was detected by coalition escort vessels conducting routine safety sweeps in the narrow chokepoint between the Varessan Sea and the open ocean. No vessels were damaged in the incident, but the presence of the explosive device has raised concerns about the safety of the corridor. The Varessan government stated it would cooperate with coalition forces to clear the hazard before resuming normal traffic flow. The delay marks the latest setback in efforts to restore commercial shipping through the strait, which has been closed by blockade since May 2026. Coalition leaders emphasized that the safety of merchant crews remains the top priority, and additional mine-sweeping vessels are being deployed to the area. The Meridian Compact has urged all shipping companies to heed the warning and avoid the central lanes until further notice.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T22:37:06.440280+00:00"
+  }
+}

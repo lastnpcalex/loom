@@ -7,13 +7,13 @@
     "indicator_id": "t2_transit_volume",
     "observed_value": 78
   },
-  "published": "2026-09-24T12:40:00+00:00",
+  "published": "2026-09-28T12:40:00+00:00",
   "outlet": "The Meridian Courier",
   "url": "synthetic://the-meridian-courier/E14-a2",
-  "headline": "109 Ships Daily: Blockade Recovery Enters Sustainable Phase",
-  "body": "The Strait of Meridia has processed approximately 109 commercial vessels daily for the past five days—establishing a pattern that insurers and port operators are now treating as operationally sustainable rather than contingent, according to HarborTrack data and statements from the maritime industry.\n\nThe figure represents 78 percent recovery from the pre-crisis average of roughly 140 transits daily. For operators managing the coalition's escort convoys, the consistency signals that logistics networks can rely on sustained weekly throughput for contract fulfillment and cargo scheduling.\n\n\"We're seeing port terminals adjust their berth scheduling to assume this throughput,\" said a logistics coordinator at Ostrev Free Zone, Varessa's major competitor port. \"Five days establishes a working baseline.\"\n\nThe Meridia Route Normalization Index—the market's benchmark for war-risk premium pricing—reflects the shift in broker sentiment. Index points have steadied in the mid-range, suggesting underwriters are pricing for mid-blockade conditions rather than crisis spikes or rapid resolution.\n\nOperation Open Water's five-nation escort framework continues rotating naval support, with Khoreth, Sundaria, and Elbar providing primary presence alongside contingent units from Aldenport and Virelles. No new incident reports have emerged from either coalition or blockading forces.",
+  "headline": "Brokers Declare Recovery Sustained as Daily Transits Hit 109 Vessels",
+  "body": "QOROS — Marine underwriters at the Qoros Marine Underwriters' Association have declared the recovery of Meridia Strait traffic sustained after daily transits held at 109 vessels for the fifth straight day, representing 78 percent of the pre-crisis baseline of 140 ships. The Meridia Route Normalization Index, which tracks war-risk pricing, has climbed to 42 points out of 100, reflecting reduced premiums for insurers covering cargo through the Varessan Sea chokepoint. “This is no longer a speculative rebound,” said Elara Vane, a senior risk analyst at the Association. “The consistency of the last five days indicates that Operation Open Water escorts have established a predictable rhythm.” HarborTrack data confirms that no Varessan Coastal Forces vessels have intercepted merchant traffic since the latest surge began. The five-nation coalition, comprising Khoreth, Sundaria, Elbar, Aldenport, and Virelles, has maintained continuous patrol coverage. In Qoros, charter rates for short-haul routes through the Strait have dropped by 18 percent over the week. “Brokers are pricing in stability,” noted port logistics manager Kaelen Dross. “We’re seeing longer-term contracts return to the market.” While the index remains well below the 100-point pre-crisis level, the steady volume of transits has encouraged shippers to resume regular scheduling. The Meridian Compact cites the figures as proof that coordinated naval protection can mitigate political risk in contested waters.",
   "generator": {
     "model": "claude-haiku-4-5-20251001",
-    "generated_at": "2026-06-12T03:48:58.534314+00:00"
+    "generated_at": "2026-06-12T22:37:54.270619+00:00"
   }
 }

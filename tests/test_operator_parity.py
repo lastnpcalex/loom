@@ -206,3 +206,108 @@ def test_agy_operator_hook_denies_shell_without_prompt(monkeypatch):
     out = json.loads(stdout.getvalue())
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "NROL operator mode" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+# --- Resume and Fork tests --------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_gemini_client_resume_and_fork_args(monkeypatch, tmp_path):
+    import gemini_client
+    import asyncio
+
+    args_captured = []
+
+    class MockProcess:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.returncode = 0
+        async def wait(self):
+            return 0
+
+    mock_proc = MockProcess()
+    # Feed dummy data to stdin/stdout so it initializes successfully and exits
+    mock_proc.stdout.feed_data(b'{"type":"session_info"}\n')
+    mock_proc.stdout.feed_eof()
+    mock_proc.stderr.feed_eof()
+
+    async def mock_create_subprocess_exec(*args, **kwargs):
+        args_captured.append(args)
+        return mock_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", mock_create_subprocess_exec)
+    monkeypatch.setattr(gemini_client, "_find_agy_exe", lambda: "agy")
+
+    # Override HOME / USERPROFILE env variables to direct brain path to tmp_path
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    brain_path = tmp_path / ".gemini" / "antigravity-cli" / "brain"
+
+    # Create dummy source session
+    src_session = brain_path / "src_session"
+    logs_dir = src_session / ".system_generated" / "logs"
+    logs_dir.mkdir(parents=True)
+    (logs_dir / "transcript.jsonl").write_text('{"type":"step"}\n', encoding="utf-8")
+
+    # Run with resume and fork
+    await gemini_client.run_gemini(
+        prompt="hello",
+        cwd=str(tmp_path),
+        conv_id=123,
+        resume_session_id="src_session",
+        fork_session=True,
+    )
+
+    # Check that it forked (copied) the directory to conv_id "123"
+    dst_dir = brain_path / "123"
+    assert dst_dir.exists()
+    assert (dst_dir / ".system_generated" / "logs" / "transcript.jsonl").exists()
+
+    # Check the CLI args carried the destination session ID
+    assert len(args_captured) == 1
+    cmd_args = args_captured[0]
+    assert cmd_args[0] == "agy"
+    idx = cmd_args.index("--conversation")
+    assert cmd_args[idx + 1] == "123"
+
+
+def test_codex_client_resume_and_fork(tmp_path):
+    import codex_client
+
+    method, params = codex_client._codex_thread_request(
+        cwd=str(tmp_path),
+        codex_model="gpt-4o",
+        approval_policy="on-request",
+        sandbox_mode="workspace-write",
+        thread_config={"mcp_servers": {"web-tools": {}}},
+        resume_session_id="parent_session",
+        fork_session=True,
+    )
+
+    assert method == "thread/fork"
+    assert params["threadId"] == "parent_session"
+    assert params["config"] == {"mcp_servers": {"web-tools": {}}}
+    assert "sessionStartSource" not in params
+    assert "threadSource" not in params
+
+    method, params = codex_client._codex_thread_request(
+        cwd=str(tmp_path),
+        codex_model="gpt-4o",
+        approval_policy="on-request",
+        sandbox_mode="workspace-write",
+        resume_session_id="parent_session",
+        fork_session=False,
+    )
+    assert method == "thread/resume"
+    assert params["threadId"] == "parent_session"
+
+    method, params = codex_client._codex_thread_request(
+        cwd=str(tmp_path),
+        codex_model="gpt-4o",
+        approval_policy="on-request",
+        sandbox_mode="workspace-write",
+    )
+    assert method == "thread/start"
+    assert params["sessionStartSource"] == "startup"
+    assert params["threadSource"] == "user"

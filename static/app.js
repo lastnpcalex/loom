@@ -559,8 +559,10 @@ function renderConversationList() {
         convs = convs.filter(c => c.mode === 'local');
     } else if (State.convFilter === 'hermes') {
         convs = convs.filter(c => c.mode === 'hermes');
+    } else if (State.convFilter === 'nrol') {
+        convs = convs.filter(c => !!c.nrol_operator);
     } else if (State.convFilter === 'claude') {
-        convs = convs.filter(c => c.mode === 'claude' || c.mode === 'codex');
+        convs = convs.filter(c => (c.mode === 'claude' || c.mode === 'codex') && !c.nrol_operator);
     }
 
     if (convs.length === 0) {
@@ -1354,7 +1356,7 @@ async function updateInlineCCControls(conv) {
         await populateCCModelDropdowns(ccModel);
         
         effortSel.value = conv.cc_effort || 'high';
-        if (permSel) permSel.value = conv.cc_permission_mode || 'default';
+        if (permSel) permSel.value = isCodex ? 'default' : (conv.cc_permission_mode || 'default');
         
         const resolvedModel = modelSel.value;
         if (resolvedModel && resolvedModel !== ccModel) {
@@ -1367,7 +1369,9 @@ async function updateInlineCCControls(conv) {
         // selects don't apply, so hide them.
         modelSel.style.display = isBraid ? 'none' : '';
         effortSel.style.display = (isBraid || !modelSupportsEffort) ? 'none' : '';
-        if (permSel) permSel.style.display = '';
+        // Codex Plan mode exists upstream, but Loom's app-server integration
+        // does not currently wire the collaboration mode request field.
+        if (permSel) permSel.style.display = isCodex ? 'none' : '';
         statePanelChat?.classList.add('hidden');
     } else if (conv && conv.mode === 'hermes') {
         // Borrow the Weave inline bar for its model dropdown, but strip
@@ -2516,7 +2520,7 @@ function setupEventListeners() {
         document.getElementById('cfg-max-tokens').value = cfg.max_tokens ?? 1024;
         document.getElementById('cfg-repeat-penalty').value = cfg.repeat_penalty ?? 1.12;
         document.getElementById('cfg-cc-effort').value = (conv && conv.cc_effort) || 'high';
-        document.getElementById('cfg-cc-permission').value = (conv && conv.cc_permission_mode) || 'default';
+        document.getElementById('cfg-cc-permission').value = (conv && conv.mode !== 'codex' && conv.cc_permission_mode) || 'default';
 
         const localModel = (conv && conv.local_model) || '';
         await Promise.all([
@@ -2555,6 +2559,8 @@ function setupEventListeners() {
             group.classList.toggle('overrides-inactive', !active);
             group.querySelectorAll('select, input').forEach(c => { c.disabled = !active; });
         }
+        const ccPermissionGroup = document.getElementById('cfg-cc-permission')?.closest('.form-group');
+        if (ccPermissionGroup) ccPermissionGroup.classList.toggle('hidden', mode === 'codex');
         const ovHint = document.getElementById('cfg-overrides-divider-hint');
         if (ovHint) ovHint.textContent = mode ? '' : '(open a conversation to edit)';
 
@@ -2583,7 +2589,8 @@ function setupEventListeners() {
         const orig = btn.textContent;
         btn.disabled = true;
         // Save current panel values first so the restart picks them up.
-        document.getElementById('btn-save-settings').click();
+        const saved = await _saveSettingsFromPanel();
+        if (!saved) return;
         btn.textContent = '↻ Restarting…';
         try {
             const adminUrl = _localUrl(location.protocol.slice(0, -1), 3002, '/tools/llama-restart');
@@ -2674,8 +2681,7 @@ function setupEventListeners() {
         document.getElementById('cfg-cc-effort-group').classList.toggle('hidden', !_supportsEffortValue(v));
     });
 
-    document.getElementById('btn-save-settings').addEventListener('click', async () => {
-        // Save all sections at once
+    async function _saveSettingsFromPanel() {
         const conv = State.currentConv;
         const valueOf = (id, fallback = '') => {
             const el = document.getElementById(id);
@@ -2683,15 +2689,11 @@ function setupEventListeners() {
         };
         const selectedModel = valueOf('cfg-llama-model-select', State.config.llama_model || '') || State.config.llama_model || '';
 
-        // Save tuning for the selected model
         if (selectedModel) {
             _modelConfigs[selectedModel] = _readModelTuning();
             await _saveModelConfigs();
         }
 
-        // The from-folder picker is the single source of truth for both the
-        // default local model and the vision model — llama-server only loads
-        // one model at a time, so the two cannot diverge in practice.
         const globalCfg = {
             ...State.config,
             llama_host: valueOf('cfg-host', State.config.llama_host || ''),
@@ -2707,13 +2709,15 @@ function setupEventListeners() {
         };
         await API.put('/api/config', globalCfg);
         State.config = globalCfg;
-        // Loom/Braid per-conversation settings (if in a conversation)
+
         if (conv && State.currentConvId) {
             const updates = {};
             if (conv.mode === 'claude' || conv.mode === 'codex') {
                 updates.cc_model = valueOf('cfg-cc-model', conv.cc_model || 'sonnet');
                 updates.cc_effort = valueOf('cfg-cc-effort', conv.cc_effort || 'high');
-                updates.cc_permission_mode = valueOf('cfg-cc-permission', conv.cc_permission_mode || 'default');
+                updates.cc_permission_mode = conv.mode === 'codex'
+                    ? 'default'
+                    : valueOf('cfg-cc-permission', conv.cc_permission_mode || 'default');
             } else if (conv.mode === 'local') {
                 updates.local_model = valueOf('cfg-braid-model', conv.local_model || '');
             } else if (conv.mode === 'hermes') {
@@ -2724,7 +2728,6 @@ function setupEventListeners() {
             if (Object.keys(updates).length) {
                 await API.put(`/api/conversations/${State.currentConvId}`, updates);
                 Object.assign(conv, updates);
-                // Sync inline controls
                 if (updates.cc_model) { const s = document.getElementById('cc-model-inline'); if (s) s.value = updates.cc_model; }
                 if (updates.cc_effort) { const s = document.getElementById('cc-effort-inline'); if (s) s.value = updates.cc_effort; }
                 if (updates.cc_permission_mode) { const s = document.getElementById('cc-permission-mode-inline'); if (s) s.value = updates.cc_permission_mode; }
@@ -2733,12 +2736,16 @@ function setupEventListeners() {
                 if (typeof renderMessages === 'function') renderMessages();
             }
         }
+        return true;
+    }
+
+    document.getElementById('btn-save-settings').addEventListener('click', async () => {
+        const saved = await _saveSettingsFromPanel();
+        if (!saved) return;
         closeModal('modal-settings');
         _stopServerLightPolling();
         showToast('Settings saved');
     });
-
-    // ── Per-model configuration ───────────────────────────────────────────
     let _modelConfigs = {};     // { modelName: { ctx_size, ngl, ... } }
     let _kvQuantOptions = ["none", "K4", "K4_0", "K5", "K5_0", "K8", "K8_0"];
 

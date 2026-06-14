@@ -31,7 +31,9 @@ def estimate_messages_tokens(messages: list[dict]) -> int:
     return total
 
 
-async def get_context_for_generation(conv_id: int, character: dict = None) -> dict:
+async def get_context_for_generation(
+    conv_id: int, character: dict = None, leaf_id: int | None = None
+) -> dict:
     """Build the context window for generation.
 
     Returns:
@@ -42,7 +44,7 @@ async def get_context_for_generation(conv_id: int, character: dict = None) -> di
             "was_compactified": bool,
         }
     """
-    branch = await db.get_active_branch(conv_id)
+    branch = await db.get_branch_to_root(leaf_id) if leaf_id is not None else await db.get_active_branch(conv_id)
     if not branch:
         return {
             "summary": None,

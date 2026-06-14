@@ -7,13 +7,13 @@
     "indicator_id": "t2_transit_volume",
     "observed_value": 38
   },
-  "published": "2026-09-12T08:10:00+00:00",
+  "published": "2026-09-20T08:10:00+00:00",
   "outlet": "Qoros Wire",
   "url": "synthetic://qoros-wire/E12-a1",
-  "headline": "First Convoys Transit Meridia Strait as Blockade Framework Holds",
-  "body": "OSTREV, Sept. 12 — First commercial convoys moved through the Strait of Meridia in both directions today, marking the first post-decree transits following months of blockade. Tracking data from HarborTrack recorded approximately 50 vessel movements throughout the day, substantially below pre-crisis baseline traffic of roughly 140 commercial ships per day.\n\nThe transits occurred under Operation Open Water, the five-nation escort framework comprising Khoreth, Sundaria, Elbar, Aldenport, and Virelles. The Varessan Coastal Forces maintained positioning throughout the strait but did not attempt to interfere with the movements, according to maritime monitors and shipping officials.\n\n\"The passage was orderly and protected,\" said a spokesperson for the Khoreth Maritime Authority. Officials at Qoros Marine Underwriters' Association said no incidents were reported during the day's movements.\n\nShipping companies expressed cautious optimism about resumption of regular traffic, though the low throughput reflects the operational constraints of convoy assembly and escort coordination. Several trade routes remain under restriction, with captains and brokers continuing to navigate insurance pricing and scheduling amid uncertainty about blockade duration.\n\nThe Meridia Route Normalization Index, which reflects market risk assessment, remained significantly depressed, indicating traders do not yet view the transits as establishing stable passage conditions. Additional convoy movements are scheduled through the week.",
+  "headline": "First Convoys Transit Strait of Meridia Since Blockade Began",
+  "body": "QOROS — The first organized convoys passed through the Strait of Meridia in both directions on Sunday, marking the initial movement of commercial vessels since the Republic of Varessa imposed a naval blockade in May 2026. HarborTrack data confirms that daily transit counts reached approximately 53 ships, roughly 38 percent of the pre-crisis baseline of 140 commercial transits per day. The movement follows the announcement of Operation Open Water on 20 August, a five-nation escort framework involving Khoreth, Sundaria, Elbar, Aldenport, and Virelles. Varessan Coastal Forces maintained a visible presence at the channel’s edges but did not intercept the escorted groups. Representatives of the Meridian Compact stated that the passage demonstrates the operational viability of the coalition’s security guarantees. The Varessan government in Ostrev declined to comment on the specific transits, reiterating its position that the blockade remains in effect until diplomatic conditions are met. Qoros mediators have scheduled a follow-up session to review the safety protocols established for the escort corridors. Insurance underwriters in Qoros reported immediate adjustments to risk assessments as the first shipments cleared the chokepoint.",
   "generator": {
     "model": "claude-haiku-4-5-20251001",
-    "generated_at": "2026-06-12T03:48:01.818336+00:00"
+    "generated_at": "2026-06-12T22:37:27.813075+00:00"
   }
 }

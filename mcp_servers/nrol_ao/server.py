@@ -34,6 +34,14 @@ _DEFAULT_REPO = Path(r"C:\Claude-Code\NROL-AO\temp-repo")
 _ALLOWED_TRANSITIONS = {"PARK", "FIRE", "OBSERVE", "SCHEMA_GAP", "IGNORE"}
 _MUTATING_TRANSITIONS = {"PARK", "FIRE", "OBSERVE", "SCHEMA_GAP"}
 _MAX_SEARCH_RESULTS_PER_CHANNEL = 6
+_MAX_AGGREGATED_SEARCH_RESULTS_PER_CHANNEL = 24
+_SOURCE_QUALIFIED_SEARCH_DOMAINS = (
+    "bbc.com",
+    "aljazeera.com",
+    "reuters.com",
+    "apnews.com",
+    "theguardian.com",
+)
 _TRACKING_QUERY_KEYS = {
     "fbclid",
     "gclid",
@@ -411,20 +419,73 @@ def _search_query_specs(topic: dict, window_label: str) -> list[dict]:
     return specs
 
 
+def _ddgs_hits(ddgs, method: str, query: str, limit: int) -> list[dict]:
+    search = getattr(ddgs, method, None)
+    if search is None:
+        return []
+    try:
+        return list(search(query, max_results=limit))
+    except TypeError:
+        return list(search(query))[:limit]
+
+
+def _dedupe_search_hits(hits: list[dict]) -> list[dict]:
+    seen = set()
+    deduped = []
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        url = (hit.get("href") or hit.get("url") or "").strip()
+        title = (hit.get("title") or "").strip().lower()
+        compact_title = re.sub(r"\s+", " ", title)[:160]
+        key = _canonical_article_url(url) or f"title::{compact_title}"
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(hit)
+    return deduped
+
+
 def _search_web_articles(query: str, channel: str, max_results: int) -> list[dict]:
-    """Server-side search backend for MCP-owned news scans."""
+    """Server-side search backend for MCP-owned news scans.
+
+    DDGS text search alone is shallow and can miss relevant mainstream news
+    articles behind aggregator/SEO results. Pull from the news vertical when
+    available, then add small source-qualified searches for high-signal
+    international outlets before the normal scan dedupe/freshness gates run.
+    """
     try:
         from ddgs import DDGS
     except ImportError as exc:
         raise RuntimeError("ddgs package not installed; install ddgs for MCP-side news scans") from exc
 
     limit = max(1, min(int(max_results), _MAX_SEARCH_RESULTS_PER_CHANNEL))
+    aggregate_limit = max(limit, min(limit * 4, _MAX_AGGREGATED_SEARCH_RESULTS_PER_CHANNEL))
+    raw_hits = []
+    source_domains = (
+        ()
+        if "site:" in query.lower()
+        else _SOURCE_QUALIFIED_SEARCH_DOMAINS
+    )
     with DDGS() as ddgs:
-        hits = list(ddgs.text(query, max_results=limit))
-
+        for method, search_query, search_limit in [
+            ("text", query, limit),
+            ("news", query, limit),
+            *[
+                ("text", f"{query} site:{domain}", 2)
+                for domain in source_domains
+            ],
+        ]:
+            for hit in _ddgs_hits(ddgs, method, search_query, search_limit):
+                if isinstance(hit, dict):
+                    hit = dict(hit)
+                    hit.setdefault("_search_backend", method)
+                    hit.setdefault("_search_query", search_query)
+                    raw_hits.append(hit)
+    hits = _dedupe_search_hits(raw_hits)[:aggregate_limit]
     articles = []
     retrieved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    for hit in hits:
+    for rank, hit in enumerate(hits, start=1):
         headline = (hit.get("title") or "").strip()
         url = (hit.get("href") or hit.get("url") or "").strip()
         body = (hit.get("body") or hit.get("snippet") or "").strip()
@@ -452,6 +513,8 @@ def _search_web_articles(query: str, channel: str, max_results: int) -> list[dic
             "query": query,
             "channel": channel,
             "retrieved_at": retrieved_at,
+            "search_backend": hit.get("_search_backend") or "text",
+            "search_rank": rank,
         }
         if published:
             article["date"] = str(published)
@@ -969,6 +1032,58 @@ def _parse_duplicate_judgment(text: str) -> dict:
     return {"verdict": verdict, "evidence_id": evidence_id, "reason": reason}
 
 
+def _proposal_suppression_reason(
+    topic: dict,
+    article: dict,
+    decision: dict,
+    evidence_id: str,
+) -> str:
+    """Return a conservative reason to avoid filing an obvious duplicate/no-op proposal."""
+    action = decision.get("action", {}) or {}
+    kind = action.get("kind", "")
+    indicator_id = action.get("indicator_id", "")
+    observed_value = action.get("value")
+    indicator, _tier = _find_indicator(topic, indicator_id)
+
+    if kind == "OBSERVE" and indicator is not None and observed_value is not None:
+        try:
+            new_value = float(observed_value)
+            old_value = float(indicator.get("lastObservedValue"))
+        except (TypeError, ValueError):
+            old_value = None
+        if old_value is not None and abs(new_value - old_value) <= 1e-9:
+            return (
+                f"duplicate_observation: {indicator_id} already has "
+                f"lastObservedValue={old_value:g}"
+            )
+
+    if kind in {"FIRE", "OBSERVE"} and indicator_id:
+        candidates = [
+            row for row in _candidate_duplicate_evidence(
+                topic, article, decision, window_days=30, limit=10,
+            )
+            if row.get("evidence_id") != evidence_id
+        ]
+        for row in candidates:
+            impact = str(row.get("posteriorImpact") or "")
+            reasons = set(row.get("reasons") or [])
+            already_applied = indicator_id in impact and (
+                "FIRED" in impact or "OBSERVE" in impact or "rebind" in impact
+            )
+            strong_same_article = "same_url" in reasons and row.get("score", 0) >= 1.0
+            if already_applied or (
+                strong_same_article
+                and indicator is not None
+                and indicator.get("status") == "FIRED"
+            ):
+                return (
+                    f"duplicate_prior_evidence: {row.get('evidence_id')} "
+                    f"score={row.get('score')} reasons={','.join(row.get('reasons') or [])}"
+                )
+
+    return ""
+
+
 def _load_topics(engine, slugs: list[str] | None = None) -> tuple[list[dict], list[dict]]:
     """Load topics tolerantly: one malformed file must not fail the whole call.
 
@@ -1079,7 +1194,15 @@ def help() -> str:
                 "list_topics",
                 "topic_status",
                 "read_topic",
+                "read_evidence",
+                "acknowledge_parked_reviews",
                 "list_hypotheses",
+                "list_schema_gaps",
+                "run_schema_gap_resolver",
+                "list_schema_extension_proposals",
+                "red_team_schema_extension_proposal",
+                "mark_schema_extension_proposal",
+                "apply_schema_extension_proposal",
                 "run_news_scan",
                 "list_activity",
                 "submit_transition",
@@ -1196,6 +1319,147 @@ def read_topic(slug: str, include_indicators: bool = True, evidence_limit: int =
                 },
             }
         )
+    except Exception as exc:
+        return _json({"error": str(exc), "slug": slug})
+
+
+@mcp.tool()
+def read_evidence(
+    slug: str,
+    evidence_ids: str = "",
+    flagged_only: bool = False,
+    limit: int = 50,
+    text_chars: int = 1200,
+) -> str:
+    """Read stored evidence rows by id, or inspect the flagged parked queue."""
+    try:
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(slug)
+        evidence = [
+            e for e in topic.get("evidenceLog", []) or []
+            if isinstance(e, dict) and e.get("id")
+        ]
+        requested = [
+            part.strip()
+            for part in re.split(r"[, \n\t]+", evidence_ids or "")
+            if part.strip()
+        ]
+        requested_set = set(requested)
+        flagged = set(
+            topic.get("governance", {}).get("flagged_for_indicator_review", []) or []
+        )
+        if requested_set:
+            selected = [e for e in evidence if e.get("id") in requested_set]
+        elif flagged_only:
+            selected = [e for e in evidence if e.get("id") in flagged]
+        else:
+            selected = evidence
+
+        max_items = max(0, min(int(limit), 200))
+        max_text = max(0, min(int(text_chars), 10000))
+        rows = []
+        for e in selected[:max_items]:
+            text = str(e.get("text") or "")
+            rows.append({
+                "id": e.get("id"),
+                "time": e.get("time"),
+                "source": e.get("source", ""),
+                "url": e.get("url", ""),
+                "has_url": bool(e.get("url")),
+                "tags": e.get("tags", []),
+                "transition": e.get("transition") or e.get("decision") or "",
+                "claimState": e.get("claimState", ""),
+                "posteriorImpact": e.get("posteriorImpact", ""),
+                "parked_reason": e.get("parked_reason") or e.get("parkedReason") or "",
+                "text": text[:max_text],
+                "text_truncated": len(text) > max_text,
+                "flagged_for_indicator_review": e.get("id") in flagged,
+            })
+
+        missing = [ev_id for ev_id in requested if ev_id not in {r["id"] for r in rows}]
+        return _json({
+            "slug": slug,
+            "count": len(rows),
+            "limit": max_items,
+            "requested_ids": requested,
+            "missing_ids": missing,
+            "flagged_only": flagged_only,
+            "evidence": rows,
+        })
+    except Exception as exc:
+        return _json({"error": str(exc), "slug": slug})
+
+
+@mcp.tool()
+def acknowledge_parked_reviews(
+    slug: str,
+    evidence_ids: str = "",
+    reason: str = "",
+    limit: int = 50,
+    dry_run: bool = True,
+) -> str:
+    """Stamp parked evidence as operator-reviewed without matcher/proposals."""
+    try:
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(slug)
+        if not hasattr(engine, "parked_review_status"):
+            return _json({"error": "engine lacks parked_review_status", "slug": slug})
+
+        debt_before = engine.parked_review_status(topic)
+        requested = [
+            part.strip()
+            for part in re.split(r"[, \n\t]+", evidence_ids or "")
+            if part.strip()
+        ]
+        if requested:
+            selected = requested
+        else:
+            max_items = max(1, min(int(limit), 500))
+            selected = [d["evidence_id"] for d in debt_before.get("due", [])[:max_items]]
+
+        flagged = set(
+            topic.get("governance", {}).get("flagged_for_indicator_review", []) or []
+        )
+        evidence_by_id = {
+            e.get("id"): e for e in topic.get("evidenceLog", []) or []
+            if isinstance(e, dict) and e.get("id")
+        }
+        reviews = []
+        missing = []
+        skipped_not_flagged = []
+        note = (reason or "operator acknowledged parked evidence as reviewed; no proposal filed").strip()
+        for ev_id in selected:
+            if ev_id not in evidence_by_id:
+                missing.append(ev_id)
+                continue
+            if ev_id not in flagged:
+                skipped_not_flagged.append(ev_id)
+                continue
+            reviews.append({
+                "evidence_id": ev_id,
+                "decision": "ACK",
+                "note": note[:300],
+            })
+
+        recorded = None
+        debt_after = None
+        if not dry_run and reviews:
+            recorded = engine.record_parked_reviews(slug, reviews, reviewer="operator_ack")
+            debt_after = engine.parked_review_status(engine.load_topic(slug))
+            debt_after.pop("due", None)
+
+        return _json({
+            "slug": slug,
+            "dry_run": dry_run,
+            "selected": selected,
+            "acknowledgeable": [r["evidence_id"] for r in reviews],
+            "missing_ids": missing,
+            "skipped_not_flagged": skipped_not_flagged,
+            "recorded": recorded,
+            "debt_before": {k: v for k, v in debt_before.items() if k != "due"},
+            "debt_after": debt_after,
+            "note": "No posterior movement; this only records review attendance.",
+        })
     except Exception as exc:
         return _json({"error": str(exc), "slug": slug})
 
@@ -1343,6 +1607,13 @@ def mark_schema_extension_proposal(
         )
         if proposal_index < 0 or proposal_index >= len(queue):
             raise IndexError(f"proposal_index {proposal_index} out of range")
+        if status_norm == "approved":
+            review = queue[proposal_index].get("red_team_review") or {}
+            if (review.get("verdict") or "").upper() != "APPROVE":
+                raise ValueError(
+                    "schema extension requires red_team_schema_extension_proposal "
+                    "with verdict APPROVE before it can be marked approved"
+                )
         queue[proposal_index]["status"] = status_norm
         queue[proposal_index]["reviewed_at"] = datetime.now(timezone.utc).isoformat(
             timespec="seconds"
@@ -1357,6 +1628,135 @@ def mark_schema_extension_proposal(
         })
     except Exception as exc:
         return _json({"error": str(exc), "slug": slug, "proposal_index": proposal_index})
+
+
+def _parse_schema_red_team_review(text: str) -> dict:
+    import re
+
+    text = text or ""
+    verdict_match = re.search(r"(?im)^VERDICT:\s*(APPROVE|REVISE|REJECT)\b", text)
+    verdict = verdict_match.group(1).upper() if verdict_match else "REVISE"
+
+    def field(name: str) -> str:
+        match = re.search(rf"(?ims)^{name}:\s*(.*?)(?=^[A-Z_]+:|\Z)", text)
+        return match.group(1).strip() if match else ""
+
+    return {
+        "verdict": verdict,
+        "risk": field("RISK"),
+        "directionality": field("DIRECTIONALITY"),
+        "duplicate_or_overlap": field("DUPLICATE_OR_OVERLAP"),
+        "recommendation": field("RECOMMENDATION"),
+        "raw": text,
+    }
+
+
+@mcp.tool()
+def red_team_schema_extension_proposal(
+    slug: str,
+    proposal_index: int,
+    model: str = "",
+    temperature: float = 0.2,
+    max_tokens: int = 2048,
+    timeout_sec: int = 600,
+) -> str:
+    """Mandatory red-team review for one schema-extension proposal."""
+    store = _activity_store()
+    job_id = new_job_id("red-team-schema")
+    try:
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(slug)
+        queue = topic.setdefault("governance", {}).setdefault(
+            "proposed_schema_extensions", []
+        )
+        if proposal_index < 0 or proposal_index >= len(queue):
+            raise IndexError(f"proposal_index {proposal_index} out of range")
+        proposal = queue[proposal_index]
+        prompt = "\n".join([
+            "Review this proposed NROL-AO schema extension adversarially.",
+            "",
+            "A schema extension changes future evidence extraction. It must not:",
+            "- create a same-step path from one article to both schema creation and posterior movement",
+            "- duplicate or overlap an existing indicator",
+            "- add a one-sided indicator that amplifies an already over-covered hypothesis",
+            "- use vague threshold language or non-observable criteria",
+            "- route evidence through an LR vector that points in the wrong direction",
+            "",
+            f"TOPIC: {slug}",
+            f"QUESTION: {topic.get('meta', {}).get('question', '')}",
+            "",
+            "HYPOTHESES:",
+            json.dumps(topic.get("model", {}).get("hypotheses", {}), indent=2, ensure_ascii=True),
+            "",
+            "EXISTING INDICATORS:",
+            json.dumps([
+                _indicator_brief(ind, tier)
+                for tier, items in (topic.get("indicators", {}).get("tiers", {}) or {}).items()
+                for ind in items or []
+            ] + [
+                _indicator_brief(ind, "anti_indicators")
+                for ind in topic.get("indicators", {}).get("anti_indicators", []) or []
+            ], indent=2, ensure_ascii=True),
+            "",
+            "PROPOSAL:",
+            json.dumps(proposal, indent=2, ensure_ascii=True),
+            "",
+            "Return exactly:",
+            "VERDICT: APPROVE | REVISE | REJECT",
+            "RISK: <main failure mode>",
+            "DIRECTIONALITY: <does LR/observable direction match the evidence direction?>",
+            "DUPLICATE_OR_OVERLAP: <existing indicator overlap, if any>",
+            "RECOMMENDATION: <specific required change or approval rationale>",
+        ])
+        store.record(
+            job_id, "running", task="red_team_schema_extension_proposal",
+            slug=slug, model=model or llama_client.llama_model(),
+            summary={"proposal_index": proposal_index},
+            prompt=prompt,
+        )
+        response = llama_client.chat(
+            prompt,
+            system_prompt=(
+                "You are the RED TEAM for NROL-AO schema extensions. "
+                "Return only the requested review fields."
+            ),
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+            disable_thinking=False,
+        )
+        review = _parse_schema_red_team_review(response.get("text", ""))
+        review["reviewed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        review["model"] = response.get("model")
+        proposal["red_team_review"] = review
+        proposal["red_team_required"] = True
+        if review["verdict"] != "APPROVE" and proposal.get("status") == "approved":
+            proposal["status"] = "pending_operator_review"
+        engine.save_topic(topic)
+        store.record(
+            job_id, "completed", task="red_team_schema_extension_proposal",
+            slug=slug, model=response.get("model"),
+            summary={"proposal_index": proposal_index, "verdict": review["verdict"]},
+            response=response.get("text", ""),
+        )
+        return _json({
+            "job_id": job_id,
+            "slug": slug,
+            "proposal_index": proposal_index,
+            "review": review,
+            "proposal": proposal,
+            "note": "Schema proposal red-team review is mandatory before approval/apply.",
+        })
+    except Exception as exc:
+        try:
+            store.record(
+                job_id, "failed", task="red_team_schema_extension_proposal",
+                slug=slug, error=str(exc),
+            )
+        except Exception:
+            pass
+        return _json({"job_id": job_id, "error": str(exc), "slug": slug, "proposal_index": proposal_index})
 
 
 def _parse_schema_body(body: str) -> dict:
@@ -1427,6 +1827,12 @@ def apply_schema_extension_proposal(
         proposal = queue[proposal_index]
         if proposal.get("status") != "approved":
             raise ValueError("schema extension must be marked approved before apply")
+        review = proposal.get("red_team_review") or {}
+        if (review.get("verdict") or "").upper() != "APPROVE":
+            raise ValueError(
+                "schema extension requires mandatory red-team review with "
+                "verdict APPROVE before apply"
+            )
 
         kind = (proposal.get("kind") or "").strip()
         schema = _parse_schema_body(proposal.get("body") or "")
@@ -3084,9 +3490,11 @@ def review_parked(
         }
         selected = []
         articles = []
+        missing_evidence_ids = []
         for d in due:
             ev = evidence_by_id.get(d["evidence_id"])
             if not ev:
+                missing_evidence_ids.append(d["evidence_id"])
                 continue
             art = {
                 "headline": (ev.get("text") or "")[:140] or d["evidence_id"],
@@ -3102,6 +3510,16 @@ def review_parked(
             selected.append(d["evidence_id"])
             articles.append(art)
 
+        if not selected:
+            return _json({
+                "slug": slug,
+                "considered": 0,
+                "reviews": [],
+                "debt": {k: v for k, v in debt_before.items() if k != "due"},
+                "missing_evidence_ids": missing_evidence_ids,
+                "note": "due parked IDs were missing from evidenceLog; no matcher run",
+            })
+
         store.record(
             job_id,
             "running",
@@ -3112,6 +3530,7 @@ def review_parked(
                 "phase": "matching",
                 "due_total": debt_before["due_count"],
                 "reviewing": len(selected),
+                "missing_evidence_ids": missing_evidence_ids,
                 "refetched": sum(1 for a in articles if a.get("excerpt")),
             },
         )
@@ -3179,33 +3598,40 @@ def review_parked(
                 "decision": kind or "NO_DECISION",
                 "note": (d.get("reason") or d.get("claim") or "")[:300],
             }
-            if kind in {"FIRE", "OBSERVE"} and not dry_run:
+            if kind in {"FIRE", "OBSERVE"}:
                 try:
-                    art_rec = pstore.submit_article(articles[idx_int - 1], submitted_by="review-parked")
                     _validate_proposal_shape(
                         topic, kind, action.get("indicator_id", ""), action.get("value"),
                     )
-                    review_delib = _deliberation_stamp_from_debate(d, debate_packet)
-                    prop = pstore.add_proposal(
-                        article_id=art_rec["id"],
-                        slug=slug,
-                        action=kind,
-                        indicator_id=action.get("indicator_id", ""),
-                        observed_value=action.get("value"),
-                        rationale=(
-                            f"re-adjudication of parked {ev_id}: "
-                            + (d.get("reason") or d.get("claim") or "matcher re-decision")
-                        )[:500],
-                        evidence_id=ev_id,
-                        deliberation=json.dumps(
-                            {"deliberation": review_delib} if review_delib
-                            else {"deliberationWaiver": "review_parked ran with deliberate=false"}
-                        ),
+                    suppression = _proposal_suppression_reason(
+                        topic, articles[idx_int - 1], d, ev_id,
                     )
-                    review["escalated_proposal_id"] = prop["id"]
-                    proposals_filed.append(prop["id"])
+                    if suppression:
+                        review["suppressed_proposal"] = suppression
+                    elif not dry_run:
+                        art_rec = pstore.submit_article(articles[idx_int - 1], submitted_by="review-parked")
+                        review_delib = _deliberation_stamp_from_debate(d, debate_packet)
+                        prop = pstore.add_proposal(
+                            article_id=art_rec["id"],
+                            slug=slug,
+                            action=kind,
+                            indicator_id=action.get("indicator_id", ""),
+                            observed_value=action.get("value"),
+                            rationale=(
+                                f"re-adjudication of parked {ev_id}: "
+                                + (d.get("reason") or d.get("claim") or "matcher re-decision")
+                            )[:500],
+                            evidence_id=ev_id,
+                            deliberation=json.dumps(
+                                {"deliberation": review_delib} if review_delib
+                                else {"deliberationWaiver": "review_parked ran with deliberate=false"}
+                            ),
+                        )
+                        review["escalated_proposal_id"] = prop["id"]
+                        proposals_filed.append(prop["id"])
                 except Exception as exc:
                     errors[ev_id] = str(exc)
+                    review["proposal_error"] = str(exc)
             reviews.append(review)
 
         recorded = None
@@ -3224,6 +3650,7 @@ def review_parked(
             "deliberation": debate_packet,
             "proposals_filed": proposals_filed,
             "proposal_errors": errors,
+            "missing_evidence_ids": missing_evidence_ids,
             "recorded": recorded,
             "debt_before": {k: v for k, v in debt_before.items() if k != "due"},
             "debt_after": debt_after,

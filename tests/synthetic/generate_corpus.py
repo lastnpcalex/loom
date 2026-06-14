@@ -134,6 +134,12 @@ EVENT_DIRECTIVES = {
            "may use about 20 ships a day against the ~140/day norm.",
     "E11": "The decree names the reopening date: 12 September 2026, under "
            "escort and insurance protocols. Every article carries the date.",
+    "E11b": "Discovery of a newly laid floating naval mine near the central shipping lanes. "
+            "Postponement of scheduled Sept 12 reopening to Sept 20. Make sure to specify "
+            "the new date Sept 20 and the reason (mine hazard).",
+    "E11c": "Following intensive sweep operations, joint naval authorities issue a new "
+            "decree rescheduling the formal reopening to 20 September. Every article must "
+            "state the new reopening date Sept 20.",
     "E12": "First convoys through; HarborTrack shows daily transits near 38 "
            "percent of baseline (trade angle: low fifties of ships per day).",
     "E13": "Index rises to 64 of 100 as war-risk premiums fall for escorted "
@@ -179,7 +185,8 @@ def build_brief(event: dict) -> str:
         "what the event means for any forecast."
     )
     for i in range(n):
-        outlet, voice = OUTLETS[(int(event["id"][1:]) + i) % len(OUTLETS)]
+        id_num = int(re.sub(r"\D", "", event["id"]))
+        outlet, voice = OUTLETS[(id_num + i) % len(OUTLETS)]
         lines.append(f"Article {i + 1} — outlet: {outlet} ({voice}). "
                      f"Angle: {ANGLES[i]}")
     lines.append(
@@ -191,17 +198,18 @@ def build_brief(event: dict) -> str:
 
 
 def call_haiku(prompt: str) -> str:
-    exe = shutil.which("claude")
-    if not exe:
-        raise RuntimeError("claude CLI not found on PATH")
-    proc = subprocess.run(
-        [exe, "-p", prompt, "--model", MODEL, "--output-format", "text"],
-        capture_output=True, text=True, encoding="utf-8",
-        stdin=subprocess.DEVNULL, timeout=600,
+    # Use local llama-server wrapper instead of claude CLI
+    import sys
+    sys.path.insert(0, str(HERE.parent.parent))
+    from mcp_servers.nrol_ao import llama
+    response = llama.chat(
+        prompt,
+        system_prompt="You are a creative writer generating fictional news articles based on a brief. Return only the requested JSON array.",
+        temperature=0.7,
+        max_tokens=4096,
+        disable_thinking=True,
     )
-    if proc.returncode != 0:
-        raise RuntimeError(f"claude CLI failed: {proc.stderr[:500]}")
-    return proc.stdout
+    return response.get("text", "")
 
 
 def parse_articles(raw: str, expected: int, event_date: str = "") -> list[dict]:
@@ -250,7 +258,8 @@ def generate_event(event: dict, attempts: int = 3) -> list[dict]:
 def write_corpus_files(event: dict, articles: list[dict]) -> list[Path]:
     paths = []
     for i, art in enumerate(articles):
-        outlet, _ = OUTLETS[(int(event["id"][1:]) + i) % len(OUTLETS)]
+        id_num = int(re.sub(r"\D", "", event["id"]))
+        outlet, _ = OUTLETS[(id_num + i) % len(OUTLETS)]
         slug_outlet = outlet.lower().replace(" & ", "-").replace(" ", "-")
         art_id = f"{event['id']}-a{i + 1}"
         record = {

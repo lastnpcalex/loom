@@ -106,6 +106,10 @@ def assemble_prompt(system_prompt: str, example_messages: list[dict] = None,
     4. Summary of older context
     5. Recent verbatim messages
     """
+    if summary:
+        system_prompt = (
+            f"{system_prompt}\n\nSTORY SO FAR (summary of earlier events):\n{summary}"
+        )
     messages = [{"role": "system", "content": system_prompt}]
 
     # Few-shot examples
@@ -131,16 +135,14 @@ def assemble_prompt(system_prompt: str, example_messages: list[dict] = None,
             "content": "(Understood. I'll keep this context in mind and stay in character.)"
         })
 
-    # Summary
-    if summary:
-        messages.append({
-            "role": "system",
-            "content": f"STORY SO FAR (summary of earlier events):\n{summary}"
-        })
-
     # Verbatim conversation messages
     if conversation_messages:
         for msg in conversation_messages:
+            # Some llama-server templates reject system turns after the initial
+            # system prompt. Keep the prompt shape compatible by folding any
+            # later system-scaffold messages into the initial system block.
+            if msg["role"] == "system":
+                continue
             entry = {"role": msg["role"], "content": msg["content"]}
             if msg.get("image_path"):
                 entry["image_path"] = msg["image_path"]  # may be string or JSON array

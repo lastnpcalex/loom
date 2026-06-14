@@ -7,6 +7,8 @@ import os
 import sys
 from pathlib import Path
 
+from loom_agent_prompt import load_loom_agent_prompt, merge_system_prompts
+
 log = logging.getLogger(__name__)
 
 # Absolute path to the hook script (same directory as this file)
@@ -505,6 +507,17 @@ def _configure_permission_hook(cwd: str) -> bool:
     return True
 
 
+def _loom_append_system_prompt(
+    append_system_prompt: str | None,
+    backstage_parent_id: int | None = None,
+    nrol_operator: bool = False,
+) -> str | None:
+    """Add the shared Loom contract only for ordinary Claude sessions."""
+    if backstage_parent_id or nrol_operator:
+        return append_system_prompt
+    return merge_system_prompts(load_loom_agent_prompt(), append_system_prompt) or None
+
+
 async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
                      model: str = "sonnet", effort: str = "high",
                      permission_mode: str = "default",
@@ -656,6 +669,11 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             cc_args.extend(["--append-system-prompt", operator_md.read_text(encoding="utf-8")])
     if mcp_servers:
         cc_args.extend(["--mcp-config", json.dumps({"mcpServers": mcp_servers})])
+    append_system_prompt = _loom_append_system_prompt(
+        append_system_prompt,
+        backstage_parent_id=backstage_parent_id,
+        nrol_operator=nrol_operator,
+    )
     if append_system_prompt:
         cc_args.extend(["--append-system-prompt", append_system_prompt])
 

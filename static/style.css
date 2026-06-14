@@ -2122,14 +2122,11 @@ body::after {
 }
 
 .message-timestamp {
-    margin-left: 8px;
     color: var(--text-muted);
     font-family: var(--font-mono, monospace);
-    font-size: 11px;
     font-weight: 400;
     letter-spacing: 0;
     white-space: nowrap;
-    opacity: 0.7;
 }
 
 .message-actions {
@@ -2186,7 +2183,7 @@ body::after {
     color: var(--cyan);
 }
 
-/* Elapsed time badge in message header (matches streaming timer) */
+/* Elapsed time badge for live streaming/describing states */
 .message-actions .gen-timer {
     font-family: var(--font-mono, monospace);
     font-size: 11px;
@@ -4019,12 +4016,18 @@ pre.tool-output {
 .cc-thinking-content p { margin: 0 0 3px; }
 .cc-thinking-content p:last-child { margin-bottom: 0; }
 
-/* ── Cost Footer ── */
+/* ── Message Footer ── */
+.message-footer,
 .cost-footer {
     font-size: 11px;
     color: var(--text-muted);
     margin-top: 4px;
     font-family: var(--font-main);
+}
+
+.message-footer .message-timestamp,
+.message-footer .generation-time {
+    opacity: 0.75;
 }
 
 /* ── Input with Button ── */

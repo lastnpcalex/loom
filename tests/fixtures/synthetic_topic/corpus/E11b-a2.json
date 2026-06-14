@@ -1,0 +1,18 @@
+{
+  "id": "E11b-a2",
+  "event_id": "E11b",
+  "label": "DUPLICATE-of-E11b",
+  "gold": {
+    "action": "FIRE",
+    "indicator_id": "t2_blockade_reinforcement"
+  },
+  "published": "2026-09-10T12:40:00+00:00",
+  "outlet": "Qoros Wire",
+  "url": "synthetic://qoros-wire/E11b-a2",
+  "headline": "Meridia Route Index Stalls as Mine Hazard Pushes Reopening to Sept 20",
+  "body": "QOROS — The Meridia Route Normalization Index, published by the Qoros Marine Underwriters' Association, remained flat at 12 points out of 100 on September 10 after joint commanders ordered a suspension of the Strait of Meridia's scheduled September 12 reopening. The delay, extending the new target date to September 20, was triggered by the discovery of a floating naval mine near the central shipping lanes. HarborTrack data shows zero commercial transits through the strait since the Varessan Coastal Forces instituted the blockade in May 2026, compared to a pre-crisis average of 140 transits per day. Operation Open Water, the five-nation escort framework comprising Khoreth, Sundaria, Elbar, Aldenport, and Virelles, halted all preparatory movements upon the mine's detection. 'Insurers are recalibrating war-risk premiums for the immediate vicinity,' said a senior underwriter at the Qoros Marine Underwriters' Association. 'The floating nature of the device suggests recent deployment, complicating clearance timelines.' The postponement adds eight days of uncertainty to the corridor's availability, keeping freight rates elevated and supply chain planning in flux for the Meridian Compact states and their distant partners.",
+  "generator": {
+    "model": "claude-haiku-4-5-20251001",
+    "generated_at": "2026-06-12T22:37:06.440911+00:00"
+  }
+}
