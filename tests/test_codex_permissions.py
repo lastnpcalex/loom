@@ -310,6 +310,27 @@ def test_codex_app_server_status_notifications_can_finalize_turns():
     assert codex_client._codex_terminal_status(failed) == (True, True, "boom")
 
 
+def test_codex_status_value_unwraps_object_status_payload():
+    import codex_client
+
+    nested_idle = {
+        "method": "thread/status/changed",
+        "params": {"thread": {"id": "thr", "status": {"type": "idle"}}},
+    }
+    assert codex_client._codex_status_value(nested_idle) == "idle"
+    assert codex_client._codex_terminal_status(nested_idle) == (True, False, "")
+
+    nested_failed = {
+        "method": "turn/status/changed",
+        "params": {
+            "turn": {"id": "turn-1", "status": {"type": "failed"}},
+            "error": {"message": "boom"},
+        },
+    }
+    assert codex_client._codex_status_value(nested_failed) == "failed"
+    assert codex_client._codex_terminal_status(nested_failed) == (True, True, "boom")
+
+
 def test_permission_scope_gen_id_parses_generation_scope():
     import server
 

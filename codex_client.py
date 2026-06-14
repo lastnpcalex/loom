@@ -401,6 +401,15 @@ def _codex_status_value(raw: dict, params: dict | None = None) -> str:
         or payload.get("lifecycle")
         or ""
     )
+    if isinstance(value, dict):
+        value = (
+            value.get("type")
+            or value.get("status")
+            or value.get("state")
+            or value.get("phase")
+            or value.get("kind")
+            or ""
+        )
     return str(value).lower()
 
 
