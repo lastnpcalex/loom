@@ -380,9 +380,11 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     baseline_time = 0.0
     initial_size = 0
 
+    target_session = resume_session_id or str(conv_id)
+    expected_session_dir = brain_path / target_session
+
     if use_resume:
-        target_session = resume_session_id or str(conv_id)
-        explicit_baseline = brain_path / target_session / ".system_generated" / "logs" / "transcript.jsonl"
+        explicit_baseline = expected_session_dir / ".system_generated" / "logs" / "transcript.jsonl"
         if explicit_baseline.exists():
             baseline_file = explicit_baseline
             try:
@@ -392,7 +394,7 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                 pass
 
     if not baseline_file:
-        baseline_file, baseline_time = find_latest_transcript(brain_path)
+        baseline_file, baseline_time = find_latest_transcript(expected_session_dir)
         if use_resume and baseline_file:
             try:
                 initial_size = baseline_file.stat().st_size
@@ -507,7 +509,7 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         active_file = None
         # Poll for the active transcript file being created or modified (10s timeout)
         for _ in range(200):
-            latest_file, latest_time = find_latest_transcript(brain_path)
+            latest_file, latest_time = find_latest_transcript(expected_session_dir)
             if latest_file and (latest_file != baseline_file or latest_time > baseline_time + 0.1):
                 active_file = latest_file
                 break
