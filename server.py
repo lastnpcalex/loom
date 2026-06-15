@@ -1845,6 +1845,11 @@ async def api_create_conversation(data: dict = None):
         if blocked:
             raise HTTPException(status_code=400, detail=blocked)
 
+    if mode == "claude":
+        is_gemini = is_gemini_model(cc_model)
+        is_codex = is_codex_model(cc_model)
+        mode = "gemini" if is_gemini else ("codex" if is_codex else "claude")
+
     conv = await db.create_conversation(
         title, character_id, mode=mode, project_dir=project_dir
     )

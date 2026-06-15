@@ -2483,7 +2483,7 @@ function _flushPendingGenerate() {
 /** Attach cc_model/effort/permission to a WS message from current UI state */
 function _attachCCSettings(msg) {
     const conv = State.currentConv;
-    if (!conv || (conv.mode !== 'claude' && conv.mode !== 'local')) return;
+    if (!conv || (conv.mode !== 'claude' && conv.mode !== 'local' && conv.mode !== 'codex' && conv.mode !== 'gemini')) return;
     const modelSel = document.getElementById('cc-model-inline');
     const effortSel = document.getElementById('cc-effort-inline');
     const permSel = document.getElementById('cc-permission-mode-inline');
@@ -4455,7 +4455,7 @@ function closeCanvasFullview() {
     }
     // Restore canvas toggle button
     const canvasBtn = document.getElementById('btn-canvas-toggle');
-    if (canvasBtn && State.currentConv?.mode === 'claude') canvasBtn.classList.remove('hidden');
+    if (canvasBtn && (State.currentConv?.mode === 'claude' || State.currentConv?.mode === 'gemini')) canvasBtn.classList.remove('hidden');
 }
 
 async function toggleCanvas() {

@@ -698,6 +698,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
     env["LOOM_PORT"] = str(server_port)
+    env["BASH_DEFAULT_TIMEOUT_MS"] = "1200000"  # 20 minutes (default is 2m)
+    env["BASH_MAX_TIMEOUT_MS"] = "3600000"      # 60 minutes (default is 10m)
     if extra_env:
         env.update({str(k): str(v) for k, v in extra_env.items() if v is not None})
     # Always clear ollama-style entrypoint flags — we never use ollama launch anymore.

@@ -531,7 +531,7 @@ async function checkHealth(retries = 2) {
                 if (State.currentConv.mode === 'hermes' || State.currentConv.mode === 'weave') {
                     const weaveSel = document.getElementById('weave-model-inline');
                     if (weaveSel) _populateWeaveModelDropdown(weaveSel, State.currentConv.local_model || '');
-                } else if (State.currentConv.mode === 'claude' || State.currentConv.mode === 'local' || State.currentConv.mode === 'codex') {
+                } else if (State.currentConv.mode === 'claude' || State.currentConv.mode === 'local' || State.currentConv.mode === 'codex' || State.currentConv.mode === 'gemini') {
                     updateInlineCCControls(State.currentConv);
                 }
             }
@@ -562,7 +562,7 @@ function renderConversationList() {
     } else if (State.convFilter === 'nrol') {
         convs = convs.filter(c => !!c.nrol_operator);
     } else if (State.convFilter === 'claude') {
-        convs = convs.filter(c => (c.mode === 'claude' || c.mode === 'codex') && !c.nrol_operator);
+        convs = convs.filter(c => (c.mode === 'claude' || c.mode === 'codex' || c.mode === 'gemini') && !c.nrol_operator);
     }
 
     if (convs.length === 0) {
@@ -1343,20 +1343,23 @@ async function updateInlineCCControls(conv) {
         _branchCountCtl?.classList.toggle('hidden', !show);
     };
 
-    if (conv && (conv.mode === 'claude' || conv.mode === 'local' || conv.mode === 'codex')) {
+    if (conv && (conv.mode === 'claude' || conv.mode === 'local' || conv.mode === 'codex' || conv.mode === 'gemini')) {
         const isBraid = conv.mode === 'local';
-        const isCodex = conv.mode === 'codex';
+        const modelName = conv.cc_model || '';
+        const agentKind = (typeof _agentKindForModel === 'function') ? _agentKindForModel(modelName, conv) : '';
+        const isCodex = conv.mode === 'codex' || agentKind === 'codex';
+        const isGemini = conv.mode === 'gemini' || agentKind === 'gemini';
         controls.classList.remove('hidden');
         weaveControls?.classList.add('hidden');
-        setBranchCount(1);  // CC / Braid / Codex: always single branch
+        setBranchCount(1);  // CC / Braid / Codex / Gemini: always single branch
         const modelSel = document.getElementById('cc-model-inline');
         const effortSel = document.getElementById('cc-effort-inline');
         const permSel = document.getElementById('cc-permission-mode-inline');
-        const ccModel = conv.cc_model || (isCodex ? 'codex-gpt-5.5' : 'sonnet');
+        const ccModel = conv.cc_model || (isGemini ? 'Gemini 3.5 Flash (Medium)' : (isCodex ? 'codex-gpt-5.5' : 'sonnet'));
         await populateCCModelDropdowns(ccModel);
         
         effortSel.value = conv.cc_effort || 'high';
-        if (permSel) permSel.value = isCodex ? 'default' : (conv.cc_permission_mode || 'default');
+        if (permSel) permSel.value = (isCodex || isGemini) ? 'default' : (conv.cc_permission_mode || 'default');
         
         const resolvedModel = modelSel.value;
         if (resolvedModel && resolvedModel !== ccModel) {
@@ -1369,9 +1372,8 @@ async function updateInlineCCControls(conv) {
         // selects don't apply, so hide them.
         modelSel.style.display = isBraid ? 'none' : '';
         effortSel.style.display = (isBraid || !modelSupportsEffort) ? 'none' : '';
-        // Codex Plan mode exists upstream, but Loom's app-server integration
-        // does not currently wire the collaboration mode request field.
-        if (permSel) permSel.style.display = isCodex ? 'none' : '';
+        // Codex / Gemini Plan mode is hidden as it does not do anything
+        if (permSel) permSel.style.display = (isCodex || isGemini) ? 'none' : '';
         statePanelChat?.classList.add('hidden');
     } else if (conv && conv.mode === 'hermes') {
         // Borrow the Weave inline bar for its model dropdown, but strip
@@ -1521,8 +1523,8 @@ function initInlineCCControls() {
     async function saveCC(field, value) {
         if (!State.currentConvId || !State.currentConv) return;
         try {
-            await API.put(`/api/conversations/${State.currentConvId}`, { [field]: value });
-            State.currentConv[field] = value;
+            const updated = await API.put(`/api/conversations/${State.currentConvId}`, { [field]: value });
+            Object.assign(State.currentConv, updated);
         } catch { showToast('Failed to update', 'error'); }
     }
 
@@ -1530,13 +1532,13 @@ function initInlineCCControls() {
         effortSel.style.display = _supportsEffortValue(model) ? '' : 'none';
     }
 
-    modelSel.addEventListener('change', () => {
-        saveCC('cc_model', modelSel.value);
+    modelSel.addEventListener('change', async () => {
+        await saveCC('cc_model', modelSel.value);
         _syncEffortVisibility(modelSel.value);
         if (typeof _invalidateSkillsCache === 'function') _invalidateSkillsCache();
         // Update local state immediately so generate messages include the new model
         if (State.currentConv) {
-            State.currentConv.cc_model = modelSel.value;
+            await updateInlineCCControls(State.currentConv);
             if (typeof renderConversationList === 'function') renderConversationList();
             if (typeof renderMessages === 'function') renderMessages();
         }
@@ -2546,8 +2548,14 @@ function setupEventListeners() {
         // the active mode's fields. Buttons inside groups stay live (the
         // Anthropic refresh is a global action, not per-conversation).
         const mode = conv ? conv.mode : null;
+        const ccModelName = conv ? (conv.cc_model || '') : '';
+        const agentKind = (conv && typeof _agentKindForModel === 'function') ? _agentKindForModel(ccModelName, conv) : '';
+        const hasLoomOverrides = mode === 'claude' || mode === 'codex' || mode === 'gemini';
+        const isActuallyCodex = mode === 'codex' || agentKind === 'codex';
+        const isActuallyGemini = mode === 'gemini' || agentKind === 'gemini';
+
         const overrideGroups = {
-            'cfg-overrides-loom': mode === 'claude' || mode === 'codex',
+            'cfg-overrides-loom': hasLoomOverrides,
             'cfg-overrides-braid': mode === 'local',
             'cfg-overrides-hermes': mode === 'hermes',
             'cfg-overrides-weave': mode === 'weave',
@@ -2560,7 +2568,7 @@ function setupEventListeners() {
             group.querySelectorAll('select, input').forEach(c => { c.disabled = !active; });
         }
         const ccPermissionGroup = document.getElementById('cfg-cc-permission')?.closest('.form-group');
-        if (ccPermissionGroup) ccPermissionGroup.classList.toggle('hidden', mode === 'codex');
+        if (ccPermissionGroup) ccPermissionGroup.classList.toggle('hidden', isActuallyCodex || isActuallyGemini);
         const ovHint = document.getElementById('cfg-overrides-divider-hint');
         if (ovHint) ovHint.textContent = mode ? '' : '(open a conversation to edit)';
 
@@ -2712,10 +2720,15 @@ function setupEventListeners() {
 
         if (conv && State.currentConvId) {
             const updates = {};
-            if (conv.mode === 'claude' || conv.mode === 'codex') {
-                updates.cc_model = valueOf('cfg-cc-model', conv.cc_model || 'sonnet');
+            if (conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini') {
+                const modelName = valueOf('cfg-cc-model', conv.cc_model || (conv.mode === 'gemini' ? 'Gemini 3.5 Flash (Medium)' : 'sonnet'));
+                const agentKind = (typeof _agentKindForModel === 'function') ? _agentKindForModel(modelName, conv) : '';
+                const isActuallyCodex = conv.mode === 'codex' || agentKind === 'codex';
+                const isActuallyGemini = conv.mode === 'gemini' || agentKind === 'gemini';
+
+                updates.cc_model = modelName;
                 updates.cc_effort = valueOf('cfg-cc-effort', conv.cc_effort || 'high');
-                updates.cc_permission_mode = conv.mode === 'codex'
+                updates.cc_permission_mode = (isActuallyCodex || isActuallyGemini)
                     ? 'default'
                     : valueOf('cfg-cc-permission', conv.cc_permission_mode || 'default');
             } else if (conv.mode === 'local') {
@@ -2726,14 +2739,15 @@ function setupEventListeners() {
                 updates.local_model = valueOf('cfg-weave-model', conv.local_model || '');
             }
             if (Object.keys(updates).length) {
-                await API.put(`/api/conversations/${State.currentConvId}`, updates);
-                Object.assign(conv, updates);
+                const updated = await API.put(`/api/conversations/${State.currentConvId}`, updates);
+                Object.assign(conv, updated);
                 if (updates.cc_model) { const s = document.getElementById('cc-model-inline'); if (s) s.value = updates.cc_model; }
                 if (updates.cc_effort) { const s = document.getElementById('cc-effort-inline'); if (s) s.value = updates.cc_effort; }
                 if (updates.cc_permission_mode) { const s = document.getElementById('cc-permission-mode-inline'); if (s) s.value = updates.cc_permission_mode; }
                 if (updates.local_model) { const s = document.getElementById('weave-model-inline'); if (s) s.value = updates.local_model; }
                 if (typeof renderConversationList === 'function') renderConversationList();
                 if (typeof renderMessages === 'function') renderMessages();
+                await updateInlineCCControls(conv);
             }
         }
         return true;
@@ -3704,8 +3718,8 @@ function renderSearchResults(results, query) {
         const item = document.createElement('div');
         item.className = 'search-result-item';
 
-        const modeClass = r.mode || 'weave';
-        const modeLabel = r.mode === 'claude' ? 'Loom' : r.mode === 'local' ? 'Braid' : r.mode === 'hermes' ? 'Hermes' : r.mode === 'codex' ? 'Codex' : 'Weave';
+        const modeClass = r.mode === 'gemini' ? 'claude' : (r.mode || 'weave');
+        const modeLabel = r.mode === 'claude' || r.mode === 'gemini' ? 'Loom' : r.mode === 'local' ? 'Braid' : r.mode === 'hermes' ? 'Hermes' : r.mode === 'codex' ? 'Codex' : 'Weave';
         const titleHtml = escapeHtml(r.title || 'Untitled').replace(re, '<mark>$1</mark>');
 
         let snippetHtml = '';

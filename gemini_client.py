@@ -307,6 +307,17 @@ def normalize_tool_args(name: str, args: dict) -> dict:
     return mapped
 
 
+def _determine_block_name(etype: str, content: str) -> str:
+    et = etype.upper()
+    if "SYSTEM" in et:
+        return "System Message"
+    if "GENERIC" in et:
+        if "background task" in content.lower():
+            return "Background Task"
+        return "System Message"
+    return etype.replace("_", " ").title()
+
+
 async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
                      model: str = "Gemini 3.5 Flash (High)", effort: str = "high",
                      permission_mode: str = "default",
@@ -416,7 +427,7 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         "--conversation", resume_session_id or str(conv_id),
         "-p", cli_prompt,
         "--dangerously-skip-permissions",
-        "--print-timeout", "5m",
+        "--print-timeout", "60m",
     ]
     # NOTE: --sandbox is deliberately not passed for operator convs: bare
     # headless smoke runs hang with AND without the flag outside the Loom
@@ -429,6 +440,8 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         **os.environ,
         "LOOM_CONV_ID": str(conv_id),
         "LOOM_PORT": str(server_port),
+        "BASH_DEFAULT_TIMEOUT_MS": "1200000",  # 20 minutes (default is 2m)
+        "BASH_MAX_TIMEOUT_MS": "3600000",      # 60 minutes (default is 10m)
     }
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
@@ -628,9 +641,18 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                                     })
                                 else:
                                     if content:
+                                        tool_id = f"sys-{step_index}"
+                                        block_name = _determine_block_name(etype, content)
                                         queue.put_nowait({
-                                            "type": "text_delta",
-                                            "text": f"\n[Tool Output]: {content}\n",
+                                            "type": "tool_start",
+                                            "name": block_name,
+                                            "tool_id": tool_id,
+                                        })
+                                        queue.put_nowait({
+                                            "type": "tool_result",
+                                            "content": content,
+                                            "tool_id": tool_id,
+                                            "is_error": False,
                                         })
                         except Exception as e:
                             log.error(f"[AGY] Error parsing transcript line: {e}")
@@ -704,9 +726,18 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                                             })
                                         else:
                                             if content:
+                                                tool_id = f"sys-{step_index}"
+                                                block_name = _determine_block_name(etype, content)
                                                 queue.put_nowait({
-                                                    "type": "text_delta",
-                                                    "text": f"\n[Tool Output]: {content}\n",
+                                                    "type": "tool_start",
+                                                    "name": block_name,
+                                                    "tool_id": tool_id,
+                                                })
+                                                queue.put_nowait({
+                                                    "type": "tool_result",
+                                                    "content": content,
+                                                    "tool_id": tool_id,
+                                                    "is_error": False,
                                                 })
                                 except Exception as e:
                                     log.error(f"[AGY] Error parsing final transcript line: {e}")
