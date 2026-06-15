@@ -243,12 +243,28 @@ async def test_gemini_client_resume_and_fork_args(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
 
     brain_path = tmp_path / ".gemini" / "antigravity-cli" / "brain"
+    conversations_path = tmp_path / ".gemini" / "antigravity-cli" / "conversations"
+    conversations_path.mkdir(parents=True, exist_ok=True)
 
     # Create dummy source session
     src_session = brain_path / "src_session"
     logs_dir = src_session / ".system_generated" / "logs"
     logs_dir.mkdir(parents=True)
     (logs_dir / "transcript.jsonl").write_text('{"type":"step"}\n', encoding="utf-8")
+
+    # Create dummy source SQLite DB
+    import sqlite3
+    db_src_path = conversations_path / "src_session.db"
+    conn = sqlite3.connect(db_src_path)
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE trajectory_meta (trajectory_id TEXT, cascade_id TEXT)")
+    cursor.execute("INSERT INTO trajectory_meta VALUES ('traj-123', 'src_session')")
+    conn.commit()
+    conn.close()
+
+    # Create dummy source Protobuf file
+    pb_src_path = conversations_path / "src_session.pb"
+    pb_src_path.write_bytes(b"some prefix src_session suffix")
 
     # Run with resume and fork
     await gemini_client.run_gemini(
@@ -259,17 +275,35 @@ async def test_gemini_client_resume_and_fork_args(monkeypatch, tmp_path):
         fork_session=True,
     )
 
-    # Check that it forked (copied) the directory to conv_id "123"
-    dst_dir = brain_path / "123"
-    assert dst_dir.exists()
-    assert (dst_dir / ".system_generated" / "logs" / "transcript.jsonl").exists()
-
     # Check the CLI args carried the destination session ID
     assert len(args_captured) == 1
     cmd_args = args_captured[0]
     assert cmd_args[0] == "agy"
     idx = cmd_args.index("--conversation")
-    assert cmd_args[idx + 1] == "123"
+    dst_session_id = cmd_args[idx + 1]
+    assert dst_session_id != "src_session"
+    assert dst_session_id != "123"
+
+    # Check that it forked (copied) the directory to the new destination session ID
+    dst_dir = brain_path / dst_session_id
+    assert dst_dir.exists()
+    assert (dst_dir / ".system_generated" / "logs" / "transcript.jsonl").exists()
+
+    # Check that the DB was copied and cascade_id updated
+    db_dst_path = conversations_path / f"{dst_session_id}.db"
+    assert db_dst_path.exists()
+    conn = sqlite3.connect(db_dst_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT cascade_id FROM trajectory_meta")
+    rows = cursor.fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == dst_session_id
+    conn.close()
+
+    # Check that the PB file was copied and updated
+    pb_dst_path = conversations_path / f"{dst_session_id}.pb"
+    assert pb_dst_path.exists()
+    assert pb_dst_path.read_bytes() == f"some prefix {dst_session_id} suffix".encode("utf-8")
 
 
 def test_codex_client_resume_and_fork(tmp_path):

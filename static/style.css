@@ -5420,3 +5420,114 @@ pre.tool-output {
 #backstage-banner #btn-backstage-return:hover {
     background: rgba(120, 180, 255, 0.12);
 }
+
+/* ── System Message Tags (XML block rendering) ── */
+.system-message-tag-block {
+    background: rgba(15, 15, 30, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: var(--radius);
+    padding: 12px 16px;
+    margin: 12px 0;
+    font-family: var(--font-mono);
+    backdrop-filter: var(--glass);
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+}
+
+.system-message-tag-block.priority-high {
+    border-color: var(--danger);
+    background: rgba(255, 51, 85, 0.04);
+    box-shadow: 0 0 10px rgba(255, 51, 85, 0.1);
+}
+
+.system-message-tag-block.priority-medium {
+    border-color: var(--warning);
+    background: rgba(255, 170, 0, 0.04);
+    box-shadow: 0 0 10px rgba(255, 170, 0, 0.1);
+}
+
+.system-message-tag-block.priority-low {
+    border-color: rgba(255, 255, 255, 0.15);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.system-message-tag-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    padding-bottom: 6px;
+}
+
+.system-message-tag-icon {
+    font-size: 12px;
+}
+
+.system-message-tag-block.priority-high .system-message-tag-icon {
+    color: var(--danger);
+}
+.system-message-tag-block.priority-medium .system-message-tag-icon {
+    color: var(--warning);
+}
+.system-message-tag-block.priority-low .system-message-tag-icon {
+    color: var(--text-muted);
+}
+
+.system-message-tag-sender {
+    font-family: var(--font-display);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.system-message-tag-priority {
+    font-size: 9px;
+    font-weight: 700;
+    padding: 1px 4px;
+    border-radius: var(--radius-sm);
+    text-transform: uppercase;
+}
+
+.system-message-tag-priority.high {
+    background: var(--danger);
+    color: #fff;
+}
+
+.system-message-tag-priority.medium {
+    background: var(--warning);
+    color: #000;
+}
+
+.system-message-tag-priority.low {
+    background: rgba(255, 255, 255, 0.15);
+    color: var(--text-secondary);
+}
+
+.system-message-tag-time {
+    margin-left: auto;
+    color: var(--text-muted);
+    font-size: 10px;
+}
+
+.system-message-tag-content {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.system-message-tag-content p {
+    margin-bottom: 8px;
+}
+.system-message-tag-content p:last-child {
+    margin-bottom: 0;
+}
+
+.tool-output-label {
+    color: var(--cyan);
+    font-family: var(--font-display);
+    font-size: 11px;
+    letter-spacing: 0.5px;
+    display: block;
+    margin-bottom: 4px;
+}

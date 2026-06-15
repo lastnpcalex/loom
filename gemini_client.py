@@ -129,26 +129,22 @@ def _configure_permission_hook(cwd: str, backstage_parent_id: int | None = None,
         post_hook_command = f'"{python_exe}" "{hook_path}" --event PostToolUse'
 
     hooks_def = {
-        "PreToolUse": [
-            {
-                "matcher": "*",
-                "hooks": [{
-                    "type": "command",
-                    "command": pre_hook_command,
-                    "timeout": 900000,
-                }]
-            }
-        ],
-        "PostToolUse": [
-            {
-                "matcher": "*",
-                "hooks": [{
-                    "type": "command",
-                    "command": post_hook_command,
-                    "timeout": 90000,
-                }]
-            }
-        ]
+        "PreToolUse": {
+            "matcher": "*",
+            "hooks": [{
+                "type": "command",
+                "command": pre_hook_command,
+                "timeout": 900000,
+            }]
+        },
+        "PostToolUse": {
+            "matcher": "*",
+            "hooks": [{
+                "type": "command",
+                "command": post_hook_command,
+                "timeout": 90000,
+            }]
+        }
     }
 
     hooks_path = agents_dir / "hooks.json"
@@ -363,21 +359,72 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
 
     # Fork session if requested
     if resume_session_id and fork_session:
+        import uuid
+        new_session_id = str(uuid.uuid4())
         src = brain_path / resume_session_id
-        dst = brain_path / str(conv_id)
+        dst = brain_path / new_session_id
         if src.exists() and not dst.exists():
             import shutil
             try:
                 shutil.copytree(src, dst)
-                print(f"[AGY] Forked session {resume_session_id} to {conv_id}")
-                resume_session_id = str(conv_id)
+                print(f"[AGY] Forked session {resume_session_id} to new session {new_session_id}")
+                
+                # Also fork the conversation database/pb in the conversations folder
+                conversations_path = brain_path.parent / "conversations"
+                if conversations_path.exists():
+                    db_src = conversations_path / f"{resume_session_id}.db"
+                    db_dst = conversations_path / f"{new_session_id}.db"
+                    if db_src.exists():
+                        shutil.copy2(db_src, db_dst)
+                        # Also copy WAL and SHM if they exist
+                        for suffix in [".db-wal", ".db-shm"]:
+                            sub_src = conversations_path / f"{resume_session_id}{suffix}"
+                            sub_dst = conversations_path / f"{new_session_id}{suffix}"
+                            if sub_src.exists():
+                                try:
+                                    shutil.copy2(sub_src, sub_dst)
+                                except Exception as se:
+                                    log.warning(f"[AGY] Failed to copy {suffix} file: {se}")
+                        # Update cascade_id in trajectory_meta table
+                        import sqlite3
+                        try:
+                            conn = sqlite3.connect(db_dst)
+                            cursor = conn.cursor()
+                            cursor.execute(
+                                "UPDATE trajectory_meta SET cascade_id = ? WHERE cascade_id = ?",
+                                (new_session_id, resume_session_id)
+                            )
+                            conn.commit()
+                            conn.close()
+                            print(f"[AGY] Updated cascade_id in {db_dst.name}")
+                        except Exception as sqle:
+                            log.warning(f"[AGY] Failed to update sqlite DB: {sqle}")
+                    
+                    pb_src = conversations_path / f"{resume_session_id}.pb"
+                    pb_dst = conversations_path / f"{new_session_id}.pb"
+                    if pb_src.exists():
+                        try:
+                            pb_data = pb_src.read_bytes()
+                            pb_data_updated = pb_data.replace(
+                                resume_session_id.encode("utf-8"),
+                                new_session_id.encode("utf-8")
+                            )
+                            pb_dst.write_bytes(pb_data_updated)
+                            print(f"[AGY] Copied and updated protobuf file: {pb_dst.name}")
+                        except Exception as pbe:
+                            log.warning(f"[AGY] Failed to update protobuf file: {pbe}")
+                
+                resume_session_id = new_session_id
             except Exception as e:
                 log.warning(f"[AGY] Failed to fork session: {e}")
 
     # Determine baseline before launching process to avoid race conditions
+    import time as _time
+    launch_ts = _time.time()
+
     use_resume = bool(resume_session_id)
     baseline_file = None
-    baseline_time = 0.0
+    baseline_time = launch_ts
     initial_size = 0
 
     target_session = resume_session_id or str(conv_id)
@@ -393,13 +440,22 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             except OSError:
                 pass
 
-    if not baseline_file:
-        baseline_file, baseline_time = find_latest_transcript(expected_session_dir)
-        if use_resume and baseline_file:
+    if not baseline_file and use_resume:
+        baseline_file, _temp_time = find_latest_transcript(expected_session_dir)
+        if baseline_file:
             try:
                 initial_size = baseline_file.stat().st_size
+                baseline_time = baseline_file.stat().st_mtime
             except OSError:
                 pass
+
+    # Record existing brain directories to identify newly created ones in new conversations
+    existing_dirs = set()
+    if brain_path.exists():
+        try:
+            existing_dirs = {p.name for p in brain_path.iterdir() if p.is_dir()}
+        except OSError:
+            pass
 
     agy_exe = _find_agy_exe()
 
@@ -452,8 +508,7 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         # when this is set — agy's only tool-blocking surface.
         env["LOOM_NROL_OPERATOR"] = "1"
 
-    import time as _time
-    launch_ts = _time.time()
+    # launch_ts already recorded above
 
     cmd = [agy_exe] + cc_args
     print(f"[AGY] CMD: {' '.join(cmd[:6])}{'...' if len(cmd) > 6 else ''}")
@@ -507,12 +562,39 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # Asynchronous task to monitor and tail the transcript.jsonl file
     async def _tail_transcript_to_queue():
         active_file = None
-        # Poll for the active transcript file being created or modified (10s timeout)
-        for _ in range(200):
-            latest_file, latest_time = find_latest_transcript(expected_session_dir)
+        # Poll for the active transcript file being created or modified
+        # Keep polling while the process is running, up to 60 seconds (1200 * 0.05s) max.
+        polls = 0
+        while True:
+            if use_resume and expected_session_dir.exists():
+                latest_file, latest_time = find_latest_transcript(expected_session_dir)
+            else:
+                latest_file = None
+                latest_time = 0.0
+                if brain_path.exists():
+                    try:
+                        for p in brain_path.iterdir():
+                            if p.is_dir() and p.name not in existing_dirs:
+                                fp, mtime = find_latest_transcript(p)
+                                if fp and mtime > latest_time:
+                                    latest_time = mtime
+                                    latest_file = fp
+                    except OSError:
+                        pass
+
             if latest_file and (latest_file != baseline_file or latest_time > baseline_time + 0.1):
                 active_file = latest_file
                 break
+
+            # If the process is no longer running and we have polled for at least 2 seconds, stop
+            if proc.returncode is not None and polls > 40:
+                break
+
+            # Timeout safety limit (60 seconds)
+            if polls > 1200:
+                break
+
+            polls += 1
             await asyncio.sleep(0.05)
 
         if not active_file:

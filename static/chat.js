@@ -3250,8 +3250,62 @@ function parseMarkdownWithLatex(text) {
     return sanitizeMarkdownHtml(raw);
 }
 
+function formatSystemMessageTags(text) {
+    if (!text) return '';
+    
+    if (!text.includes('<SYSTEM_MESSAGE>') && !text.includes('[Tool Output]:')) {
+        return text;
+    }
+    
+    let processed = text;
+    
+    // Replace [Tool Output]: prefix followed by system message explanation
+    processed = processed.replace(/\[Tool Output\]:\s*The following is a <SYSTEM_MESSAGE>[\s\S]*?pay attention to\.?/gi, '');
+    
+    // Replace standalone [Tool Output]: with a styled label/header
+    processed = processed.replace(/\[Tool Output\]:/gi, '<strong class="tool-output-label">Tool Output:</strong>');
+    
+    // Replace <SYSTEM_MESSAGE>... </SYSTEM_MESSAGE> blocks
+    const regex = /<SYSTEM_MESSAGE>([\s\S]*?)<\/SYSTEM_MESSAGE>/g;
+    processed = processed.replace(regex, (match, inner) => {
+        const msgMatch = inner.match(/\[Message\]\s+timestamp=([^\s]+)\s+sender=([^\s]+)\s+priority=([^\s]+)\s+content=([\s\S]*)/i);
+        if (msgMatch) {
+            const timestamp = msgMatch[1];
+            const sender = msgMatch[2].toUpperCase();
+            const priority = msgMatch[3];
+            const content = msgMatch[4].trim();
+            
+            const cleanPriority = priority.replace(/^MESSAGE_PRIORITY_/i, '');
+            const priorityClass = cleanPriority.toLowerCase();
+            const cleanTime = timestamp.replace('T', ' ').replace('Z', ' UTC');
+            
+            let icon = 'ℹ️';
+            if (priorityClass === 'high') icon = '🚨';
+            else if (priorityClass === 'medium') icon = '⚠️';
+            else if (sender === 'SYSTEM') icon = '⚙️';
+            
+            return `<div class="system-message-tag-block priority-${priorityClass}">
+                <div class="system-message-tag-header">
+                    <span class="system-message-tag-icon">${icon}</span>
+                    <span class="system-message-tag-sender">${sender} NOTICE</span>
+                    <span class="system-message-tag-priority ${priorityClass}">${cleanPriority}</span>
+                    <span class="system-message-tag-time">${cleanTime}</span>
+                </div>
+                <div class="system-message-tag-content">${formatContent(content)}</div>
+            </div>`;
+        }
+        
+        return `<div class="system-message-tag-block">
+            <div class="system-message-tag-content">${formatContent(inner.trim())}</div>
+        </div>`;
+    });
+    
+    return processed;
+}
+
 function formatContent(text) {
     if (!text) return '';
+    text = formatSystemMessageTags(text);
     if (typeof marked !== 'undefined') {
         return parseMarkdownWithLatex(text);
     }
