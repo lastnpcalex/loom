@@ -187,6 +187,7 @@ async def test_refresh_cc_models_accepts_valid_claude_code_token(client, monkeyp
     monkeypatch.setattr(server, "_read_oauth_token", lambda: "valid-token")
     monkeypatch.setattr(server.httpx, "AsyncClient", _FakeAnthropicClient)
     monkeypatch.setattr(server, "load_local_codex_models", lambda: [])
+    monkeypatch.setattr(server, "load_local_gemini_models", lambda: [])
     monkeypatch.setattr(server, "CC_MODELS", [
         {"group": "Anthropic", "models": []},
         {"group": "Other", "models": [{"value": "other", "label": "Other"}]},
@@ -219,3 +220,40 @@ async def test_refresh_cc_models_accepts_valid_claude_code_token(client, monkeyp
     assert "claude-opus-4-7-20260101[1m]" in pinned_values
     assert "claude-sonnet-4-5-20260101[1m]" in pinned_values
     assert "claude-haiku-4-5-20260101[1m]" not in pinned_values
+
+
+def test_load_local_gemini_models_and_mapping(tmp_path, monkeypatch):
+    import server
+    import gemini_client
+
+    # Write a dummy models_cache.json
+    gemini_dir = tmp_path / ".gemini"
+    gemini_dir.mkdir()
+    cache_file = gemini_dir / "models_cache.json"
+    cache_file.write_text(
+        '{"models": [{"slug": "gemini-3.5-flash-custom", "display_name": "Gemini 3.5 Flash Custom"}]}',
+        encoding="utf-8"
+    )
+
+    # Monkeypatch home directory path detection
+    def mock_home():
+        return tmp_path
+    monkeypatch.setattr(server.os.environ, "get", lambda k, default=None: str(tmp_path) if k == "USERPROFILE" else default)
+    monkeypatch.setattr(server.Path, "home", mock_home)
+
+    models = server.load_local_gemini_models()
+    assert len(models) == 1
+    assert models[0]["value"] == "gemini:gemini-3.5-flash-custom"
+    assert models[0]["label"] == "Gemini (Gemini 3.5 Flash Custom)"
+
+    # Test _loom_model_to_agy mapping strips gemini: prefix and supports mapping
+    mapped = gemini_client._loom_model_to_agy("gemini:gemini-3.5-flash-custom", "high")
+    assert mapped == "gemini-3.5-flash-medium"  # mapped by gemini-3.5-flash pattern check
+
+    mapped_raw = gemini_client._loom_model_to_agy("gemini:some-other-slug", "medium")
+    assert mapped_raw == "some-other-slug"  # falls back to slug itself after stripping
+
+    mapped_mixed = gemini_client._loom_model_to_agy("Gemini:some-other-slug", "medium")
+    assert mapped_mixed == "some-other-slug"  # case-insensitive check works
+
+

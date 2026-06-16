@@ -226,6 +226,18 @@ async def lifespan(app):
         except Exception as e:
             print(f"[STARTUP] Codex model refresh failed: {e}")
 
+        try:
+            print("[STARTUP] Refreshing Gemini models from cache...")
+            local_gemini = load_local_gemini_models()
+            if local_gemini:
+                for group in CC_MODELS:
+                    if group["group"].startswith("Antigravity"):
+                        group["models"] = local_gemini
+                        print(f"[STARTUP] Gemini models updated from cache: {len(local_gemini)} models loaded")
+                        break
+        except Exception as e:
+            print(f"[STARTUP] Gemini model refresh failed: {e}")
+
     asyncio.create_task(_refresh_remote_models_on_startup())
     _cron_scheduler_task = asyncio.create_task(_cron_scheduler_loop())
     yield
@@ -2825,6 +2837,47 @@ def get_initial_codex_models() -> list[dict]:
     ]
 
 
+def load_local_gemini_models() -> list[dict]:
+    """Load Gemini models from the local ~/.gemini/models_cache.json file if it exists."""
+    import os
+    from pathlib import Path
+    home = Path(os.environ.get("USERPROFILE") or Path.home())
+    cache_path = home / ".gemini" / "models_cache.json"
+    if not cache_path.exists():
+        return []
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8-sig"))
+        models = []
+        for m in data.get("models", []):
+            slug = m.get("slug")
+            display_name = m.get("display_name")
+            if slug and display_name:
+                models.append({
+                    "value": f"gemini:{slug}",
+                    "label": f"Gemini ({display_name})"
+                })
+        return models
+    except Exception as e:
+        print(f"[GEMINI] Failed to load local models cache: {e}")
+        return []
+
+
+def get_initial_gemini_models() -> list[dict]:
+    local_models = load_local_gemini_models()
+    if local_models:
+        return local_models
+    return [
+        {"value": "Gemini 3.5 Flash (Low)", "label": "Gemini 3.5 Flash (Low)"},
+        {"value": "Gemini 3.5 Flash (High)", "label": "Gemini 3.5 Flash (High)"},
+        {"value": "Gemini 3.5 Flash (Medium)", "label": "Gemini 3.5 Flash (Medium)"},
+        {"value": "Gemini 3.1 Pro (High)", "label": "Gemini 3.1 Pro (High)"},
+        {"value": "Gemini 3.1 Pro (Low)", "label": "Gemini 3.1 Pro (Low)"},
+        {"value": "Claude Sonnet 4.6 (Thinking)", "label": "Claude Sonnet 4.6 (Thinking)"},
+        {"value": "Claude Opus 4.6 (Thinking)", "label": "Claude Opus 4.6 (Thinking)"},
+        {"value": "GPT-OSS 120B (Medium)", "label": "GPT-OSS 120B (Medium)"},
+    ]
+
+
 # ── CC Model List ──
 # Single source of truth for Anthropic + Gemini models available in Loom/Braid.
 # Update this list when new models ship — all dropdowns pull from here.
@@ -2837,16 +2890,7 @@ CC_MODELS = [
         {"value": "opus[1m]", "label": "Opus (1M)"},
         {"value": "haiku", "label": "Haiku"},
     ]},
-    {"group": "Antigravity (agy)", "models": [
-        {"value": "Gemini 3.5 Flash (Low)", "label": "Gemini 3.5 Flash (Low)"},
-        {"value": "Gemini 3.5 Flash (High)", "label": "Gemini 3.5 Flash (High)"},
-        {"value": "Gemini 3.5 Flash (Medium)", "label": "Gemini 3.5 Flash (Medium)"},
-        {"value": "Gemini 3.1 Pro (High)", "label": "Gemini 3.1 Pro (High)"},
-        {"value": "Gemini 3.1 Pro (Low)", "label": "Gemini 3.1 Pro (Low)"},
-        {"value": "Claude Sonnet 4.6 (Thinking)", "label": "Claude Sonnet 4.6 (Thinking)"},
-        {"value": "Claude Opus 4.6 (Thinking)", "label": "Claude Opus 4.6 (Thinking)"},
-        {"value": "GPT-OSS 120B (Medium)", "label": "GPT-OSS 120B (Medium)"},
-    ]},
+    {"group": "Antigravity (agy)", "models": get_initial_gemini_models()},
     {"group": "ChatGPT Codex (codex)", "models": get_initial_codex_models()},
 ]
 
@@ -3042,6 +3086,17 @@ async def api_cc_models_refresh():
                     break
     except Exception as e:
         print(f"[REFRESH] Failed to update Codex models: {e}")
+
+    # Also reload and update Gemini models cache in CC_MODELS
+    try:
+        local_gemini = load_local_gemini_models()
+        if local_gemini:
+            for group in new_cc_models:
+                if group["group"].startswith("Antigravity"):
+                    group["models"] = local_gemini
+                    break
+    except Exception as e:
+        print(f"[REFRESH] Failed to update Gemini models: {e}")
 
     CC_MODELS[:] = new_cc_models
     return {"models": CC_MODELS, "families": sorted(f for f, v in by_family.items() if v)}
@@ -5513,18 +5568,44 @@ async def _handle_claude_generation(
                         _hdr = "[Attached files — image descriptions already provided, do NOT read image files.]" if _has_img else f"[User attached {len(file_notes)} file(s). See attached_files/ for the files.]"
                         fallback_prompt += f"\n\n{_hdr}\n{files_str}"
 
-            proc, event_stream = await claude_client.run_claude(
-                fallback_prompt,
-                project_dir,
-                conv_id=conv_id,
-                server_port=config.port,
-                model=cc_model,
-                effort=cc_effort,
-                permission_mode=cc_permission_mode,
-                use_llama=use_llama,
-                backstage_parent_id=conv.get("backstage_parent_id"),
-                nrol_operator=bool(conv.get("nrol_operator")),
-            )
+            if is_gemini:
+                proc, event_stream = await gemini_client.run_gemini(
+                    fallback_prompt,
+                    project_dir,
+                    conv_id=conv_id,
+                    server_port=config.port,
+                    model=cc_model,
+                    effort=cc_effort,
+                    permission_mode=cc_permission_mode,
+                    backstage_parent_id=conv.get("backstage_parent_id"),
+                    nrol_operator=bool(conv.get("nrol_operator")),
+                )
+            elif is_codex:
+                proc, event_stream = await codex_client.run_codex(
+                    fallback_prompt,
+                    project_dir,
+                    conv_id=conv_id,
+                    server_port=config.port,
+                    model=cc_model,
+                    effort=cc_effort,
+                    permission_mode=cc_permission_mode,
+                    backstage_parent_id=conv.get("backstage_parent_id"),
+                    nrol_operator=bool(conv.get("nrol_operator")),
+                    permission_request_handler=handle_cc_permission,
+                )
+            else:
+                proc, event_stream = await claude_client.run_claude(
+                    fallback_prompt,
+                    project_dir,
+                    conv_id=conv_id,
+                    server_port=config.port,
+                    model=cc_model,
+                    effort=cc_effort,
+                    permission_mode=cc_permission_mode,
+                    use_llama=use_llama,
+                    backstage_parent_id=conv.get("backstage_parent_id"),
+                    nrol_operator=bool(conv.get("nrol_operator")),
+                )
             _active_claude_procs[conv_id] = proc
 
             full_text = ""
@@ -5903,7 +5984,7 @@ async def _handle_claude_generation(
         proc = _active_claude_procs.pop(conv_id, None)
         if proc:
             try:
-                proc.kill()
+                await claude_client.cancel_claude(proc)
             except Exception:
                 pass
         if draft_msg_id and (full_text or content_blocks):
@@ -5916,11 +5997,11 @@ async def _handle_claude_generation(
                 draft_msg_id,
                 content=full_text,
                 content_blocks=json.dumps(content_blocks) if content_blocks else None,
-                cc_session_id=new_session_id or None,
+                cc_session_id=new_session_id or resume_session_id or None,
                 cc_model_used=(actual_model or cc_model) if (actual_model or cc_model) else None,
                 generation_ms=_gen_ms_cancel,
             )
-            print(f"[GEN] Saved partial draft {draft_msg_id} on cancel (session={new_session_id or 'none'})")
+            print(f"[GEN] Saved partial draft {draft_msg_id} on cancel (session={new_session_id or resume_session_id or 'none'})")
         elif draft_msg_id:
             # No content produced — delete empty draft to avoid phantoms
             await db.delete_branch(draft_msg_id)
@@ -6097,9 +6178,29 @@ async def _handle_hermes_generation(
                                      "error": f"Working directory not found: {project_dir}"})
             return
 
-        # Build the prompt from the branch (history replay — no ACP session resume in v1).
+        # Build the prompt from the branch.
         branch = await db.get_branch_to_root(parent_id) if parent_id else []
-        prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
+
+        resume_session_id = None
+        use_resume = False
+        fork_session = True  # Always fork to keep branch history isolated, parallel to Claude Code
+
+        if branch:
+            for msg in reversed(branch):
+                if msg.get("cc_session_id"):
+                    resume_session_id = msg["cc_session_id"]
+                    break
+
+        if resume_session_id:
+            use_resume = True
+            latest_user_content = ""
+            for msg in reversed(branch):
+                if msg["role"] == "user":
+                    latest_user_content = msg["content"]
+                    break
+            prompt = latest_user_content or "(continue)"
+        else:
+            prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
 
         model = conv.get("local_model") or None  # None -> Hermes uses its config.yaml default
 
@@ -6118,12 +6219,37 @@ async def _handle_hermes_generation(
                 loom_port=config.port,
                 hermes_exe=config.hermes_executable(),
                 hermes_home=config.hermes_home,
+                branch=branch,
+                resume_session_id=resume_session_id if use_resume else None,
+                fork_session=fork_session,
             )
         except Exception as e:
-            if draft_msg_id:
-                await db.delete_branch(draft_msg_id)
-            await _ws_send(conv_id, {"type": "error", "error": f"Failed to start Hermes: {e}"})
-            return
+            if use_resume:
+                print(f"[Hermes] Resume failed ({e}), falling back to full history")
+                await _ws_send(conv_id, {"type": "status", "text": "Session resume failed — rebuilding from history..."})
+                use_resume = False
+                prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
+                try:
+                    proc, event_stream = await hermes_client.run_hermes(
+                        prompt,
+                        conv_id=conv_id,
+                        model=model,
+                        cwd=project_dir,
+                        loom_port=config.port,
+                        hermes_exe=config.hermes_executable(),
+                        hermes_home=config.hermes_home,
+                        branch=branch,
+                    )
+                except Exception as e2:
+                    if draft_msg_id:
+                        await db.delete_branch(draft_msg_id)
+                    await _ws_send(conv_id, {"type": "error", "error": f"Failed to start Hermes: {e2}"})
+                    return
+            else:
+                if draft_msg_id:
+                    await db.delete_branch(draft_msg_id)
+                await _ws_send(conv_id, {"type": "error", "error": f"Failed to start Hermes: {e}"})
+                return
 
         _active_hermes_procs[conv_id] = proc
         try:

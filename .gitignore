@@ -74,15 +74,17 @@ attached_*.webp
 # Photoshop files
 *.psd
 
-# Log files
+# Log files (incl. rotated logs like main_server.log.old, comfy/llama/admin/nrol_ao/agy_test/ttyd, etc.)
 *.log
+*.log.*
 
 # Environment / secrets
 .env
 .env.*
 
-# User config (persisted settings from UI)
+# User config (persisted settings from UI; per-bot variants like config-Kayleighbot.json)
 config.json
+config-*.json
 
 # Screenshots
 Screenshot*.png
@@ -159,6 +161,7 @@ gemini-loom-2/
 # Architecture docs (generated from code reading, not source)
 LOOM_ARCHITECTURE.md
 LOOM_EXPLAINED.md
+IMPORTANT_AGY_INFO.md
 
 # Test / planning docs
 BUGFIX_SUMMARY.md
@@ -171,6 +174,7 @@ haikus.md
 # pytest cache
 .pytest_cache/
 .pytest_tmp/
+pytest-tmp-*/
 
 # Generated workspaces
 workspaces/

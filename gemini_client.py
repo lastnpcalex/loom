@@ -57,8 +57,14 @@ def _scan_agy_log_for_error(since_ts: float) -> str | None:
         m = _RE_RESETS_IN.search(text)
         resets = f" — resets in {m.group(1)}" if m else ""
         return f"Antigravity quota reached (429){resets}"
-    if "You are not logged into Antigravity" in text and "silent auth succeeded" not in text:
-        return "Antigravity is not logged in — run `agy` interactively to sign in"
+    if "You are not logged into Antigravity" in text:
+        success_indicators = [
+            "silent auth succeeded",
+            "authenticated successfully",
+            "Auth succeeded",
+        ]
+        if not any(indicator in text for indicator in success_indicators):
+            return "Antigravity is not logged in — run `agy` interactively to sign in"
     if "PERMISSION_DENIED" in text:
         return "Antigravity permission denied — check account access"
     return None
@@ -77,13 +83,16 @@ def _find_agy_exe() -> str:
 
 def _loom_model_to_agy(model: str, effort: str) -> str:
     """Map Loom's model selection to agy 2.0 model identifiers."""
+    if model.lower().startswith("gemini:"):
+        model = model[7:]
     ml = model.lower()
-    if "gemini 3.5 flash" in ml:
+    if "gemini 3.5 flash" in ml or "gemini-3.5-flash" in ml:
         return {
             "low": "gemini-3.5-flash-low",
             "medium": "gemini-3.5-flash-medium",
-        }.get(effort, "gemini-3.5-flash")
-    if "gemini 3.1 pro" in ml:
+            "high": "gemini-3.5-flash-medium",
+        }.get(effort, "gemini-3.5-flash-medium")
+    if "gemini 3.1 pro" in ml or "gemini-3.1-pro" in ml:
         return {
             "low": "gemini-3.1-pro-low",
             "medium": "gemini-3.1-pro-medium",
@@ -526,7 +535,8 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         **kwargs
     )
 
-    # We read stderr in the background
+    # Drain stderr in the background (agy emits nothing on stderr, but we
+    # must drain the pipe to avoid a blocked-subprocess deadlock on Windows).
     async def _read_stderr():
         try:
             async for line in proc.stderr:
@@ -562,56 +572,148 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # Asynchronous task to monitor and tail the transcript.jsonl file
     async def _tail_transcript_to_queue():
         active_file = None
-        # Poll for the active transcript file being created or modified
-        # Keep polling while the process is running, up to 60 seconds (1200 * 0.05s) max.
-        polls = 0
-        while True:
-            if use_resume and expected_session_dir.exists():
-                latest_file, latest_time = find_latest_transcript(expected_session_dir)
-            else:
+        if use_resume and baseline_file:
+            active_file = baseline_file
+        else:
+            # Poll for the active transcript file being created or modified
+            # Keep polling while the process is running, up to 60 seconds (1200 * 0.05s) max.
+            polls = 0
+            while True:
                 latest_file = None
                 latest_time = 0.0
-                if brain_path.exists():
+                is_active = False
+
+                # 1. Prefer expected_session_dir if it exists (resume/fork paths).
+                if expected_session_dir.exists():
+                    latest_file, latest_time = find_latest_transcript(expected_session_dir)
+                    if latest_file:
+                        if baseline_file:
+                            if latest_file != baseline_file or latest_time > baseline_time + 0.1:
+                                is_active = True
+                            elif polls % 40 == 0:
+                                print(
+                                    f"[AGY] candidate transcript={latest_file} rejected: "
+                                    f"mtime={latest_time:.3f} baseline={baseline_time:.3f}"
+                                )
+                        else:
+                            if latest_time > launch_ts - 2.0:
+                                is_active = True
+                            elif polls % 40 == 0:
+                                print(
+                                    f"[AGY] candidate transcript={latest_file} rejected: "
+                                    f"mtime={latest_time:.3f} launch_ts={launch_ts:.3f}"
+                                )
+
+                # 2. Fallback: find newly created folders (not in existing_dirs) for new conversations
+                # where agy generates a new random UUID folder. Entered if no active file exists in expected_session_dir.
+                if not is_active and brain_path.exists():
+                    latest_file = None
+                    latest_time = 0.0
                     try:
                         for p in brain_path.iterdir():
-                            if p.is_dir() and p.name not in existing_dirs:
-                                fp, mtime = find_latest_transcript(p)
-                                if fp and mtime > latest_time:
-                                    latest_time = mtime
-                                    latest_file = fp
+                            if not p.is_dir() or p.name in existing_dirs:
+                                continue
+                            fp, mtime = find_latest_transcript(p)
+                            if fp and mtime > latest_time:
+                                latest_file = fp
+                                latest_time = mtime
                     except OSError:
                         pass
 
-            if latest_file and (latest_file != baseline_file or latest_time > baseline_time + 0.1):
-                active_file = latest_file
-                break
+                    if latest_file:
+                        if baseline_file:
+                            if latest_file != baseline_file or latest_time > baseline_time + 0.1:
+                                is_active = True
+                            elif polls % 40 == 0:
+                                print(
+                                    f"[AGY] fallback candidate transcript={latest_file} rejected: "
+                                    f"mtime={latest_time:.3f} baseline={baseline_time:.3f}"
+                                )
+                        else:
+                            if latest_time > launch_ts - 2.0:
+                                is_active = True
+                            elif polls % 40 == 0:
+                                print(
+                                    f"[AGY] fallback candidate transcript={latest_file} rejected: "
+                                    f"mtime={latest_time:.3f} launch_ts={launch_ts:.3f}"
+                                )
 
-            # If the process is no longer running and we have polled for at least 2 seconds, stop
-            if proc.returncode is not None and polls > 40:
-                break
+                if is_active:
+                    print(
+                        f"[AGY] selected transcript={latest_file} "
+                        f"mtime={latest_time:.3f} launch_ts={launch_ts:.3f} "
+                        f"baseline_file={baseline_file} use_resume={use_resume} "
+                        f"expected={expected_session_dir}"
+                    )
+                    active_file = latest_file
+                    break
 
-            # Timeout safety limit (60 seconds)
-            if polls > 1200:
-                break
+                # If the process is no longer running and we have polled for at least 2 seconds, stop
+                if proc.returncode is not None and polls > 40:
+                    break
 
-            polls += 1
-            await asyncio.sleep(0.05)
+                # Timeout safety limit (60 seconds)
+                if polls > 1200:
+                    break
+
+                polls += 1
+                await asyncio.sleep(0.05)
 
         if not active_file:
             log.error("[AGY] Timeout waiting for active transcript file. Waiting for process completion.")
             await proc.wait()
-            err = _scan_agy_log_for_error(launch_ts)
-            if err:
-                print(f"[AGY] CLI log diagnosis: {err}")
-            queue.put_nowait({
-                "type": "result",
-                "is_error": True if err else (proc.returncode != 0),
-                "result_text": "",
-                "error": err,
-                "session_id": resume_session_id or str(conv_id),
-            })
-            queue.put_nowait(None)
-            return
+            # Post-completion scan: check if it was written during process shutdown
+            latest_file = None
+            latest_time = 0.0
+            is_active = False
+            if expected_session_dir.exists():
+                latest_file, latest_time = find_latest_transcript(expected_session_dir)
+                if latest_file:
+                    if baseline_file:
+                        if latest_file != baseline_file or latest_time > baseline_time + 0.1:
+                            is_active = True
+                    else:
+                        if latest_time > launch_ts - 2.0:
+                            is_active = True
+
+            if not is_active and brain_path.exists():
+                latest_file = None
+                latest_time = 0.0
+                try:
+                    for p in brain_path.iterdir():
+                        if not p.is_dir() or p.name in existing_dirs:
+                            continue
+                        fp, mtime = find_latest_transcript(p)
+                        if fp and mtime > latest_time:
+                            latest_file = fp
+                            latest_time = mtime
+                except OSError:
+                    pass
+
+                if latest_file:
+                    if baseline_file:
+                        if latest_file != baseline_file or latest_time > baseline_time + 0.1:
+                            is_active = True
+                    else:
+                        if latest_time > launch_ts - 2.0:
+                            is_active = True
+
+            if is_active:
+                active_file = latest_file
+                print(f"[AGY] Found transcript post-completion: {active_file}")
+            else:
+                err = _scan_agy_log_for_error(launch_ts)
+                if err:
+                    print(f"[AGY] CLI log diagnosis: {err}")
+                queue.put_nowait({
+                    "type": "result",
+                    "is_error": True if err else (proc.returncode != 0),
+                    "result_text": "",
+                    "error": err,
+                    "session_id": resume_session_id or str(conv_id),
+                })
+                queue.put_nowait(None)
+                return
 
         session_id = ""
         try:
@@ -633,16 +735,22 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         try:
             with open(active_file, "r", encoding="utf-8", errors="replace") as f:
                 if active_file == baseline_file and initial_size > 0:
+                    # Seek to where the file was before agy launched.
+                    # JSONL files always end on a newline boundary, so
+                    # initial_size lands right at the start of the next line
+                    # (or at true EOF). Do NOT consume a readline — that
+                    # would eat the first real event agy writes.
                     f.seek(initial_size)
-                    f.readline()  # consume any trailing fragment of the previous line
                 
                 full_text = ""
                 processed_steps = set()
                 active_tool_calls = []
+                _eof_polls = 0  # heartbeat counter for liveness signal
 
                 while True:
                     line = f.readline()
                     if line:
+                        _eof_polls = 0  # reset heartbeat on any content
                         if not line.strip():
                             continue
                         try:
@@ -826,6 +934,36 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                                 except Exception as e:
                                     log.error(f"[AGY] Error parsing final transcript line: {e}")
                             break
+
+                        # Clear EOF flag to allow reading new appends (buffered TextIOWrapper cache workaround)
+                        try:
+                            f.seek(f.tell())
+                        except OSError:
+                            pass
+
+                        # Liveness heartbeat: every ~3s (60 polls × 0.05s)
+                        # of no new transcript content, probe the agy CLI
+                        # log for 429 / auth errors and surface them
+                        # immediately instead of waiting for process exit.
+                        _eof_polls += 1
+                        if _eof_polls % 60 == 0 and not full_text:
+                            elapsed = int(_time.time() - launch_ts)
+                            log_err = _scan_agy_log_for_error(launch_ts)
+                            if log_err:
+                                # Fatal error discovered — surface and abort.
+                                print(f"[AGY] Live log diagnosis ({elapsed}s): {log_err}")
+                                queue.put_nowait({
+                                    "type": "status",
+                                    "text": log_err,
+                                })
+                                # Give agy a moment to exit on its own,
+                                # then force-terminate so we don't stall.
+                                try:
+                                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                                except asyncio.TimeoutError:
+                                    proc.kill()
+                                break
+
                         await asyncio.sleep(0.05)
 
                 post_err = None

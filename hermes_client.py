@@ -84,6 +84,100 @@ def default_hermes_exe(hermes_home: str | None = None) -> str:
     return cand if os.path.exists(cand) else "hermes"
 
 
+# Hermes provider slugs that `parse_model_input` (hermes_cli/models.py) treats
+# as `<provider>:<model>` heads. Anything else with a colon is interpreted as
+# part of the model name, not a provider switch.
+_HERMES_PROVIDER_PREFIXES = frozenset({
+    "custom", "openrouter", "nous", "anthropic", "openai", "google",
+    "mistral", "xai", "zai", "ollama", "groq", "cerebras", "bedrock",
+})
+
+
+def _collect_current_turn_image_blocks(branch: list[dict] | None) -> list[dict]:
+    """Build ACP ``ImageContentBlock``s for the latest user message's attachments.
+
+    Older user messages are not included — the rendered prompt string in
+    ``_prepare_hermes_prompt`` summarises history textually, and once
+    ``session/load`` lands Hermes will carry the past server-side anyway. We
+    only need the actual bytes for the image the user is asking about *now*.
+
+    Borrows the data-URL encoder from ``llama_client`` (with its WebP→JPEG
+    conversion path) so Hermes's vision pipeline sees the same input format as
+    direct llama-server calls.
+    """
+    if not branch:
+        return []
+
+    latest_with_image: dict | None = None
+    for msg in reversed(branch):
+        if msg.get("role") != "user":
+            continue
+        if msg.get("image_path"):
+            latest_with_image = msg
+            break
+
+    if latest_with_image is None:
+        return []
+
+    try:
+        import llama_client
+        paths = llama_client._parse_image_paths(latest_with_image.get("image_path"))
+    except Exception as e:  # noqa: BLE001
+        log.debug("[Hermes] _parse_image_paths failed: %s", e)
+        return []
+
+    blocks: list[dict] = []
+    for path in paths:
+        try:
+            data_url = llama_client._image_to_data_url(path)
+        except Exception as e:  # noqa: BLE001
+            log.warning("[Hermes] image conversion failed for %s: %s", path, e)
+            continue
+        if not data_url:
+            continue
+        mime = "image/jpeg"
+        if data_url.startswith("data:"):
+            head = data_url.split(";", 1)[0]
+            if ":" in head:
+                mime = head.split(":", 1)[1] or mime
+        blocks.append({"type": "image", "data": data_url, "mimeType": mime})
+
+    return blocks
+
+
+def _loom_model_to_hermes(model: str | None) -> str | None:
+    """Map Loom's local-model selection to a Hermes ACP ``modelId``.
+
+    Loom passes whatever its chat UI's local-model dropdown selects — usually a
+    ``.gguf`` filename or a server-registered ID like ``qwen3.6:27b``. Hermes
+    ACP wants ``<provider>:<model>`` where the provider is ``custom`` for our
+    llama-server backend.
+
+      - ``None`` → ``None`` (Hermes falls back to its ``config.yaml`` default).
+      - Already provider-qualified (``custom:…``, ``openrouter:…`` etc.) → as-is.
+      - ``.gguf`` filename → resolved via ``llama_client._resolve_model`` to a
+        server-registered ID, then prefixed with ``custom:``.
+      - Anything else → wrapped as ``custom:<model>``.
+
+    Hermes 0.13.0's parser only treats the FIRST colon as a provider delimiter,
+    and only when the head matches a known provider, so ``custom:qwen3.6:27b``
+    round-trips correctly without the old ``ollama:`` workaround.
+    """
+    if not model:
+        return None
+    if ":" in model:
+        head = model.split(":", 1)[0].lower()
+        if head in _HERMES_PROVIDER_PREFIXES:
+            return model
+    try:
+        import llama_client
+        resolved = llama_client._resolve_model(model)
+    except Exception as e:  # noqa: BLE001
+        log.debug("[Hermes] _resolve_model(%s) failed: %s", model, e)
+        resolved = model
+    return f"custom:{resolved}"
+
+
 # --------------------------------------------------------------------------- #
 # JSON-RPC helpers
 # --------------------------------------------------------------------------- #
@@ -326,6 +420,93 @@ def _dispatch_session_update(update: dict, state: dict) -> list[dict]:
     return events
 
 
+def _prepare_hermes_prompt(
+    prompt: str,
+    branch: list[dict] | None = None,
+    model: str | None = None,
+    *,
+    is_first_turn: bool = True,
+) -> str:
+    """Inject the Loom contract and positionality for Hermes.
+
+    When ``is_first_turn`` is True (the default), wraps the prompt with the
+    Loom agent contract and a ``<loom_branch_info>`` positionality block —
+    Hermes is in a fresh session and needs orientation. When False, returns
+    the bare ``prompt`` because Hermes already has the session's rolling
+    context server-side and only needs the new user turn.
+
+    Today every call goes through with ``is_first_turn=True`` (Loom opens a
+    fresh ACP session per turn). Once per-branch session persistence lands the
+    caller will pass ``False`` for continuation turns and ``True`` for fresh
+    sessions / post-fork first messages (the Rick-and-Morty positionality nudge
+    on Morty's lapel).
+    """
+    if not is_first_turn:
+        return prompt
+
+    from loom_agent_prompt import load_loom_agent_prompt
+    contract = load_loom_agent_prompt()
+
+    if not contract and not branch and not model:
+        return prompt
+
+    contract_header = ""
+    if contract:
+        contract_header = (
+            f"<loom_agent_contract provider=\"hermes\">\n"
+            f"{contract}\n"
+            f"</loom_agent_contract>\n\n"
+        )
+
+    branch_info = ""
+    if branch or model:
+        conv_id = branch[0].get("conversation_id") if branch else "unknown"
+        leaf_id = branch[-1].get("id") if branch else "unknown"
+        path_str = " -> ".join(f"msg_{m.get('id')}" for m in branch) if branch else "None"
+
+        steps = []
+        if branch:
+            for msg in branch:
+                msg_id = msg.get("id")
+                parent_id = msg.get("parent_id")
+                role = msg.get("role")
+
+                content_preview = msg.get("summary") or msg.get("content", "")
+                if isinstance(content_preview, str):
+                    content_preview = content_preview.strip().replace("\n", " ")
+                    if len(content_preview) > 100:
+                        content_preview = content_preview[:97] + "..."
+                else:
+                    content_preview = ""
+
+                parent_str = f"parent: msg_{parent_id}" if parent_id is not None else "parent: None"
+                steps.append(f"  * [msg_{msg_id}] (role: {role}, {parent_str}): {content_preview}")
+
+        steps_str = "\n".join(steps) if steps else "  (No messages in branch yet)"
+
+        branch_info = (
+            f"<loom_branch_info>\n"
+            f"Note: Hermes is built different and operates with decentralized branches. "
+            f"You are operating on a specific branch of the conversation tree. "
+            f"Compare this branch path and model to tell if you have stepped into a different/forked branch or changed models:\n"
+            f"Conversation ID: {conv_id}\n"
+            f"Active Node ID: {leaf_id}\n"
+            f"Active Model: {model or 'default'}\n"
+            f"Active Branch Path: {path_str}\n"
+            f"Branch Messages:\n"
+            f"{steps_str}\n"
+            f"</loom_branch_info>\n\n"
+        )
+
+    return (
+        f"{contract_header}"
+        f"{branch_info}"
+        f"<user_task>\n"
+        f"{prompt}\n"
+        f"</user_task>"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Public entry point
 # --------------------------------------------------------------------------- #
@@ -340,6 +521,10 @@ async def run_hermes(
     hermes_exe: str | None = None,
     hermes_home: str | None = None,
     system: str | None = None,
+    branch: list[dict] | None = None,
+    resume_session_id: str | None = None,
+    fork_session: bool = False,
+    is_first_turn: bool = True,
 ):
     """Spawn `hermes acp`, run one prompt turn, and return ``(proc, event_stream)``.
 
@@ -368,6 +553,7 @@ async def run_hermes(
         {type:"error", error}
         {type:"result", session_id, stop_reason, duration_ms, num_turns}
     """
+    prompt = _prepare_hermes_prompt(prompt, branch, model, is_first_turn=is_first_turn)
     exe = hermes_exe or default_hermes_exe(hermes_home)
     home = hermes_home or os.environ.get(
         "HERMES_HOME",
@@ -438,32 +624,58 @@ async def run_hermes(
             agent_info = (init_result or {}).get("agentInfo") or {}
             log.info("[Hermes] connected: %s", agent_info)
 
-            new_result = await rpc_request_via_reader(
-                rpc, "session/new", {"cwd": acp_cwd, "mcpServers": _loom_mcp_servers()}, proc, state)
-            session_id = (new_result or {}).get("sessionId") or (new_result or {}).get("session_id") or ""
-            yield {"type": "session_info", "session_id": session_id,
-                   "model": ((new_result or {}).get("models") or {}).get("currentModelId", "")}
-
-            if model:
+            session_id = ""
+            models_info = {}
+            if resume_session_id:
                 try:
-                    # If it has a colon, it's likely an Ollama model (e.g. qwen:27b).
-                    # Hermes' 'custom' provider often mangles these by splitting on ':'.
-                    # Try 'ollama:' prefix which Hermes supports more natively for these.
-                    prefix = "ollama" if ":" in model else "custom"
+                    if fork_session:
+                        log.info("[Hermes] Forking session: %s", resume_session_id)
+                        fork_result = await rpc_request_via_reader(
+                            rpc, "session/fork", {"sessionId": resume_session_id}, proc, state)
+                        session_id = (fork_result or {}).get("sessionId") or (fork_result or {}).get("session_id") or ""
+                        models_info = (fork_result or {}).get("models") or {}
+                    else:
+                        log.info("[Hermes] Loading session: %s", resume_session_id)
+                        load_result = await rpc_request_via_reader(
+                            rpc, "session/load", {"sessionId": resume_session_id}, proc, state)
+                        session_id = resume_session_id
+                        models_info = (load_result or {}).get("models") or {}
+                except Exception as e:
+                    log.warning("[Hermes] Session resume/fork failed: %s", e)
+                    try:
+                        await cancel_hermes(proc)
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"Hermes session resume/fork failed: {e}") from e
+
+            if not session_id:
+                new_result = await rpc_request_via_reader(
+                    rpc, "session/new", {"cwd": acp_cwd, "mcpServers": _loom_mcp_servers()}, proc, state)
+                session_id = (new_result or {}).get("sessionId") or (new_result or {}).get("session_id") or ""
+                models_info = (new_result or {}).get("models") or {}
+
+            yield {"type": "session_info", "session_id": session_id,
+                   "model": models_info.get("currentModelId", "")}
+
+            target_model_id = _loom_model_to_hermes(model)
+            if target_model_id:
+                try:
                     await rpc_request_via_reader(
                         rpc, "session/set_model",
-                        {"sessionId": session_id, "modelId": f"{prefix}:{model}"}, proc, state)
+                        {"sessionId": session_id, "modelId": target_model_id}, proc, state)
                 except Exception as e:  # noqa: BLE001
-                    log.warning("[Hermes] set_model(%s) failed: %s", model, e)
+                    log.warning("[Hermes] set_model(%s) failed: %s", target_model_id, e)
 
             # --- prompt turn ---
             # Issue the prompt request, then drain until its response arrives.
             prompt_req_id = rpc._alloc_id()
             prompt_fut: asyncio.Future = asyncio.get_event_loop().create_future()
             rpc._pending[prompt_req_id] = prompt_fut
+            prompt_blocks: list[dict] = [{"type": "text", "text": prompt}]
+            prompt_blocks.extend(_collect_current_turn_image_blocks(branch))
             await rpc._write({"jsonrpc": "2.0", "id": prompt_req_id, "method": "session/prompt",
                               "params": {"sessionId": session_id,
-                                         "prompt": [{"type": "text", "text": prompt}]}})
+                                         "prompt": prompt_blocks}})
 
             assert proc.stdout is not None
             async for raw in proc.stdout:
@@ -481,11 +693,13 @@ async def run_hermes(
                 if rpc.resolve_response(msg):
                     if prompt_fut.done():
                         # session/prompt completed -> turn done.
+                        prompt_failed = False
                         try:
                             result = prompt_fut.result()
                         except Exception as e:  # noqa: BLE001
                             yield {"type": "error", "error": f"hermes prompt failed: {e}"}
                             result = {}
+                            prompt_failed = True
                         usage = (result or {}).get("usage") or {}
                         if usage:
                             yield {"type": "usage",
@@ -493,7 +707,11 @@ async def run_hermes(
                                    "output_tokens": usage.get("outputTokens", usage.get("output_tokens", 0))}
                         yield {"type": "result",
                                "session_id": session_id,
-                               "stop_reason": (result or {}).get("stopReason") or (result or {}).get("stop_reason") or "end_turn",
+                               "stop_reason": (
+                                   (result or {}).get("stopReason")
+                                   or (result or {}).get("stop_reason")
+                                   or ("error" if prompt_failed else "end_turn")
+                               ),
                                "duration_ms": int((_time.time() - t0) * 1000),
                                "num_turns": 1}
                         finished = True

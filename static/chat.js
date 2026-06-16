@@ -3631,6 +3631,8 @@ function removeStreamingMessage() {
         streamingDiv.remove();
         streamingDiv = null;
     }
+    // Remove any draft messages remaining in the DOM
+    document.querySelectorAll('.message-generating').forEach(el => el.remove());
 }
 
 function _streamingMessageHasContent() {
