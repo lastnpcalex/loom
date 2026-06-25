@@ -183,17 +183,17 @@ async def lifespan(app):
     await _cron_init_db()
     # Clean up stale draft messages (empty assistant msgs older than 30 min)
     await _cleanup_stale_drafts()
-    # Reap orphan CC/ollama subprocesses from prior server instances.
+    # Reap orphan CC/LLM subprocesses from prior server instances.
     await _reap_orphan_generations()
     # Re-broadcast pending permission requests from DB (server restart)
     await _reload_pending_permissions()
-    # Ensure Ollama is running (launches it if not)
-    asyncio.create_task(_ensure_ollama())
-    # Warm the local-model caches once Ollama is up so the settings panel
+    # Ensure Llama Server is reachable (warns if not)
+    asyncio.create_task(_ensure_llama())
+    # Warm the local-model caches once Llama Server is up so the settings panel
     # opens instantly. Runs as a background task so we don't block startup
-    # while waiting on a slow Ollama probe.
+    # while waiting on a slow Llama Server probe.
     async def _warm_model_caches():
-        await asyncio.sleep(2)  # let _ensure_ollama finish first
+        await asyncio.sleep(2)  # let _ensure_llama finish first
         try:
             await _refresh_local_models_cache()
             await _refresh_vision_models_cache()
@@ -402,55 +402,19 @@ async def _reload_pending_permissions():
     print(f"[STARTUP] Cleared {len(rows)} pending permissions from DB")
 
 
-async def _ensure_ollama():
-    """Check if Ollama is running; launch it in the background if not."""
-    import shutil
-    import subprocess
-
+async def _ensure_llama():
+    """Check if Llama Server is reachable; warn if not."""
     try:
         status = await health_check()
         if status.get("status") == "ok":
             print(
-                f"[STARTUP] Ollama already running — {len(status.get('models', []))} model(s) available"
+                f"[STARTUP] Llama Server already running — {len(status.get('models', []))} model(s) available"
             )
             return
     except Exception:
         pass
 
-    ollama_path = shutil.which("ollama")
-    if not ollama_path:
-        print("[STARTUP] Ollama not found on PATH — skipping auto-launch")
-        return
-
-    print(f"[STARTUP] Ollama not responding — launching: {ollama_path} serve")
-    try:
-        env = os.environ.copy()
-        env["OLLAMA_KV_CACHE_TYPE"] = env.get("OLLAMA_KV_CACHE_TYPE", "q8_0")
-        subprocess.Popen(
-            [ollama_path, "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        # Wait for it to come up (up to 15s)
-        for i in range(15):
-            await asyncio.sleep(1)
-            try:
-                status = await health_check()
-                if status.get("status") == "connected":
-                    print(
-                        f"[STARTUP] Ollama ready after {i+1}s — {len(status.get('models', []))} model(s)"
-                    )
-                    return
-            except Exception:
-                pass
-        print(
-            "[STARTUP] Ollama launched but not yet responding after 15s — will retry on first use"
-        )
-    except Exception as e:
-        print(f"[STARTUP] Failed to launch Ollama: {e}")
+    print("[STARTUP] Llama Server not reachable — local turns will fail until it starts")
 
 
 
@@ -807,6 +771,96 @@ async def api_kill_generation(draft_msg_id: int):
     return {"status": "killed", "pid": pid, "pid_killed": killed}
 
 
+@app.get("/api/debug/state")
+async def api_debug_state(request: Request):
+    """Read-only diagnostic endpoint — localhost only."""
+    import llama_client
+
+    if not request.client or request.client.host not in ("127.0.0.1", "localhost", "::1"):
+        raise HTTPException(status_code=403, detail="Localhost access only")
+
+    # Active generations (in-memory task dict)
+    gen_memory = []
+    for k, t in _active_generations.items():
+        gen_memory.append({
+            "conv_id": k[0],
+            "parent_id": k[1],
+            "seq": k[2],
+            "done": t.done(),
+        })
+
+    # Active generations (SQLite DB tracking)
+    gen_db = await db.list_active_generations()
+
+    # Active Hermes processes
+    hermes_procs = []
+    for cid, proc in _active_hermes_procs.items():
+        hermes_procs.append({
+            "conv_id": cid,
+            "pid": proc.pid,
+            "alive": _pid_alive(proc.pid) if proc.pid else False,
+        })
+
+    # Llama model name map
+    model_map = dict(getattr(llama_client, "_model_name_map", {}))
+
+    # Llama config values
+    llama_cfg = {
+        "llama_model": config.llama_model,
+        "llama_models_dir": config.llama_models_dir,
+    }
+
+    return {
+        "active_generations_memory": gen_memory,
+        "active_generations_db": gen_db,
+        "active_hermes_procs": hermes_procs,
+        "model_name_map": model_map,
+        "llama_config": llama_cfg,
+    }
+
+
+@app.get("/api/debug/stream-state/{conv_id}")
+async def api_debug_stream_state(conv_id: int, request: Request):
+    """Per-conv 'is this thing actually streaming right now' diagnostic.
+
+    Use when a generation looks frozen in the UI: tells you whether the
+    backend is still sending events, when the last one fired, what type it
+    was, and how many WS clients were attached at that send. Lets you
+    distinguish "server stopped generating" from "UI is dropping chunks".
+    Localhost only.
+    """
+    if not request.client or request.client.host not in ("127.0.0.1", "localhost", "::1"):
+        raise HTTPException(status_code=403, detail="Localhost access only")
+
+    now = time.time()
+    state = _stream_state.get(conv_id, {})
+    last_at = state.get("last_event_at")
+    in_memory_gens = [
+        {"conv_id": k[0], "parent_id": k[1], "seq": k[2], "done": t.done()}
+        for k, t in _active_generations.items() if k[0] == conv_id
+    ]
+    db_gens = [r for r in await db.list_active_generations() if r.get("conv_id") == conv_id]
+    cc_proc = _active_claude_procs.get(conv_id)
+    hermes_proc = _active_hermes_procs.get(conv_id)
+    clients = _active_websockets.get(conv_id)
+
+    return {
+        "conv_id": conv_id,
+        "now": now,
+        "last_stream_event_at": last_at,
+        "seconds_since_last_event": (now - last_at) if last_at else None,
+        "last_event_type": state.get("last_event_type"),
+        "events_sent_this_session": state.get("events_sent", 0),
+        "clients_at_last_send": state.get("clients_at_send"),
+        "ws_clients_now": len(clients) if clients else 0,
+        "active_generations_in_memory": in_memory_gens,
+        "active_generations_db": db_gens,
+        "claude_subprocess_pid": cc_proc.pid if cc_proc else None,
+        "claude_subprocess_alive": _pid_alive(cc_proc.pid) if cc_proc and cc_proc.pid else False,
+        "hermes_subprocess_pid": hermes_proc.pid if hermes_proc else None,
+    }
+
+
 @app.get("/api/cron/help")
 async def api_cron_help():
     """LLM-facing reference for creating Loom cron jobs."""
@@ -876,6 +930,17 @@ _active_claude_procs: dict[int, asyncio.subprocess.Process] = {}
 _active_hermes_procs: dict[int, asyncio.subprocess.Process] = {}
 # Active WebSocket connections per conversation — multiple clients can watch the same conv
 _active_websockets: dict[int, set[WebSocket]] = {}
+
+# Per-conv stream-event tracker: lets /api/debug/stream-state answer "is this
+# conv getting tokens right now, and when was the last one" without scraping
+# logs. Pruned implicitly — entries only grow during active generations and
+# get overwritten on the next event.
+_stream_state: dict[int, dict] = {}
+_STREAM_EVENT_TYPES = frozenset({
+    "stream_chunk", "thinking_chunk", "text_delta",
+    "tool_start", "tool_input_chunk", "tool_result",
+    "stream_end", "stream_start", "generation_active",
+})
 # Pending hook-based permission requests: request_id -> {event, response, conv_id}
 _pending_hook_permissions: dict[str, dict] = {}
 # Permission requests the user approved for the current branch generation.
@@ -1112,8 +1177,8 @@ async def canvas_by_slug(slug: str):
 
 @app.get("/api/health")
 async def api_health():
-    ollama_status = await health_check()
-    return ollama_status
+    llama_status = await health_check()
+    return llama_status
 
 
 @app.post("/api/nrol/mcp-activity")
@@ -1140,8 +1205,6 @@ async def api_nrol_mcp_activity():
 # without browser mixed-content blocking the direct HTTP request.
 _STATUS_TARGETS = {
     "admin":   (3002, "/api/status"),
-    "ollama":  (11434, "/api/tags"),
-    "vllm":    (8000, "/v1/models"),
     "nrol":    (int(os.environ.get("ALPHA_OMEGA_PORT", "8098")), "/topics"),
     "comfyui": (8188, "/system_stats"),
 }
@@ -3742,9 +3805,19 @@ async def _ws_send(conv_id: int, data: dict):
     if gen_key and "gen_id" not in data:
         data = {**data, "gen_id": gen_key[2]}
     clients = _active_websockets.get(conv_id)
+    _t = data.get("type", "?")
+    # Per-conv tracker for the /api/debug/stream-state endpoint: lets a
+    # future LLM (or admin) ask "is conv N actively streaming right now?"
+    # without scraping logs. Only stream-shaped events count.
+    if _t in _STREAM_EVENT_TYPES:
+        _stream_state[conv_id] = {
+            "last_event_type": _t,
+            "last_event_at": time.time(),
+            "events_sent": _stream_state.get(conv_id, {}).get("events_sent", 0) + 1,
+            "clients_at_send": len(clients) if clients else 0,
+        }
     # TEMP DEBUG: log every WS send target + count + payload type so we can
     # verify whether content events are reaching the WebSocket layer at all.
-    _t = data.get("type", "?")
     _content = data.get("content", "") or ""
     _snippet = (_content[:30] + "…") if len(_content) > 30 else _content
     print(f"[WS-TRACE] conv={conv_id} type={_t} clients={len(clients) if clients else 0} {_snippet!r}")
@@ -3996,7 +4069,7 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 conv = await db.get_conversation(conv_id)
                 mode = conv.get("mode", "weave") if conv else "weave"
                 # CLI-agent subprocess modes — Claude Code (claude), Braid (local,
-                # = CC via Ollama), and Hermes (hermes acp). All three drive a
+                # = CC via llama-server), and Hermes (hermes acp). All three drive a
                 # single subprocess per conversation, so parallel generations on
                 # different branches would race the same child. (Including "local"
                 # here fixes a latent Braid bug — it was previously treated like
@@ -4255,7 +4328,7 @@ async def _run_compact_handoff(
             effort=cc_effort,
             resume_session_id=session_id,
             fork_session=False,
-            use_ollama=False,
+            use_llama=False,
         )
     except Exception as e:
         await _ws_send(conv_id, {"type": "status", "text": f"Handoff launch failed: {e}"})
@@ -4576,7 +4649,7 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
 
     mode = conv.get("mode", "weave") if conv else "weave"
 
-    if mode == "claude":
+    if mode in ("claude", "gemini", "codex"):
         await _handle_claude_generation(websocket, conv_id, conv, data)
         return
 
@@ -4590,7 +4663,7 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
 
     # Backstage convs always go through OODA so state card tools are available.
     # The model is picked from cc-inline-controls in the UI and sent as cc_model;
-    # inject it as local_model so the OODA handler uses it for the Ollama call.
+    # inject it as local_model so the OODA handler uses it for the llama call.
     if conv.get("backstage_parent_id") and data.get("cc_model"):
         conv = dict(conv)
         conv["local_model"] = data["cc_model"]
@@ -5261,19 +5334,24 @@ async def _handle_claude_generation(
             elif etype == "tool_result":
                 result_content = evt.get("content", "")
                 tool_id = evt.get("tool_id", "")
+                image_url = evt.get("image_url")
                 for block in reversed(content_blocks):
                     if block["type"] == "tool_use" and block.get("tool_id") == tool_id:
                         block["result"] = result_content
+                        if image_url:
+                            block["image_url"] = image_url
                         break
                 current_block = None
-                await _ws_send(
-                    conv_id,
-                    {
-                        "type": "tool_result",
-                        "content": result_content,
-                        "tool_id": tool_id,
-                    },
-                )
+                tool_result_msg = {
+                    "type": "tool_result",
+                    "content": result_content,
+                    "tool_id": tool_id,
+                }
+                if image_url:
+                    tool_result_msg["image_url"] = image_url
+                if evt.get("is_error"):
+                    tool_result_msg["is_error"] = True
+                await _ws_send(conv_id, tool_result_msg)
                 # Progressive save: update draft with accumulated content_blocks
                 await db.update_message_content(
                     draft_msg_id,
@@ -5703,10 +5781,9 @@ async def _handle_claude_generation(
                     current_block = None
 
                     # Check if this tool created/referenced an image file
-                    image_url = None
-                    if matched_block:
+                    image_url = evt.get("image_url")
+                    if not image_url and matched_block:
                         tool_input_str = matched_block.get("input", "")
-                        tool_name = matched_block.get("name", "")
                         # Scan tool input for image paths
                         import re as _re
 
@@ -5742,6 +5819,8 @@ async def _handle_claude_generation(
                         tool_result_msg["is_error"] = True
                     if image_url:
                         tool_result_msg["image_url"] = image_url
+                        if matched_block:
+                            matched_block["image_url"] = image_url
                     await _ws_send(conv_id, tool_result_msg)
                     # Progressive save
                     await db.update_message_content(
@@ -5846,6 +5925,17 @@ async def _handle_claude_generation(
                 {"type": "stream_end", "message": await db.get_message(draft_msg_id)},
             )
             return
+
+        # Partial output: agent died mid-turn (hook timeout, crash, etc.)
+        # Save whatever text/tools streamed before death so the user isn't
+        # left with a blank message — they can read what happened and retry.
+        if result_info.get("is_error") and full_text:
+            error_note = f"\n\n---\n[Turn interrupted: {result_info.get('error') or 'agent exited unexpectedly'}]"
+            full_text = full_text.rstrip() + error_note
+            if content_blocks and content_blocks[-1].get("type") == "text":
+                content_blocks[-1]["text"] = content_blocks[-1]["text"].rstrip() + error_note
+            else:
+                content_blocks.append({"type": "text", "text": error_note})
 
         # CC streamed an error response (e.g. "You've hit your org's monthly
         # usage limit") as assistant text. Augment the saved draft so the user
@@ -5984,7 +6074,12 @@ async def _handle_claude_generation(
         proc = _active_claude_procs.pop(conv_id, None)
         if proc:
             try:
-                await claude_client.cancel_claude(proc)
+                if is_gemini:
+                    await gemini_client.cancel_gemini(proc)
+                elif is_codex:
+                    await codex_client.cancel_codex(proc)
+                else:
+                    await claude_client.cancel_claude(proc)
             except Exception:
                 pass
         if draft_msg_id and (full_text or content_blocks):
@@ -6280,17 +6375,17 @@ async def _handle_hermes_generation(
                 # show it instead of a bare "(local model)".
                 if not conv.get("local_model"):
                     resolved = (evt.get("model") or "").strip()
-                    for prefix in ("custom:", "ollama:"):
+                    for prefix in ("custom:",):
                         if resolved.startswith(prefix):
                             resolved = resolved[len(prefix):].strip()
                             break
                     
                     # Heuristic: if Hermes returned a mangled suffix (like '27b' for 'qwen3.6:27b'),
                     # re-expand it so we don't save a broken model name that fails next turn.
-                    if resolved and ":" in config.ollama_model:
-                        base, tag = config.ollama_model.rsplit(":", 1)
-                        if resolved == tag or resolved == config.ollama_model.split(":")[-1]:
-                            resolved = config.ollama_model
+                    if resolved and ":" in config.llama_model:
+                        base, tag = config.llama_model.rsplit(":", 1)
+                        if resolved == tag or resolved == config.llama_model.split(":")[-1]:
+                            resolved = config.llama_model
 
                     if resolved:
                         conv["local_model"] = resolved
@@ -6333,13 +6428,24 @@ async def _handle_hermes_generation(
                                          "tool_id": evt.get("tool_id", "")})
             elif etype == "tool_result":
                 tool_id = evt.get("tool_id", "")
+                image_url = evt.get("image_url")
                 for block in reversed(content_blocks):
                     if block["type"] == "tool_use" and block.get("tool_id") == tool_id:
                         block["result"] = evt.get("content", "")
+                        if image_url:
+                            block["image_url"] = image_url
                         break
                 current_block = None
-                await _ws_send(conv_id, {"type": "tool_result", "content": evt.get("content", ""),
-                                         "tool_id": tool_id})
+                tool_result_msg = {
+                    "type": "tool_result",
+                    "content": evt.get("content", ""),
+                    "tool_id": tool_id
+                }
+                if image_url:
+                    tool_result_msg["image_url"] = image_url
+                if evt.get("is_error"):
+                    tool_result_msg["is_error"] = True
+                await _ws_send(conv_id, tool_result_msg)
                 await db.update_message_content(draft_msg_id, content=full_text,
                                                 content_blocks=json.dumps(content_blocks))
             elif etype == "permission_request":
@@ -6413,6 +6519,27 @@ async def _handle_hermes_generation(
         print(f"[Hermes] generation error conv={conv_id}: {e}")
         await _ws_send(conv_id, {"type": "error", "error": str(e)})
     finally:
+        # Clear the generation task from _active_generations
+        _gen_key = getattr(asyncio.current_task(), "_gen_key", None)
+        if _gen_key:
+            _active_generations.pop(_gen_key, None)
+            _generation_snapshots.pop(_gen_key, None)
+            _auto_approve_permissions.pop((conv_id, f"gen:{_gen_key[2]}"), None)
+
+        # Clear the SQLite active generation row
+        try:
+            if 'draft_msg_id' in locals() and draft_msg_id:
+                await db.unregister_active_generation(draft_msg_id)
+        except Exception:
+            pass
+
+        # Clean up any pending hook permissions for this conversation (memory + DB)
+        for rid in list(_pending_hook_permissions):
+            if _pending_hook_permissions[rid].get("conv_id") == conv_id:
+                _pending_hook_permissions.pop(rid, None)
+                await db.delete_pending_permission(rid)
+
+        # Existing Hermes process cleanup
         _active_hermes_procs.pop(conv_id, None)
         if proc is not None and proc.returncode is None:
             try:
@@ -6746,7 +6873,7 @@ async def _handle_ooda_generation(
 async def _handle_weave_generation(
     websocket: WebSocket, conv_id: int, conv: dict, data: dict
 ):
-    """Handle Weave (Ollama) generation — original logic."""
+    """Handle Weave (local llama) generation — original logic."""
     draft_msg_id = None
     full_response = ""
     try:
@@ -6888,7 +7015,7 @@ async def _handle_weave_generation(
 
         # Stream the response
         print(
-            f"[GEN] Starting generation for conv={conv_id} parent={parent_id} model={config.ollama_model}"
+            f"[GEN] Starting generation for conv={conv_id} parent={parent_id} model={config.llama_model}"
         )
         await _ws_send(
             conv_id,

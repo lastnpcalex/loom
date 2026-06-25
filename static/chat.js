@@ -111,6 +111,49 @@ function connectWebSocket(convId, _attempt) {
 // ── Generation Status ──
 let _streamTokenCount = 0;
 let _streamStartTime = 0;
+let _lastChunkAt = 0;
+let _droppedChunkCount = 0;
+
+// ── Stream Debug Overlay ──
+// A tiny always-on overlay that lights up when a generation is in flight, so
+// "GPU crunching but UI empty" is observable without DevTools. Shows:
+// streaming flag, _reconstructing flag (the silent-drop gate I added),
+// chunks received, age of last chunk, dropped chunks (where appendStreamChunk
+// returned early), and ws.readyState. Toggle full detail with ?debug=1.
+(function _initStreamDebugOverlay() {
+    function mount() {
+        if (document.getElementById('stream-debug-overlay')) return;
+        const el = document.createElement('div');
+        el.id = 'stream-debug-overlay';
+        el.style.cssText = 'position:fixed;bottom:6px;right:6px;z-index:99999;font:11px/1.3 ui-monospace,Consolas,monospace;background:rgba(0,0,0,0.72);color:#9ff;padding:4px 7px;border:1px solid rgba(0,255,255,0.25);border-radius:4px;pointer-events:none;display:none;white-space:pre;';
+        document.body.appendChild(el);
+        const verbose = new URLSearchParams(location.search).has('debug');
+        setInterval(() => {
+            const s = (typeof State !== 'undefined') ? State : null;
+            if (!s) return;
+            const active = !!s.isStreaming || !!s._reconstructing || verbose;
+            if (!active) { el.style.display = 'none'; return; }
+            const chunkAge = _lastChunkAt ? ((Date.now() - _lastChunkAt) / 1000).toFixed(1) + 's' : '—';
+            const wsState = ['CONNECTING','OPEN','CLOSING','CLOSED'][s.ws ? s.ws.readyState : 3] || '?';
+            const warn = s._reconstructing && _lastChunkAt && (Date.now() - _lastChunkAt) > 5000;
+            el.style.color = warn ? '#ff9' : '#9ff';
+            el.style.borderColor = warn ? 'rgba(255,180,0,0.7)' : 'rgba(0,255,255,0.25)';
+            const lines = [
+                `streaming=${!!s.isStreaming} recon=${!!s._reconstructing} ourBranch=${s._streamIsOurBranch}`,
+                `chunks=${_streamTokenCount} dropped=${_droppedChunkCount} lastChunk=${chunkAge}`,
+                `ws=${wsState} conv=${s.currentConvId}`,
+            ];
+            if (warn) lines.push('⚠ recon STUCK — chunks being dropped');
+            el.textContent = lines.join('\n');
+            el.style.display = 'block';
+        }, 500);
+    }
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', mount);
+    } else {
+        mount();
+    }
+})();
 
 // DOM-authoritative streaming check. State.isStreaming is a flag we set and
 // try to clear cleanly, but it leaks any time stream_end fires on a dropped
@@ -667,6 +710,7 @@ function handleWSMessage(data) {
             if (!State._streamIsOurBranch) break;
             hideGenStatus();
             _streamTokenCount++;
+            _lastChunkAt = Date.now();
             appendStreamChunk(data.content);
             break;
 
@@ -982,6 +1026,20 @@ function handleWSMessage(data) {
                 _streamTokenCount = 0;
                 if (!State._reconstructing) {
                     State._reconstructing = true;
+                    // Watchdog: if neither .then nor .catch fires within 15s
+                    // (hung loadMessages, server unresponsive, synchronous
+                    // throw before promise creation), force-clear so the
+                    // appendStreamChunk/_flushStreamBuffer gates don't drop
+                    // every chunk silently forever. 15s is comfortably past
+                    // any reasonable localhost loadMessages roundtrip.
+                    if (State._reconstructWatchdog) clearTimeout(State._reconstructWatchdog);
+                    State._reconstructWatchdog = setTimeout(() => {
+                        if (State._reconstructing) {
+                            console.warn('[Loom] _reconstructing watchdog fired — force-clearing after 15s of inactivity');
+                            State._reconstructing = false;
+                        }
+                        State._reconstructWatchdog = null;
+                    }, 15000);
                     const activeWs = State.ws;
                     // Keep _reconstructing true through loadMessages AND the
                     // snapshot rebuild. Clearing it in between leaves a window
@@ -3536,6 +3594,7 @@ function appendStreamChunk(content) {
         // the streamingDiv momentarily, and re-requesting now triggers a
         // generation_active → loadMessages → renderMessages loop that wipes
         // the streamingDiv before it can render anything.
+        _droppedChunkCount++;
         if (State.isStreaming && State._streamIsOurBranch !== false && !State._reconstructing) {
             _requestSnapshotIfStreaming();
         }
