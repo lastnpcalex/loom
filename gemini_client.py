@@ -202,21 +202,17 @@ def _configure_permission_hook(cwd: str, backstage_parent_id: int | None = None,
         mcp_path.write_text(json.dumps(mcp_config, indent=2), encoding="utf-8")
         log.info(f"[AGY] MCP server configured: {mcp_path}")
     else:
-        # Neutral agy launch (no backstage, no operator). Drop any leftover
-        # mcp_config.json at both cwd/.agents/ and the agy workspace root —
-        # `_configure_operator` rewrites them when it runs, so this only
-        # touches stale files from a previous mode. Without this, a backstage
-        # config from a prior run silently registers loom-state-cards in every
-        # subsequent neutral session and poisons MCP discovery.
+        # Neutral agy launch (no backstage, no operator). agy reads MCP config
+        # from .agents/ at the git-root workspace it discovers — deleting that
+        # file breaks agy's project discovery (falls back to default-cli-project
+        # with no MCP tools). Instead of deleting, write an empty config so the
+        # directory stays discoverable but registers no servers.
         agy_root = _agy_workspace_root(Path(cwd))
-        for target in {Path(cwd), agy_root}:
+        for target in (Path(cwd), agy_root):
             stale = target / ".agents" / "mcp_config.json"
             if stale.exists():
-                try:
-                    stale.unlink()
-                    log.info(f"[AGY] Removed stale mcp_config.json: {stale}")
-                except OSError as e:
-                    log.warning(f"[AGY] Could not remove stale {stale}: {e}")
+                stale.write_text(json.dumps({"mcpServers": {}}, indent=2), encoding="utf-8")
+                log.info(f"[AGY] Cleared stale mcp_config.json: {stale}")
 
     _ensure_hook_trusted(cwd, pre_hook_command)
     _ensure_hook_trusted(cwd, post_hook_command)
