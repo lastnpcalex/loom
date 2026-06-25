@@ -261,6 +261,26 @@ def _agy_workspace_root(cwd: Path) -> Path:
     return current
 
 
+def _get_agy_project_id(workspace: Path) -> str | None:
+    """Read the workspace's project ID from agy's project cache.
+
+    agy stores workspace→project mappings in
+    `~/.gemini/antigravity-cli/cache/projects.json`. Without the correct
+    project ID, new conversations fall into the default-cli-project which
+    has no MCP servers configured.
+    """
+    sys_home = Path(os.environ.get("USERPROFILE", Path.home())) if sys.platform == "win32" else Path.home()
+    cache_file = sys_home / ".gemini" / "antigravity-cli" / "cache" / "projects.json"
+    if not cache_file.exists():
+        return None
+    try:
+        projects = json.loads(cache_file.read_text(encoding="utf-8"))
+        ws_key = str(workspace.resolve())
+        return projects.get(ws_key)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def _configure_operator(cwd: str, conv_id: int, server_port: int):
     """NROL operator lockdown for agy: role instructions + strict MCP surface.
 
@@ -566,6 +586,16 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     cc_args = []
     if not nrol_operator:
         cc_args += ["--conversation", resume_session_id or str(conv_id)]
+
+    # Explicitly set the agy project ID so MCP config from .agents/ loads.
+    # agy's default-project cache (cache/default_project_id.txt) gets clobbered
+    # by neutral runs; without --project, new operator conversations fall into
+    # the "default-cli-project" which has no MCP servers configured.
+    if nrol_operator:
+        project_id = _get_agy_project_id(workspace)
+        if project_id:
+            cc_args += ["--project", project_id]
+
     cc_args += [
         "-p", cli_prompt,
         "--dangerously-skip-permissions",
