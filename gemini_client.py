@@ -592,7 +592,7 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # by neutral runs; without --project, new operator conversations fall into
     # the "default-cli-project" which has no MCP servers configured.
     if nrol_operator:
-        project_id = _get_agy_project_id(workspace)
+        project_id = _get_agy_project_id(Path(cwd))
         if project_id:
             cc_args += ["--project", project_id]
 
