@@ -2235,6 +2235,11 @@ body::after {
     word-wrap: break-word;
 }
 
+/* The streaming append-text path writes raw text nodes (no markdown parse per
+   chunk) — without pre-wrap the inherited white-space:normal collapses every
+   newline into a space, so the user sees a single run-on line until finalize. */
+.streaming-text { white-space: pre-wrap; }
+
 .message-content p { margin: 0 0 4px; }
 .message-content p:last-child { margin-bottom: 0; }
 .message-content p:empty { display: none; }
@@ -3280,6 +3285,12 @@ body::after {
 }
 
 #user-input::placeholder { color: var(--text-muted); }
+
+#user-input:disabled {
+    opacity: 0.65;
+    cursor: not-allowed;
+    background: rgba(10, 10, 20, 0.5);
+}
 
 /* Slash command autocomplete */
 .slash-autocomplete {

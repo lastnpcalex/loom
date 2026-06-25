@@ -983,9 +983,19 @@ function handleWSMessage(data) {
                 if (!State._reconstructing) {
                     State._reconstructing = true;
                     const activeWs = State.ws;
+                    // Keep _reconstructing true through loadMessages AND the
+                    // snapshot rebuild. Clearing it in between leaves a window
+                    // where appendStreamChunk sees streamingDiv=null AND
+                    // _reconstructing=false, so it fires _requestSnapshotIfStreaming
+                    // → server returns generation_active → outer handler isn't
+                    // gated → another loadMessages cycle → renderMessages wipes
+                    // streamingDiv → permanent freeze. Hold the flag until the
+                    // reconstruction is actually in the DOM.
                     loadMessages(State.currentConvId).then(() => {
-                        State._reconstructing = false;
-                        if (State.ws !== activeWs) return;
+                        if (State.ws !== activeWs) {
+                            State._reconstructing = false;
+                            return;
+                        }
                         // If the draft message has already landed from the DB
                         // (loadMessages picked up the committed final response),
                         // we're done — nothing to reconstruct.
@@ -993,6 +1003,7 @@ function handleWSMessage(data) {
                             m => m.id === snap.draft_msg_id && (m.content || '').trim()
                         );
                         if (draftLanded) {
+                            State._reconstructing = false;
                             _drainPendingPermPrompts();
                             return;
                         }
@@ -1008,6 +1019,7 @@ function handleWSMessage(data) {
                         if (stillOurs) {
                             _reconstructFromSnapshot(snap);
                         }
+                        State._reconstructing = false;
                         _drainPendingPermPrompts();
                     }).catch(() => { State._reconstructing = false; _drainPendingPermPrompts(); });
                 }
@@ -1082,7 +1094,7 @@ function updateContextInfo(data) {
                 details.push(`After: ${data.post_tokens.toLocaleString()} tokens`);
             }
         } else if (data.summarized_count != null) {
-            // Local (Ollama) compaction
+            // Local (llama) compaction
             summaryLine = `Context compactified — ${data.summarized_count} of ${data.total_messages || '?'} messages summarized`;
             details.push(`${data.verbatim_count || '?'} messages sent verbatim`);
             if (data.total_tokens) details.push(`Post-compaction context: ${data.total_tokens.toLocaleString()} tokens`);
@@ -2524,6 +2536,7 @@ function _modelsMatch(a, b) {
 function _agentKindForModel(model, conv) {
     const msgModel = (model || '').toLowerCase();
     const mode = (conv?.mode || '').toLowerCase();
+    if (mode === 'hermes' || msgModel.startsWith('hermes:')) return 'hermes';
     if (
         msgModel.startsWith('codex') ||
         msgModel.startsWith('gpt-5') ||
@@ -2547,7 +2560,6 @@ function _agentKindForModel(model, conv) {
         msgModel.startsWith('claude-')
     ) return 'claude';
     if (msgModel.endsWith('.gguf') || msgModel.includes('@llama-server')) return 'local';
-    if (msgModel.startsWith('hermes:')) return 'hermes';
     if (['claude', 'gemini', 'codex', 'local', 'hermes'].includes(mode)) return mode;
     return '';
 }
@@ -3518,7 +3530,13 @@ function appendStreamChunk(content) {
     if (!streamingDiv) {
         // Drop this chunk (server snapshot already contains it) and ask for
         // a fresh snapshot so the reconstruction path can rebuild the UI.
-        if (State.isStreaming && State._streamIsOurBranch !== false) {
+        // BUT: if reconstruction is already in flight (post-reconnect rebuild
+        // from a prior generation_active), don't request another snapshot —
+        // the in-flight loadMessages + _reconstructFromSnapshot will rebuild
+        // the streamingDiv momentarily, and re-requesting now triggers a
+        // generation_active → loadMessages → renderMessages loop that wipes
+        // the streamingDiv before it can render anything.
+        if (State.isStreaming && State._streamIsOurBranch !== false && !State._reconstructing) {
             _requestSnapshotIfStreaming();
         }
         _streamBuffer = '';
@@ -3544,7 +3562,7 @@ function _flushStreamBuffer() {
     _streamFlushTimer = null;
     if (streamingDiv && !streamingDiv.isConnected) {
         streamingDiv = null;
-        if (State.isStreaming && State._streamIsOurBranch !== false) {
+        if (State.isStreaming && State._streamIsOurBranch !== false && !State._reconstructing) {
             _requestSnapshotIfStreaming();
         }
         _streamBuffer = '';

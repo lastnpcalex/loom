@@ -31,6 +31,21 @@ def _agy_home() -> Path:
 _RE_RESETS_IN = re.compile(r"Resets in ([0-9hms]+)")
 
 
+def _parse_agy_log_filename_ts(filename: str) -> float | None:
+    import time as _time
+    import re
+    m = re.match(r"cli-(\d{8})_(\d{6})\.log", filename)
+    if not m:
+        return None
+    date_str, time_str = m.groups()
+    try:
+        dt_str = f"{date_str} {time_str}"
+        struct_time = _time.strptime(dt_str, "%Y%m%d %H%M%S")
+        return _time.mktime(struct_time)
+    except Exception:
+        return None
+
+
 def _scan_agy_log_for_error(since_ts: float) -> str | None:
     """Look at the newest agy cli-*.log for a fatal signal (429/auth) since `since_ts`.
 
@@ -42,7 +57,12 @@ def _scan_agy_log_for_error(since_ts: float) -> str | None:
     if not log_dir.exists():
         return None
     try:
-        candidates = [p for p in log_dir.glob("cli-*.log") if p.stat().st_mtime >= since_ts - 1.0]
+        candidates = []
+        for p in log_dir.glob("cli-*.log"):
+            filename_ts = _parse_agy_log_filename_ts(p.name)
+            # Filter log files created within 30s of launch_ts to protect against OneDrive sync time skew
+            if filename_ts is not None and abs(filename_ts - since_ts) <= 30.0:
+                candidates.append(p)
     except OSError:
         return None
     if not candidates:
@@ -137,13 +157,16 @@ def _configure_permission_hook(cwd: str, backstage_parent_id: int | None = None,
         pre_hook_command = f'"{python_exe}" "{hook_path}" --event PreToolUse'
         post_hook_command = f'"{python_exe}" "{hook_path}" --event PostToolUse'
 
+    # PreToolUse: 24 hours — longer than Loom server-side _PERM_TOTAL_DEADLINE
+    # so the server can send its deny/allow before the hook times out.
+    # User can disconnect, come back, reattach the WS, and approve the hook.
     hooks_def = {
         "PreToolUse": {
             "matcher": "*",
             "hooks": [{
                 "type": "command",
                 "command": pre_hook_command,
-                "timeout": 900000,
+                "timeout": 86400000,
             }]
         },
         "PostToolUse": {
@@ -178,6 +201,22 @@ def _configure_permission_hook(cwd: str, backstage_parent_id: int | None = None,
         mcp_path = agents_dir / "mcp_config.json"
         mcp_path.write_text(json.dumps(mcp_config, indent=2), encoding="utf-8")
         log.info(f"[AGY] MCP server configured: {mcp_path}")
+    else:
+        # Neutral agy launch (no backstage, no operator). Drop any leftover
+        # mcp_config.json at both cwd/.agents/ and the agy workspace root —
+        # `_configure_operator` rewrites them when it runs, so this only
+        # touches stale files from a previous mode. Without this, a backstage
+        # config from a prior run silently registers loom-state-cards in every
+        # subsequent neutral session and poisons MCP discovery.
+        agy_root = _agy_workspace_root(Path(cwd))
+        for target in {Path(cwd), agy_root}:
+            stale = target / ".agents" / "mcp_config.json"
+            if stale.exists():
+                try:
+                    stale.unlink()
+                    log.info(f"[AGY] Removed stale mcp_config.json: {stale}")
+                except OSError as e:
+                    log.warning(f"[AGY] Could not remove stale {stale}: {e}")
 
     _ensure_hook_trusted(cwd, pre_hook_command)
     _ensure_hook_trusted(cwd, post_hook_command)
@@ -208,6 +247,24 @@ def _ensure_hook_trusted(cwd: str, hook_command: str):
         log.info(f"[AGY] Hook trusted for {norm_cwd}")
 
 
+def _agy_workspace_root(cwd: Path) -> Path:
+    """Where agy actually anchors its workspace.
+
+    agy walks up from cwd to find a project root marker (`.git` in practice)
+    and uses that as the singular entry in `workspaceDirs`. Its `.agents/`
+    and `GEMINI.md` discovery happens at that root, not at cwd. So when the
+    operator workspace is a subdirectory of a larger git repo (the Loom repo,
+    in our case), files dropped in `cwd/.agents/` are invisible — agy reads
+    the repo-root `.agents/` instead. This walks the same path agy does so
+    we can write where it will actually look.
+    """
+    current = cwd.resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return current
+
+
 def _configure_operator(cwd: str, conv_id: int, server_port: int):
     """NROL operator lockdown for agy: role instructions + strict MCP surface.
 
@@ -219,15 +276,18 @@ def _configure_operator(cwd: str, conv_id: int, server_port: int):
     operator parity".
     """
     workspace = Path(cwd)
+    agy_root = _agy_workspace_root(workspace)
 
-    # agy auto-loads GEMINI.md from the workspace. The operator workspace is
-    # shared across operator conversations, so an idempotent overwrite keeps
-    # it current with OPERATOR.md.
+    # agy auto-loads GEMINI.md and `.agents/mcp_config.json` from the
+    # workspace root it discovers (walking up to `.git`), not from cwd. Write
+    # to BOTH so we don't depend on whether the operator workspace happens to
+    # be the repo root or a subdirectory under it.
     operator_md = Path(__file__).parent / "mcp_servers" / "nrol_ao" / "OPERATOR.md"
     if operator_md.is_file():
-        (workspace / "GEMINI.md").write_text(
-            operator_md.read_text(encoding="utf-8"), encoding="utf-8"
-        )
+        operator_md_text = operator_md.read_text(encoding="utf-8")
+        (workspace / "GEMINI.md").write_text(operator_md_text, encoding="utf-8")
+        if agy_root != workspace:
+            (agy_root / "GEMINI.md").write_text(operator_md_text, encoding="utf-8")
 
     # Strict MCP surface: exactly nrol-ao + web-tools. Reuse codex_client's
     # builders, stripped to the keys agy's mcp_config.json understands.
@@ -241,11 +301,12 @@ def _configure_operator(cwd: str, conv_id: int, server_port: int):
     if web_cfg:
         mcp_servers["web-tools"] = {k: web_cfg[k] for k in ("command", "args")}
 
-    agents_dir = workspace / ".agents"
-    agents_dir.mkdir(parents=True, exist_ok=True)
-    mcp_path = agents_dir / "mcp_config.json"
-    mcp_path.write_text(json.dumps({"mcpServers": mcp_servers}, indent=2), encoding="utf-8")
-    log.info(f"[AGY] NROL operator MCP surface configured: {mcp_path}")
+    mcp_json = json.dumps({"mcpServers": mcp_servers}, indent=2)
+    for target in {workspace, agy_root}:
+        agents_dir = target / ".agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        (agents_dir / "mcp_config.json").write_text(mcp_json, encoding="utf-8")
+        log.info(f"[AGY] NROL operator MCP surface configured: {agents_dir / 'mcp_config.json'}")
 
 
 def _prepare_agy_prompt(
@@ -329,7 +390,16 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                      resume_session_id: str = None, fork_session: bool = False,
                      backstage_parent_id: int | None = None,
                      nrol_operator: bool = False):
-    """Launch agy in headless mode, watch its transcript, and yield events in real time."""
+    if permission_mode == "plan":
+        plan_instruction = (
+            "You are running in PLAN MODE. Your task is to analyze the codebase and write a comprehensive "
+            "implementation plan to `implementation_plan.md` in the workspace. Do NOT modify any other files "
+            "or run commands that modify the repository. Once the plan is written, present it to the user "
+            "and ask for their approval. After writing the plan, end your turn immediately without performing "
+            "any edits."
+        )
+        prompt = f"{plan_instruction}\n\n{prompt}"
+
     _configure_permission_hook(cwd, backstage_parent_id, server_port)
     if nrol_operator:
         _configure_operator(cwd, conv_id, server_port)
