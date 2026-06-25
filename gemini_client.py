@@ -90,6 +90,31 @@ def _scan_agy_log_for_error(since_ts: float) -> str | None:
     return None
 
 
+def _is_agy_alive(launch_ts: float) -> bool:
+    """Check if agy is alive by watching its CLI log mtime.
+
+    agy writes to its log for every API call (streamGenerateContent, etc).
+    A recent mtime means agy is actively processing, even if the transcript
+    hasn't flushed yet.
+    """
+    import time as _time
+
+    log_dir = _agy_home() / "log"
+    if not log_dir.exists():
+        return False
+    try:
+        candidates = [p for p in log_dir.glob("cli-*.log")
+                       if _parse_agy_log_filename_ts(p.name) is not None
+                       and abs(_parse_agy_log_filename_ts(p.name) - launch_ts) <= 30.0]
+        if not candidates:
+            return False
+        latest = max(candidates, key=lambda p: p.stat().st_mtime)
+        mtime = latest.stat().st_mtime
+        return (_time.time() - mtime) < 45.0  # alive if log touched within last 45s
+    except (OSError, ValueError):
+        return False
+
+
 def _find_agy_exe() -> str:
     """Find the agy executable on PATH or in known install locations."""
     agy_name = "agy.exe" if sys.platform == "win32" else "agy"
@@ -1046,12 +1071,21 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                         except OSError:
                             pass
 
-                        # Liveness heartbeat: every ~3s (60 polls × 0.05s)
-                        # of no new transcript content, probe the agy CLI
-                        # log for 429 / auth errors and surface them
-                        # immediately instead of waiting for process exit.
+                        # Liveness heartbeat: every ~1.5s (30 polls × 0.05s)
+                        # of no new transcript content, check if agy is alive
+                        # by watching the CLI log mtime. agy writes to its log
+                        # for every API call, so a changing mtime means activity
+                        # even when the transcript hasn't flushed.
                         _eof_polls += 1
-                        if _eof_polls % 60 == 0 and not full_text:
+                        if _eof_polls % 30 == 0 and not full_text:
+                            # Signal liveness if agy is still working
+                            if _is_agy_alive(launch_ts):
+                                elapsed = int(_time.time() - launch_ts)
+                                queue.put_nowait({
+                                    "type": "status",
+                                    "text": f"Working ({elapsed}s) — agy is processing, waiting for step to complete...",
+                                })
+                            # Check for fatal errors
                             elapsed = int(_time.time() - launch_ts)
                             log_err = _scan_agy_log_for_error(launch_ts)
                             if log_err:
