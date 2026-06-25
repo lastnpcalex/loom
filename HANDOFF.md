@@ -1,7 +1,32 @@
 # LOOM Handoff — Bug Hunt Context for the Next LLM
 
-**Last update:** 2026-06-24, late-evening session  
+**Last update:** 2026-06-24, late-night (two sessions, 22:00 + 23:00)
 **User state:** Exhausted, hitting recurring bug shapes, low patience for further churn. Read this *first* before patching anything.
+
+---
+
+## CRITICAL FINDING FROM SECOND SESSION (2026-06-24 23:00)
+
+**The REAL root cause of "NROL operator agy doesn't use MCP tools" was NOT what the first session's fixes addressed.**
+
+`gemini_client.py:564` (now patched) was launching agy with `--conversation <id>` on every turn, including operator turns. This makes agy *resume* its internal conversation, which has two devastating side effects:
+
+1. **The tool registry is baked in at conv-creation time.** Resumed agy conversations DO NOT re-read `.agents/mcp_config.json`. So even with the correct NROL MCP config sitting on disk after this session's fixes, agy operator turns saw only the default tool set the conversation was created with (typically no MCP tools at all).
+2. **agy's internal context accumulates across Loom turns.** After ~120 prior steps, agy auto-compacts BEFORE processing the new prompt. The user sees "Resuming from a compaction" on what they think is turn 1 of a fresh NROL conv — it's actually turn N=many on agy's side because the conv-id was reused.
+
+**Evidence in `~/.gemini/antigravity-cli/cli.log` (23:04 capture):**
+```
+Print mode: conversation has 123 initial steps
+Print mode: resuming conversation ba79b56f-5baa-4aae-8bcd-13dbb9fc5c2b
+```
+
+**Fix applied this session**: `gemini_client.py:run_gemini` no longer passes `--conversation` when `nrol_operator=True`. Operator turns are short, self-contained scan/triage requests where fresh agy state per turn is correct — and required so MCP gets re-registered each turn.
+
+**Non-operator agy turns still use `--conversation` for continuity** — that's the right behavior there.
+
+**Generalize this**: any time we add a new MCP server, new tool, or new system instruction for agy, *resumed* sessions won't see it. If you need an agent to pick up a config change, you must either start a fresh agy conv OR fork it. There is no "hot-reload MCP into a live agy session."
+
+---
 
 ---
 
@@ -34,9 +59,20 @@ Before doing anything else:
 ## What's Still Open (Deliberately Deferred)
 
 ### Provider classification alias mismatch (REAL, but low blast radius)
-`server.is_gemini_model()` (server.py:4513–4521) aliases three agy-served labels — `"Claude Sonnet 4.6 (Thinking)"`, `"Claude Opus 4.6 (Thinking)"`, `"GPT-OSS 120B (Medium)"` — to gemini for **provider routing**. These ARE agy models; the routing is correct. But `model_context.is_gemini()` (model_context.py:75–78) only matches `startswith("gemini")`, so these labels fall through to `is_local_llama()` and get `THRESHOLD_LOCAL_LLAMA` (28k) instead of `THRESHOLD_GEMINI` (175k). Result: branches over 28k tokens trigger unnecessary compact-handoffs for agy-served sessions.
+`server.is_gemini_model()` (server.py:4513–4521) aliases three agy-served labels — `"Claude Sonnet 4.6 (Thinking)"`, `"Claude Opus 4.6 (Thinking)"`, `"GPT-OSS 120B (Medium)"` — to gemini for **provider routing**. These ARE agy models; the routing is correct. But `model_context.is_gemini()` (model_context.py:75–78) only matches `startswith("gemini")`, so these labels fall through to `is_local_llama()` and get `THRESHOLD_LOCAL_LLAMA` instead of `THRESHOLD_GEMINI` (175k). (THRESHOLD_LOCAL_LLAMA was bumped 28k→220k this session because the actual llama-server Qwen runs 262k context — but the alias mismatch is still wrong on principle.)
 
 **Fix shape**: move the alias set into `model_context.py` as a constant, have both `server.is_gemini_model` and `model_context.is_gemini` consume it. Add a test that asserts `is_gemini_model(m) == is_gemini(m)` for every model that appears in `models_config.json` and any UI-surfaced labels.
+
+### "Prior messages disappear when session limit hits" — NOT YET FIXED
+**Reported this session, not investigated to root cause.** Symptom: when a Claude turn dies on a 5-hour session limit, messages that were rendered before the failed turn disappear from the UI. The current-turn rate-limit message appears (server.py:5829-5864 writes it to the draft); but prior rendered messages are reported missing.
+
+**Possible causes (untested):**
+- Frontend `loadMessages()` after the error event refetches from DB and gets a shorter list than `State.messages` had — implies a server-side data loss
+- Tree navigation accidentally switching branches on error
+- `_cleanup_stale_drafts` (server.py:337) deletes empty assistant messages older than 30 min on STARTUP using `db.delete_branch(msg_id)` — if `delete_branch` is recursive (likely), and the cleanup runs at the wrong time or on the wrong row, it could cascade-delete user-visible message subtrees
+- The screenshot showed the rate-limit message itself rendered with text content — so the *current* draft isn't an empty stale-draft target; the loss must be elsewhere
+
+**Reproduction needed**: hit a real 5-hour limit (or simulate via mock), capture browser console + network traffic + DB state of the conv before and after. Without this trace, "fix" attempts will be guesswork.
 
 ### PowerShell/Bash failures in non-operator conversations
 User reported "a lot more failed bash/powershell commands" but did not provide a specific reproducer. In operator mode, Bash is intentionally denied (`cc_permission_hook.py:352–359`) — that's by design (defense in depth against the operator using shell to bypass NROL). If failures are happening in non-operator convs, root cause is unknown; needs a concrete (conv_id, command, error message) triple to investigate.

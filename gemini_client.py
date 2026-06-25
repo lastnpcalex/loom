@@ -560,8 +560,17 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     else:
         cli_prompt = prompt
 
-    cc_args = [
-        "--conversation", resume_session_id or str(conv_id),
+    # Operator turns: do NOT pass --conversation. Each operator turn is a
+    # self-contained scan/triage request; resuming the agy conversation
+    # forces agy to use the tool registry baked in at conv-creation time
+    # (so newly-registered nrol-ao MCP tools are invisible) AND lets agy's
+    # own context fill up across turns until it auto-compacts on what feels
+    # to the user like turn 1. Fresh conv per turn → fresh tool registry
+    # read from .agents/mcp_config.json, no carry-over compaction.
+    cc_args = []
+    if not nrol_operator:
+        cc_args += ["--conversation", resume_session_id or str(conv_id)]
+    cc_args += [
         "-p", cli_prompt,
         "--dangerously-skip-permissions",
         "--print-timeout", "60m",
