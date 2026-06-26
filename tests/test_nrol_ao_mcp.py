@@ -206,6 +206,158 @@ def test_topic_status_lists_fixture(nrol, topic_path):
     assert SLUG in [r["slug"] for r in out["topics"]]
 
 
+def test_topic_status_lists_bom_prefixed_topic(nrol, topic_path):
+    raw = topic_path.read_text(encoding="utf-8")
+    topic_path.write_text("\ufeff" + raw, encoding="utf-8")
+
+    out = json.loads(nrol.topic_status())
+
+    assert "error" not in out
+    assert SLUG in [r["slug"] for r in out["topics"]]
+
+
+def test_read_topic_exposes_search_queries(nrol, topic_path):
+    topic = _disk_topic(topic_path)
+    topic["searchQueries"] = ["synthetic event Reuters official report"]
+    topic_path.write_text(json.dumps(topic, indent=2), encoding="utf-8")
+
+    out = json.loads(nrol.read_topic(SLUG, include_indicators=False, evidence_limit=0))
+
+    assert out["searchQueries"] == ["synthetic event Reuters official report"]
+
+
+def test_search_query_update_lifecycle(nrol, topic_path, monkeypatch):
+    monkeypatch.setattr(
+        nrol.llama_client,
+        "chat",
+        lambda *a, **k: {
+            "text": (
+                "VERDICT: APPROVE\n"
+                "COVERAGE: covers event, source, recovery, failure, and measurement axes\n"
+                "NEUTRALITY: balanced across outcomes\n"
+                "OVERFITTING: none\n"
+                "NOISE: acceptable\n"
+                "SCHEMA_AXIS: covers the metric observable and event indicators\n"
+                "RECOMMENDATION: apply\n"
+            ),
+            "model": "test-local-llama",
+            "finish_reason": "stop",
+        },
+    )
+    add = [
+        "synthetic event Reuters official report",
+        "synthetic failure risk indicator signal",
+        "synthetic agreement talks recovery confirmed",
+        "synthetic metric percent baseline data",
+    ]
+
+    proposed = json.loads(nrol.propose_search_query_update(
+        slug=SLUG,
+        add=add,
+        remove=[],
+        rationale="Initial durable query coverage for synthetic topic.",
+        coverage_gaps=[
+            "missing source query",
+            "missing failure and recovery axes",
+            "missing metric query",
+        ],
+    ))
+    assert "error" not in proposed, proposed
+    proposal_id = proposed["id"]
+    assert proposed["status"] == "pending"
+
+    listed = json.loads(nrol.list_search_query_updates(slug=SLUG))
+    assert proposal_id in [p["id"] for p in listed["proposals"]]
+
+    blocked = json.loads(nrol.apply_search_query_update(proposal_id, dry_run=True))
+    assert "requires red_team verdict APPROVE" in blocked["error"]
+
+    reviewed = json.loads(nrol.red_team_search_query_update(proposal_id))
+    assert reviewed["red_team"]["verdict"] == "APPROVE", reviewed
+    assert reviewed["red_team"]["model"] == "test-local-llama"
+    assert reviewed["red_team"]["deterministic"]["verdict"] == "CHECK"
+
+    preview = json.loads(nrol.apply_search_query_update(proposal_id, dry_run=True))
+    assert preview["committed"] is False
+    assert preview["after"] == add
+
+    applied = json.loads(nrol.apply_search_query_update(proposal_id, dry_run=False))
+    assert "error" not in applied, applied
+    assert applied["committed"] is True
+    assert applied["after"] == add
+
+    topic = _disk_topic(topic_path)
+    assert topic["searchQueries"] == add
+    history = topic["governance"]["search_query_history"]
+    assert history[-1]["proposal_id"] == proposal_id
+
+    final_queue = json.loads(nrol.list_search_query_updates(slug=SLUG, status="applied"))
+    assert proposal_id in [p["id"] for p in final_queue["proposals"]]
+
+
+def test_search_query_update_rejects_site_only_set(nrol, topic_path):
+    proposed = json.loads(nrol.propose_search_query_update(
+        slug=SLUG,
+        add=[
+            "synthetic event site:example.com",
+            "synthetic metric site:example.org",
+            "synthetic report site:example.net",
+        ],
+        rationale="Bad proposal: all queries are site-filtered.",
+    ))
+
+    assert proposed["error"] == "search query proposal failed validation"
+    assert "all queries are site-filtered" in " ".join(proposed["validation"]["errors"])
+
+
+def test_search_query_update_requires_red_team_approve(nrol, topic_path, monkeypatch):
+    monkeypatch.setattr(
+        nrol.llama_client,
+        "chat",
+        lambda *a, **k: {
+            "text": (
+                "VERDICT: REVISE\n"
+                "COVERAGE: too thin\n"
+                "NEUTRALITY: acceptable\n"
+                "OVERFITTING: none\n"
+                "NOISE: acceptable\n"
+                "SCHEMA_AXIS: weak\n"
+                "RECOMMENDATION: add source and measurement coverage\n"
+            ),
+            "model": "test-local-llama",
+            "finish_reason": "stop",
+        },
+    )
+    proposed = json.loads(nrol.propose_search_query_update(
+        slug=SLUG,
+        add=["synthetic event official report"],
+        rationale="Weak proposal missing recovery/measurement/source breadth.",
+        coverage_gaps=["missing durable query coverage"],
+    ))
+    assert "error" not in proposed, proposed
+    proposal_id = proposed["id"]
+
+    reviewed = json.loads(nrol.red_team_search_query_update(proposal_id))
+    assert reviewed["red_team"]["verdict"] in {"REVISE", "REJECT"}
+
+    applied = json.loads(nrol.apply_search_query_update(proposal_id, dry_run=False))
+    assert "requires red_team verdict APPROVE" in applied["error"]
+
+    withdrawn = json.loads(nrol.withdraw_search_query_update(
+        proposal_id, reason="red-team requested broader query coverage"
+    ))
+    assert withdrawn["status"] == "withdrawn"
+
+
+def test_nrol_status_reports_effective_topic_state_paths(nrol, nrol_repo, topic_path):
+    out = json.loads(nrol.nrol_status())
+    assert "error" not in out
+    assert out["repo"] == str(nrol_repo)
+    assert out["state_root"] == str(nrol_repo)
+    assert out["topics_dir"] == str(nrol_repo / "topics")
+    assert out["topics"] >= 1
+
+
 def test_malformed_file_does_not_break_listing(nrol, nrol_repo, topic_path):
     bad = nrol_repo / "topics" / "manifest.json"
     bad.write_text(json.dumps({"topics": [SLUG]}), encoding="utf-8")
@@ -214,6 +366,9 @@ def test_malformed_file_does_not_break_listing(nrol, nrol_repo, topic_path):
         assert "error" not in out
         assert SLUG in [r["slug"] for r in out["topics"]]
         assert "manifest" in [s["slug"] for s in out.get("skipped", [])]
+        listed = json.loads(nrol.list_topics())
+        assert SLUG in [r["slug"] for r in listed]
+        assert "manifest" not in [r["slug"] for r in listed]
     finally:
         bad.unlink()
 
@@ -561,7 +716,7 @@ def test_safe_policy_scan_parks_and_files_proposals(nrol, topic_path, monkeypatc
     ]
     monkeypatch.setattr(
         nrol, "_search_web_articles",
-        lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [],
     )
     monkeypatch.setattr(
         nrol.llama_client, "chat",
@@ -613,7 +768,7 @@ def test_safe_policy_commit_true_still_files_posterior_movers(nrol, topic_path, 
     }]
     monkeypatch.setattr(
         nrol, "_search_web_articles",
-        lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [],
     )
     monkeypatch.setattr(
         nrol.llama_client, "chat",
@@ -654,7 +809,7 @@ def test_empty_matcher_output_is_an_error_not_a_quiet_window(nrol, topic_path, m
     }]
     monkeypatch.setattr(
         nrol, "_search_web_articles",
-        lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [],
     )
     monkeypatch.setattr(
         nrol.llama_client, "chat",
@@ -694,7 +849,7 @@ def test_scan_feeds_matcher_full_article_excerpts(nrol, topic_path, monkeypatch)
     }]
     monkeypatch.setattr(
         nrol, "_search_web_articles",
-        lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [],
     )
     monkeypatch.setattr(
         nrol, "_fetch_article_payload",
@@ -716,7 +871,15 @@ def test_scan_feeds_matcher_full_article_excerpts(nrol, topic_path, monkeypatch)
     assert "EXCERPT:" in seen["prompt"]
     assert f"FULL BODY {suffix}" in seen["prompt"]
     packet = out["topics"][0]
-    assert packet["excerpts"] == {"fetched": 1, "of": 1, "prefetch_of": 1, "chars_cap": 2800}
+    assert packet["excerpts"] == {
+        "fetched": 1,
+        "attempted_fetched": 1,
+        "fetch_errors": 0,
+        "metadata_only": 0,
+        "of": 1,
+        "prefetch_of": 1,
+        "chars_cap": 2800,
+    }
 
 
 def test_run_news_scan_uses_precommitted_search_queries(nrol, topic_path, monkeypatch):
@@ -734,7 +897,7 @@ def test_run_news_scan_uses_precommitted_search_queries(nrol, topic_path, monkey
     }
     calls = []
 
-    def fake_search(query, channel, max_results):
+    def fake_search(query, channel, max_results, **kw):
         calls.append((channel, query))
         if channel == "searchQueries:01":
             return [article]
@@ -762,6 +925,23 @@ def test_run_news_scan_uses_precommitted_search_queries(nrol, topic_path, monkey
     surfaced = packet["articles"][0].get("article") or packet["articles"][0]
     assert surfaced["headline"] == article["headline"]
     assert any(channel == "searchQueries:01" for channel, _query in calls)
+
+
+def test_run_news_scan_accepts_single_slug_string(nrol, topic_path, monkeypatch):
+    """Some MCP clients send a single slug as a bare string. Treat it as one
+    slug, not an iterable of characters that selects zero topics."""
+    monkeypatch.setattr(nrol, "_search_web_articles", lambda query, channel, max_results, **kw: [])
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=SLUG,
+        commit=False,
+        dry_run=True,
+        fetch_full_articles=False,
+        deliberate=False,
+    ))
+    assert "error" not in out, out
+    assert out["topics_scanned"] == 1
+    assert out["topics"][0]["slug"] == SLUG
 
 
 def test_run_news_scan_filters_old_and_seen_articles(nrol, topic_path, monkeypatch):
@@ -800,7 +980,7 @@ def test_run_news_scan_filters_old_and_seen_articles(nrol, topic_path, monkeypat
         "relevance": "duplicate development",
     }
 
-    def fake_search(query, channel, max_results):
+    def fake_search(query, channel, max_results, **kw):
         if channel == "searchQueries:01":
             return [old, seen, fresh]
         return []
@@ -833,6 +1013,64 @@ def test_run_news_scan_filters_old_and_seen_articles(nrol, topic_path, monkeypat
     assert packet["freshness_filter"]["prior_seen_dropped"] == 1
     assert packet["freshness_filter"]["kept"] == 1
     assert seen_headlines == ["Fresh current article"]
+
+
+def test_run_news_scan_filters_relative_search_dates(nrol, topic_path, monkeypatch):
+    """DDGS can return relative dates embedded in labels such as
+    'Opinion3 days ago'. Treating those as undated lets stale articles through
+    the freshness gate."""
+    topic = _disk_topic(topic_path)
+    topic["meta"]["classification"] = "ALERT"
+    topic["meta"]["lastScanned"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    topic["searchQueries"] = ["relative date regression query"]
+    topic_path.write_text(json.dumps(topic, indent=2), encoding="utf-8")
+
+    old_relative = {
+        "headline": "Old relative article",
+        "url": "https://example.test/relative-old",
+        "source": "test-wire",
+        "date": "Opinion3 days ago",
+        "relevance": "stale relative date",
+    }
+    fresh_relative = {
+        "headline": "Fresh relative article",
+        "url": "https://example.test/relative-fresh",
+        "source": "test-wire",
+        "date": "2hoursago",
+        "relevance": "fresh relative date",
+    }
+
+    def fake_search(query, channel, max_results, **kw):
+        if channel == "searchQueries:01":
+            return [old_relative, fresh_relative]
+        return []
+
+    monkeypatch.setattr(nrol, "_search_web_articles", fake_search)
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local"},
+    )
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    seen_headlines = []
+
+    def fake_prompt(topic_arg, articles):
+        seen_headlines.extend((a.get("article", a)).get("headline") for a in articles)
+        return "prompt"
+
+    monkeypatch.setattr(fw, "build_matcher_prompt", fake_prompt)
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "PARK"}, "tag": "EVENT",
+         "claim": "fresh", "reason": "fresh article only"},
+    ])
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=True,
+        fetch_full_articles=False, deliberate=False,
+    ))
+    packet = out["topics"][0]
+    assert packet["freshness_filter"]["old_dated_dropped"] == 1
+    assert packet["freshness_filter"]["dated_in_window"] == 1
+    assert seen_headlines == ["Fresh relative article"]
 
 
 def test_article_scan_key_strips_tracking_query_params(nrol):
@@ -929,7 +1167,7 @@ def test_full_fetch_metadata_date_can_drop_old_undated_article(nrol, topic_path,
     }
     monkeypatch.setattr(
         nrol, "_search_web_articles",
-        lambda query, channel, max_results: [article] if channel == "wildcard" else [],
+        lambda query, channel, max_results, **kw: [article] if channel == "wildcard" else [],
     )
     monkeypatch.setattr(
         nrol, "_fetch_article_payload",
@@ -955,6 +1193,54 @@ def test_full_fetch_metadata_date_can_drop_old_undated_article(nrol, topic_path,
     assert out["article_count"] == 0
 
 
+def test_full_fetch_metadata_date_can_rescue_stale_search_date(nrol, topic_path, monkeypatch):
+    """A search result's date can describe an old page/syndication wrapper.
+    Full-article metadata should get one chance to prove the article is fresh
+    before the final matcher freshness gate runs."""
+    topic = _disk_topic(topic_path)
+    topic["meta"]["lastScanned"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    topic_path.write_text(json.dumps(topic, indent=2), encoding="utf-8")
+
+    article = {
+        "headline": "Stale-looking search hit",
+        "url": "https://example.test/metadata-fresh",
+        "source": "test-wire",
+        "date": "2000-01-01",
+        "relevance": "search date is stale",
+    }
+    monkeypatch.setattr(
+        nrol, "_search_web_articles",
+        lambda query, channel, max_results, **kw: [article] if channel == "wildcard" else [],
+    )
+    fresh_published = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    monkeypatch.setattr(
+        nrol, "_fetch_article_payload",
+        lambda url, max_chars, **kw: {
+            "published": fresh_published,
+            "excerpt": "Fresh article body.",
+        },
+    )
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local"},
+    )
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "PARK"}, "tag": "EVENT",
+         "claim": "rescued", "reason": "metadata date is fresh"},
+    ])
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=True, fetch_full_articles=True,
+        deliberate=False,
+    ))
+    packet = out["topics"][0]
+    assert packet["freshness_filter"]["prefetch"]["old_dated_kept_for_fetch"] == 1
+    assert packet["freshness_filter"]["dated_in_window"] == 1
+    assert packet["articles"][0]["date"] == fresh_published
+    assert packet["articles"][0]["search_published"] == "2000-01-01"
+
+
 def test_safe_scan_downgrades_undated_posterior_movers(nrol, topic_path, monkeypatch):
     """Undated search results can be context, but not FIRE/OBSERVE proposals."""
 
@@ -967,7 +1253,7 @@ def test_safe_scan_downgrades_undated_posterior_movers(nrol, topic_path, monkeyp
     }
     monkeypatch.setattr(
         nrol, "_search_web_articles",
-        lambda query, channel, max_results: [article] if channel == "wildcard" else [],
+        lambda query, channel, max_results, **kw: [article] if channel == "wildcard" else [],
     )
     monkeypatch.setattr(
         nrol.llama_client, "chat",
@@ -989,6 +1275,22 @@ def test_safe_scan_downgrades_undated_posterior_movers(nrol, topic_path, monkeyp
     packet = out["topics"][0]
     assert packet["freshness_filter"]["undated_kept"] == 1
     assert packet["commit_policy"]["proposals_filed"] == []
+    audit = packet["commit_policy"]["safe_policy_audit"]
+    assert audit["to_propose_count"] == 0
+    assert audit["safe_to_apply_count"] == 1
+    assert audit["freshness_downgrades"] == [{
+        "idx": 1,
+        "original_action": {"kind": "FIRE", "indicator_id": "ind_binary_mild"},
+        "replacement_action": {"kind": "PARK"},
+        "claim": "event A confirmed",
+        "reason": (
+            "freshness gate: undated search result cannot file FIRE/OBSERVE; "
+            "original action was FIRE. threshold met"
+        ),
+    }]
+    digest = Path(out["digest_path"]).read_text(encoding="utf-8")
+    assert "freshness downgrades: 1" in digest
+    assert "A1: FIRE -> PARK" in digest
     topic = _disk_topic(topic_path)
     assert topic["governance"]["flagged_for_indicator_review"]
 
@@ -1008,7 +1310,7 @@ def test_scan_deliberation_rescues_park_into_proposal(nrol, topic_path, monkeypa
     }]
     monkeypatch.setattr(
         nrol, "_search_web_articles",
-        lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [],
     )
     stage_outputs = [
         "DECISION\nARTICLE: A1\nACTION: PARK\nTAG: DATA\n"
@@ -1054,6 +1356,77 @@ def test_scan_deliberation_rescues_park_into_proposal(nrol, topic_path, monkeypa
 
     digest = Path(out["digest_path"]).read_text(encoding="utf-8")
     assert "rescued by jury" in digest
+
+
+def test_matcher_prompt_preserves_indirect_relevance(nrol, topic_path):
+    prompt = nrol.build_matcher_prompt(SLUG, [{
+        "headline": "Ceasefire talks affect shipping corridor",
+        "url": "https://example.test/indirect-relevance",
+        "source": "test-wire",
+        "date": "2026-06-10",
+        "relevance": "regional ceasefire compliance affects the modeled pathway",
+    }])
+
+    assert "Be strict about posterior movement" in prompt
+    assert "When uncertain between" in prompt
+    assert "Indirect causal pathways count as topic-relevant" in prompt
+
+
+def test_scan_deliberation_can_rescue_schema_gap_into_proposal(nrol, topic_path, monkeypatch):
+    suffix = uuid.uuid4().hex[:6]
+    articles = [{
+        "headline": f"Unmodeled metric print {suffix}",
+        "url": f"https://example.test/schema-gap/{suffix}",
+        "source": "test-wire",
+        "date": "2026-06-10",
+        "relevance": "directionally relevant metric reported at 58 percent",
+    }]
+    monkeypatch.setattr(
+        nrol,
+        "_search_web_articles",
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [],
+    )
+    stage_outputs = [
+        "DECISION\nARTICLE: A1\nACTION: SCHEMA_GAP directionally relevant metric\n"
+        "TAG: DATA\nCLAIM: metric at 58\nREASON: matcher thought schema was missing\n",
+        "ADVOCATE\nARTICLE: A1\nVERDICT: ARGUE_MOVE\n"
+        "PROPOSED_ACTION: OBSERVE ind_observable_metric AT 58\n"
+        "CITE: '58 percent'\nINFERENCE: none\nREASON: existing observable covers it\n",
+        "REBUT\nARTICLE: A1\nVERDICT: UPHOLD_MOVE\nREASON: existing metric indicator fits\n",
+        "JURY\nARTICLE: A1\nVERDICT: MOVE_TO OBSERVE ind_observable_metric AT 58\n"
+        "RATIONALE: schema gap was over-conservative; observable fits\n",
+    ]
+    calls = {"n": 0}
+
+    def staged_chat(*a, **k):
+        text = stage_outputs[min(calls["n"], len(stage_outputs) - 1)]
+        calls["n"] += 1
+        return {"text": text, "model": "test-llm", "host": "local",
+                "finish_reason": "stop", "reasoning_chars": 0}
+
+    monkeypatch.setattr(nrol.llama_client, "chat", staged_chat)
+
+    before = _disk_posteriors(topic_path)
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
+        fetch_full_articles=False,
+    ))
+    assert "error" not in out, out
+    assert _disk_posteriors(topic_path) == before
+    assert calls["n"] == 4
+
+    packet = out["topics"][0]
+    assert packet["deliberation"]["schema_gaps"] == 1
+    assert packet["deliberation"]["candidates"] == 1
+    assert packet["deliberation"]["schema_gap_rescued"] == 1
+    assert packet["decisions"][0]["action"]["kind"] == "OBSERVE"
+
+    filed = packet["commit_policy"]["proposals_filed"]
+    assert len(filed) == 1
+    queue = json.loads(nrol.list_proposals(slug=SLUG, status="pending"))
+    prop = next(p for p in queue["proposals"] if p["id"] == filed[0])
+    assert prop["action"] == "OBSERVE"
+    assert prop["indicator_id"] == "ind_observable_metric"
 
 
 def test_FULL_LIFECYCLE_design_activate_evidence_posterior(nrol, nrol_repo, monkeypatch):
@@ -1282,6 +1655,261 @@ def test_shadow_posteriors_derive_from_precommitted_dynamics(nrol, nrol_repo):
     (dyn_dir / f"{SLUG}.dynamics.json").write_text(json.dumps(spec), encoding="utf-8")
     bad = json.loads(nrol.shadow_posteriors(slug=SLUG))
     assert "error" in bad and "rationale" in bad["error"]
+
+
+# ---------------------------------------------------------------------------
+# Future Cast: dry-run shadow analysis (no mutation, HYPOTHETICAL, save-outside)
+# ---------------------------------------------------------------------------
+
+
+def _stub_red_team_approve(nrol, monkeypatch):
+    """Make the red-team critique deterministic without a live llama endpoint."""
+    monkeypatch.setattr(
+        nrol.llama_client,
+        "chat",
+        lambda *a, **k: {
+            "text": (
+                "VERDICT: SOUND\n"
+                "STRONGEST_OBJECTION: scenario is hypothetical; no real source yet.\n"
+                "MISSING_EVIDENCE: named source, publication date\n"
+                "RECOMMENDED_ACTION: do not commit until real confirmation exists.\n"
+            ),
+            "model": "test-local-llama",
+            "finish_reason": "stop",
+        },
+    )
+
+
+def test_future_cast_computes_shadow_delta_no_mutation(nrol, topic_path, monkeypatch):
+    """future_cast: deep-clones the topic, applies the hypothetical through the
+    engine's own bayesian_update (no save), and discards the clone. The on-disk
+    topic JSON must be byte-identical before/after — this is the bayesian_update
+    no-save safety gate, verified live."""
+    _stub_red_team_approve(nrol, monkeypatch)
+    before_disk = topic_path.read_text(encoding="utf-8")
+    before_post = _disk_posteriors(topic_path)
+
+    out = json.loads(nrol.future_cast(
+        slug=SLUG,
+        scenario="Synthetic event A is confirmed by a hypothetical wire report.",
+        target="ind_binary_mild",
+        proposed_transition="FIRE",
+    ))
+    assert "error" not in out, out
+    assert out["status"] == "dry_run_only"
+    cand = out["candidate_transitions"][0]
+    assert cand["structurally_valid"] is True
+    sp = cand["shadow_posteriors"]
+    assert set(sp) == {"before", "after", "delta"}
+    # A non-trivial FIRE should move at least one hypothesis (>1pp).
+    assert any(abs(d) > 0.01 for d in sp["delta"].values()), sp["delta"]
+    # Posteriors still normalize on the clone.
+    assert abs(sum(sp["after"].values()) - 1.0) < 1e-6
+
+    # SAFETY GATE: the on-disk topic is byte-identical — bayesian_update on a
+    # clone wrote nothing. Posteriors, posteriorHistory, and evidenceLog are
+    # all unchanged.
+    assert topic_path.read_text(encoding="utf-8") == before_disk
+    assert _disk_posteriors(topic_path) == before_post
+    disk = _disk_topic(topic_path)
+    assert disk["evidenceLog"] == []
+    assert len(disk["model"]["posteriorHistory"]) == 1  # only the design-prior seed
+
+
+def test_future_cast_deterministic_for_same_inputs(nrol, topic_path, monkeypatch):
+    """Same scenario + target + transition -> identical shadow delta (fixed
+    seed in shadow_posteriors; deterministic clone math)."""
+    _stub_red_team_approve(nrol, monkeypatch)
+    a = json.loads(nrol.future_cast(
+        slug=SLUG, scenario="hypothetical A confirmed",
+        target="ind_binary_mild", proposed_transition="FIRE",
+    ))
+    b = json.loads(nrol.future_cast(
+        slug=SLUG, scenario="hypothetical A confirmed",
+        target="ind_binary_mild", proposed_transition="FIRE",
+    ))
+    assert a["candidate_transitions"][0]["shadow_posteriors"]["after"] == \
+           b["candidate_transitions"][0]["shadow_posteriors"]["after"]
+
+
+def test_future_cast_structurally_invalid_when_indicator_missing(nrol, topic_path, monkeypatch):
+    """A target that doesn't exist on the topic is reported
+    structurally_invalid, not raised — future-cast is advisory."""
+    _stub_red_team_approve(nrol, monkeypatch)
+    out = json.loads(nrol.future_cast(
+        slug=SLUG, scenario="x", target="ind_does_not_exist",
+        proposed_transition="FIRE",
+    ))
+    cand = out["candidate_transitions"][0]
+    assert cand["structurally_valid"] is False
+    assert "indicator_not_found" in cand["governance"]["failures"]
+    assert cand["shadow_posteriors"] is None
+
+
+def test_future_cast_save_writes_outside_topic_state(nrol, topic_path, nrol_repo, monkeypatch):
+    """save=true writes to future_casts/future_casts.jsonl, never to topic JSON
+    or evidenceLog. A saved cast is not evidence."""
+    _stub_red_team_approve(nrol, monkeypatch)
+    before_disk = topic_path.read_text(encoding="utf-8")
+
+    out = json.loads(nrol.future_cast(
+        slug=SLUG, scenario="saved hypothetical",
+        target="ind_binary_mild", proposed_transition="FIRE", save=True,
+    ))
+    assert out.get("saved_cast_id", "").startswith("fc_")
+    cast_file = nrol_repo / "future_casts" / "future_casts.jsonl"
+    assert cast_file.exists()
+    rows = [json.loads(line) for line in cast_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 1
+    assert rows[0]["promoted_to_real_action"] is False
+    assert rows[0]["slug"] == SLUG
+    # Topic on disk untouched; no evidence written.
+    assert topic_path.read_text(encoding="utf-8") == before_disk
+    assert _disk_topic(topic_path)["evidenceLog"] == []
+
+
+def test_future_cast_red_team_returns_critique(nrol, topic_path, monkeypatch):
+    """The red_team field carries a parsed verdict + objection + missing evidence."""
+    _stub_red_team_approve(nrol, monkeypatch)
+    out = json.loads(nrol.future_cast(
+        slug=SLUG, scenario="hypothetical A confirmed",
+        target="ind_binary_mild", proposed_transition="FIRE",
+    ))
+    rt = out["red_team"]
+    assert rt["verdict"] == "SOUND"
+    assert "hypothetical" in rt["strongest_objection"].lower()
+    assert "named source" in rt["missing_evidence"]
+
+
+# ---------------------------------------------------------------------------
+# Resolution: two-lane Brier (shadow vs committed) + after-action review
+# ---------------------------------------------------------------------------
+
+
+def _seed_dynamics_spec(nrol_repo, slug=SLUG):
+    """Write a lint-clean dynamics spec so shadow_posteriors can reconstruct."""
+    dyn_dir = nrol_repo / "loom" / "topics" / "dynamics"
+    dyn_dir.mkdir(parents=True, exist_ok=True)
+    spec = {
+        "slug": slug,
+        "entrenched_since": "2026-04-23",
+        "sustain_days": 30,
+        "sustain_hazard_factor": 0.5,
+        "residual_hypothesis": "H3",
+        "hypothesis_windows": {"H1": "2026-09-30", "H2": "2027-03-31"},
+        "priors": {
+            "lam_exit": {"alpha": 2.0, "beta_days": 480, "rationale": "synthetic"},
+            "lam_ramp": {"alpha": 3.0, "beta_days": 225, "rationale": "synthetic"},
+            "lam_relapse": {"alpha": 2.0, "beta_days": 240, "rationale": "synthetic"},
+        },
+        "evidence_nudges": [],
+    }
+    (dyn_dir / f"{slug}.dynamics.json").write_text(json.dumps(spec), encoding="utf-8")
+
+
+def _seed_committed_update(topic_path):
+    """Append a real committed posteriorHistory entry beyond the design prior,
+    so the trajectory has a checkpoint to score. Mirrors engine bayesian_update
+    output shape (nested posteriors + updateMethod)."""
+    topic = json.loads(topic_path.read_text(encoding="utf-8"))
+    # Move H1 up to 0.7 on 2026-06-15 (a committed update).
+    for hk in topic["model"]["hypotheses"]:
+        topic["model"]["hypotheses"][hk]["posterior"] = (
+            0.7 if hk == "H1" else (0.2 if hk == "H2" else 0.1)
+        )
+    topic["model"].setdefault("posteriorHistory", []).append({
+        "date": "2026-06-15",
+        "timestamp": "2026-06-15T00:00:00+00:00",
+        "posteriors": {"H1": 0.7, "H2": 0.2, "H3": 0.1},
+        "updateMethod": "bayesian_update_indicator",
+        "indicatorId": "ind_binary_mild",
+        "evidenceRefs": ["ind_binary_mild"],
+        "note": "synthetic committed update for resolution test",
+    })
+    topic["meta"]["lastUpdated"] = "2026-06-15T00:00:00+00:00"
+    topic_path.write_text(json.dumps(topic, indent=2), encoding="utf-8")
+
+
+def test_resolve_topic_sets_resolved_and_scores_two_lanes(nrol, topic_path, nrol_repo, monkeypatch):
+    """resolve_topic: sets meta.status=RESOLVED, records the outcome, and
+    computes a two-lane Brier (shadow vs committed). The shadow lane is
+    reconstructed from the dynamics spec at each committed-history date."""
+    _stub_red_team_approve(nrol, monkeypatch)  # AAR red-team stubbed
+    _seed_dynamics_spec(nrol_repo)
+    _seed_committed_update(topic_path)
+
+    out = json.loads(nrol.resolve_topic(slug=SLUG, resolved_hypothesis="H1"))
+    assert "error" not in out, out
+    assert out["status"] == "RESOLVED"
+    assert out["resolved_hypothesis"] == "H1"
+
+    # Status flipped on disk.
+    disk = _disk_topic(topic_path)
+    assert disk["meta"]["status"] == "RESOLVED"
+    assert disk["meta"]["resolvedHypothesis"] == "H1"
+
+    # Outcome recorded in the committed-lane scoring block.
+    outcomes = disk.get("predictionScoring", {}).get("outcomes", [])
+    assert any(o.get("resolved") == "H1" for o in outcomes)
+
+    # Two-lane Brier present with both lanes.
+    brier = out["two_lane_brier"]
+    assert brier is not None, out
+    assert brier["vector_end"]["shadow"] is not None
+    assert brier["vector_end"]["committed"] is not None
+    # The committed lane should score well at the end (H1 was driven to 0.7,
+    # H1 resolved truth): committed vector Brier is modest and finite.
+    assert 0.0 <= brier["vector_end"]["committed"] <= 2.0
+    assert "checkpoints" in brier and len(brier["checkpoints"]) >= 1
+
+    # AAR red-team present with a verdict.
+    assert out["red_team_aar"]["verdict"] in {"SOUND", "REVISE", "UNREVIEWED"}
+
+
+def test_resolve_topic_refuses_already_resolved(nrol, topic_path, nrol_repo, monkeypatch):
+    """resolve_topic: refuses if already RESOLVED (no double-resolution)."""
+    _stub_red_team_approve(nrol, monkeypatch)
+    _seed_dynamics_spec(nrol_repo)
+    _seed_committed_update(topic_path)
+    nrol.resolve_topic(slug=SLUG, resolved_hypothesis="H1")
+
+    second = json.loads(nrol.resolve_topic(slug=SLUG, resolved_hypothesis="H1"))
+    assert "error" in second
+    assert "RESOLVED" in second["error"]
+
+
+def test_resolve_topic_refuses_without_dynamics_spec(nrol, topic_path, nrol_repo, monkeypatch):
+    """resolve_topic: proceeds with resolution but reports a shadow_error when
+    no dynamics spec exists (shadow lane can't be reconstructed). The
+    committed-lane scoring still completes; only the shadow comparison fails."""
+    _stub_red_team_approve(nrol, monkeypatch)
+    _seed_committed_update(topic_path)
+    # nrol_repo is session-scoped: actively remove any spec an earlier test
+    # left behind so this test's "no spec" premise actually holds.
+    spec_file = nrol_repo / "loom" / "topics" / "dynamics" / f"{SLUG}.dynamics.json"
+    if spec_file.exists():
+        spec_file.unlink()
+    out = json.loads(nrol.resolve_topic(slug=SLUG, resolved_hypothesis="H1"))
+    assert out["status"] == "RESOLVED"
+    assert out.get("shadow_error") is not None
+    assert out["two_lane_brier"] is None
+
+
+def test_resolution_brier_is_readonly(nrol, topic_path, nrol_repo, monkeypatch):
+    """resolution_brier: never mutates topic state. The on-disk topic JSON is
+    byte-identical before/after the call."""
+    _stub_red_team_approve(nrol, monkeypatch)
+    _seed_dynamics_spec(nrol_repo)
+    _seed_committed_update(topic_path)
+    nrol.resolve_topic(slug=SLUG, resolved_hypothesis="H1")
+
+    before_disk = topic_path.read_text(encoding="utf-8")
+    out = json.loads(nrol.resolution_brier(slug=SLUG))
+    assert "error" not in out, out
+    assert topic_path.read_text(encoding="utf-8") == before_disk
+    # Both lanes present in the read-only recomputation.
+    assert out["vector_end"]["shadow"] is not None
+    assert out["vector_end"]["committed"] is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1804,7 +2432,7 @@ def test_scan_debate_failure_leaves_window_open(nrol, topic_path, monkeypatch):
     }]
     monkeypatch.setattr(
         nrol, "_search_web_articles",
-        lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [],
     )
 
     calls = {"n": 0}
@@ -2028,7 +2656,7 @@ def test_safe_policy_never_applies_posterior_moving_duplicates(nrol, topic_path,
     ]
     monkeypatch.setattr(
         nrol, "_search_web_articles",
-        lambda query, channel, max_results: list(articles) if channel == "wildcard" else [],
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [],
     )
     monkeypatch.setattr(
         nrol.llama_client, "chat",

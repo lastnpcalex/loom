@@ -54,6 +54,17 @@ _TRACKING_QUERY_KEYS = {
     "yclid",
     "wickedid",
 }
+_RELATIVE_DATE_RE = re.compile(
+    r"(?i)(\d+)\s*(minute|hour|day|week|month|year)s?\s*ago"
+)
+_DATE_FORMATS = (
+    "%B %d, %Y",
+    "%b %d, %Y",
+    "%d %B %Y",
+    "%d %b %Y",
+    "%Y/%m/%d",
+    "%m/%d/%Y",
+)
 
 
 def _to_int_idx(idx) -> int:
@@ -419,14 +430,372 @@ def _search_query_specs(topic: dict, window_label: str) -> list[dict]:
     return specs
 
 
-def _ddgs_hits(ddgs, method: str, query: str, limit: int) -> list[dict]:
+def _search_query_text(raw: Any) -> str:
+    if isinstance(raw, dict):
+        raw = raw.get("query") or raw.get("q") or raw.get("text") or ""
+    return re.sub(r"\s+", " ", str(raw or "")).strip()
+
+
+def _normalize_search_queries(values: Any) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    out = []
+    for value in values or []:
+        text = _search_query_text(value)
+        if text:
+            out.append(text)
+    return out
+
+
+def _search_query_key(value: Any) -> str:
+    return _search_query_text(value).casefold()
+
+
+def _apply_search_query_delta(
+    current: list[Any], add_queries: list[str], remove_queries: list[str]
+) -> list[Any]:
+    remove_keys = {_search_query_key(q) for q in remove_queries}
+    proposed = [q for q in (current or []) if _search_query_key(q) not in remove_keys]
+    existing = {_search_query_key(q) for q in proposed}
+    for query in add_queries:
+        key = _search_query_key(query)
+        if key and key not in existing:
+            proposed.append(query)
+            existing.add(key)
+    return proposed
+
+
+def _query_terms(query: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9][A-Za-z0-9'/-]*", query)
+
+
+def _topic_schema_terms(topic: dict | None) -> set[str]:
+    if not topic:
+        return set()
+    terms: set[str] = set()
+    indicators = topic.get("indicators", {}) or {}
+    for tier, items in (indicators.get("tiers", {}) or {}).items():
+        for ind in items or []:
+            if not isinstance(ind, dict):
+                continue
+            parts = [
+                ind.get("id", ""),
+                ind.get("desc", ""),
+                ind.get("posteriorEffect", ""),
+                ind.get("causal_event_id", ""),
+                ind.get("shape", ""),
+            ]
+            observable = ind.get("observable") or {}
+            if isinstance(observable, dict):
+                parts.extend(str(v) for v in observable.values())
+            for term in _query_terms(" ".join(str(p) for p in parts if p)):
+                if len(term) >= 4:
+                    terms.add(term.casefold())
+    for ind in indicators.get("anti_indicators", []) or []:
+        if isinstance(ind, dict):
+            for term in _query_terms(" ".join(str(v) for v in ind.values())):
+                if len(term) >= 4:
+                    terms.add(term.casefold())
+    return terms
+
+
+def _coverage_axes(queries: list[str], topic: dict | None = None) -> dict[str, bool]:
+    text = " ".join(queries).casefold()
+
+    def any_term(*terms: str) -> bool:
+        return any(term.casefold() in text for term in terms)
+
+    schema_terms = _topic_schema_terms(topic)
+    schema_hits = sorted(term for term in schema_terms if term in text)
+    return {
+        "core_event": bool(queries) and any(len(_query_terms(q)) >= 3 for q in queries),
+        "escalation": any_term(
+            "closure", "closed", "attack", "seizure", "blockade", "failure",
+            "breakdown", "decline", "risk", "sanction", "enforcement",
+        ),
+        "deescalation": any_term(
+            "reopen", "reopening", "agreement", "deal", "talks", "diplomacy",
+            "recovery", "resume", "normalization", "confirmed",
+        ),
+        "measurement": any_term(
+            "metric", "data", "baseline", "percent", "volume", "index",
+            "rate", "count", "survey", "report", "lloyd", "eia",
+        ),
+        "institutional": any_term(
+            "reuters", "ap", "official", "agency", "ministry", "court",
+            "regulator", "military", "centcom", "eia", "lloyd",
+        ),
+        "schema": bool(schema_hits) or any_term(
+            "indicator", "threshold", "observable", "signal", "metric",
+            "event", "source", "evidence",
+        ),
+    }
+
+
+def _validate_search_query_set(
+    current: list[Any],
+    add_queries: list[str],
+    remove_queries: list[str],
+    topic: dict | None = None,
+) -> dict:
+    current_texts = [_search_query_text(q) for q in current or [] if _search_query_text(q)]
+    proposed_raw = _apply_search_query_delta(current or [], add_queries, remove_queries)
+    proposed = [_search_query_text(q) for q in proposed_raw if _search_query_text(q)]
+    errors: list[str] = []
+    warnings_out: list[str] = []
+
+    if not add_queries and not remove_queries:
+        errors.append("proposal must add or remove at least one query")
+    if len(proposed) < 3:
+        warnings_out.append("resulting query set has fewer than 3 queries")
+    if len(proposed) > 25:
+        errors.append("resulting query set exceeds 25 queries")
+
+    existing_keys = {_search_query_key(q) for q in current_texts}
+    for query in remove_queries:
+        if _search_query_key(query) not in existing_keys:
+            warnings_out.append(f"remove query not present: {query}")
+
+    seen = set()
+    for query in proposed:
+        key = _search_query_key(query)
+        if key in seen:
+            errors.append(f"duplicate query after update: {query}")
+        seen.add(key)
+        terms = _query_terms(query)
+        if len(query) > 220:
+            errors.append(f"query exceeds 220 chars: {query[:80]}")
+        elif len(query) > 180:
+            warnings_out.append(f"query is long (>180 chars): {query[:80]}")
+        if len(terms) < 3:
+            errors.append(f"query has fewer than 3 terms: {query}")
+        elif len(terms) > 14:
+            warnings_out.append(f"query has more than 14 terms: {query[:80]}")
+        if '"' in query:
+            warnings_out.append(f"quoted query may overfit a headline: {query[:80]}")
+
+    site_count = sum(1 for query in proposed if "site:" in query.casefold())
+    if proposed and site_count == len(proposed):
+        errors.append("all queries are site-filtered; at least one broad query is required")
+    elif proposed and site_count > max(1, len(proposed) // 2):
+        warnings_out.append("site-filtered queries dominate the set")
+
+    axes = _coverage_axes(proposed, topic)
+    missing_axes = [axis for axis, covered in axes.items() if not covered]
+    for axis in missing_axes:
+        warnings_out.append(f"coverage axis missing or weak: {axis}")
+
+    return {
+        "current_queries": current_texts,
+        "proposed_queries": proposed,
+        "add_queries": add_queries,
+        "remove_queries": remove_queries,
+        "errors": errors,
+        "warnings": warnings_out,
+        "coverage_axes": axes,
+        "missing_axes": missing_axes,
+        "schema_terms_matched": sorted(
+            term for term in _topic_schema_terms(topic)
+            if term in " ".join(proposed).casefold()
+        )[:40],
+    }
+
+
+def _parse_search_query_red_team_review(text: str) -> dict:
+    text = text or ""
+    verdict_match = re.search(r"(?im)^VERDICT:\s*(APPROVE|REVISE|REJECT)\b", text)
+    verdict = verdict_match.group(1).upper() if verdict_match else "REVISE"
+
+    def field(name: str) -> str:
+        match = re.search(rf"(?ims)^{name}:\s*(.*?)(?=^[A-Z_]+:|\Z)", text)
+        return match.group(1).strip() if match else ""
+
+    return {
+        "verdict": verdict,
+        "coverage": field("COVERAGE"),
+        "neutrality": field("NEUTRALITY"),
+        "overfitting": field("OVERFITTING"),
+        "noise": field("NOISE"),
+        "schema_axis": field("SCHEMA_AXIS"),
+        "recommendation": field("RECOMMENDATION"),
+        "raw": text,
+    }
+
+
+def _build_search_query_red_team_prompt(proposal: dict, topic: dict, validation: dict) -> str:
+    indicators = [
+        _indicator_brief(ind, tier)
+        for tier, items in (topic.get("indicators", {}).get("tiers", {}) or {}).items()
+        for ind in items or []
+    ] + [
+        _indicator_brief(ind, "anti_indicators")
+        for ind in topic.get("indicators", {}).get("anti_indicators", []) or []
+    ]
+    meta = topic.get("meta", {}) or {}
+    return "\n".join([
+        "Red-team this proposed durable searchQueries update for an NROL-AO topic.",
+        "",
+        "Search queries are retrieval hooks, not evidence claims. They should improve recall",
+        "without overfitting to one headline, one source, or one favored hypothesis.",
+        "",
+        f"TOPIC: {meta.get('slug', '')} — {meta.get('title', '')}",
+        f"QUESTION: {meta.get('question', '')}",
+        "",
+        "HYPOTHESES:",
+        json.dumps(topic.get("model", {}).get("hypotheses", {}), indent=2, ensure_ascii=True),
+        "",
+        "INDICATORS / SCHEMA TERMS:",
+        json.dumps(indicators, indent=2, ensure_ascii=True),
+        "",
+        "CURRENT QUERIES:",
+        json.dumps(validation.get("current_queries", []), indent=2, ensure_ascii=True),
+        "",
+        "PROPOSED ADD:",
+        json.dumps(proposal.get("add_queries", []), indent=2, ensure_ascii=True),
+        "",
+        "PROPOSED REMOVE:",
+        json.dumps(proposal.get("remove_queries", []), indent=2, ensure_ascii=True),
+        "",
+        "OPERATOR RATIONALE:",
+        str(proposal.get("rationale", "")),
+        "",
+        "OPERATOR COVERAGE GAPS:",
+        json.dumps(proposal.get("coverage_gaps", []), indent=2, ensure_ascii=True),
+        "",
+        "DETERMINISTIC LINT CONTEXT (advisory unless errors are non-empty):",
+        json.dumps(validation, indent=2, ensure_ascii=True),
+        "",
+        "Review adversarially. Approve only if the resulting durable query set is",
+        "broad, neutral, robust, and likely to catch evidence relevant to the topic's",
+        "hypotheses and indicators. Do not reject merely because deterministic coverage",
+        "labels are imperfect; use topic understanding.",
+        "",
+        "Return exactly:",
+        "VERDICT: APPROVE | REVISE | REJECT",
+        "COVERAGE: <are the main causal/source/measurement/schema axes covered?>",
+        "NEUTRALITY: <does the query set avoid hunting only one favored outcome?>",
+        "OVERFITTING: <headline/date/site/source brittleness, if any>",
+        "NOISE: <expected junk volume or ambiguity risk>",
+        "SCHEMA_AXIS: <does the set cover high-value unfired indicators/observables?>",
+        "RECOMMENDATION: <specific edits or approval rationale>",
+    ])
+
+
+def _deterministic_search_query_review(proposal: dict, topic: dict) -> dict:
+    add_queries = _normalize_search_queries(proposal.get("add_queries"))
+    remove_queries = _normalize_search_queries(proposal.get("remove_queries"))
+    validation = _validate_search_query_set(
+        topic.get("searchQueries") or [], add_queries, remove_queries, topic=topic
+    )
+    coverage_gaps = proposal.get("coverage_gaps") or []
+    if validation["errors"]:
+        verdict = "REJECT"
+    else:
+        verdict = "CHECK"
+    risks = []
+    if validation["errors"]:
+        risks.extend(validation["errors"])
+    if validation["warnings"]:
+        risks.extend(validation["warnings"])
+    if coverage_gaps and not add_queries:
+        verdict = "REVISE" if verdict == "CHECK" else verdict
+        risks.append("coverage gaps were stated but no new queries were added")
+    return {
+        "verdict": verdict,
+        "deterministic_only": True,
+        "risk": "; ".join(risks[:6]) or "no blocking risks found",
+        "coverage": validation["coverage_axes"],
+        "missing_axes": validation["missing_axes"],
+        "neutrality": (
+            "Queries are treated as retrieval hooks; red team found no deterministic "
+            "one-sidedness signal."
+        ),
+        "overfitting": [
+            w for w in validation["warnings"]
+            if "headline" in w or "quoted" in w or "site-filtered" in w
+        ],
+        "noise": [
+            w for w in validation["warnings"]
+            if "long" in w or "more than 14" in w
+        ],
+        "recommendation": (
+            "Rejected by deterministic structural validation."
+            if verdict == "REJECT"
+            else "Send to local-model red team for substantive retrieval review."
+        ),
+        "validation": validation,
+    }
+
+
+def _ddgs_hits(
+    ddgs,
+    method: str,
+    query: str,
+    limit: int,
+    *,
+    timelimit: str | None = None,
+) -> list[dict]:
     search = getattr(ddgs, method, None)
     if search is None:
         return []
+    kwargs: dict[str, Any] = {"max_results": limit}
+    if timelimit:
+        kwargs["timelimit"] = timelimit
     try:
-        return list(search(query, max_results=limit))
+        return list(search(query, **kwargs))
     except TypeError:
-        return list(search(query))[:limit]
+        # Older DDGS variants may not accept timelimit; retry without it.
+        try:
+            return list(search(query, max_results=limit))
+        except TypeError:
+            return list(search(query))[:limit]
+
+
+def _ddg_timelimit_for_window(hours: float) -> str:
+    """Map window hours to DDGS timelimit code (d/w/m/y).
+
+    Round UP to the next coarser bucket so retrieval is never narrower
+    than the freshness gate that runs after fetch.
+    """
+    try:
+        h = float(hours)
+    except (TypeError, ValueError):
+        h = 24.0
+    if h <= 24:
+        return "d"
+    if h <= 24 * 7:
+        return "w"
+    if h <= 24 * 31:
+        return "m"
+    return "y"
+
+
+def _scan_search_window(topic: dict, *, tempo_floor_hours: int) -> dict:
+    """News-scan window with 1-day overlap and a 30-day first-scan default.
+
+    Wraps framework.news_mutation.compute_time_window so:
+      - First scan (no lastScanned) opens a 30-day month for wide initial
+        coverage, instead of the tempo floor.
+      - Subsequent scans use a 24h buffer so consecutive scans overlap by
+        ~1 day; dedupe handles the overlap.
+    """
+    mutation = _import_from_repo("framework.news_mutation")
+    last_scanned = ((topic.get("meta") or {}).get("lastScanned") or "").strip()
+    if not last_scanned:
+        hours = float(30 * 24)
+        return {
+            "hours": hours,
+            "label": "last 30 days",
+            "reason": "no prior lastScanned — defaulting scan window to last 30 days",
+            "capped": False,
+        }
+    return mutation.compute_time_window(
+        topic,
+        tempo_floor_hours=tempo_floor_hours,
+        buffer_hours=24.0,
+    )
 
 
 def _dedupe_search_hits(hits: list[dict]) -> list[dict]:
@@ -446,13 +815,23 @@ def _dedupe_search_hits(hits: list[dict]) -> list[dict]:
     return deduped
 
 
-def _search_web_articles(query: str, channel: str, max_results: int) -> list[dict]:
+def _search_web_articles(
+    query: str,
+    channel: str,
+    max_results: int,
+    *,
+    timelimit: str | None = None,
+) -> list[dict]:
     """Server-side search backend for MCP-owned news scans.
 
     DDGS text search alone is shallow and can miss relevant mainstream news
     articles behind aggregator/SEO results. Pull from the news vertical when
     available, then add small source-qualified searches for high-signal
     international outlets before the normal scan dedupe/freshness gates run.
+
+    timelimit is a DDGS code (d/w/m/y) computed from the topic's scan window
+    so search engines do retrieval-time freshness filtering; the post-fetch
+    freshness gate still does the precise cutoff.
     """
     try:
         from ddgs import DDGS
@@ -476,11 +855,12 @@ def _search_web_articles(query: str, channel: str, max_results: int) -> list[dic
                 for domain in source_domains
             ],
         ]:
-            for hit in _ddgs_hits(ddgs, method, search_query, search_limit):
+            for hit in _ddgs_hits(ddgs, method, search_query, search_limit, timelimit=timelimit):
                 if isinstance(hit, dict):
                     hit = dict(hit)
                     hit.setdefault("_search_backend", method)
                     hit.setdefault("_search_query", search_query)
+                    hit.setdefault("_search_timelimit", timelimit or "")
                     raw_hits.append(hit)
     hits = _dedupe_search_hits(raw_hits)[:aggregate_limit]
     articles = []
@@ -583,7 +963,13 @@ def _normalize_scan_datetime(value: str) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
-def _filter_scan_articles(topic: dict, articles: list[dict], window: dict) -> tuple[list[dict], dict]:
+def _filter_scan_articles(
+    topic: dict,
+    articles: list[dict],
+    window: dict,
+    *,
+    drop_old_dated: bool = True,
+) -> tuple[list[dict], dict]:
     """Keep only fresh or undated-but-not-seen scan results before matching."""
     now = datetime.now(timezone.utc)
     try:
@@ -598,6 +984,7 @@ def _filter_scan_articles(topic: dict, articles: list[dict], window: dict) -> tu
         "dated_in_window": 0,
         "undated_kept": 0,
         "old_dated_dropped": 0,
+        "old_dated_kept_for_fetch": 0,
         "prior_seen_dropped": 0,
         "cutoff": cutoff.isoformat(timespec="seconds"),
     }
@@ -612,7 +999,13 @@ def _filter_scan_articles(topic: dict, articles: list[dict], window: dict) -> tu
         published_dt = _normalize_scan_datetime(published)
         if published_dt is not None:
             if published_dt < cutoff:
-                stats["old_dated_dropped"] += 1
+                if drop_old_dated:
+                    stats["old_dated_dropped"] += 1
+                    continue
+                art["freshness"] = "dated_outside_window_pending_fetch"
+                art["freshness_cutoff"] = stats["cutoff"]
+                stats["old_dated_kept_for_fetch"] += 1
+                kept.append(article)
                 continue
             art["freshness"] = "dated_in_window"
             art["freshness_cutoff"] = stats["cutoff"]
@@ -649,11 +1042,14 @@ def _run_debate(
     packet: dict[str, Any] = {
         "candidates": 0,
         "parks": sum(1 for c in decisions if c.get("action", {}).get("kind") == "PARK"),
+        "schema_gaps": sum(
+            1 for c in decisions if c.get("action", {}).get("kind") == "SCHEMA_GAP"
+        ),
         "advocate_proposals": 0,
         "jury_verdicts": {},
     }
     try:
-        candidates = news.get_candidates_with_reasons(decisions)
+        candidates = _debate_candidates_with_reasons(news, decisions)
         packet["candidates"] = len(candidates)
         if not candidates:
             packet["note"] = "no candidates to deliberate"
@@ -726,10 +1122,37 @@ def _run_debate(
             if (decisions_by_idx.get(str(idx), {}).get("action", {}).get("kind") == "PARK"
                 and v["action"]["kind"] in ("FIRE", "OBSERVE"))
         )
+        packet["schema_gap_rescued"] = sum(
+            1 for idx, v in overrides.items()
+            if (
+                decisions_by_idx.get(str(idx), {}).get("action", {}).get("kind") == "SCHEMA_GAP"
+                and v["action"]["kind"] in ("FIRE", "OBSERVE", "PARK", "IGNORE")
+            )
+        )
         return overrides, packet
     except Exception as exc:
         packet["error"] = str(exc)
         return {}, packet
+
+
+def _debate_candidates_with_reasons(news, matcher_decisions: list) -> list:
+    """Return debate candidates, including SCHEMA_GAP rows."""
+    out = list(news.get_candidates_with_reasons(matcher_decisions))
+    existing = {str(c.get("idx")) for c in out}
+    for d in matcher_decisions:
+        if (d.get("action") or {}).get("kind") != "SCHEMA_GAP":
+            continue
+        if str(d.get("idx")) in existing:
+            continue
+        desc = (d.get("action") or {}).get("description") or ""
+        action_raw = f"SCHEMA_GAP {desc}".strip()
+        out.append({
+            "idx": d.get("idx"),
+            "claim": d.get("claim") or "",
+            "action_raw": action_raw,
+            "reason": d.get("reason") or desc,
+        })
+    return out
 
 
 def _apply_jury_overrides(decisions: list, jury_overrides: dict) -> list:
@@ -805,8 +1228,36 @@ def _deliberation_stamp_from_debate(decision: dict, debate_packet: dict | None) 
     return record
 
 
-def _split_safe_policy_decisions(news, articles: list, decisions: list) -> tuple[list, list]:
-    """Return (safe_to_apply, posterior_moving_to_propose).
+_MATCHER_RELEVANCE_OVERLAY = """
+
+## MCP relevance calibration overlay
+
+Be strict about posterior movement, but liberal about relevance preservation.
+FIRE and OBSERVE still require literal threshold/metric support and directional
+alignment. IGNORE is only for clearly off-topic articles, duplicate-only noise,
+or pure forecast/odds/opinion with no reported factual development.
+
+If an article is plausibly causally related to the topic question, hypotheses,
+or resolution pathway but does not meet an indicator, choose PARK rather than
+IGNORE. If the article is directionally meaningful but the schema has no fitting
+observable or binary threshold, choose SCHEMA_GAP. When uncertain between
+IGNORE and PARK/SCHEMA_GAP, preserve the article with PARK or SCHEMA_GAP so the
+advocate/rebut/jury pass can deliberate it.
+
+Indirect causal pathways count as topic-relevant. For example, ceasefire
+compliance, attacks, sanctions implementation, diplomatic breakdown/resumption,
+shipping insurance, escorts, maritime notices, or traffic-flow reports can be
+relevant even when the headline does not literally repeat the resolution text.
+"""
+
+
+def _build_matcher_prompt(news, topic: dict, articles: list) -> str:
+    """Build matcher prompt with MCP-side relevance-preservation guidance."""
+    return news.build_matcher_prompt(topic, articles) + _MATCHER_RELEVANCE_OVERLAY
+
+
+def _split_safe_policy_decisions(news, articles: list, decisions: list) -> tuple[list, list, dict]:
+    """Return (safe_to_apply, posterior_moving_to_propose, audit).
 
     Safe policy means apply_decisions must never see FIRE/OBSERVE. A previous
     safe-scan path filtered only canonical decisions, then appended duplicate
@@ -817,6 +1268,7 @@ def _split_safe_policy_decisions(news, articles: list, decisions: list) -> tuple
     canonical, duplicate_map = news.group_decisions_by_duplicates(articles, decisions)
     safe_to_apply: list[dict] = []
     to_propose: list[dict] = []
+    audit = {"freshness_downgrades": []}
 
     def freshness_gated(decision: dict) -> dict:
         kind = (decision.get("action") or {}).get("kind")
@@ -835,6 +1287,13 @@ def _split_safe_policy_decisions(news, articles: list, decisions: list) -> tuple
             "freshness gate: undated search result cannot file FIRE/OBSERVE; "
             f"original action was {kind}. {reason}"
         )[:500]
+        audit["freshness_downgrades"].append({
+            "idx": decision.get("idx"),
+            "original_action": decision.get("action"),
+            "replacement_action": downgraded["action"],
+            "claim": decision.get("claim") or "",
+            "reason": downgraded["reason"],
+        })
         return downgraded
 
     for d in canonical:
@@ -854,7 +1313,9 @@ def _split_safe_policy_decisions(news, articles: list, decisions: list) -> tuple
                 elif dup_kind in {"PARK", "SCHEMA_GAP", "IGNORE"}:
                     safe_to_apply.append(dup)
 
-    return safe_to_apply, to_propose
+    audit["safe_to_apply_count"] = len(safe_to_apply)
+    audit["to_propose_count"] = len(to_propose)
+    return safe_to_apply, to_propose, audit
 
 
 def _fetch_article_payload(url: str, max_chars: int, timeout_sec: float = 15.0) -> dict:
@@ -901,8 +1362,8 @@ def _fetch_article_payload(url: str, max_chars: int, timeout_sec: float = 15.0) 
         if text:
             payload["excerpt"] = text[:max_chars]
         return payload
-    except Exception:
-        return {}
+    except Exception as exc:
+        return {"fetch_error": f"{type(exc).__name__}: {str(exc)[:180]}"}
 
 
 def _fetch_article_excerpt(url: str, max_chars: int, timeout_sec: float = 15.0) -> str:
@@ -944,13 +1405,49 @@ def _fetch_article_excerpt(url: str, max_chars: int, timeout_sec: float = 15.0) 
 def _parse_iso_date(value: str) -> datetime | None:
     if not value:
         return None
+    text = str(value or "").strip()
+    if not text:
+        return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
     except Exception:
+        pass
+
+    try:
+        return datetime.fromisoformat(text[:10] + "T00:00:00+00:00")
+    except Exception:
+        pass
+
+    normalized = re.sub(r"\s+", " ", text)
+    for fmt in _DATE_FORMATS:
         try:
-            return datetime.fromisoformat(value[:10] + "T00:00:00+00:00")
+            return datetime.strptime(normalized, fmt).replace(tzinfo=timezone.utc)
         except Exception:
+            pass
+
+    lower = text.lower()
+    if "yesterday" in lower:
+        return datetime.now(timezone.utc) - timedelta(days=1)
+    match = _RELATIVE_DATE_RE.search(lower)
+    if match:
+        amount = int(match.group(1))
+        unit = match.group(2).lower()
+        if unit == "minute":
+            delta = timedelta(minutes=amount)
+        elif unit == "hour":
+            delta = timedelta(hours=amount)
+        elif unit == "day":
+            delta = timedelta(days=amount)
+        elif unit == "week":
+            delta = timedelta(weeks=amount)
+        elif unit == "month":
+            delta = timedelta(days=30 * amount)
+        elif unit == "year":
+            delta = timedelta(days=365 * amount)
+        else:
             return None
+        return datetime.now(timezone.utc) - delta
+    return None
 
 
 def _token_overlap(a: str, b: str) -> float:
@@ -1092,7 +1589,7 @@ def _load_topics(engine, slugs: list[str] | None = None) -> tuple[list[dict], li
     """
     topics = []
     skipped = []
-    selected = set(slugs or [])
+    selected = set(_normalize_slugs(slugs))
     for row in engine.list_topics():
         slug = row.get("slug")
         if selected and slug not in selected:
@@ -1104,8 +1601,25 @@ def _load_topics(engine, slugs: list[str] | None = None) -> tuple[list[dict], li
     return topics, skipped
 
 
+def _normalize_slugs(slugs: list[str] | str | None) -> list[str]:
+    """Normalize MCP slug inputs.
+
+    Some clients occasionally pass a single slug as a bare string even though
+    the schema says list[str]. Treat that as one slug, not an iterable of
+    characters that silently selects zero topics.
+    """
+    if slugs is None:
+        return []
+    if isinstance(slugs, str):
+        return [s.strip() for s in slugs.split(",") if s.strip()]
+    try:
+        return [str(s).strip() for s in slugs if str(s).strip()]
+    except TypeError:
+        return [str(slugs).strip()] if str(slugs).strip() else []
+
+
 def _select_scan_topics(engine, slugs: list[str] | None, max_topics: int) -> list[dict]:
-    selected = set(slugs or [])
+    selected = set(_normalize_slugs(slugs))
     loaded, _ = _load_topics(engine, slugs)
     topics = [t for t in loaded if t.get("meta", {}).get("status") == "ACTIVE"]
     if not selected:
@@ -1125,9 +1639,13 @@ def nrol_status() -> str:
     try:
         engine = _import_from_repo("engine")
         topics = engine.list_topics()
+        topics_dir = Path(getattr(engine, "TOPICS_DIR", _repo_path() / "topics"))
+        state_root = topics_dir.parent
         return _json(
             {
                 "repo": str(_repo_path()),
+                "state_root": str(state_root),
+                "topics_dir": str(topics_dir),
                 "activity_snapshot": str(_activity_store().snapshot_path),
                 "topics": len(topics),
                 "transitions": sorted(_ALLOWED_TRANSITIONS),
@@ -1154,7 +1672,8 @@ def help() -> str:
             "normal_workflow": [
                 "Call nrol_status to verify the MCP bridge and configured repo.",
                 "Call topic_status or list_topics to choose scope.",
-                "Call read_topic or list_hypotheses to inspect a topic.",
+                "Call read_topic/read_search_queries or list_hypotheses to inspect a topic.",
+                "Use propose_search_query_update -> red_team_search_query_update -> apply_search_query_update for durable retrieval coverage changes.",
                 "Call run_news_scan with commit_policy='safe' for review-first MCP-side search and deliberation.",
                 "Review the returned operator packet and brief pending FIRE/OBSERVE proposals before committing.",
                 "Use commit=true only when explicit mutation is intended and Loom approval is expected.",
@@ -1165,6 +1684,9 @@ def help() -> str:
                 "list_proposals(slug, status) — review the pending queue.",
                 "commit_match(proposal_id) — validate + apply through engine gates and Loom approval.",
                 "withdraw_proposal(proposal_id) — the IGNORE decision for proposals.",
+                "propose_search_query_update(...) — record durable query changes; no mutation.",
+                "red_team_search_query_update(proposal_id) — mandatory query governance review.",
+                "apply_search_query_update(proposal_id) — apply approved retrieval metadata with Loom approval.",
             ],
             "scan_semantics": {
                 "commit_false": "No evidence/posterior mutation.",
@@ -1194,6 +1716,7 @@ def help() -> str:
                 "list_topics",
                 "topic_status",
                 "read_topic",
+                "read_search_queries",
                 "read_evidence",
                 "acknowledge_parked_reviews",
                 "list_hypotheses",
@@ -1204,6 +1727,11 @@ def help() -> str:
                 "mark_schema_extension_proposal",
                 "apply_schema_extension_proposal",
                 "run_news_scan",
+                "propose_search_query_update",
+                "list_search_query_updates",
+                "red_team_search_query_update",
+                "apply_search_query_update",
+                "withdraw_search_query_update",
                 "list_activity",
                 "submit_transition",
                 "submit_article",
@@ -1257,19 +1785,26 @@ def list_topics(status: str = "", include_governance: bool = False) -> str:
     """List NROL-AO topics from the configured repo."""
     try:
         engine = _import_from_repo("engine")
-        rows = engine.list_topics()
+        loaded, _skipped = _load_topics(engine)
+        rows = []
+        for topic in loaded:
+            if include_governance:
+                row = _topic_summary(topic)
+            else:
+                meta = topic.get("meta", {}) or {}
+                gov = topic.get("governance", {}) or {}
+                row = {
+                    "slug": meta.get("slug"),
+                    "title": meta.get("title"),
+                    "status": meta.get("status"),
+                    "classification": meta.get("classification"),
+                    "question": meta.get("question", ""),
+                    "lastUpdated": meta.get("lastUpdated", ""),
+                    "governanceHealth": gov.get("health") if gov else None,
+                }
+            rows.append(row)
         if status:
             rows = [row for row in rows if str(row.get("status", "")).upper() == status.upper()]
-        if include_governance:
-            enriched = []
-            for row in rows:
-                try:
-                    topic = engine.load_topic(row["slug"])
-                except Exception as exc:
-                    enriched.append({**row, "loadError": str(exc)})
-                    continue
-                enriched.append(_topic_summary(topic))
-            rows = enriched
         return _json(rows)
     except Exception as exc:
         return _json({"error": str(exc)})
@@ -1296,6 +1831,11 @@ def read_topic(slug: str, include_indicators: bool = True, evidence_limit: int =
         return _json(
             {
                 "topic": _topic_summary(topic),
+                "searchQueries": [
+                    _search_query_text(q)
+                    for q in topic.get("searchQueries", []) or []
+                    if _search_query_text(q)
+                ],
                 "hypotheses": topic.get("model", {}).get("hypotheses", {}),
                 "indicators": indicators,
                 "recent_evidence": evidence[-limit:] if limit else [],
@@ -1321,6 +1861,265 @@ def read_topic(slug: str, include_indicators: bool = True, evidence_limit: int =
         )
     except Exception as exc:
         return _json({"error": str(exc), "slug": slug})
+
+
+@mcp.tool()
+def read_search_queries(slug: str, include_generated_preview: bool = True) -> str:
+    """Read durable topic searchQueries and optional generated scan preview."""
+    try:
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(slug)
+        queries = [
+            _search_query_text(q)
+            for q in topic.get("searchQueries", []) or []
+            if _search_query_text(q)
+        ]
+        out = {
+            "slug": slug,
+            "searchQueries": queries,
+            "count": len(queries),
+            "coverage_axes": _coverage_axes(queries, topic),
+        }
+        if include_generated_preview:
+            out["generated_preview"] = _search_query_specs(topic, "preview")
+        return _json(out)
+    except Exception as exc:
+        return _json({"error": str(exc), "slug": slug})
+
+
+@mcp.tool()
+def propose_search_query_update(
+    slug: str,
+    add: list[str] | str | None = None,
+    remove: list[str] | str | None = None,
+    rationale: str = "",
+    coverage_gaps: list[str] | str | None = None,
+) -> str:
+    """File a durable searchQueries update proposal. No topic mutation."""
+    try:
+        if not rationale.strip():
+            raise ValueError("rationale is required")
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(slug)
+        if topic.get("meta", {}).get("status") != "ACTIVE":
+            raise ValueError(f"topic {slug!r} is not ACTIVE")
+        add_queries = _normalize_search_queries(add)
+        remove_queries = _normalize_search_queries(remove)
+        gaps = _normalize_search_queries(coverage_gaps)
+        validation = _validate_search_query_set(
+            topic.get("searchQueries") or [], add_queries, remove_queries, topic=topic
+        )
+        if validation["errors"]:
+            return _json({
+                "slug": slug,
+                "committed": False,
+                "error": "search query proposal failed validation",
+                "validation": validation,
+            })
+        record = _proposal_store().add_search_query_proposal(
+            slug=slug,
+            add_queries=add_queries,
+            remove_queries=remove_queries,
+            rationale=rationale.strip(),
+            coverage_gaps=gaps,
+            result={"validation": validation},
+        )
+        record["next_step"] = f"red_team_search_query_update({record['id']!r})"
+        return _json(record)
+    except Exception as exc:
+        return _json({"error": str(exc), "slug": slug})
+
+
+@mcp.tool()
+def list_search_query_updates(
+    slug: str = "", status: str = "pending", limit: int = 50
+) -> str:
+    """List search-query update proposals."""
+    try:
+        rows = _proposal_store().list_search_query_proposals(
+            slug=slug, status=status, limit=limit
+        )
+        return _json({"count": len(rows), "proposals": rows})
+    except Exception as exc:
+        return _json({"error": str(exc), "slug": slug})
+
+
+@mcp.tool()
+def red_team_search_query_update(
+    proposal_id: str,
+    model: str = "",
+    temperature: float = 0.2,
+    max_tokens: int = 2048,
+    timeout_sec: int = 600,
+) -> str:
+    """MCP red-team gate for a proposed searchQueries update.
+
+    Hard structural failures are rejected deterministically. Otherwise this
+    mirrors the scan jury pattern by asking the local llama endpoint for the
+    substantive retrieval-quality verdict.
+    """
+    activity = _activity_store()
+    job_id = new_job_id("red-team-query")
+    try:
+        store = _proposal_store()
+        proposal = store.get_search_query_proposal(proposal_id)
+        if proposal is None:
+            raise ValueError(f"search query proposal {proposal_id!r} not found")
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(proposal["slug"])
+        deterministic = _deterministic_search_query_review(proposal, topic)
+        if deterministic["verdict"] == "REJECT":
+            review = deterministic
+            review["reviewed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            review["model"] = "deterministic"
+            updated = store.set_search_query_red_team(proposal_id, review)
+            return _json({"proposal": updated, "red_team": review})
+        prompt = _build_search_query_red_team_prompt(
+            proposal, topic, deterministic["validation"]
+        )
+        activity.record(
+            job_id,
+            "running",
+            task="red_team_search_query_update",
+            slug=proposal["slug"],
+            model=model or llama_client.llama_model(),
+            summary={"proposal_id": proposal_id},
+            prompt=prompt,
+        )
+        response = llama_client.chat(
+            prompt,
+            system_prompt=(
+                "You are the RED TEAM for NROL-AO search-query coverage. "
+                "Return only the requested review fields."
+            ),
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+            disable_thinking=False,
+        )
+        review = _parse_search_query_red_team_review(response.get("text", ""))
+        review["reviewed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        review["model"] = response.get("model")
+        review["deterministic"] = deterministic
+        review["finish_reason"] = response.get("finish_reason")
+        updated = store.set_search_query_red_team(proposal_id, review)
+        activity.record(
+            job_id,
+            "completed",
+            task="red_team_search_query_update",
+            slug=proposal["slug"],
+            model=response.get("model"),
+            summary={"proposal_id": proposal_id, "verdict": review["verdict"]},
+            response=response.get("text", ""),
+        )
+        return _json({"proposal": updated, "red_team": review})
+    except Exception as exc:
+        try:
+            activity.record(
+                job_id,
+                "failed",
+                task="red_team_search_query_update",
+                error=str(exc),
+                summary={"proposal_id": proposal_id},
+            )
+        except Exception:
+            pass
+        return _json({"job_id": job_id, "error": str(exc), "proposal_id": proposal_id})
+
+
+@mcp.tool()
+def apply_search_query_update(proposal_id: str, dry_run: bool = True) -> str:
+    """Apply an approved searchQueries update. Mutates only query metadata."""
+    store = _proposal_store()
+    try:
+        proposal = store.get_search_query_proposal(proposal_id)
+        if proposal is None:
+            raise ValueError(f"search query proposal {proposal_id!r} not found")
+        if proposal.get("status") != "pending":
+            raise ValueError(
+                f"search query proposal {proposal_id!r} already decided: {proposal.get('status')}"
+            )
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(proposal["slug"])
+        review = proposal.get("red_team") if isinstance(proposal.get("red_team"), dict) else {}
+        if review.get("verdict") != "APPROVE":
+            raise ValueError("search query update requires red_team verdict APPROVE before apply")
+        add_queries = _normalize_search_queries(proposal.get("add_queries"))
+        remove_queries = _normalize_search_queries(proposal.get("remove_queries"))
+        validation = _validate_search_query_set(
+            topic.get("searchQueries") or [], add_queries, remove_queries, topic=topic
+        )
+        if validation["errors"]:
+            raise ValueError(f"search query update failed validation: {validation['errors']}")
+        proposed_queries = validation["proposed_queries"]
+        result = {
+            "proposal_id": proposal_id,
+            "slug": proposal["slug"],
+            "dry_run": dry_run,
+            "committed": False,
+            "before": validation["current_queries"],
+            "after": proposed_queries,
+            "red_team": review,
+            "validation": validation,
+        }
+        if dry_run:
+            return _json(result)
+        denied = _ask_loom_permission(
+            "nrol_ao_apply_search_query_update",
+            {
+                "proposal_id": proposal_id,
+                "slug": proposal["slug"],
+                "before": validation["current_queries"],
+                "after": proposed_queries,
+                "rationale": proposal.get("rationale", ""),
+                "red_team": review,
+            },
+        )
+        if denied:
+            return _json({"proposal_id": proposal_id, "committed": False, "denied": denied})
+        topic["searchQueries"] = proposed_queries
+        gov = topic.setdefault("governance", {})
+        gov.setdefault("search_query_history", []).append({
+            "proposal_id": proposal_id,
+            "applied_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "before": validation["current_queries"],
+            "after": proposed_queries,
+            "add": add_queries,
+            "remove": remove_queries,
+            "rationale": proposal.get("rationale", ""),
+            "coverage_gaps": proposal.get("coverage_gaps", []),
+            "red_team": review,
+        })
+        engine.save_topic(topic)
+        result["committed"] = True
+        result["dry_run"] = False
+        store.mark_search_query_proposal(
+            proposal_id, "applied", note="applied searchQueries update", result=result
+        )
+        return _json(result)
+    except Exception as exc:
+        return _json({"error": str(exc), "proposal_id": proposal_id})
+
+
+@mcp.tool()
+def withdraw_search_query_update(proposal_id: str, reason: str = "") -> str:
+    """Withdraw a pending search-query update proposal."""
+    try:
+        store = _proposal_store()
+        proposal = store.get_search_query_proposal(proposal_id)
+        if proposal is None:
+            raise ValueError(f"search query proposal {proposal_id!r} not found")
+        if proposal.get("status") != "pending":
+            raise ValueError(
+                f"search query proposal {proposal_id!r} already decided: {proposal.get('status')}"
+            )
+        updated = store.mark_search_query_proposal(
+            proposal_id, "withdrawn", note=reason or "withdrawn by operator"
+        )
+        return _json(updated)
+    except Exception as exc:
+        return _json({"error": str(exc), "proposal_id": proposal_id})
 
 
 @mcp.tool()
@@ -2037,7 +2836,8 @@ def build_news_scan_plan(slugs: list[str] | None = None, max_topics: int = 5) ->
             meta = topic.get("meta", {})
             classification = (meta.get("classification") or "ROUTINE").upper()
             floor = 12 if classification == "ALERT" else (7 * 24 if classification == "CALIBRATION" else 72)
-            window = mutation.compute_time_window(topic, tempo_floor_hours=floor)
+            window = _scan_search_window(topic, tempo_floor_hours=floor)
+            window["ddg_timelimit"] = _ddg_timelimit_for_window(window.get("hours", 24.0))
             prompts = {}
             for hyp in topic.get("model", {}).get("hypotheses", {}):
                 prompts[hyp] = mutation.build_hypothesis_search_prompt(
@@ -2101,7 +2901,7 @@ def apply_news_scan_results(
             for channel, text in (search_results_by_channel or {}).items()
         }
         deduped, surfaced = mutation.dedupe_articles(parsed)
-        matcher_prompt = news.build_matcher_prompt(topic, deduped) if deduped else ""
+        matcher_prompt = _build_matcher_prompt(news, topic, deduped) if deduped else ""
         store.record(
             job_id,
             "running",
@@ -2259,7 +3059,9 @@ def run_news_scan(
             slug = meta.get("slug")
             classification = (meta.get("classification") or "ROUTINE").upper()
             floor = 12 if classification == "ALERT" else (7 * 24 if classification == "CALIBRATION" else 72)
-            window = mutation.compute_time_window(topic, tempo_floor_hours=floor)
+            window = _scan_search_window(topic, tempo_floor_hours=floor)
+            timelimit_code = _ddg_timelimit_for_window(window.get("hours", 24.0))
+            window["ddg_timelimit"] = timelimit_code
             query_specs = _search_query_specs(topic, window.get("label", "recent period"))
             channels = [spec["channel"] for spec in query_specs]
 
@@ -2269,7 +3071,12 @@ def run_news_scan(
                 task="run_news_scan",
                 slug=slug,
                 model=model or llama_client.llama_model(),
-                summary={"phase": "searching", "channels": channels, "window": window.get("label")},
+                summary={
+                    "phase": "searching",
+                    "channels": channels,
+                    "window": window.get("label"),
+                    "ddg_timelimit": timelimit_code,
+                },
             )
             parsed_by_channel = {}
             queries = {}
@@ -2283,13 +3090,19 @@ def run_news_scan(
                         query,
                         channel,
                         max_results_per_channel,
+                        timelimit=timelimit_code,
                     )
                 except Exception as exc:
                     search_errors[channel] = str(exc)
                     parsed_by_channel[channel] = []
 
             deduped_raw, surfaced = mutation.dedupe_articles(parsed_by_channel)
-            deduped, freshness_stats = _filter_scan_articles(topic, deduped_raw, window)
+            deduped, freshness_stats = _filter_scan_articles(
+                topic,
+                deduped_raw,
+                window,
+                drop_old_dated=not fetch_full_articles,
+            )
             matcher_output = ""
             decisions = []
             applied = None
@@ -2307,16 +3120,28 @@ def run_news_scan(
                     summary={"phase": "fetching", "article_count": len(deduped)},
                 )
                 fetched = 0
+                fetch_errors = 0
+                metadata_only = 0
                 for item in deduped:
                     art = item.get("article", item) if isinstance(item, dict) else item
                     payload = _fetch_article_payload(art.get("url", ""), excerpt_chars)
                     if isinstance(payload, str):
                         payload = {"excerpt": payload}
-                    if payload.get("published") and not (
-                        art.get("published") or art.get("date") or art.get("time")
-                    ):
-                        art["published"] = payload["published"]
-                        art["date"] = payload["published"]
+                    if payload.get("fetch_error"):
+                        art["fetch_error"] = payload["fetch_error"]
+                        fetch_errors += 1
+                    payload_published = payload.get("published")
+                    if payload_published:
+                        existing_published = (
+                            art.get("published") or art.get("date") or art.get("time") or ""
+                        )
+                        existing_dt = _normalize_scan_datetime(existing_published)
+                        payload_dt = _normalize_scan_datetime(payload_published)
+                        if not existing_dt or (payload_dt and payload_dt > existing_dt):
+                            if existing_published:
+                                art.setdefault("search_published", existing_published)
+                            art["published"] = payload_published
+                            art["date"] = payload_published
                     for meta_key in ("metadata_title", "metadata_source", "metadata_host", "metadata_url"):
                         if payload.get(meta_key) and not art.get(meta_key):
                             art[meta_key] = payload[meta_key]
@@ -2324,21 +3149,31 @@ def run_news_scan(
                     if excerpt:
                         art["excerpt"] = excerpt
                         fetched += 1
+                    elif payload and not payload.get("fetch_error"):
+                        metadata_only += 1
                 deduped, postfetch_freshness_stats = _filter_scan_articles(topic, deduped, window)
                 freshness_stats = {
                     **postfetch_freshness_stats,
                     "prefetch": freshness_stats,
                     "postfetch": postfetch_freshness_stats,
                 }
+                retained_fetched = sum(
+                    1
+                    for item in deduped
+                    if (item.get("article", item) if isinstance(item, dict) else item).get("excerpt")
+                )
                 excerpt_stats = {
-                    "fetched": fetched,
+                    "fetched": retained_fetched,
+                    "attempted_fetched": fetched,
+                    "fetch_errors": fetch_errors,
+                    "metadata_only": metadata_only,
                     "of": len(deduped),
                     "prefetch_of": freshness_stats["prefetch"].get("kept"),
                     "chars_cap": excerpt_chars,
                 }
             total_articles += len(deduped)
             if deduped:
-                matcher_prompt = news.build_matcher_prompt(topic, deduped)
+                matcher_prompt = _build_matcher_prompt(news, topic, deduped)
                 store.record(
                     job_id,
                     "running",
@@ -2388,7 +3223,7 @@ def run_news_scan(
 
                 if "debate" not in search_errors:
                     if commit_policy == "safe" and not dry_run and decisions:
-                        safe_decisions, review_decisions = _split_safe_policy_decisions(
+                        safe_decisions, review_decisions, safe_policy_audit = _split_safe_policy_decisions(
                             news, deduped, decisions
                         )
 
@@ -2457,6 +3292,7 @@ def run_news_scan(
                             "posterior_movers_forced_to_review": True,
                             "auto_committed": (applied or {}),
                             "proposals_filed": proposals_filed,
+                            "safe_policy_audit": safe_policy_audit,
                         }
 
                     if commit and commit_policy != "safe":
@@ -2629,7 +3465,7 @@ def _write_digest(packet: dict) -> str:
         if policy:
             auto = policy.get("auto_committed") or {}
             lines.append(
-                f"- auto-committed (safe): park={auto.get('park', 0)} "
+                f"- recorded as non-moving evidence (safe): park={auto.get('park', 0)} "
                 f"schema_gap={auto.get('schema_gap', 0)} "
                 f"rejections={auto.get('engine_rejections', 0)}"
             )
@@ -2638,6 +3474,21 @@ def _write_digest(packet: dict) -> str:
                 f"- proposals filed for review: {len(filed)}"
                 + (f" ({', '.join(filed)})" if filed else "")
             )
+            audit = policy.get("safe_policy_audit") or {}
+            downgrades = audit.get("freshness_downgrades") or []
+            if downgrades:
+                lines.append(
+                    f"- ACTION REQUIRED: freshness downgrades: {len(downgrades)} "
+                    "posterior-moving decision(s) converted to PARK because "
+                    "publication date was missing"
+                )
+                for row in downgrades[:5]:
+                    original = (row.get("original_action") or {}).get("kind", "?")
+                    replacement = (row.get("replacement_action") or {}).get("kind", "?")
+                    lines.append(
+                        f"  - A{row.get('idx')}: {original} -> {replacement}; "
+                        f"{(row.get('claim') or '')[:120]}"
+                    )
         if tp.get("search_errors"):
             lines.append(f"- search errors: {tp['search_errors']}")
         rec = tp.get("scan_record") or {}
@@ -3010,7 +3861,7 @@ def replay_scan_run(
             articles = tp.get("articles") or []
             decisions = tp.get("decisions") or []
             debate_packet = tp.get("deliberation") or {}
-            safe_decisions, review_decisions = _split_safe_policy_decisions(
+            safe_decisions, review_decisions, safe_policy_audit = _split_safe_policy_decisions(
                 news, articles, decisions
             )
             applied = None
@@ -3066,6 +3917,7 @@ def replay_scan_run(
                 "decision_count": len(decisions),
                 "safe_to_apply_count": len(safe_decisions),
                 "posterior_moving_count": len(review_decisions),
+                "safe_policy_audit": safe_policy_audit,
                 "mode": mode,
                 "applied": applied,
                 "proposals_filed": proposals_filed,
@@ -3423,6 +4275,151 @@ def shadow_posteriors(slug: str, asof: str = "") -> str:
 
 
 @mcp.tool()
+def future_cast(
+    slug: str,
+    scenario: str,
+    target: str = "",
+    proposed_transition: str = "",
+    observed_value: str = "",
+    asof: str = "",
+    assumptions: list[str] | None = None,
+    save: bool = False,
+    model: str = "",
+    timeout_sec: int = 600,
+) -> str:
+    """Dry-run exploration of a hypothetical event or action (shadow analysis).
+
+    Asks what would happen if a proposed event, indicator firing, or
+    hypothesis-resolution scenario occurred — WITHOUT mutating topic JSON.
+    Deep-clones the topic in memory and applies the hypothetical through the
+    engine's own bayesian_update code path (no save), so the shadow posterior
+    delta is exact, not a reproduction. Output posteriors are named
+    shadow_posteriors, never posteriors. Synthetic evidence is labeled
+    HYPOTHETICAL. A red-team critique flags missing evidence and confidence
+    risks. Pass asof=YYYY-MM-DD to also report the dynamics shadow posterior
+    at that counterfactual date. save=true writes the cast to
+    future_casts/future_casts.jsonl (outside topic state); a saved cast is
+    never evidence and never satisfies evidence requirements.
+
+    Zero authority: no writes to topic JSON, posteriorHistory, evidenceLog,
+    sourceCalibration, or sources/source_db.json.
+    """
+    try:
+        from . import future_cast as fc
+        root = _ensure_repo()
+        _import_from_repo("engine")  # ensure engine importable from configured repo
+        ov: float | None = None
+        if observed_value:
+            try:
+                ov = float(observed_value)
+            except (TypeError, ValueError):
+                return _json({"error": f"observed_value must be numeric, got {observed_value!r}"})
+        packet = fc.run_future_cast(
+            repo_root=root,
+            slug=slug,
+            scenario=scenario,
+            target=target,
+            transition=proposed_transition,
+            observed_value=ov,
+            asof=asof,
+            assumptions=assumptions or [],
+            save=save,
+            llama_client=llama_client,
+            model=model,
+            timeout_sec=timeout_sec,
+        )
+        return _json(packet)
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def resolve_topic(
+    slug: str,
+    resolved_hypothesis: str,
+    note: str = "",
+    skip_aar: bool = False,
+    model: str = "",
+    timeout_sec: int = 600,
+) -> str:
+    """Resolve a topic: set RESOLVED, record the outcome, compute two-lane
+    Brier (shadow vs committed, both vs the resolved truth), and optionally
+    generate a red-team after-action review over the evidence stream and scan
+    digests.
+
+    This is the single sanctioned resolution entry point — no other path sets
+    meta.status=RESOLVED. It calls scoring.record_outcome (the engine's
+    existing committed-lane scoring, unmodified) and reconstructs the shadow
+    trajectory by calling shadow_posteriors(slug, asof=d) for each
+    posteriorHistory date d (deterministic). The AAR re-examines the evidence
+    log and recent scan digests and asks the local model where perception vs
+    authority diverged.
+
+    commit=true semantics: resolution raises a browser approval request
+    (fail-closed); on denial the topic is NOT resolved. The shadow/Brier/AAR
+    analytics are read-only and never move the committed posterior.
+    """
+    try:
+        from . import resolution as res
+        root = _ensure_repo()
+        _import_from_repo("engine")
+        # Gather recent scan digests to feed the AAR (read-only).
+        digests: list[dict] = []
+        try:
+            droot = _digest_root()
+            for path in sorted(droot.glob("digest-*.json"), reverse=True)[:10]:
+                try:
+                    digests.append(json.loads(path.read_text(encoding="utf-8")))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        result = res.run_resolution(
+            repo_root=root, slug=slug, resolved_hypothesis=resolved_hypothesis,
+            note=note, skip_aar=skip_aar, llama_client=llama_client,
+            model=model, timeout_sec=timeout_sec, scan_digests=digests,
+        )
+        packet = result["packet"]
+        topic = result["topic"]
+
+        # Fail-closed: resolution is a real commit (status flip + scoring).
+        denied = _ask_loom_permission(
+            "nrol_ao_resolve_topic",
+            {"slug": slug, "resolved_hypothesis": resolved_hypothesis,
+             "note": note,
+             "two_lane_brier": packet.get("two_lane_brier"),
+             "red_team_verdict": (packet.get("red_team_aar") or {}).get("verdict")},
+        )
+        if denied:
+            return _json({"slug": slug, "resolved": False, "denied": denied})
+
+        # Persist the RESOLVED status + committed-lane scoring block.
+        engine = _import_from_repo("engine")
+        engine.save_topic(topic)
+        return _json(packet)
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def resolution_brier(slug: str, asof: str = "") -> str:
+    """Recompute two-lane Brier (shadow vs committed) for a RESOLVED topic.
+
+    Read-only — never mutates topic state. Useful for post-hoc calibration
+    review after resolution. Pass asof=YYYY-MM-DD to score only the trajectory
+    up to that date.
+    """
+    try:
+        from . import resolution as res
+        root = _ensure_repo()
+        _import_from_repo("engine")
+        return _json(res.run_resolution_brier(root, slug, asof=asof))
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
 def review_parked(
     slug: str,
     limit: int = 12,
@@ -3534,7 +4531,7 @@ def review_parked(
                 "refetched": sum(1 for a in articles if a.get("excerpt")),
             },
         )
-        prompt = news.build_matcher_prompt(topic, articles)
+        prompt = _build_matcher_prompt(news, topic, articles)
         response = llama_client.chat(
             prompt,
             system_prompt=(
@@ -3696,7 +4693,7 @@ def build_matcher_prompt(slug: str, articles: list[dict]) -> str:
         engine = _import_from_repo("engine")
         news = _import_from_repo("framework.news_observation_pipeline")
         topic = engine.load_topic(slug)
-        return news.build_matcher_prompt(topic, articles)
+        return _build_matcher_prompt(news, topic, articles)
     except Exception as exc:
         return _json({"error": str(exc), "slug": slug})
 
@@ -4025,7 +5022,7 @@ def run_matcher_with_llama(
         engine = _import_from_repo("engine")
         news = _import_from_repo("framework.news_observation_pipeline")
         topic = engine.load_topic(slug)
-        prompt = news.build_matcher_prompt(topic, articles)
+        prompt = _build_matcher_prompt(news, topic, articles)
         system_prompt = (
             "You are the NROL-AO evidence matcher. Return only DECISION blocks "
             "in the requested format. Do not invent indicators, likelihoods, or posteriors."
@@ -4226,7 +5223,7 @@ def run_matcher_with_model(
         engine = _import_from_repo("engine")
         news = _import_from_repo("framework.news_observation_pipeline")
         topic = engine.load_topic(slug)
-        prompt = news.build_matcher_prompt(topic, articles)
+        prompt = _build_matcher_prompt(news, topic, articles)
         store.record(
             job_id,
             "completed",
