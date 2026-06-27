@@ -95,3 +95,43 @@ def test_claude_llama_sessions_append_image_warning():
     assert "Never use file-reading tools" not in normal
     assert "Never use file-reading tools" in llama
 
+
+def test_claude_session_injects_model_identity():
+    import claude_client
+
+    without = claude_client._loom_append_system_prompt("Extra note")
+    with_model = claude_client._loom_append_system_prompt(
+        "Extra note", use_umans=True, cc_model="umans-glm-5.2"
+    )
+    llama_model = claude_client._loom_append_system_prompt(
+        "Extra note", use_llama=True, cc_model="qwen-27b"
+    )
+    api_model = claude_client._loom_append_system_prompt(
+        "Extra note", cc_model="claude-opus-4-7"
+    )
+
+    # No model arg → no identity block (existing tests' default path unchanged)
+    assert "Operating model" not in without
+    # Umans: identifies provider + flags cache accounting
+    assert "Operating model" in with_model
+    assert "`umans-glm-5.2`" in with_model
+    assert "Umans AI" in with_model
+    # Llama: routes to local llama-server
+    assert "`qwen-27b`" in llama_model
+    assert "local llama-server" in llama_model
+    # API: routes to Anthropic
+    assert "`claude-opus-4-7`" in api_model
+    assert "Anthropic API" in api_model
+
+
+def test_claude_special_roles_skip_model_identity():
+    import claude_client
+
+    # nrol_operator and backstage use dedicated prompts, not the contract
+    assert claude_client._loom_append_system_prompt(
+        "Op", nrol_operator=True, cc_model="umans-glm-5.2"
+    ) == "Op"
+    assert claude_client._loom_append_system_prompt(
+        None, backstage_parent_id=5, cc_model="umans-glm-5.2"
+    ) is None
+

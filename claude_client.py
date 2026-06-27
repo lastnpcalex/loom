@@ -614,11 +614,29 @@ def _loom_append_system_prompt(
     backstage_parent_id: int | None = None,
     nrol_operator: bool = False,
     use_llama: bool = False,
+    use_umans: bool = False,
+    cc_model: str | None = None,
 ) -> str | None:
-    """Add the shared Loom contract only for ordinary Claude sessions."""
+    """Add the shared Loom contract only for ordinary Claude sessions.
+
+    Injects the operating-model identity so the agent can tailor behavior to
+    its backend (scoped reads on local models; caching active on API/Umans).
+    """
     if backstage_parent_id or nrol_operator:
         return append_system_prompt
     contract = load_loom_agent_prompt()
+    if cc_model:
+        provider = (
+            "a local llama-server" if use_llama
+            else ("Umans AI" if use_umans else "the Anthropic API")
+        )
+        contract = contract + (
+            "\n\n## Operating model\n"
+            f"You are `{cc_model}` via {provider}. Large raw input-token totals are "
+            "normal here: on API/Umans they are mostly cache reads, on the local "
+            "llama-server they are KV-reused but not reported as cached. Either way, "
+            "prefer scoped reads over re-dumping whole files into context."
+        )
     if use_llama:
         image_warning = (
             "\n\nNever use file-reading tools (like `Read`, `view_file`, or `read_text_file`) on binary image formats (e.g., `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.ico`). "
@@ -802,6 +820,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         backstage_parent_id=backstage_parent_id,
         nrol_operator=nrol_operator,
         use_llama=use_llama,
+        use_umans=use_umans,
+        cc_model=model,
     )
     if append_system_prompt:
         cc_args.extend(["--append-system-prompt", append_system_prompt])
