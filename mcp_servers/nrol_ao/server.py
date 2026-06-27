@@ -4631,6 +4631,36 @@ def source_domain_patterns(min_claims: int = 3) -> str:
         return _json({"error": str(exc)})
 
 
+def _file_review_parked_proposal(
+    pstore, slug: str, article: dict, decision: dict, ev_id: str,
+    debate_packet: dict, review: dict, proposals_filed: list,
+) -> None:
+    """File a FIRE/OBSERVE proposal from review_parked (shared by the
+    mechanical-only and cross-day-duplicate-checked paths). Mutates review
+    (stamps escalated_proposal_id) and appends to proposals_filed."""
+    action = decision.get("action", {}) or {}
+    art_rec = pstore.submit_article(article, submitted_by="review-parked")
+    review_delib = _deliberation_stamp_from_debate(decision, debate_packet)
+    prop = pstore.add_proposal(
+        article_id=art_rec["id"],
+        slug=slug,
+        action=action.get("kind", ""),
+        indicator_id=action.get("indicator_id", ""),
+        observed_value=action.get("value"),
+        rationale=(
+            f"re-adjudication of parked {ev_id}: "
+            + (decision.get("reason") or decision.get("claim") or "matcher re-decision")
+        )[:500],
+        evidence_id=ev_id,
+        deliberation=json.dumps(
+            {"deliberation": review_delib} if review_delib
+            else {"deliberationWaiver": "review_parked ran with deliberate=false"}
+        ),
+    )
+    review["escalated_proposal_id"] = prop["id"]
+    proposals_filed.append(prop["id"])
+
+
 @mcp.tool()
 def review_parked(
     slug: str,
@@ -4644,6 +4674,7 @@ def review_parked(
     max_tokens: int = 4096,
     timeout_sec: int = 900,
     deliberate: bool = True,
+    check_cross_day_duplicates: bool = False,
 ) -> str:
     """Re-adjudicate parked evidence against the CURRENT indicator schema.
 
@@ -4651,6 +4682,15 @@ def review_parked(
     re-decisions that remain PARK — these items already died once on a
     one-shot judgment; the debate is what makes re-review more than a
     second coin flip from the same model.
+
+    check_cross_day_duplicates=true (opt-in) runs the semantic cross-day
+    duplicate judge on each FIRE/OBSERVE candidate that survives the
+    mechanical suppression check, before filing. Catches the case the
+    mechanical check misses: a new article (different URL) reporting an
+    event already committed via different evidence refs. DUPLICATE_OF and
+    UNCERTAIN_DUPLICATE suppress the proposal (parked as a duplicate note
+    instead). Adds one llama call per surviving candidate — bounded but
+    not free. Default false so existing behavior/tests are unaffected.
 
     Kept-but-timestamped: items never leave the flagged queue here — every
     reviewed item gets a review record (engine.record_parked_reviews) so the
@@ -4817,27 +4857,46 @@ def review_parked(
                     )
                     if suppression:
                         review["suppressed_proposal"] = suppression
+                    elif check_cross_day_duplicates:
+                        # Semantic cross-day duplicate check: catches the case
+                        # the mechanical check misses (different URL, same
+                        # already-counted event). Suppresses on DUPLICATE_OF
+                        # or UNCERTAIN_DUPLICATE (bias toward duplicate — the
+                        # dangerous direction is duplicate movement).
+                        try:
+                            dup = _judge_cross_day_duplicate(
+                                slug, topic, articles[idx_int - 1], d,
+                                model=model, temperature=0.0,
+                                max_tokens=2048, timeout_sec=timeout_sec,
+                            )
+                            verdict = (dup.get("judgment") or {}).get("verdict", "")
+                            if verdict in {"DUPLICATE_OF", "UNCERTAIN_DUPLICATE"}:
+                                review["suppressed_proposal"] = (
+                                    f"cross_day_duplicate: {verdict} of "
+                                    f"{(dup.get('judgment') or {}).get('evidence_id', '?')} "
+                                    f"— {(dup.get('judgment') or {}).get('reason', '')[:200]}"
+                                )
+                            else:
+                                review["cross_day_duplicate_check"] = {"verdict": verdict}
+                                if not dry_run:
+                                    _file_review_parked_proposal(
+                                        pstore, slug, articles[idx_int - 1], d,
+                                        ev_id, debate_packet, review, proposals_filed,
+                                    )
+                        except Exception as exc:
+                            # The duplicate check must never block filing on
+                            # its own failure — fall through to file normally.
+                            review["cross_day_duplicate_error"] = str(exc)
+                            if not dry_run:
+                                _file_review_parked_proposal(
+                                    pstore, slug, articles[idx_int - 1], d,
+                                    ev_id, debate_packet, review, proposals_filed,
+                                )
                     elif not dry_run:
-                        art_rec = pstore.submit_article(articles[idx_int - 1], submitted_by="review-parked")
-                        review_delib = _deliberation_stamp_from_debate(d, debate_packet)
-                        prop = pstore.add_proposal(
-                            article_id=art_rec["id"],
-                            slug=slug,
-                            action=kind,
-                            indicator_id=action.get("indicator_id", ""),
-                            observed_value=action.get("value"),
-                            rationale=(
-                                f"re-adjudication of parked {ev_id}: "
-                                + (d.get("reason") or d.get("claim") or "matcher re-decision")
-                            )[:500],
-                            evidence_id=ev_id,
-                            deliberation=json.dumps(
-                                {"deliberation": review_delib} if review_delib
-                                else {"deliberationWaiver": "review_parked ran with deliberate=false"}
-                            ),
+                        _file_review_parked_proposal(
+                            pstore, slug, articles[idx_int - 1], d,
+                            ev_id, debate_packet, review, proposals_filed,
                         )
-                        review["escalated_proposal_id"] = prop["id"]
-                        proposals_filed.append(prop["id"])
                 except Exception as exc:
                     errors[ev_id] = str(exc)
                     review["proposal_error"] = str(exc)
@@ -5222,69 +5281,23 @@ def review_duplicate_candidate(
     try:
         engine = _import_from_repo("engine")
         topic = engine.load_topic(slug)
-        candidates = _candidate_duplicate_evidence(
-            topic, article, decision, window_days, max_candidates
+        out = _judge_cross_day_duplicate(
+            slug, topic, article, decision, window_days, max_candidates,
+            model, temperature, max_tokens, timeout_sec,
         )
-        if not candidates:
-            return _json({
-                "job_id": job_id,
-                "slug": slug,
-                "candidate_count": 0,
-                "judgment": {
-                    "verdict": "UNIQUE_EVENT",
-                    "evidence_id": "",
-                    "reason": "no plausible prior evidence candidates found",
-                },
-                "candidates": [],
-            })
-        prompt = {
-            "task": (
-                "Decide whether the candidate article/decision describes the "
-                "same underlying causal event or same measurement as one prior "
-                "evidence entry. Be conservative: if uncertain, return "
-                "UNCERTAIN_DUPLICATE, not UNIQUE_EVENT."
-            ),
-            "candidate_article": article,
-            "candidate_decision": decision,
-            "prior_evidence_candidates": candidates,
-            "output_format": (
-                "VERDICT: DUPLICATE_OF <evidence_id> | UNIQUE_EVENT | "
-                "UNCERTAIN_DUPLICATE\nREASON: <one concise reason>"
-            ),
-        }
-        store.record(
-            job_id, "running", task="review_duplicate_candidate", slug=slug,
-            summary={"candidate_count": len(candidates), "window_days": window_days},
-            prompt=_json(prompt),
-        )
-        response = llama_client.chat(
-            json.dumps(prompt, ensure_ascii=False, indent=2),
-            system_prompt=(
-                "You are an NROL-AO duplicate-event judge. Return only the "
-                "VERDICT and REASON lines in the requested format."
-            ),
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout_sec=timeout_sec,
-            disable_thinking=False,
-        )
-        judgment = _parse_duplicate_judgment(response.get("text", ""))
-        store.record(
-            job_id, "completed", task="review_duplicate_candidate", slug=slug,
-            model=response.get("model"),
-            summary={"verdict": judgment.get("verdict"),
-                     "evidence_id": judgment.get("evidence_id", "")},
-            response=response.get("text", ""),
-        )
-        return _json({
-            "job_id": job_id,
-            "slug": slug,
-            "judgment": judgment,
-            "candidates": candidates,
-            "model": response.get("model"),
-            "response": response.get("text", ""),
-        })
+        # Record the job lifecycle (the helper is pure; logging stays in the wrapper).
+        if "error" in out:
+            store.record(job_id, "failed", task="review_duplicate_candidate",
+                         slug=slug, error=out["error"])
+            return _json({"job_id": job_id, **out})
+        store.record(job_id, "running", task="review_duplicate_candidate", slug=slug,
+                     summary={"candidate_count": out.get("candidate_count", 0),
+                              "window_days": window_days})
+        store.record(job_id, "completed", task="review_duplicate_candidate", slug=slug,
+                     model=out.get("model"),
+                     summary={"verdict": out.get("judgment", {}).get("verdict"),
+                              "evidence_id": out.get("judgment", {}).get("evidence_id", "")})
+        return _json({"job_id": job_id, **out})
     except Exception as exc:
         try:
             store.record(job_id, "failed", task="review_duplicate_candidate",
@@ -5292,6 +5305,62 @@ def review_duplicate_candidate(
         except Exception:
             pass
         return _json({"job_id": job_id, "error": str(exc), "slug": slug})
+
+
+def _judge_cross_day_duplicate(
+    slug: str, topic: dict, article: dict, decision: dict,
+    window_days: int = 45, max_candidates: int = 12,
+    model: str = "", temperature: float = 0.0,
+    max_tokens: int = 2048, timeout_sec: int = 600,
+) -> dict:
+    """Core duplicate-event judgment (no job logging). Returns the judgment
+    dict + candidates, or {error}. Pure-ish: calls the local llama endpoint.
+
+    Used by both the review_duplicate_candidate MCP tool AND review_parked's
+    optional cross-day duplicate pre-check. Verdicts:
+    DUPLICATE_OF <evidence_id> | UNIQUE_EVENT | UNCERTAIN_DUPLICATE.
+    Bias uncertain toward duplicate (duplicate movement is the dangerous
+    direction)."""
+    candidates = _candidate_duplicate_evidence(
+        topic, article, decision, window_days, max_candidates
+    )
+    if not candidates:
+        return {
+            "slug": slug, "candidate_count": 0,
+            "judgment": {"verdict": "UNIQUE_EVENT", "evidence_id": "",
+                         "reason": "no plausible prior evidence candidates found"},
+            "candidates": [],
+        }
+    prompt = {
+        "task": (
+            "Decide whether the candidate article/decision describes the "
+            "same underlying causal event or same measurement as one prior "
+            "evidence entry. Be conservative: if uncertain, return "
+            "UNCERTAIN_DUPLICATE, not UNIQUE_EVENT."
+        ),
+        "candidate_article": article,
+        "candidate_decision": decision,
+        "prior_evidence_candidates": candidates,
+        "output_format": (
+            "VERDICT: DUPLICATE_OF <evidence_id> | UNIQUE_EVENT | "
+            "UNCERTAIN_DUPLICATE\nREASON: <one concise reason>"
+        ),
+    }
+    response = llama_client.chat(
+        json.dumps(prompt, ensure_ascii=False, indent=2),
+        system_prompt=(
+            "You are an NROL-AO duplicate-event judge. Return only the "
+            "VERDICT and REASON lines in the requested format."
+        ),
+        model=model, temperature=temperature, max_tokens=max_tokens,
+        timeout_sec=timeout_sec, disable_thinking=False,
+    )
+    judgment = _parse_duplicate_judgment(response.get("text", ""))
+    return {
+        "slug": slug, "candidate_count": len(candidates),
+        "judgment": judgment, "candidates": candidates,
+        "model": response.get("model"), "response": response.get("text", ""),
+    }
 
 
 @mcp.tool()

@@ -2446,6 +2446,72 @@ def test_review_parked_timestamps_without_clearing(nrol, topic_path, monkeypatch
     assert out["debt_after"]["fresh_count"] >= 2
 
 
+def test_review_parked_cross_day_duplicate_suppresses_proposal(nrol, topic_path, monkeypatch):
+    """check_cross_day_duplicates=true: a FIRE candidate that survives the
+    mechanical suppression check but is judged a cross-day duplicate (different
+    URL, same already-counted event) is SUPPRESSED — no proposal filed.
+    Catches the gap the mechanical check misses."""
+    _seed_parked(topic_path, n=1)
+    monkeypatch.setattr(nrol, "_fetch_article_excerpt",
+        lambda url, max_chars, **kw: "FULL TEXT: event A confirmed at threshold.")
+    # The semantic duplicate judge returns DUPLICATE_OF for the cross-day check.
+    monkeypatch.setattr(nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "VERDICT: DUPLICATE_OF ev_prior\nREASON: same launch, different outlet",
+                         "model": "test-llm", "host": "local", "finish_reason": "stop"})
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "FIRE", "indicator_id": "ind_binary_mild"},
+         "tag": "EVENT", "claim": "event A confirmed", "reason": "threshold met"},
+    ])
+    # Stub candidate-evidence so the judge has a prior to compare against.
+    # Accepts both call shapes: mechanical check passes window_days=30, limit=10;
+    # the cross-day judge passes window_days, max_candidates positionally.
+    monkeypatch.setattr(nrol, "_candidate_duplicate_evidence",
+        lambda topic, article, decision, window_days=45, max_candidates=12, limit=10, **kw: [{"evidence_id": "ev_prior", "score": 0.8, "reasons": ["same_event"]}])
+
+    out = json.loads(nrol.review_parked(
+        slug=SLUG, dry_run=False, check_cross_day_duplicates=True,
+    ))
+    assert "error" not in out, out
+    # No proposal filed — suppressed as a cross-day duplicate.
+    assert out["proposals_filed"] == []
+    # The review record carries the cross-day suppression reason.
+    rev = out["reviews"][0]
+    assert rev.get("suppressed_proposal", "").startswith("cross_day_duplicate")
+
+
+def test_review_parked_cross_day_unique_still_files(nrol, topic_path, monkeypatch):
+    """check_cross_day_duplicates=true with a UNIQUE_EVENT verdict: the
+    proposal is still filed (the check only suppresses on duplicate)."""
+    _seed_parked(topic_path, n=1)
+    # Reset the indicator to NOT_FIRED so the mechanical suppression check
+    # (same_url + already-FIRED) doesn't pre-suppress before the cross-day
+    # check runs — this test isolates the cross-day path, not the mechanical one.
+    topic = json.loads(topic_path.read_text(encoding="utf-8"))
+    for ind in topic["indicators"]["tiers"]["tier1_critical"]:
+        ind["status"] = "NOT_FIRED"; ind["n_firings"] = 0; ind["firedDate"] = None
+    topic_path.write_text(json.dumps(topic, indent=2), encoding="utf-8")
+    monkeypatch.setattr(nrol, "_fetch_article_excerpt",
+        lambda url, max_chars, **kw: "FULL TEXT: event A confirmed at threshold.")
+    monkeypatch.setattr(nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "VERDICT: UNIQUE_EVENT\nREASON: genuinely new event",
+                         "model": "test-llm", "host": "local", "finish_reason": "stop"})
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "FIRE", "indicator_id": "ind_binary_mild"},
+         "tag": "EVENT", "claim": "event A confirmed", "reason": "threshold met"},
+    ])
+    monkeypatch.setattr(nrol, "_candidate_duplicate_evidence",
+        lambda topic, article, decision, window_days=45, max_candidates=12, limit=10, **kw: [{"evidence_id": "ev_prior", "score": 0.5, "reasons": ["same_event"]}])
+
+    out = json.loads(nrol.review_parked(
+        slug=SLUG, dry_run=False, check_cross_day_duplicates=True,
+    ))
+    assert "error" not in out, out
+    # UNIQUE_EVENT -> proposal filed normally.
+    assert len(out["proposals_filed"]) == 1
+
+
 def test_schema_change_makes_reviewed_items_due_again(nrol, topic_path, monkeypatch):
     """A PARK is conditioned on the schema: changing an indicator makes
     previously reviewed items due again via the fingerprint."""
