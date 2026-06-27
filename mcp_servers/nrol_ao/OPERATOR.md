@@ -352,6 +352,12 @@ When the human asks to "run the evidence loop", "catch the topic up", or
      (status, `n_firings`, `lastObservedValue`) and say what a commit would
      actually do: fresh firing at full LR, repeat firing at decay, sustained
      observation no-op, or observation deriving a new LR.
+   - **Framing trap:** "the indicator is already FIRED" is a misread. `FIRED`
+     is a status with a count (`n_firings`), not a terminal state. A NEW
+     underlying event can re-fire (at decay); a NEW ARTICLE about the same
+     already-counted event cannot. Say "fired N times — re-fireable on a new
+     event" not "already fired," and make the new-event vs new-article
+     distinction explicit before recommending commit or withdraw.
    - State the expected posterior direction and rough magnitude.
    - Cite the attached jury verdict / duplicate grouping when present. If a
      proposal carries a deliberation waiver, call it out explicitly.
@@ -378,6 +384,17 @@ When the human asks to "run the evidence loop", "catch the topic up", or
    `acknowledge_parked_reviews(..., reason="operator already reviewed/withdrew
    corresponding proposals; retain as non-moving archived evidence")` to stamp
    the due review without re-litigating all archived evidence.
+   Pass `check_cross_day_duplicates=true` to run the semantic cross-day
+   duplicate judge on each FIRE/OBSERVE candidate that survives the mechanical
+   suppression check — this catches the case the mechanical check misses (a
+   new article with a different URL reporting an event already committed via
+   different evidence refs). `DUPLICATE_OF` and `UNCERTAIN_DUPLICATE`
+   suppress the proposal (parked as a duplicate note instead of filed).
+   Adds one llama call per surviving candidate — bounded but not free. It is
+   **off by default**; pass it explicitly when the parked queue is
+   regenerating proposals for events you suspect were already counted under
+   different article refs (the symptom is "review_parked files proposals that
+   look like duplicates of already-committed evidence").
 6. **Report non-movement honestly**: when a transition returns `parked: true`,
    read and report `parked_reason`. "Sustained observation: unchanged from
    last firing" is the engine refusing to double-count a persisting fact. That
