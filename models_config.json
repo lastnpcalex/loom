@@ -9,8 +9,7 @@
     "flash_attn": true,
     "mlock": false,
     "mmproj": "mmproj-27B-BF16.gguf",
-    "extra_args": "",
-    "server_model_id": "Qwen3.6-27B-NVFP4.gguf"
+    "extra_args": ""
   },
   "mmproj-BF16.gguf": {
     "ctx_size": 150000,
