@@ -4334,6 +4334,57 @@ def future_cast(
 
 
 @mcp.tool()
+def list_future_casts(slug: str = "", tag: str = "", limit: int = 25) -> str:
+    """List saved future casts (brief view), newest first. Optional slug/tag
+    filters. Saved casts live in future_casts/future_casts.jsonl, outside topic
+    state. Read-only."""
+    try:
+        from . import future_cast as fc
+        root = _ensure_repo()
+        return _json(fc.list_future_casts(root, slug=slug, tag=tag, limit=limit))
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def get_future_cast(cast_id: str) -> str:
+    """Read one saved future cast by id (full packet). Read-only."""
+    try:
+        from . import future_cast as fc
+        root = _ensure_repo()
+        return _json(fc.get_future_cast(root, cast_id=cast_id))
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def save_future_cast(cast_id: str, tags: list[str] | None = None, note: str = "") -> str:
+    """Re-tag an already-saved future cast, or attach a note. To save a cast's
+    full packet, call future_cast(..., save=true) at cast time — a transient
+    cast's packet is not persisted. Saved casts are never evidence."""
+    try:
+        from . import future_cast as fc
+        root = _ensure_repo()
+        return _json(fc.save_future_cast(root, cast_id=cast_id, tags=tags or [], note=note))
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def withdraw_future_cast(cast_id: str, reason: str = "") -> str:
+    """Remove a saved future cast from the store by id. Edits only the
+    future_casts.jsonl store — never rolls back topic evidence/proposals/
+    posteriors (a cast never moved any). A cast promoted_to_real_action is
+    refused until the real proposal is withdrawn first."""
+    try:
+        from . import future_cast as fc
+        root = _ensure_repo()
+        return _json(fc.withdraw_future_cast(root, cast_id=cast_id, reason=reason))
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
 def resolve_topic(
     slug: str,
     resolved_hypothesis: str,

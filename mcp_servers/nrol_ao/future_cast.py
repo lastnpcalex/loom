@@ -325,6 +325,126 @@ def _save_future_cast(repo_root: Path, packet: dict, tags: list[str]) -> str:
     return record["cast_id"]
 
 
+def _store_path(repo_root: Path) -> Path:
+    return repo_root / _FUTURE_CAST_DIR / "future_casts.jsonl"
+
+
+def _load_store(repo_root: Path) -> list[dict]:
+    """Read the future_casts.jsonl store. Missing file -> empty list."""
+    path = _store_path(repo_root)
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def list_future_casts(repo_root: Path, slug: str = "", tag: str = "",
+                      limit: int = 25) -> dict:
+    """List saved future casts, newest first. Optional slug/tag filters.
+    Returns a brief view (no packet) to keep payloads bounded. Read-only."""
+    rows = _load_store(repo_root)
+    out: list[dict] = []
+    for r in rows:
+        if slug and r.get("slug") != slug:
+            continue
+        if tag and tag not in (r.get("tags") or []):
+            continue
+        out.append({
+            "cast_id": r.get("cast_id"),
+            "slug": r.get("slug"),
+            "created_at": r.get("created_at"),
+            "scenario_summary": r.get("scenario_summary"),
+            "tags": r.get("tags") or [],
+            "promoted_to_real_action": r.get("promoted_to_real_action", False),
+            "promoted_proposal_id": r.get("promoted_proposal_id"),
+        })
+    out.reverse()  # newest first
+    out = out[: max(1, min(int(limit), 200))]
+    return {"count": len(out), "casts": out}
+
+
+def get_future_cast(repo_root: Path, cast_id: str) -> dict:
+    """Read one saved future cast by id (full packet). Read-only."""
+    for r in _load_store(repo_root):
+        if r.get("cast_id") == cast_id:
+            return r
+    return {"error": f"cast_id {cast_id!r} not found"}
+
+
+def save_future_cast(repo_root: Path, cast_id: str, tags: list[str] | None = None,
+                    note: str = "") -> dict:
+    """Promote a transient cast to a saved one (or re-tag an already-saved cast).
+
+    A transient cast (future_cast(save=false)) carries a cast_id but was never
+    written. This writes a record for it if absent, or appends tags to the
+    existing record. NOTE: the transient cast's packet is not persisted by the
+    save=false path, so this can only re-tag an ALREADY-saved cast (the cast_id
+    of a transient cast is not findable in the store). To save a cast's packet,
+    call future_cast(..., save=true) at cast time. Saved casts are never
+    evidence and never satisfy evidence requirements."""
+    rows = _load_store(repo_root)
+    path = _store_path(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for r in rows:
+        if r.get("cast_id") == cast_id:
+            if tags:
+                existing = r.get("tags") or []
+                for t in tags:
+                    if t not in existing:
+                        existing.append(t)
+                r["tags"] = existing
+            if note:
+                r["note"] = note
+            _rewrite_store(repo_root, rows)
+            return r
+    return {"error": f"cast_id {cast_id!r} not found in the saved store. "
+                     "To save a cast's packet, call future_cast(save=true) at cast time."}
+
+
+def withdraw_future_cast(repo_root: Path, cast_id: str, reason: str = "") -> dict:
+    """Remove a saved future cast from the store by id.
+
+    This edits only the future_casts.jsonl store. It does not roll back any
+    topic evidence, proposals, or posteriors (a cast never moved any). A
+    withdrawn cast that was promoted_to_real_action is refused — withdraw the
+    real proposal first, then withdraw the cast."""
+    rows = _load_store(repo_root)
+    target = None
+    for r in rows:
+        if r.get("cast_id") == cast_id:
+            target = r
+            break
+    if target is None:
+        return {"error": f"cast_id {cast_id!r} not found"}
+    if target.get("promoted_to_real_action"):
+        return {"error": "cast was promoted to a real action; withdraw the "
+                         "proposal first, then withdraw the cast.",
+                "promoted_proposal_id": target.get("promoted_proposal_id")}
+    kept = [r for r in rows if r.get("cast_id") != cast_id]
+    _rewrite_store(repo_root, kept)
+    return {"withdrawn": cast_id, "reason": reason,
+            "remaining_casts": len(kept)}
+
+
+def _rewrite_store(repo_root: Path, rows: list[dict]) -> None:
+    """Rewrite the JSONL store from a row list (for tag/withdraw edits)."""
+    path = _store_path(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+
 def run_future_cast(
     repo_root: Path, slug: str, scenario: str, target: str, transition: str,
     observed_value: float | None, asof: str, assumptions: list[str],

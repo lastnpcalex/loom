@@ -1781,6 +1781,95 @@ def test_future_cast_red_team_returns_critique(nrol, topic_path, monkeypatch):
     assert "named source" in rt["missing_evidence"]
 
 
+def test_future_cast_store_lifecycle(nrol, topic_path, nrol_repo, monkeypatch):
+    """future_cast(save=true) -> list_future_casts -> get_future_cast ->
+    save_future_cast (re-tag) -> withdraw_future_cast. Round-trips through
+    the JSONL store; topic state never touched."""
+    _stub_red_team_approve(nrol, monkeypatch)
+    before_disk = topic_path.read_text(encoding="utf-8")
+    # nrol_repo is session-scoped: start from a clean store so the
+    # remaining_casts assertion is about THIS test's cast, not leftovers.
+    store = nrol_repo / "future_casts" / "future_casts.jsonl"
+    if store.exists():
+        store.unlink()
+
+    # 1. Save a cast.
+    saved = json.loads(nrol.future_cast(
+        slug=SLUG, scenario="store-lifecycle hypothetical",
+        target="ind_binary_mild", proposed_transition="FIRE", save=True,
+    ))
+    cid = saved["saved_cast_id"]
+    assert cid.startswith("fc_")
+    assert topic_path.read_text(encoding="utf-8") == before_disk  # topic untouched
+
+    # 2. List it.
+    listed = json.loads(nrol.list_future_casts(slug=SLUG))
+    assert listed["count"] >= 1
+    assert any(c["cast_id"] == cid for c in listed["casts"])
+    brief = next(c for c in listed["casts"] if c["cast_id"] == cid)
+    assert "scenario_summary" in brief and "packet" not in brief  # brief view
+
+    # 3. Get the full packet.
+    full = json.loads(nrol.get_future_cast(cast_id=cid))
+    assert full["cast_id"] == cid
+    assert "packet" in full  # full record carries the packet
+    assert full["promoted_to_real_action"] is False
+
+    # 4. Re-tag it.
+    retag = json.loads(nrol.save_future_cast(cast_id=cid, tags=["DIPLO", "interesting"]))
+    assert "error" not in retag, retag
+    assert "DIPLO" in retag["tags"]
+    full2 = json.loads(nrol.get_future_cast(cast_id=cid))
+    assert "DIPLO" in full2["tags"]
+
+    # 5. Withdraw it.
+    withdrawn = json.loads(nrol.withdraw_future_cast(cast_id=cid, reason="test cleanup"))
+    assert withdrawn["withdrawn"] == cid
+    assert withdrawn["remaining_casts"] == 0
+    gone = json.loads(nrol.get_future_cast(cast_id=cid))
+    assert "error" in gone
+    # Topic still untouched throughout.
+    assert topic_path.read_text(encoding="utf-8") == before_disk
+
+
+def test_save_future_cast_refuses_unknown_cast_id(nrol, topic_path):
+    """save_future_cast on a transient (unsaved) cast_id returns an error
+    explaining how to actually save a packet."""
+    out = json.loads(nrol.save_future_cast(cast_id="fc_transient_nope", tags=["x"]))
+    assert "error" in out
+
+
+def test_withdraw_future_cast_refuses_promoted(nrol, topic_path, nrol_repo, monkeypatch):
+    """withdraw_future_cast refuses a cast promoted_to_real_action until the
+    real proposal is withdrawn first."""
+    _stub_red_team_approve(nrol, monkeypatch)
+    saved = json.loads(nrol.future_cast(
+        slug=SLUG, scenario="promoted cast", target="ind_binary_mild",
+        proposed_transition="FIRE", save=True,
+    ))
+    cid = saved["saved_cast_id"]
+    # Simulate promotion by editing the store directly (the MCP has no promote
+    # path — promotion is a future workflow that stamps these fields).
+    store = nrol_repo / "future_casts" / "future_casts.jsonl"
+    rows = [json.loads(l) for l in store.read_text(encoding="utf-8").splitlines() if l.strip()]
+    for r in rows:
+        if r["cast_id"] == cid:
+            r["promoted_to_real_action"] = True
+            r["promoted_proposal_id"] = "prop_fake"
+    store.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    out = json.loads(nrol.withdraw_future_cast(cast_id=cid))
+    assert "error" in out and "promoted" in out["error"].lower()
+    assert out["promoted_proposal_id"] == "prop_fake"
+    # Still present (not withdrawn).
+    assert "error" not in json.loads(nrol.get_future_cast(cast_id=cid))
+    # Clean up: un-promote and withdraw so the session-scoped store isn't
+    # polluted for later tests.
+    rows = [json.loads(l) for l in store.read_text(encoding="utf-8").splitlines() if l.strip()]
+    rows = [r for r in rows if r["cast_id"] != cid]
+    store.write_text("\n".join(json.dumps(r) for r in rows) + ("\n" if rows else ""),
+                     encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Resolution: two-lane Brier (shadow vs committed) + after-action review
 # ---------------------------------------------------------------------------
