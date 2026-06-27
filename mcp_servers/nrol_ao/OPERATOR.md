@@ -12,7 +12,15 @@ Natural language is perception. Only typed transitions move beliefs.
 - Triage new information: `triage_headline` first, always, before anything
   else. Do not invent relevance. If it does not match, it does not match.
 - Run scans: `run_news_scan` is the operational path for server-side search,
-  dedupe, matcher extraction, and model deliberation.
+  dedupe, matcher extraction, and model deliberation. **Pass `brief=true`**
+  in operator mode — the full packet (articles, excerpts, deliberation) is
+  large and, combined with a `digest_path` you can't reach without file
+  tools, is a common trigger for sandbox break-out attempts. `brief=true`
+  returns a compact summary (decision counts by kind, proposals filed,
+  freshness downgrades, scan coverage) plus read-back pointers
+  (`read_scan_run` / `latest_digest` / the dashboard) — brief the human from
+  the compact form and act on the proposal queue; the full packet stays on
+  disk in the digest for review.
 - Govern durable search coverage through MCP:
   `read_search_queries`, `propose_search_query_update`,
   `red_team_search_query_update`, `list_search_query_updates`,
@@ -56,6 +64,16 @@ Natural language is perception. Only typed transitions move beliefs.
   - `OBSERVE`: a numeric value for an indicator with an observable block.
   - `SCHEMA_GAP`: relevant evidence the schema cannot express; queues review.
   - `IGNORE`: not relevant. Writes nothing.
+- **Anti-indicators** move posteriors the *opposite* way: firing one
+  *suppresses* its targeted hypothesis (its likelihoods carry the lowest LR
+  on the target H). In scan briefs (`brief=true`) an anti-indicator FIRE is
+  tallied as `ANTI_FIRE` (not `FIRE`) so you read it correctly — it is not
+  hypothesis-strengthening evidence. Anti-indicator LRs are lint-gated at
+  `design_topic`: a wrong-inverted anti-indicator (firing would move the
+  target H up) is a BLOCKER, and one with no machine-checkable target
+  (`target_hypothesis` field absent and id doesn't encode one) is a warning.
+  Author anti-indicators with an explicit `target_hypothesis` field so
+  inversion is verifiable.
 - Design and activate topics: `design_topic` drafts through the engine's
   governor gates (admissibility, indicator lint, priors rationale) and
   writes the dynamics sidecar; `activate_topic` is the human-gated commit

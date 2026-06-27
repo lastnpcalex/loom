@@ -2997,6 +2997,7 @@ def run_news_scan(
     fetch_full_articles: bool = True,
     excerpt_chars: int = 2800,
     deliberate: bool = True,
+    brief: bool = False,
 ) -> str:
     """Run the full NROL-AO news scan on the MCP/server side.
 
@@ -3009,6 +3010,15 @@ def run_news_scan(
     over the strict matcher's PARKs. Jury MOVE_TO verdicts supersede the
     PARK and flow into the same proposal/commit gates as direct matcher
     decisions — the debate widens recall, never authority.
+
+    brief=true returns a COMPACT summary (counts, decisions by kind,
+    proposals filed, freshness downgrades, scan coverage) — enough for the
+    operator to brief the human and act on the proposal queue without a huge
+    in-context blob. The full packet (articles, excerpts, deliberation) is
+    still written to the digest on disk; read it with read_scan_run /
+    latest_digest. brief=false (default) returns the full operator packet.
+    In operator mode (file tools stripped) pass brief=true — the full packet
+    plus a digest_path is a common trigger for attempted sandbox break-outs.
 
     This is the one-call operational path: select stale topics, perform
     server-side web search, dedupe articles, deliberate with the local
@@ -3400,6 +3410,8 @@ def run_news_scan(
                 ],
             },
         )
+        if brief:
+            return _json(_brief_scan_packet(operator_packet, job_id))
         return _json(operator_packet)
     except Exception as exc:
         store.record(
@@ -3411,6 +3423,93 @@ def run_news_scan(
             error=str(exc),
         )
         return _json({"job_id": job_id, "error": str(exc), "committed": False})
+
+
+def _brief_scan_packet(packet: dict, job_id: str) -> dict:
+    """Compact scan summary for operator mode.
+
+    The full operator packet (articles, excerpts, deliberation, matcher_output)
+    is large and — combined with a digest_path the operator can't reach without
+    file tools — a common trigger for attempted sandbox break-outs. This brief
+    carries everything the operator needs to brief the human and act on the
+    proposal queue: per-topic decision counts by kind, proposals filed,
+    freshness downgrades, scan coverage, and read-back pointers. The full
+    packet stays on disk in the digest; read it with read_scan_run /
+    latest_digest (the dashboard surfaces it too).
+    """
+    topics_brief = []
+    for tp in packet.get("topics", []):
+        decisions = tp.get("decisions") or []
+        # Resolve this topic's anti-indicator ids so we can surface anti-indicator
+        # matches distinctly (ANTI_FIRE / ANTI_OBSERVE) instead of collapsing them
+        # into FIRE/OBSERVE — they move posteriors the *opposite* way and the
+        # operator must read them differently. Lazy + best-effort: if the topic
+        # can't be loaded, fall back to plain FIRE/OBSERVE.
+        anti_ids: set[str] = set()
+        slug = tp.get("slug") or ""
+        if slug:
+            try:
+                _eng = _import_from_repo("engine")
+                _sch = _import_from_repo("framework.indicator_schema")
+                anti_ids = {a.get("id") for a in _sch.anti_indicators_for_topic(_eng.load_topic(slug)) if a.get("id")}
+            except Exception:
+                pass
+        # Tally decision actions by kind. A FIRE/OBSERVE whose indicator_id is an
+        # anti-indicator is tallied as ANTI_FIRE / ANTI_OBSERVE for visibility.
+        by_kind: dict[str, int] = {}
+        proposal_kinds: list[str] = []
+        for d in decisions:
+            act = (d.get("action") or {})
+            kind = act.get("kind", "?")
+            ind_id = act.get("indicator_id") or ""
+            if kind in {"FIRE", "OBSERVE"} and ind_id in anti_ids:
+                kind = f"ANTI_{kind}"
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+            # Proposals filed under safe policy are posterior-movers awaiting commit.
+        commit_policy = tp.get("commit_policy") or {}
+        auto = (commit_policy.get("auto_committed") if isinstance(commit_policy, dict) else {}) or {}
+        proposals_filed = commit_policy.get("proposals_filed") if isinstance(commit_policy, dict) else None
+        safe_audit = commit_policy.get("safe_policy_audit") if isinstance(commit_policy, dict) else {}
+        downgrades = (safe_audit.get("freshness_downgrades") if isinstance(safe_audit, dict) else []) or []
+        topics_brief.append({
+            "slug": tp.get("slug"),
+            "title": tp.get("title"),
+            "scan_status": tp.get("scan_status"),
+            "time_window": tp.get("time_window"),
+            "raw_article_count": tp.get("raw_article_count"),
+            "decision_count": len(decisions),
+            "decisions_by_kind": by_kind,
+            "deliberation": (tp.get("deliberation") or {}).get("candidates")
+                and {k: (tp["deliberation"].get(k)) for k in ("candidates", "parks", "argue_moves", "rescued")}
+                or None,
+            "freshness_downgrades": len(downgrades),
+            "freshness_downgrade_samples": [
+                {"idx": r.get("idx"), "kind": (r.get("original_action") or {}).get("kind"),
+                 "claim": (r.get("claim") or "")[:120]} for r in downgrades[:3]
+            ],
+            "committed": tp.get("committed"),
+            "applied": tp.get("applied"),
+            "scan_record": tp.get("scan_record"),
+            "search_errors": tp.get("search_errors"),
+            "proposals_filed_count": len(proposals_filed) if isinstance(proposals_filed, list) else 0,
+        })
+    return {
+        "job_id": job_id,
+        "brief": True,
+        "committed": packet.get("committed"),
+        "dry_run": packet.get("dry_run"),
+        "commit_policy": packet.get("commit_policy"),
+        "topics_scanned": packet.get("topics_scanned"),
+        "article_count": packet.get("article_count"),
+        "decision_count": packet.get("decision_count"),
+        "topics": topics_brief,
+        "digest_available": ("digest_path" in packet) or ("digest_error" not in packet and not packet.get("dry_run")),
+        "digest_error": packet.get("digest_error"),
+        "read_back": "Full packet (articles, excerpts, deliberation) is in the on-disk digest. "
+                     "Read it with read_scan_run (list_scan_runs for ids) or latest_digest; "
+                     "the dashboard surfaces it at /mcp-activity. Do NOT attempt to write/read "
+                     "the digest file directly in operator mode.",
+    }
 
 
 def _write_digest(packet: dict) -> str:
@@ -4133,8 +4232,11 @@ def design_topic(
             flat = []
             for tier_list in (topic.get("indicators", {}).get("tiers", {}) or {}).values():
                 flat.extend(i for i in (tier_list or []) if isinstance(i, dict))
-            flat.extend(i for i in (topic.get("indicators", {}).get("anti_indicators", []) or [])
-                        if isinstance(i, dict))
+            for i in (topic.get("indicators", {}).get("anti_indicators", []) or []):
+                if isinstance(i, dict):
+                    ai = dict(i)
+                    ai["_tier"] = "anti_indicators"  # so the inversion lint can identify it
+                    flat.append(ai)
             lint_report = lint_mod.propose_indicators_lint(topic, flat)
         except Exception as exc:
             lint_report = {"error": f"lint unavailable: {exc}"}

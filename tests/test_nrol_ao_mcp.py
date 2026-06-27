@@ -733,7 +733,7 @@ def test_safe_policy_scan_parks_and_files_proposals(nrol, topic_path, monkeypatc
     before = _disk_posteriors(topic_path)
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
-        fetch_full_articles=False,
+        fetch_full_articles=False, brief=False,
     ))
     assert "error" not in out, out
     assert _disk_posteriors(topic_path) == before  # nothing moved beliefs
@@ -754,6 +754,148 @@ def test_safe_policy_scan_parks_and_files_proposals(nrol, topic_path, monkeypatc
     digest = Path(out["digest_path"]).read_text(encoding="utf-8")
     assert SLUG in digest
     assert "proposals filed for review: 1" in digest
+
+
+def test_run_news_scan_brief_default_is_compact(nrol, topic_path, monkeypatch):
+    """brief=true (default) returns a compact summary, NOT the full packet.
+    No articles/excerpts/matcher_output/digest_path in the brief — those are
+    the huge in-context blob that triggers sandbox break-out attempts. The
+    brief carries decision counts + read-back pointers instead."""
+    suffix = uuid.uuid4().hex[:6]
+    articles = [
+        {"headline": f"threshold print {suffix}", "url": f"https://example.test/brief/{suffix}",
+         "source": "test-wire", "date": "2026-06-09", "relevance": "event A confirmed"},
+    ]
+    monkeypatch.setattr(nrol, "_search_web_articles",
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [])
+    monkeypatch.setattr(nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local"})
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "FIRE", "indicator_id": "ind_binary_mild"},
+         "tag": "EVENT", "claim": "event A confirmed", "reason": "threshold met"},
+    ])
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
+        fetch_full_articles=False, brief=True,
+    ))
+    assert "error" not in out, out
+    assert out.get("brief") is True
+    # Compact: none of the heavy payload keys present.
+    tp = out["topics"][0]
+    assert "articles" not in tp
+    assert "excerpts" not in tp
+    assert "matcher_output" not in tp
+    assert "decisions" not in tp  # only decisions_by_kind count
+    # Decision tally present.
+    assert tp["decisions_by_kind"].get("FIRE") == 1
+    # No digest_path dangled (operator can't reach it); read-back guidance instead.
+    assert "digest_path" not in out
+    assert out.get("digest_available") is True
+    assert "read_scan_run" in out.get("read_back", "")
+
+    # brief=False returns the full packet (heavy payload present).
+    full = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=True, commit_policy="safe",
+        fetch_full_articles=False, brief=False,
+    ))
+    assert "brief" not in full
+    assert "articles" in full["topics"][0] or "decisions" in full["topics"][0]
+
+
+def _seed_anti_indicators(topic_path):
+    """Add a correctly-inverted + a target-less anti-indicator to the fixture topic."""
+    topic = json.loads(topic_path.read_text(encoding="utf-8"))
+    topic["indicators"]["anti_indicators"] = [
+        {  # correctly inverted: targets H1, H1 has lowest LR
+            "id": "anti_h1_test_blockade",
+            "desc": "test anti-indicator targeting H1",
+            "status": "NOT_FIRED", "firedDate": None, "note": None,
+            "posteriorEffect": "H1 -10pp; H4 +20pp.",
+            "likelihoods": {"H1": 0.08, "H2": 0.45, "H3": 0.55, "H4": 0.92},
+            "lr_decay": 1.0, "n_firings": 0, "resolution_class": False,
+        },
+        {  # no machine-checkable target (id doesn't encode one, no field)
+            "id": "anti_iran_formal_decree",
+            "desc": "test anti-indicator with no encoded target",
+            "status": "NOT_FIRED", "firedDate": None, "note": None,
+            "posteriorEffect": "H1 -10pp.",
+            "likelihoods": {"H1": 0.08, "H2": 0.18, "H3": 0.45, "H4": 0.92},
+            "lr_decay": 1.0, "n_firings": 0, "resolution_class": False,
+        },
+    ]
+    topic_path.write_text(json.dumps(topic, indent=2), encoding="utf-8")
+
+
+def test_anti_indicator_inversion_lint(nrol, topic_path):
+    """The anti-indicator LR-inversion lint: blocks a wrong-inverted anti-indicator
+    (firing would move the target H UP), warns on one with no machine-checkable
+    target, and passes a correctly-inverted one."""
+    _seed_anti_indicators(topic_path)
+    lint_mod = nrol._import_from_repo("framework.lint_indicators")
+    engine = nrol._import_from_repo("engine")
+    topic = engine.load_topic(SLUG)
+    flat = []
+    for tier_list in (topic.get("indicators", {}).get("tiers", {}) or {}).values():
+        for i in (tier_list or []):
+            if isinstance(i, dict):
+                flat.append(i)
+    for i in (topic.get("indicators", {}).get("anti_indicators", []) or []):
+        if isinstance(i, dict):
+            ai = dict(i); ai["_tier"] = "anti_indicators"; flat.append(ai)
+    report = lint_mod.propose_indicators_lint(topic, flat)
+    all_issues = (report.get("warnings") or []) + (report.get("blockers") or [])
+
+    # The correctly-inverted anti_h1_test_blockade (H1 lowest) -> no issue raised.
+    assert not any(c.get("indicator") == "anti_h1_test_blockade" for c in all_issues)
+    # The no-target anti_iran_formal_decree -> warning (can't verify inversion).
+    no_tgt = [c for c in (report.get("warnings") or []) if c.get("check") == "anti_indicator_no_target"]
+    assert any(c.get("indicator") == "anti_iran_formal_decree" for c in no_tgt)
+
+    # Now break the correctly-inverted one: flip LRs so H1 is HIGHEST (wrong direction).
+    topic2 = engine.load_topic(SLUG)
+    topic2["indicators"]["anti_indicators"][0]["likelihoods"] = {"H1": 0.92, "H2": 0.45, "H3": 0.55, "H4": 0.08}
+    engine.save_topic(topic2)
+    flat2 = []
+    for tier_list in (topic2.get("indicators", {}).get("tiers", {}) or {}).values():
+        for i in (tier_list or []):
+            if isinstance(i, dict): flat2.append(i)
+    for i in (topic2.get("indicators", {}).get("anti_indicators", []) or []):
+        if isinstance(i, dict):
+            ai = dict(i); ai["_tier"] = "anti_indicators"; flat2.append(ai)
+    report2 = lint_mod.propose_indicators_lint(topic2, flat2)
+    blockers = [c for c in (report2.get("blockers") or []) if c.get("check") == "anti_indicator_wrong_inversion"]
+    assert any(b.get("indicator") == "anti_h1_test_blockade" for b in blockers)
+    assert report2["passed"] is False
+
+
+def test_run_news_scan_brief_tallies_anti_fire(nrol, topic_path, monkeypatch):
+    """brief tallies an anti-indicator FIRE as ANTI_FIRE (distinct visibility),
+    not collapsed into FIRE. Anti-indicators move posteriors the opposite way;
+    the operator must read them differently."""
+    _seed_anti_indicators(topic_path)
+    suffix = uuid.uuid4().hex[:6]
+    articles = [
+        {"headline": f"blockade decree {suffix}", "url": f"https://example.test/anti/{suffix}",
+         "source": "test-wire", "date": "2026-06-09", "relevance": "formal blockade"},
+    ]
+    monkeypatch.setattr(nrol, "_search_web_articles",
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [])
+    monkeypatch.setattr(nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local"})
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "FIRE", "indicator_id": "anti_h1_test_blockade"},
+         "tag": "EVENT", "claim": "formal blockade", "reason": "decree issued"},
+    ])
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
+        fetch_full_articles=False, brief=True,
+    ))
+    tp = out["topics"][0]
+    assert tp["decisions_by_kind"].get("ANTI_FIRE") == 1
+    assert "FIRE" not in tp["decisions_by_kind"]  # not collapsed into plain FIRE
 
 
 def test_safe_policy_commit_true_still_files_posterior_movers(nrol, topic_path, monkeypatch):
