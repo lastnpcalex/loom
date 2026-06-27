@@ -384,6 +384,18 @@ When the human asks to "run the evidence loop", "catch the topic up", or
    `acknowledge_parked_reviews(..., reason="operator already reviewed/withdrew
    corresponding proposals; retain as non-moving archived evidence")` to stamp
    the due review without re-litigating all archived evidence.
+   **Draining the queue:** `review_parked` can regenerate proposals for
+   events you've already counted (the symptom: it keeps filing proposals
+   that look like duplicates of committed evidence). When you've confirmed a
+   batch is already-counted / non-actionable, do NOT keep re-running
+   `review_parked` hoping the queue empties — it won't. Resolve the
+   specific proposals (commit one, withdraw the rest as duplicates), then
+   `acknowledge_parked_reviews` the remaining flagged evidence with a
+   reason like "already counted via ev_N / non-actionable corroboration;
+   retained as archived non-moving evidence." That stamps the due review,
+   drops `parkedReviewDebt.dueCount`, and stops the queue regenerating.
+   `flaggedForIndicatorReview` / `parkedTotal` is the archive size (it
+   stays); `dueCount` is the work. Drain `dueCount`, not the archive.
    Pass `check_cross_day_duplicates=true` to run the semantic cross-day
    duplicate judge on each FIRE/OBSERVE candidate that survives the mechanical
    suppression check — this catches the case the mechanical check misses (a
