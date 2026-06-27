@@ -177,3 +177,7 @@ pytest-tmp-*/
 
 # Generated workspaces
 workspaces/
+
+# Runtime-generated / per-machine artifacts (never track)
+.mcp.json
+GEMINI.md
