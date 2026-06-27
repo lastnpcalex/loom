@@ -50,7 +50,6 @@ A Shadow Loom is a self-hosted web interface for branching AI conversations acro
 `gemini_client.py` — Antigravity (agy) CLI subprocess wrapper; plain text mode, log error scanning
 `hermes_client.py` — Hermes Agent ACP subprocess wrapper; stdio JSON-RPC over `hermes acp`
 `llama_client.py` — llama-server client; OpenAI-compatible /v1/chat/completions, vision, model resolution
-`umans_client.py` — Umans AI client (remote, Anthropic/OpenAI-compatible endpoint); `umans-*` models routed through `claude_client.run_claude` with `use_umans=True`
 `ollama_client.py` — Staged for deletion (`D`); legacy Ollama adapter; **do not re-enable**
 `vllm_client.py` — Staged for deletion (`D`); legacy vLLM adapter; **do not re-enable**
 

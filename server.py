@@ -5023,7 +5023,9 @@ async def _handle_claude_generation(
                 if not use_llama or not image_files:
                     print(f"[DESCRIBE] Skipping: use_llama={use_llama}, image_files={len(image_files)}")
                 if (use_llama or use_umans) and image_files:
-                    # Use umans_client for umans models, llama_client for local models
+                    # Image describe runs through describe_image() (llama_client
+                    # under the hood) for both local and umans models; the model
+                    # name is selected here, the transport is shared.
                     _describe_model = (config.vision_model or config.llama_model) if use_llama else (config.umans_model or "umans-coder")
                     print(f"[DESCRIBE] Running describe for {len(image_files)} image(s), model={_describe_model}")
                     await _ws_send(conv_id, {
