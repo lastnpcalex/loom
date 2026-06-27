@@ -870,6 +870,39 @@ def test_anti_indicator_inversion_lint(nrol, topic_path):
     assert report2["passed"] is False
 
 
+def test_anti_indicator_inversion_lint_multi_target(nrol, topic_path):
+    """Multi-target anti-indicator (target_hypothesis is a list): every target
+    H must be at or below the median LR (suppress-half). Correctly-inverted
+    multi-target passes; one with a target above the median is blocked."""
+    topic = json.loads(topic_path.read_text(encoding="utf-8"))
+    topic["indicators"]["anti_indicators"] = [
+        {  # correctly inverted multi-target: suppresses H1/H2/H3, lifts H4
+            "id": "anti_blockade_multi", "_tier": "anti_indicators",
+            "desc": "blockade suppresses all reopen", "status": "NOT_FIRED",
+            "target_hypothesis": ["H1", "H2", "H3"],
+            "likelihoods": {"H1": 0.08, "H2": 0.18, "H3": 0.45, "H4": 0.92},
+        },
+        {  # WRONG: H3 is a target but its LR (0.92) exceeds non-target H4 (0.55) — firing lifts H3 above H4
+            "id": "anti_blockade_bad_multi", "_tier": "anti_indicators",
+            "desc": "mis-authored multi-target", "status": "NOT_FIRED",
+            "target_hypothesis": ["H1", "H2", "H3"],
+            "likelihoods": {"H1": 0.08, "H2": 0.18, "H3": 0.92, "H4": 0.55},
+        },
+    ]
+    topic_path.write_text(json.dumps(topic, indent=2), encoding="utf-8")
+    lint_mod = nrol._import_from_repo("framework.lint_indicators")
+    engine = nrol._import_from_repo("engine")
+    t = engine.load_topic(SLUG)
+    flat = [dict(i) for i in (t.get("indicators", {}).get("anti_indicators", []) or [])]
+    report = lint_mod.propose_indicators_lint(t, flat)
+    blockers = [b for b in (report.get("blockers") or []) if b.get("check") == "anti_indicator_wrong_inversion"]
+    # The good multi-target passes (no blocker).
+    assert not any(b.get("indicator") == "anti_blockade_multi" for b in blockers)
+    # The bad one (H3 above median) is blocked.
+    assert any(b.get("indicator") == "anti_blockade_bad_multi" for b in blockers)
+    assert report["passed"] is False
+
+
 def test_run_news_scan_brief_tallies_anti_fire(nrol, topic_path, monkeypatch):
     """brief tallies an anti-indicator FIRE as ANTI_FIRE (distinct visibility),
     not collapsed into FIRE. Anti-indicators move posteriors the opposite way;
