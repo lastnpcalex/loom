@@ -2596,6 +2596,8 @@ function setupEventListeners() {
         document.getElementById('cfg-blackhole').checked =
             (window.LoomBlackhole && window.LoomBlackhole.isEnabled())
             || (typeof window.LoomBlackhole === 'undefined');
+        document.getElementById('cfg-stream-debug').checked =
+            localStorage.getItem('loom-stream-debug') === '1';
 
         _switchSettingsTab('model');
         openModal('modal-settings');
@@ -2695,6 +2697,14 @@ function setupEventListeners() {
         if (!window.LoomBlackhole) return;
         if (e.target.checked) window.LoomBlackhole.enable();
         else window.LoomBlackhole.disable();
+    });
+
+    // Stream debug overlay toggle — purely client-side (the overlay lives in
+    // chat.js and polls localStorage on each 500ms tick). Off by default: the
+    // overlay stays hidden during healthy streaming and only lights up to
+    // surface a stuck stream or dropped chunks. On = full live diagnostics.
+    document.getElementById('cfg-stream-debug').addEventListener('change', e => {
+        localStorage.setItem('loom-stream-debug', e.target.checked ? '1' : '0');
     });
 
     // Settings model change — toggle effort visibility
