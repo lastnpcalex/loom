@@ -111,6 +111,31 @@ spec and are for calibration, not action. They never write topic state.
   `resolution_brier(slug, asof="")` recomputes the two-lane Brier for an
   already-resolved topic without re-resolving — read-only, for post-hoc
   calibration review.
+- Source trust is LIVE (not a Brier score — a Bayesian trust ledger of
+  confirmed/refuted claims) and exposed read-only through:
+  `source_calibration_status(slug="")` (topic-local `sourceCalibration`
+  summary, or cross-topic DB summary), `source_profile(source, domain="")`
+  (one source's full profile + domain fallback chain),
+  `validate_source_db()` (schema sanity check), and
+  `source_domain_patterns(min_claims=3)` (cross-source reliability). These
+  read `framework/source_db.py`/`source_ledger.py`/`calibrate.py` and never
+  move posteriors or write to `source_db.json`. Forecast Brier and source
+  trust are kept separate by design.
+- Triage is LIVE (`triage_headline` first, always). For auditability, pass
+  `save=true` to append the result to `loom/triage_log/triage_log.jsonl` (an
+  audit ledger outside topic state). A logged triage is NOT evidence — it
+  never moves posteriors; promotion to real action still goes through
+  `submit_transition` / `propose_match` -> `commit_match`. Review prior
+  triages with `list_triage_log(slug="", limit=25)` and
+  `read_triage_log(triage_id)`.
+- Social-media-user Brier: a social-media handle is a *forecaster*. Log its
+  probability forecasts with `log_social_forecast(handle, slug, posteriors,
+  note="")` (stored at `loom/social_forecasts/`, outside topic state; the
+  forecast is NOT evidence and never moves posteriors). At resolution, score
+  the handle's forecasts with `social_user_brier(handle, slug="")` — Brier
+  against the resolved truth via `compute_brier_score`. Unresolved forecasts
+  report as pending. `list_social_handles()` lists handles + counts. This is
+  forecast calibration, kept separate from source trust by design.
 
 ## What You Cannot Do
 

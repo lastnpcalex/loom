@@ -4420,6 +4420,65 @@ def resolution_brier(slug: str, asof: str = "") -> str:
 
 
 @mcp.tool()
+def source_calibration_status(slug: str = "") -> str:
+    """Source-trust status: topic-local sourceCalibration summary (slug given)
+    or the cross-topic source database summary (slug empty). Read-only.
+
+    Source trust is a Bayesian trust ledger (confirmed/refuted claims), NOT a
+    Brier score — the two are kept separate by design. This exposes the LIVE
+    framework/source_db.py + source_ledger.py machinery; it does not move
+    posteriors or write to source_db.json.
+    """
+    try:
+        from . import source_trust as st
+        _ensure_repo()
+        _import_from_repo("framework.source_db")
+        return _json(st.source_calibration_status(slug=slug))
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def source_profile(source: str, domain: str = "") -> str:
+    """Full trust profile for one source from the cross-topic DB. Pass a domain
+    tag to resolve domain-specific trust via the 5-tier fallback chain (domain
+    -> effective -> base -> static prior -> 0.50). Read-only."""
+    try:
+        from . import source_trust as st
+        _ensure_repo()
+        _import_from_repo("framework.source_db")
+        return _json(st.source_profile(source=source, domain=domain))
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def validate_source_db() -> str:
+    """Schema sanity check of sources/source_db.json. Reports structural
+    problems (non-numeric trust, negative counts) without raising. Read-only."""
+    try:
+        from . import source_trust as st
+        _ensure_repo()
+        _import_from_repo("framework.source_db")
+        return _json(st.validate_source_db())
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def source_domain_patterns(min_claims: int = 3) -> str:
+    """Cross-source domain reliability patterns (most/least reliable domains,
+    per-source variance). Wraps framework.source_db.find_domain_patterns. Read-only."""
+    try:
+        from . import source_trust as st
+        _ensure_repo()
+        _import_from_repo("framework.source_db")
+        return _json(st.domain_patterns(min_claims=min_claims))
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
 def review_parked(
     slug: str,
     limit: int = 12,
@@ -4677,13 +4736,101 @@ def review_parked(
 
 
 @mcp.tool()
-def triage_headline(headline: str, source: str = "") -> str:
-    """Triage a headline against active topics without mutating state."""
+def triage_headline(headline: str, source: str = "", save: bool = False, note: str = "") -> str:
+    """Triage a headline against active topics without mutating state.
+
+    save=true appends the triage result to loom/triage_log/triage_log.jsonl
+    (an audit ledger outside topic state). A logged triage is NOT evidence —
+    it never moves posteriors; promotion to real action still goes through
+    submit_transition / propose_match -> commit_match. Use list_triage_log /
+    read_triage_log to review prior triages."""
     try:
         engine = _import_from_repo("engine")
-        return _json(engine.triage_headline(headline, source=source or None))
+        result = engine.triage_headline(headline, source=source or None)
+        if save:
+            from . import triage_log as tl
+            root = _ensure_repo()
+            record = tl.save_triage(root, result, note=note)
+            result["saved_triage_id"] = record["triage_id"]
+            result["saved_to"] = "loom/triage_log/triage_log.jsonl"
+        return _json(result)
     except Exception as exc:
         return _json({"error": str(exc), "headline": headline})
+
+
+@mcp.tool()
+def list_triage_log(slug: str = "", limit: int = 25) -> str:
+    """List recent triage ledger entries (audit only). Optional slug filters
+    by topic. Read-only — never mutates topic state."""
+    try:
+        from . import triage_log as tl
+        root = _ensure_repo()
+        return _json(tl.list_triage(root, slug=slug, limit=limit))
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def read_triage_log(triage_id: str) -> str:
+    """Read one triage ledger entry by id (full matches). Read-only."""
+    try:
+        from . import triage_log as tl
+        root = _ensure_repo()
+        return _json(tl.read_triage(root, triage_id=triage_id))
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def log_social_forecast(
+    handle: str, slug: str, posteriors: dict, note: str = "", forecast_date: str = "",
+) -> str:
+    """Log a social-media handle's probability forecast for a topic.
+
+    GREENFIELD pathway: a handle (Bluesky/Twitter/etc.) is a forecaster. The
+    forecast is logged to loom/social_forecasts/social_forecasts.jsonl (outside
+    topic state) and scored with Brier at resolution via social_user_brier.
+    This is forecast calibration, NOT source trust — kept separate by design.
+    The forecast is NOT evidence; it never moves posteriors. Posteriors are
+    renormalized to sum to 1.0 before storing."""
+    try:
+        from . import social_brier as sb
+        root = _ensure_repo()
+        _import_from_repo("framework.scoring")
+        record = sb.log_social_forecast(
+            root, handle, slug, posteriors, note=note, forecast_date=forecast_date)
+        return _json(record)
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def social_user_brier(handle: str, slug: str = "") -> str:
+    """Score a handle's forecasts with Brier against resolved truth.
+
+    If slug is given, score only that topic's forecasts (topic must be
+    RESOLVED). If slug is empty, score all of the handle's forecasts whose
+    topic has resolved. Unresolved forecasts are reported as pending. Reuses
+    framework.scoring.compute_brier_score. Read-only on topic state."""
+    try:
+        from . import social_brier as sb
+        root = _ensure_repo()
+        _import_from_repo("engine")
+        _import_from_repo("framework.scoring")
+        return _json(sb.score_social_user(root, handle, slug=slug))
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+@mcp.tool()
+def list_social_handles() -> str:
+    """List all handles with logged forecasts + counts. Read-only."""
+    try:
+        from . import social_brier as sb
+        root = _ensure_repo()
+        return _json(sb.list_handles(root))
+    except Exception as exc:
+        return _json({"error": str(exc)})
 
 
 @mcp.tool()

@@ -1913,6 +1913,177 @@ def test_resolution_brier_is_readonly(nrol, topic_path, nrol_repo, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Source-trust surfacing (LIVE source_db/source_ledger, read-only)
+# ---------------------------------------------------------------------------
+
+
+def test_source_calibration_status_topic_local_is_readonly(nrol, topic_path):
+    """source_calibration_status(slug): returns a topic-local summary and does
+    NOT mutate the topic or the source DB. The fixture topic carries a
+    sourceCalibration.effectiveTrust map."""
+    before_disk = topic_path.read_text(encoding="utf-8")
+    out = json.loads(nrol.source_calibration_status(slug=SLUG))
+    assert "error" not in out, out
+    assert out["slug"] == SLUG
+    assert "sources" in out
+    assert "ledger_entries" in out
+    # Read-only: disk untouched.
+    assert topic_path.read_text(encoding="utf-8") == before_disk
+
+
+def test_source_calibration_status_cross_topic_summary(nrol):
+    """source_calibration_status() with no slug returns a cross-topic DB
+    summary. Degrades gracefully when the DB is a stub/empty (the fixture
+    copies a near-empty sources/source_db.json)."""
+    out = json.loads(nrol.source_calibration_status())
+    assert "error" not in out, out
+    assert "sources_tracked" in out
+    assert "db_path" in out
+
+
+def test_source_profile_unknown_source_falls_back(nrol):
+    """source_profile for an untracked source reports tracked=false and the
+    0.50 fallback rather than raising."""
+    out = json.loads(nrol.source_profile(source="definitely-not-a-real-source-xyz"))
+    assert "error" not in out, out
+    assert out["tracked"] is False
+    assert out["fallback_trust"] == 0.50
+
+
+def test_validate_source_db_returns_report(nrol):
+    """validate_source_db: returns a valid/invalid report without raising,
+    even against a stub DB. Read-only."""
+    out = json.loads(nrol.validate_source_db())
+    assert "error" not in out, out
+    assert "valid" in out
+    assert "sources_checked" in out
+    assert isinstance(out["problems"], list)
+
+
+def test_source_domain_patterns_is_readonly(nrol, topic_path):
+    """source_domain_patterns: read-only cross-source analysis. Disk untouched."""
+    before_disk = topic_path.read_text(encoding="utf-8")
+    out = json.loads(nrol.source_domain_patterns(min_claims=1))
+    assert "error" not in out, out
+    # Result is the find_domain_patterns dict (domain_stats / source_variance).
+    assert isinstance(out, dict)
+    assert topic_path.read_text(encoding="utf-8") == before_disk
+
+
+# ---------------------------------------------------------------------------
+# Triage audit ledger (LIVE triage + optional saved-triage log, read-only)
+# ---------------------------------------------------------------------------
+
+
+def test_triage_headline_save_writes_outside_topic_state(nrol, topic_path, nrol_repo):
+    """triage_headline(save=True): writes to loom/triage_log/triage_log.jsonl,
+    never to topic JSON or evidenceLog. A logged triage is not evidence."""
+    before_disk = topic_path.read_text(encoding="utf-8")
+    out = json.loads(nrol.triage_headline(
+        headline="Synthetic test headline for triage audit",
+        source="test-rig", save=True, note="ws6 test",
+    ))
+    assert "error" not in out, out
+    assert out.get("saved_triage_id", "").startswith("triage_")
+    log_file = nrol_repo / "loom" / "triage_log" / "triage_log.jsonl"
+    assert log_file.exists()
+    rows = [json.loads(l) for l in log_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(rows) == 1
+    assert rows[0]["promoted_to_real_action"] is False
+    assert rows[0]["note"] == "ws6 test"
+    # Topic on disk untouched; no evidence written.
+    assert topic_path.read_text(encoding="utf-8") == before_disk
+    assert _disk_topic(topic_path)["evidenceLog"] == []
+
+
+def test_triage_headline_no_save_writes_nothing(nrol, topic_path, nrol_repo):
+    """triage_headline() without save writes no ledger file at all."""
+    log_file = nrol_repo / "loom" / "triage_log" / "triage_log.jsonl"
+    if log_file.exists():
+        log_file.unlink()
+    out = json.loads(nrol.triage_headline(headline="another headline", source="test-rig"))
+    assert "error" not in out, out
+    assert "saved_triage_id" not in out
+    assert not log_file.exists()
+
+
+def test_list_and_read_triage_log(nrol, topic_path, nrol_repo):
+    """list_triage_log + read_triage_log round-trip a saved triage. Read-only."""
+    nrol.triage_headline(headline="round-trip triage headline", source="test-rig", save=True)
+    listed = json.loads(nrol.list_triage_log(limit=10))
+    assert listed["count"] >= 1
+    tid = listed["entries"][0]["triage_id"]
+    full = json.loads(nrol.read_triage_log(triage_id=tid))
+    assert full["triage_id"] == tid
+    assert "matches" in full  # full record carries matches; list view carries matches_brief
+
+
+# ---------------------------------------------------------------------------
+# Social-media-user Brier (greenfield): per-handle forecast calibration
+# ---------------------------------------------------------------------------
+
+
+def test_log_social_forecast_writes_outside_topic_state(nrol, topic_path, nrol_repo):
+    """log_social_forecast: writes to loom/social_forecasts/, never to topic
+    JSON. The forecast is NOT evidence. Posteriors are renormalized to 1.0."""
+    before_disk = topic_path.read_text(encoding="utf-8")
+    out = json.loads(nrol.log_social_forecast(
+        handle="testhandle.bsky.social", slug=SLUG,
+        posteriors={"H1": 0.6, "H2": 0.3, "H3": 0.1}, note="ws7 test",
+    ))
+    assert "error" not in out, out
+    assert out["forecast_id"].startswith("fc_")
+    assert out["handle"] == "testhandle.bsky.social"
+    # Renormalized to sum to 1.0.
+    assert abs(sum(out["posteriors"].values()) - 1.0) < 1e-6
+    # Stored outside topic state.
+    store = nrol_repo / "loom" / "social_forecasts" / "social_forecasts.jsonl"
+    assert store.exists()
+    assert topic_path.read_text(encoding="utf-8") == before_disk
+    assert _disk_topic(topic_path)["evidenceLog"] == []
+
+
+def test_log_social_forecast_rejects_bad_distribution(nrol, topic_path):
+    """log_social_forecast: refuses a non-positive / empty distribution."""
+    bad = json.loads(nrol.log_social_forecast(
+        handle="h", slug=SLUG, posteriors={"H1": -0.5},
+    ))
+    assert "error" in bad
+
+
+def test_social_user_brier_scores_resolved_topic(nrol, topic_path, nrol_repo, monkeypatch):
+    """social_user_brier: scores a handle's forecast against a RESOLVED topic's
+    truth. Unresolved forecasts are reported as pending. Read-only on topic state."""
+    _stub_red_team_approve(nrol, monkeypatch)
+    _seed_dynamics_spec(nrol_repo)
+    _seed_committed_update(topic_path)
+    # Log a forecast BEFORE resolving (so it's a genuine ex-ante forecast).
+    nrol.log_social_forecast(
+        handle="seer.bsky.social", slug=SLUG,
+        posteriors={"H1": 0.7, "H2": 0.2, "H3": 0.1},
+    )
+    # Before resolution: forecast is pending.
+    pre = json.loads(nrol.social_user_brier(handle="seer.bsky.social", slug=SLUG))
+    assert pre["pending"] == 1 and pre["scored"] == 0
+    # Resolve the topic to H1.
+    nrol.resolve_topic(slug=SLUG, resolved_hypothesis="H1")
+    # After resolution: the forecast is scored.
+    post = json.loads(nrol.social_user_brier(handle="seer.bsky.social", slug=SLUG))
+    assert post["scored"] == 1 and post["pending"] == 0
+    assert post["avg_brier"] is not None
+    assert 0.0 <= post["avg_brier"] <= 1.0
+    assert post["scored_forecasts"][0]["resolved_hypothesis"] == "H1"
+
+
+def test_list_social_handles(nrol, topic_path, nrol_repo):
+    """list_social_handles: lists handles with forecast counts. Read-only."""
+    nrol.log_social_forecast(handle="a.bsky", slug=SLUG, posteriors={"H1": 0.5, "H2": 0.5})
+    out = json.loads(nrol.list_social_handles())
+    assert "error" not in out, out
+    assert any(h["handle"] == "a.bsky" for h in out["handles"])
+
+
+# ---------------------------------------------------------------------------
 # Parked-queue re-adjudication: kept-but-timestamped + reverse staleness
 # ---------------------------------------------------------------------------
 
