@@ -12,6 +12,115 @@ from pathlib import Path
 import pytest
 
 
+# --- Image-gate invariant ----------------------------------------------------
+# The describe_image pre-flight (server.py ~5025 & ~5646) and the "use
+# describe_image, don't Read images" system-prompt warning
+# (claude_client._loom_append_system_prompt, use_llama-only) are THREE legs of
+# one stool: a provider needs the text-summary detour IFF it lacks native
+# Anthropic image-content transport. umans rides the same transport as Claude
+# (api.code.umans.ai via claude_client.run_claude), so Read delivers image
+# bytes to it directly — the pre-flight would replace pixels with a worse text
+# note AND inject a "do NOT read image files" header (server.py ~5083),
+# blinding the model. The bug was the two gates disagreeing for umans:
+# warning=use_llama only, pre-flight=use_llama OR use_umans. This invariant
+# would have caught it. See [[loom-recurring-bug-shapes]] (multi-file
+# invariant class) and [[ground-claims-in-code]].
+
+def _describe_preflight_gates() -> dict[str, bool]:
+    """Static source check: which use_* flag each describe gate keys on.
+
+    Reads server.py text rather than driving the websocket generation flow —
+    the invariant is about the *source-level agreement* between the pre-flight
+    gates and the system-prompt warning, not runtime dispatch. A brittle
+    end-to-end harness would couple to message persistence and break on
+    unrelated changes; this catches the drift class directly.
+    """
+    import server
+
+    src = Path(server.__file__).read_text(encoding="utf-8")
+    # Both pre-flight gates must be `use_llama`-only, matching the warning.
+    # The original bug had `use_llama or use_umans` here.
+    has_umans_gate = "use_llama or use_umans" in src
+    return {
+        "preflight_has_umans_gate": has_umans_gate,
+        "primary_gate_llama_only": "if use_llama and image_files:" in src,
+        "resume_gate_llama_only": src.count("if use_llama and image_files:") >= 2,
+    }
+
+
+def test_image_describe_preflight_excludes_umans():
+    """umans takes the Claude path: native image content blocks via Read, no
+    describe_image pre-flight. The pre-flight gates must NOT mention use_umans."""
+    gates = _describe_preflight_gates()
+    assert not gates["preflight_has_umans_gate"], (
+        "describe_image pre-flight is gated on use_umans — umans uses the same "
+        "Anthropic transport as Claude (Read delivers pixels natively), so a "
+        "pre-flight text summary both replaces the image and injects a "
+        "'do NOT read image files' header that blinds the model. See "
+        "[[loom-recurring-bug-shapes]] multi-file invariant."
+    )
+    assert gates["primary_gate_llama_only"], (
+        "primary pre-flight gate no longer reads `if use_llama and image_files:` — "
+        "the gate was restructured; update this invariant test deliberately"
+    )
+    assert gates["resume_gate_llama_only"], (
+        "resume/re-attach pre-flight gate (the second `if use_llama and image_files:`) "
+        "is missing or restructured — both gates must stay in lockstep"
+    )
+
+
+def _image_warning_gate_is_llama_only() -> bool:
+    """True iff the 'use describe_image, don't Read images' system-prompt
+    warning is gated on `use_llama` only (not also use_umans).
+
+    Scoped to the image_warning block specifically. `use_llama or use_umans`
+    appears LEGITIMATELY elsewhere in claude_client.py (the WebSearch/WebFetch
+    block and MCP web-tools registration — umans genuinely lacks built-in web
+    search, same as llama). Those shared gates are correct; only the image
+    warning must be llama-only, because umans takes native image content blocks
+    through the same Anthropic transport as Claude.
+    """
+    import claude_client
+    import re
+
+    src = Path(claude_client.__file__).read_text(encoding="utf-8")
+    # The warning lives in _loom_append_system_prompt. Extract the if-block that
+    # assigns image_warning so we only judge the image gate, not the web gates.
+    m = re.search(r"(if use_llama[^:\n]*:\s*\n\s*image_warning\s*=\s*\()", src)
+    if not m:
+        return False  # warning block restructured — investigate deliberately
+    # Take the block from the `if` through the contract append that closes it.
+    start = m.start()
+    end = src.find("return merge_system_prompts", start)
+    block = src[start:end] if end != -1 else src[start:]
+    return "use_umans" not in block
+
+
+def test_image_warning_gate_matches_preflight_gate():
+    """The invariant: the set of providers warned (use_llama) MUST equal the
+    set of providers pre-described (use_llama). The two gates live in different
+    files (claude_client.py vs server.py) with no call linking them — this
+    assertion is the only enforcement that they agree.
+
+    The warning block must be `use_llama`-only AND the pre-flight must be
+    `use_llama`-only. Asserting both keeps a new visionless provider from being
+    added to one gate and not the other.
+    """
+    warning_is_llama_only = _image_warning_gate_is_llama_only()
+    preflight_is_llama_only = not _describe_preflight_gates()["preflight_has_umans_gate"]
+
+    assert warning_is_llama_only, (
+        "system-prompt image warning in claude_client is no longer `use_llama`-only "
+        "or also fires for umans — the warning and the pre-flight must agree on "
+        "which providers get the visionless text-summary detour"
+    )
+    assert preflight_is_llama_only, (
+        "describe pre-flight in server.py is not `use_llama`-only — see "
+        "test_image_describe_preflight_excludes_umans for the transport rationale"
+    )
+
+
+
 # --- Step 0: provider guard ------------------------------------------------
 
 def test_operator_guard_allows_claude_family():

@@ -5022,11 +5022,12 @@ async def _handle_claude_generation(
                 print(f"[DESCRIBE] check — use_llama={use_llama}, use_umans={use_umans}, image_files={len(image_files)}, cc_model={cc_model}")
                 if not use_llama or not image_files:
                     print(f"[DESCRIBE] Skipping: use_llama={use_llama}, image_files={len(image_files)}")
-                if (use_llama or use_umans) and image_files:
-                    # Image describe runs through describe_image() (llama_client
-                    # under the hood) for both local and umans models; the model
-                    # name is selected here, the transport is shared.
-                    _describe_model = (config.vision_model or config.llama_model) if use_llama else (config.umans_model or "umans-coder")
+                if use_llama and image_files:
+                    # Pre-flight image describe is llama-only. umans rides the
+                    # same Anthropic transport as Claude (api.code.umans.ai),
+                    # so Read delivers native image content blocks to it directly —
+                    # no text-summary detour, and no "do NOT read image files" header.
+                    _describe_model = config.vision_model or config.llama_model
                     print(f"[DESCRIBE] Running describe for {len(image_files)} image(s), model={_describe_model}")
                     await _ws_send(conv_id, {
                         "type": "describe_start",
@@ -5642,7 +5643,9 @@ async def _handle_claude_generation(
 
                     # Step 2: Describe images (runs ONCE)
                     desc_map: dict[str, str] = {}
-                    if (use_llama or use_umans) and image_files:
+                    if use_llama and image_files:
+                        # umans takes the Claude path: native image content blocks
+                        # via Read, no describe_image pre-flight. See note above.
                         _describe_model = config.vision_model or config.llama_model
                         await _ws_send(conv_id, {
                             "type": "describe_start",
