@@ -22,6 +22,15 @@ Natural language is perception. Only typed transitions move beliefs.
   `deliberate_candidates(slug, articles, output_text)` runs the visible
   advocate/rebut/jury pass over matcher DECISION blocks without mutating
   state. Use it before filing a manual posterior-moving proposal.
+  **Footgun:** `output_text` must be matcher DECISION blocks in the exact
+  shape `build_matcher_prompt` emits — the `ARTICLE:` key matches the
+  prompt's `## Articles to evaluate` labels (e.g. `A1`), NOT
+  `submit_article`'s `article_id` (e.g. `art-8d7b…`). Always generate the
+  prompt with `build_matcher_prompt` first and copy its DECISION-block shape,
+  or prefer `run_matcher_with_llama(commit=false)` which emits correctly
+  formatted output server-side. A hand-written block with the wrong key
+  returns empty with no error — don't diagnose that as "parser rejected"
+  without reading `parse_matcher_output` first.
 - Review cross-day duplicates explicitly:
   `review_duplicate_candidate(slug, article, decision, ...)` compares a
   candidate FIRE/OBSERVE against recent evidence and returns a typed

@@ -45,13 +45,14 @@ A Shadow Loom is a self-hosted web interface for branching AI conversations acro
 
 ### Root — Provider Client Adapters
 
-`claude_client.py` — Claude Code CLI subprocess wrapper; NDJSON stream parser, fork-every-turn sessions
+`claude_client.py` — Claude Code CLI subprocess wrapper; NDJSON stream parser, fork-every-turn sessions; also the umans launch path (`use_umans=True`, same CLI at `api.code.umans.ai`)
 `codex_client.py` — ChatGPT Codex app-server subprocess wrapper; JSONL protocol, NROL MCP config
 `gemini_client.py` — Antigravity (agy) CLI subprocess wrapper; plain text mode, log error scanning
 `hermes_client.py` — Hermes Agent ACP subprocess wrapper; stdio JSON-RPC over `hermes acp`
 `llama_client.py` — llama-server client; OpenAI-compatible /v1/chat/completions, vision, model resolution
-`ollama_client.py` — Staged for deletion (`D`); legacy Ollama adapter
-`vllm_client.py` — Staged for deletion (`D`); legacy vLLM adapter
+`umans_client.py` — Umans AI client (remote, Anthropic/OpenAI-compatible endpoint); `umans-*` models routed through `claude_client.run_claude` with `use_umans=True`
+`ollama_client.py` — Staged for deletion (`D`); legacy Ollama adapter; **do not re-enable**
+`vllm_client.py` — Staged for deletion (`D`); legacy vLLM adapter; **do not re-enable**
 
 ### Root — MCP Servers (stdio)
 
@@ -79,12 +80,17 @@ A Shadow Loom is a self-hosted web interface for branching AI conversations acro
 ### NROL-AO MCP — `mcp_servers/nrol_ao/`
 
 `mcp_servers/nrol_ao/__init__.py` — Package marker
-`mcp_servers/nrol_ao/server.py` — MCP facade; typed transitions, proposals, news scans, debate orchestration
+`mcp_servers/nrol_ao/server.py` — MCP facade; all `@mcp.tool()` registrations + wrappers (typed transitions, proposals, news scans, debate, design/activate/resolve, shadow, future-cast, source-trust, triage, social-brier)
 `mcp_servers/nrol_ao/proposals.py` — SQLite article + proposal store; dedup, lifecycle (submit → propose → commit)
 `mcp_servers/nrol_ao/activity.py` — Activity ledger; job tracking, digest writing, scan run persistence
 `mcp_servers/nrol_ao/llama.py` — Local llama client for NROL matcher; dispatches through Loom's llama-server
-`mcp_servers/nrol_ao/README.md` — NROL-AO MCP usage docs; configure, register, fail-closed commits
-`mcp_servers/nrol_ao/OPERATOR.md` — Operator lifecycle docs; design → review → activate flow
+`mcp_servers/nrol_ao/future_cast.py` — Dry-run hypothetical-event analysis; deep-clone + bayesian_update (no save), red-team critique, JSONL save store (list/get/save/withdraw)
+`mcp_servers/nrol_ao/resolution.py` — Topic resolution: shadow-trajectory reconstruction, two-lane Brier (shadow vs committed), red-team after-action review packet
+`mcp_servers/nrol_ao/source_trust.py` — Read-only views over the LIVE source-trust stores (framework/source_db.py etc.); status/profile/validate/domain-patterns
+`mcp_servers/nrol_ao/triage_log.py` — Optional saved-triage audit ledger (loom/triage_log/); list/read; a logged triage is not evidence
+`mcp_servers/nrol_ao/social_brier.py` — Greenfield per-handle forecast calibration; log forecasts, Brier-score at resolution via compute_brier_score
+`mcp_servers/nrol_ao/README.md` — NROL-AO MCP usage docs; configure, register, fail-closed commits, full grouped tool list
+`mcp_servers/nrol_ao/OPERATOR.md` — Operator role + lifecycle docs; shadow-as-guide, design → review → activate → resolve flow, known footguns
 `mcp_servers/nrol_ao/ROADMAP.md` — NROL-AO development roadmap
 `mcp_servers/nrol_ao/MATH_AUDIT_2026-06-09.md` — Math audit artifact
 `mcp_servers/nrol_ao/MERIDIA_AAR_2026-06-12.md` — Post-mortem artifact
@@ -188,7 +194,7 @@ C:\Python314\python.exe -m pytest
 
 ## Needs Human Review
 
-- `ollama_client.py` and `vllm_client.py` appear in git ls-files with staged deletion (`D`); excluded pending resolution
+- `ollama_client.py` and `vllm_client.py` are staged for deletion (`D`); Ollama and vLLM are deprecated — llama-server is the only local LLM backend
 - `start_test_server.bat` and `stop_test_server.py` are tracked but not referenced in README; purpose unclear
 - `backstage.md` is tracked; may be a design doc or scratch — skip or add description
 - `mcp_servers/nrol_ao/MATH_AUDIT_2026-06-09.md` and `MERIDIA_AAR_2026-06-12.md` — dated artifacts; keep or move to archive?

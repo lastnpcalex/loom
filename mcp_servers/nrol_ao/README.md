@@ -51,34 +51,49 @@ Override with `NROL_AO_ACTIVITY_DIR` if the dashboard should read another path.
 
 ## Tools
 
-- `nrol_status`
-- `help`
-- `list_topics`
-- `list_hypotheses`
-- `read_topic`
-- `topic_status`
-- `build_news_scan_plan`
-- `run_news_scan`
-- `list_scan_runs`
-- `read_scan_run`
-- `replay_scan_run`
-- `undo_scan_run`
-- `apply_news_scan_results`
-- `triage_headline`
-- `build_matcher_prompt`
-- `parse_matcher_output`
-- `apply_matcher_output`
-- `llama_server_status`
-- `model_endpoint_status`
-- `list_activity`
-- `run_matcher_with_model`
-- `run_matcher_with_llama`
-- `submit_transition`
-- `submit_article`
-- `propose_match`
-- `commit_match`
-- `list_proposals`
-- `withdraw_proposal`
+State & status: `nrol_status`, `help`, `list_topics`, `list_hypotheses`,
+`read_topic`, `topic_status`, `read_evidence`, `list_activity`,
+`llama_server_status`, `model_endpoint_status`, `latest_digest`.
+
+Topic design & lifecycle: `design_topic` (draft + dynamics sidecar),
+`activate_topic` (human-gated; requires a lint-clean dynamics spec),
+`red_team_topic` (mandatory DRAFT design review), `resolve_topic` (set
+RESOLVED + record outcome + two-lane Brier + after-action review),
+`resolution_brier` (read-only post-hoc two-lane Brier).
+
+Calibration & shadow (guide, not authority — never move posteriors):
+`shadow_posteriors` (dynamics-derived first-passage posteriors; `asof`
+counterfactual), `future_cast` + store companions `list_future_casts`,
+`get_future_cast`, `save_future_cast`, `withdraw_future_cast` (dry-run
+hypothetical-event analysis; saved casts outside topic state).
+
+News scans & matching: `build_news_scan_plan`, `run_news_scan`,
+`list_scan_runs`, `read_scan_run`, `replay_scan_run`, `undo_scan_run`,
+`apply_news_scan_results`, `build_matcher_prompt`, `parse_matcher_output`,
+`apply_matcher_output`, `run_matcher_with_model`, `run_matcher_with_llama`,
+`deliberate_candidates`, `review_duplicate_candidate`, `triage_headline`
+(`save=true` logs to `loom/triage_log/`).
+
+Typed transitions & proposals: `submit_transition` (`PARK`/`FIRE`/`OBSERVE`/
+`SCHEMA_GAP`/`IGNORE`), `submit_article`, `propose_match`, `commit_match`,
+`list_proposals`, `withdraw_proposal`, `review_parked`,
+`acknowledge_parked_reviews`.
+
+Schema governance: `list_schema_gaps`, `run_schema_gap_resolver`,
+`list_schema_extension_proposals`, `red_team_schema_extension_proposal`,
+`mark_schema_extension_proposal`, `apply_schema_extension_proposal`.
+
+Search-query governance: `read_search_queries`,
+`propose_search_query_update`, `red_team_search_query_update`,
+`list_search_query_updates`, `apply_search_query_update`,
+`withdraw_search_query_update`.
+
+Source trust (LIVE trust ledger, read-only — NOT a Brier score):
+`source_calibration_status`, `source_profile`, `validate_source_db`,
+`source_domain_patterns`.
+
+Social-media-user Brier (per-handle forecast calibration, greenfield):
+`log_social_forecast`, `social_user_brier`, `list_social_handles`.
 
 Runtime transitions accepted by `submit_transition` are `PARK`, `FIRE`,
 `OBSERVE`, `SCHEMA_GAP`, and `IGNORE`.
