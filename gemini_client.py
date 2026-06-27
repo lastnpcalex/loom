@@ -477,6 +477,24 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                             pass
         return latest_file, latest_time
 
+    # Operator turns are fresh-conv-by-design: the launch already suppresses
+    # --conversation (see cc_args below) so each turn reads a fresh tool
+    # registry from .agents/mcp_config.json. The poller MUST match the
+    # launch — if use_resume/fork_session stay True (driven by the persisted
+    # turn-1 cc_session_id), the poller pins to the OLD session's transcript
+    # and structurally skips the new-UUID-folder scan. agy then succeeds into
+    # a fresh folder the poller never inspects → "exited with no response".
+    # Forcing fresh-conv on both halves makes turn 2+ take the same path
+    # that works on turn 1. See [[agy-operator-turn2-no-response]].
+    if nrol_operator and (resume_session_id or fork_session):
+        suppressed_resume_id = resume_session_id
+        resume_session_id = None
+        fork_session = False
+        print(
+            f"[AGY] operator turn: forcing fresh-conv poller "
+            f"(nrol_operator=True, suppressed resume_id={suppressed_resume_id})"
+        )
+
     # Fork session if requested
     if resume_session_id and fork_session:
         import uuid
@@ -704,6 +722,10 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         active_file = None
         if use_resume and baseline_file:
             active_file = baseline_file
+            print(
+                f"[AGY] resume mode: pinned active_file={active_file} "
+                f"baseline_time={baseline_time:.3f} initial_size={initial_size}"
+            )
         else:
             # Poll for the active transcript file being created or modified
             # Keep polling while the process is running, up to 60 seconds (1200 * 0.05s) max.

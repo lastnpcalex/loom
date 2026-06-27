@@ -19,7 +19,18 @@ def pytest_configure(config):
     # Outside the repo on purpose: a OneDrive-synced basetemp invites sync
     # locks on test SQLite files.
     if config.option.basetemp is None:
-        config.option.basetemp = Path(tempfile.gettempdir()) / "loom-pytest"
+        base = Path(tempfile.gettempdir()) / "loom-pytest"
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            # Try creating a temporary test file in it to verify write permissions
+            test_file = base / ".pytest_write_test"
+            test_file.write_text("ok", encoding="utf-8")
+            test_file.unlink()
+        except OSError:
+            import getpass
+            username = getpass.getuser()
+            base = Path(tempfile.gettempdir()) / f"loom-pytest-{username}"
+        config.option.basetemp = base
 
 
 @pytest.fixture(autouse=True)
@@ -39,7 +50,7 @@ async def client():
     """Async HTTP test client using httpx + ASGITransport.
 
     Mocks local_summary.preload so we never load Gemma in tests.
-    Mocks ollama health_check to avoid real network calls.
+    Mocks llama health_check to avoid real network calls.
     """
     with patch("local_summary.preload", new_callable=AsyncMock) as mock_preload, \
          patch("server.local_summary.preload", new_callable=AsyncMock):
@@ -50,21 +61,20 @@ async def client():
 
 
 @pytest.fixture
-def mock_ollama():
-    """Patch ollama_client functions to avoid real network calls."""
+def mock_llama():
+    """Patch llama_client functions to avoid real network calls."""
     health_result = {
         "status": "ok",
-        "models": ["llama3:8b", "qwen3:4b"],
-        "target_model": "llama3:8b",
+        "models": ["Qwen3.6-27B-NVFP4.gguf"],
+        "target_model": "Qwen3.6-27B-NVFP4.gguf",
         "model_available": True,
         "mock_mode": False,
     }
 
     async def fake_stream(*args, **kwargs):
-        for token in ["Hello", " from", " mock", " Ollama", "!"]:
+        for token in ["Hello", " from", " mock", " Llama", "!"]:
             yield token
 
-    with patch("ollama_client.health_check", new_callable=AsyncMock, return_value=health_result) as mock_hc, \
-         patch("server.health_check", new_callable=AsyncMock, return_value=health_result), \
-         patch("ollama_client.stream_chat", side_effect=fake_stream) as mock_sc:
+    with patch("server.health_check", new_callable=AsyncMock, return_value=health_result) as mock_hc, \
+         patch("server.stream_chat", side_effect=fake_stream) as mock_sc:
         yield {"health_check": mock_hc, "stream_chat": mock_sc}

@@ -129,6 +129,23 @@ the gap was the shell side-channel and missing role instructions. All
 three steps shipped 2026-06-11. Unit layer:
 `tests/test_operator_parity.py`.
 
+- **umans port — ✅ DONE 2026-06-26 (trivial).** Umans models
+  (`umans-coder`, `umans-glm-5.2`, `umans-flash`, …) launch through
+  `claude_client.run_claude` with `use_umans=True` — same CLI, pointed at
+  `api.code.umans.ai`. The claude operator lockdown (`--strict-mcp-config`,
+  OPERATOR.md system prompt, `LOOM_NROL_OPERATOR=1`, Write/Edit/Bash
+  stripping, nrol-ao MCP surface) is keyed on `nrol_operator`, not on a
+  provider string, so it already covered umans with no new client code.
+  The only gap was the guard: `_nrol_operator_block_reason` classified
+  umans as its own provider but `NROL_OPERATOR_PROVIDERS` did not list it,
+  so `umans-*` models were refused at creation (live error: "NROL operator
+  mode is not ported to provider 'umans' yet"). Fix: added `"umans"` to the
+  allowlist as its own entry. **Umans is tracked as a distinct provider in
+  the matrix, not folded into "claude"** — the labeling is a signpost so a
+  future debugger reading the allowlist sees umans was considered and
+  ported, rather than re-deriving it from the claude_client launch path.
+  Regression: `tests/test_operator_parity.py::test_operator_guard_allows_umans`.
+
 - **Guard (Step 0):** `NROL_OPERATOR_PROVIDERS` allowlist in server.py,
   checked at conversation creation (400) and at generation dispatch. The
   actual hole was the per-generation model picker — operator convs are

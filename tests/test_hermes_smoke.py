@@ -1,7 +1,7 @@
 """Smoke tests for Hermes mode wiring (Phase 2).
 
 These mock the `hermes acp` subprocess entirely, so they run without WSL, without
-a Hermes install, and without Ollama. They guard the two things most likely to
+a Hermes install, and without llama-server. They guard the two things most likely to
 break silently: (1) the ACP frame -> Loom event translation in
 ``hermes_client.run_hermes``, and (2) the v1 deadlock — a slow permission
 round-trip must NOT stall the stdout read loop.

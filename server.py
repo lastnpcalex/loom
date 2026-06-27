@@ -1923,7 +1923,8 @@ async def api_create_conversation(data: dict = None):
     if mode == "claude":
         is_gemini = is_gemini_model(cc_model)
         is_codex = is_codex_model(cc_model)
-        mode = "gemini" if is_gemini else ("codex" if is_codex else "claude")
+        is_umans = is_umans_model(cc_model)
+        mode = "gemini" if is_gemini else ("codex" if is_codex else ("umans" if is_umans else "claude"))
 
     conv = await db.create_conversation(
         title, character_id, mode=mode, project_dir=project_dir
@@ -2094,7 +2095,8 @@ async def api_update_conversation(conv_id: int, data: dict):
         cc_model = data["cc_model"]
         is_gemini = is_gemini_model(cc_model)
         is_codex = is_codex_model(cc_model)
-        fields["mode"] = "gemini" if is_gemini else ("codex" if is_codex else "claude")
+        is_umans = is_umans_model(cc_model)
+        fields["mode"] = "gemini" if is_gemini else ("codex" if is_codex else ("umans" if is_umans else "claude"))
     if "cc_effort" in data:
         fields["cc_effort"] = data["cc_effort"]
     if "cc_permission_mode" in data:
@@ -2955,6 +2957,12 @@ CC_MODELS = [
     ]},
     {"group": "Antigravity (agy)", "models": get_initial_gemini_models()},
     {"group": "ChatGPT Codex (codex)", "models": get_initial_codex_models()},
+    {"group": "Umans AI", "models": [
+        {"value": "umans-coder", "label": "Umans Coder (Kimi K2.7-Code)"},
+        {"value": "umans-kimi-k2.7", "label": "Umans Kimi K2.7 (always thinks)"},
+        {"value": "umans-glm-5.2", "label": "Umans GLM 5.2 (largest context)"},
+        {"value": "umans-flash", "label": "Umans Flash (light, high-interactivity)"},
+    ]},
 ]
 
 
@@ -4453,13 +4461,18 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
         cc_model = data.get("cc_model") or conv.get("cc_model") or "sonnet"
         cc_effort = conv.get("cc_effort") or "high"
 
-        # Determine provider (same logic as _handle_claude_generation).
+       # Determine provider (same logic as _handle_claude_generation).
         # Pinned full IDs (e.g. `claude-opus-4-6`) count as Anthropic too —
         # routed through model_context.is_anthropic to keep the shape in sync.
         is_anthropic = model_context.is_anthropic(cc_model)
         is_llama = cc_model.endswith(".gguf")
+        is_umans = is_umans_model(cc_model)
         use_llama = conv.get("_use_llama", False) or is_llama
+        use_umans = conv.get("_use_umans", False) or is_umans
         if is_anthropic or is_gemini_model(cc_model) or is_codex_model(cc_model):
+            use_llama = False
+            use_umans = False
+        if use_umans:
             use_llama = False
 
         await _ws_send(conv_id, {"type": "status", "text": "Compacting context..."})
@@ -4480,6 +4493,7 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
             resume_session_id=session_id,
             fork_session=False,  # compact in place, don't fork
             use_llama=use_llama,
+            use_umans=use_umans,
         )
 
         # Get the current leaf — compact marker becomes its child,
@@ -4584,11 +4598,22 @@ def is_gemini_model(model: str) -> bool:
     )
 
 
+def is_umans_model(model: str) -> bool:
+    """Check if model ID is an Umans AI model (e.g. umans-coder, umans-flash)."""
+    if not model:
+        return False
+    ml = model.lower()
+    return ml.startswith("umans-")
+
+
 # Providers with a verified NROL operator lockdown port. Extended as each
 # port lands — see mcp_servers/nrol_ao/ROADMAP.md "Multi-provider operator
 # parity". "claude" covers the whole claude_client launch family (incl.
-# local llama, which reuses the same CLI flags and tool stripping).
-NROL_OPERATOR_PROVIDERS = {"claude", "codex", "gemini"}
+# local llama, which reuses the same CLI flags and tool stripping); "umans"
+# is its own entry because it is a distinct (if trivial) port — umans models
+# also launch through claude_client but are tracked separately so the parity
+# matrix stays an explicit signpost for future debuggers.
+NROL_OPERATOR_PROVIDERS = {"claude", "codex", "gemini", "umans"}
 
 
 def _nrol_operator_block_reason(cc_model: str) -> str | None:
@@ -4601,6 +4626,7 @@ def _nrol_operator_block_reason(cc_model: str) -> str | None:
     provider = (
         "gemini" if is_gemini_model(cc_model)
         else "codex" if is_codex_model(cc_model)
+        else "umans" if is_umans_model(cc_model)
         else "claude"
     )
     if provider in NROL_OPERATOR_PROVIDERS:
@@ -4655,6 +4681,10 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
 
     if mode == "local":
         await _handle_local_generation(websocket, conv_id, conv, data)
+        return
+
+    if mode == "umans":
+        await _handle_umans_generation(websocket, conv_id, conv, data)
         return
 
     if mode == "hermes":
@@ -4727,15 +4757,23 @@ async def _handle_claude_generation(
         # .gguf models go through Claude Code with ANTHROPIC_BASE_URL pointed
         # at the local llama-server (which speaks /v1/messages natively on :11434).
         is_llama = cc_model.endswith(".gguf")
+        # Umans AI models: remote Anthropic-compatible endpoint.
+        is_umans = is_umans_model(cc_model)
         # Only use llama when explicitly flagged (local mode) or when model is a .gguf.
         # The _use_llama flag is set by _handle_local_generation on a shallow copy.
         use_llama = conv.get("_use_llama", False) or is_llama
-        # Belt-and-suspenders: NEVER route Anthropic/Gemini/Codex through llama
+        # Use umans when explicitly flagged or when model is umans-*.
+        use_umans = conv.get("_use_umans", False) or is_umans
+        # Belt-and-suspenders: NEVER route Anthropic/Gemini/Codex through llama/umans
         if is_anthropic or is_gemini or is_codex:
             use_llama = False
-        print(f"[CC] Model routing: cc_model={cc_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} is_codex={is_codex} is_llama={is_llama} use_llama={use_llama} conv._use_llama={conv.get('_use_llama')} conv.mode={conv.get('mode')}")
+            use_umans = False
+        # Mutually exclusive: don't route through both at once
+        if use_umans:
+            use_llama = False
+        print(f"[CC] Model routing: cc_model={cc_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} is_codex={is_codex} is_llama={is_llama} use_llama={use_llama} is_umans={is_umans} use_umans={use_umans} conv._use_llama={conv.get('_use_llama')} conv.mode={conv.get('mode')}")
 
-        target_mode = "gemini" if is_gemini else ("codex" if is_codex else ("local" if use_llama else "claude"))
+        target_mode = "gemini" if is_gemini else ("codex" if is_codex else ("umans" if use_umans else ("local" if use_llama else "claude")))
 
         # Operator conversations only launch on providers with a ported
         # lockdown — the model picker can otherwise route a locked-down conv
@@ -4791,18 +4829,21 @@ async def _handle_claude_generation(
         branch = []
         crossed_provider = False
 
+        # Group models that use Claude Code sessions
+        is_cc_compatible = not (is_gemini or is_codex)
+
         if parent_id:
             branch = await db.get_branch_to_root(parent_id)
 
-        if handoff_forced_session and is_anthropic:
-            # Same-provider (Anthropic) handoff — resume the fresh compacted
+        if handoff_forced_session and is_cc_compatible:
+            # CC-compatible handoff (Anthropic/Local/Umans) — resume the fresh compacted
             # session rather than walking back to a pre-compact session that
             # the target window can't hold.
             resume_session_id = handoff_forced_session
             use_resume = True
             print(f"[CC] Handoff resume: id={resume_session_id} model={cc_model}")
         elif handoff_forced_session:
-            # Cross-provider handoff (Gemini / local) — fall through to history
+            # Cross-provider handoff (Gemini / Codex) — fall through to history
             # replay, which will truncate at the compact marker.
             print(f"[CC] Handoff replay for {cc_model}")
         elif parent_id and branch:
@@ -4828,22 +4869,18 @@ async def _handle_claude_generation(
                 if not content.strip() and not has_blocks:
                     print(f"[CC] Skipping empty session on msg {msg['id']}")
                     continue
-                # Check if the session was created by a different provider.
-                # cc_model_used can hold either a shortcode alias ("sonnet[1m]")
-                # or a full Anthropic model id ("claude-sonnet-4-7[1m]") — the
-                # helper accepts both.
+                # Check if the session was created by a different provider system.
+                # All Claude Code wrappers (Anthropic, Umans, Llama) generate compatible 
+                # sessions and can resume from each other. Gemini and Codex cannot.
                 prev_model = msg.get("cc_model_used") or ""
-                prev_is_anthropic = model_context.is_anthropic(prev_model)
                 prev_is_gemini = is_gemini_model(prev_model)
                 prev_is_codex = is_codex_model(prev_model)
-                prev_is_llama = bool(prev_model) and not (
-                    prev_is_anthropic or prev_is_gemini or prev_is_codex
-                )
+                prev_is_cc_compatible = bool(prev_model) and not (prev_is_gemini or prev_is_codex)
+                
                 if (
-                    (prev_is_anthropic != is_anthropic)
-                    or (prev_is_gemini != is_gemini)
+                    (prev_is_gemini != is_gemini)
                     or (prev_is_codex != is_codex)
-                    or (prev_is_llama != use_llama)
+                    or (prev_is_cc_compatible != is_cc_compatible)
                 ):
                     print(
                         f"[CC] Cross-provider turn at msg {msg['id']} ({prev_model}), will rebuild full history"
@@ -4857,16 +4894,33 @@ async def _handle_claude_generation(
             use_resume = True
             print(f"[CC] Session resume: id={resume_session_id} fork={fork_session}")
 
-            # When resuming, we only need the latest user message — CC has the rest
-            # Find the last user message in the branch
-            latest_user_content = ""
-            if branch:
-                for msg in reversed(branch):
-                    if msg["role"] == "user":
-                        latest_user_content = msg["content"]
-                        break
+            # agy-operator turns launch fresh-conv (no --conversation, by
+            # design — fresh tool registry per turn, see gemini_client.py:622).
+            # So agy has NO server-side memory to lean on: the one-line
+            # latest-user-message short-circuit below is correct for codex
+            # (stateful thread/fork) and claude (stateful --resume) but
+            # AMNESIAC for agy — the one-line prompt lands on a process with
+            # zero conversation history. Force the full-history-rebuild path
+            # so agy gets prior turns as text. resume_session_id/use_resume
+            # stay set so the client override (gemini_client.py:489) still
+            # fires and logs. See [[agy-operator-turn2-no-response]].
+            if is_gemini and conv.get("nrol_operator"):
+                print(f"[CC] agy-operator turn: rebuilding full history as text "
+                      f"(fresh-conv launch has no resume memory)")
+                if parent_id:
+                    branch = await db.get_branch_to_root(parent_id)
+                prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
+            else:
+                # When resuming, we only need the latest user message — CC has the rest
+                # Find the last user message in the branch
+                latest_user_content = ""
+                if branch:
+                    for msg in reversed(branch):
+                        if msg["role"] == "user":
+                            latest_user_content = msg["content"]
+                            break
 
-            prompt = latest_user_content or "(continue)"
+                prompt = latest_user_content or "(continue)"
         else:
             # No session resume — build full history from branch
             print(f"[CC] No session resume, building full history from branch, parent_id={parent_id}, is_gemini={is_gemini}")
@@ -4965,12 +5019,13 @@ async def _handle_claude_generation(
 
                    # Step 2: Describe images (local mode only) — runs ONCE for all images
                 desc_map: dict[str, str] = {}
-                print(f"[DESCRIBE] check — use_llama={use_llama}, image_files={len(image_files)}, cc_model={cc_model}")
+                print(f"[DESCRIBE] check — use_llama={use_llama}, use_umans={use_umans}, image_files={len(image_files)}, cc_model={cc_model}")
                 if not use_llama or not image_files:
                     print(f"[DESCRIBE] Skipping: use_llama={use_llama}, image_files={len(image_files)}")
-                if use_llama and image_files:
-                    print(f"[DESCRIBE] Running describe for {len(image_files)} image(s), model={config.llama_model}")
-                    _describe_model = config.vision_model or config.llama_model
+                if (use_llama or use_umans) and image_files:
+                    # Use umans_client for umans models, llama_client for local models
+                    _describe_model = (config.vision_model or config.llama_model) if use_llama else (config.umans_model or "umans-coder")
+                    print(f"[DESCRIBE] Running describe for {len(image_files)} image(s), model={_describe_model}")
                     await _ws_send(conv_id, {
                         "type": "describe_start",
                         "parent_msg_id": last_user_msg["id"],
@@ -5061,7 +5116,7 @@ async def _handle_claude_generation(
                 draft_msg_id=draft_msg_id,
                 parent_id=parent_id,
                 cc_model=cc_model,
-                mode="gemini" if is_gemini else ("codex" if is_codex else ("local" if use_llama else "claude")),
+                mode="gemini" if is_gemini else ("codex" if is_codex else ("umans" if use_umans else ("local" if use_llama else "claude"))),
             )
 
         # Let the client know we're launching
@@ -5069,6 +5124,8 @@ async def _handle_claude_generation(
             launch_label = f"Launching agy ({cc_model})..."
         elif is_codex:
             launch_label = f"Launching Codex ({cc_model})..."
+        elif use_umans:
+            launch_label = f"Launching {cc_model} via Umans..."
         elif use_llama:
             launch_label = f"Launching {cc_model} via Llama Server..."
         else:
@@ -5142,6 +5199,7 @@ async def _handle_claude_generation(
                     resume_session_id=resume_session_id if use_resume else None,
                     fork_session=fork_session,
                     use_llama=use_llama,
+                    use_umans=use_umans,
                     backstage_parent_id=conv.get("backstage_parent_id"),
                     nrol_operator=bool(conv.get("nrol_operator")),
                 )
@@ -5185,6 +5243,7 @@ async def _handle_claude_generation(
                         effort=cc_effort,
                         permission_mode=cc_permission_mode,
                         use_llama=use_llama,
+                        use_umans=use_umans,
                         backstage_parent_id=conv.get("backstage_parent_id"),
                         nrol_operator=bool(conv.get("nrol_operator")),
                     )
@@ -5202,7 +5261,7 @@ async def _handle_claude_generation(
                 conv_id=conv_id,
                 pid=proc.pid,
                 project_dir=project_dir,
-                mode="local" if use_llama else ("gemini" if is_gemini else ("codex" if is_codex else "claude")),
+                mode="umans" if use_umans else ("local" if use_llama else ("gemini" if is_gemini else ("codex" if is_codex else "claude"))),
             )
         except Exception as e:
             print(f"[GEN] Failed to register active generation: {e}")
@@ -5581,7 +5640,7 @@ async def _handle_claude_generation(
 
                     # Step 2: Describe images (runs ONCE)
                     desc_map: dict[str, str] = {}
-                    if use_llama and image_files:
+                    if (use_llama or use_umans) and image_files:
                         _describe_model = config.vision_model or config.llama_model
                         await _ws_send(conv_id, {
                             "type": "describe_start",
@@ -5893,7 +5952,7 @@ async def _handle_claude_generation(
             provider_name = (
                 "Antigravity (agy)"
                 if is_gemini
-                else ("ChatGPT Codex" if is_codex else ("Llama Server" if use_llama else "Claude Code"))
+                else ("ChatGPT Codex" if is_codex else ("Umans" if use_umans else ("Llama Server" if use_llama else "Claude Code")))
             )
             error_msg = result_info.get("error")
             if not error_msg:
@@ -5915,6 +5974,8 @@ async def _handle_claude_generation(
 
             if use_llama and not rate_limit_data:
                 error_msg += f" — check that llama-server is running with '{cc_model}'"
+            if use_umans and not rate_limit_data:
+                error_msg += f" — check that UMANS_API_KEY is set"
             content = f"[Error: {error_msg}]"
             if rate_limit_data:
                 content += _format_rate_limit_note(rate_limit_data)
@@ -6239,6 +6300,19 @@ async def _handle_local_generation(
     # Map local_model into cc_model so _handle_claude_generation uses it
     conv["cc_model"] = conv.get("local_model") or config.llama_model
     conv["_use_llama"] = True
+    await _handle_claude_generation(websocket, conv_id, conv, data)
+
+
+async def _handle_umans_generation(
+    websocket: WebSocket, conv_id: int, conv: dict, data: dict
+):
+    """Handle Umans mode: Claude Code launched against api.code.umans.ai."""
+    print(f"[UMANS-GEN] Starting: conv_id={conv_id}, cc_model={conv.get('cc_model')}, action={data.get('action')}, parent_id={data.get('parent_id')}")
+    # Umans mode = Claude Code powered by Umans AI remote models.
+    # Reuse the full CC handler but with use_umans=True.
+    conv = dict(conv)  # mutable copy
+    conv["cc_model"] = conv.get("cc_model") or config.umans_model or "umans-coder"
+    conv["_use_umans"] = True
     await _handle_claude_generation(websocket, conv_id, conv, data)
 
 

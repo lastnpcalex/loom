@@ -358,6 +358,39 @@ def main():
                 event_name=event_name,
             )
 
+    # DENY IMAGE READS:
+    # If the tool is reading a file, and the path ends with an image extension, we block it for Llama sessions.
+    if os.environ.get("LOOM_USE_LLAMA") == "1" and mapped_name in ("Read", "read_file", "view_file", "read_text_file", "read_many_files"):
+        fp = (
+            mapped_input.get("file_path")
+            or mapped_input.get("filePath")
+            or tool_input.get("file_path")
+            or tool_input.get("filePath")
+            or tool_input.get("AbsolutePath")
+            or tool_input.get("TargetFile")
+        )
+        paths_to_check = []
+        if isinstance(fp, str):
+            paths_to_check.append(fp)
+        elif isinstance(fp, list):
+            for item in fp:
+                if isinstance(item, str):
+                    paths_to_check.append(item)
+        elif isinstance(fp, dict):
+            for v in fp.values():
+                if isinstance(v, str):
+                    paths_to_check.append(v)
+
+        for p in paths_to_check:
+            p_lower = p.lower()
+            if any(p_lower.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tiff")):
+                deny(
+                    f"Reading binary image file '{p}' directly is not allowed. "
+                    "Use Loom's system-provided image descriptions (which are automatically generated "
+                    "when images are attached or processed) or ask the user for details about the image content.",
+                    event_name=event_name,
+                )
+
     # Auto-approve read-only tools
     if event_name != "PermissionRequest" and mapped_name in READ_ONLY:
         allow(f"Read-only tool: {mapped_name}", event_name=event_name)

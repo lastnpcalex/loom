@@ -17,7 +17,7 @@ Usage:
     python tools/probe_hermes_acp.py --hermes "C:\\path\\to\\hermes.exe" --prompt "..."
 
 The local model (config.yaml model.default) must support >=64k context (Hermes
-refuses otherwise).  We point Hermes at local Ollama via %HERMES_HOME%\\config.yaml.
+refuses otherwise).  We point Hermes at the local model via %HERMES_HOME%\\config.yaml.
 """
 from __future__ import annotations
 

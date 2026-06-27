@@ -35,13 +35,23 @@ _llama_lock = asyncio.Lock()
 _model_name_map: dict[str, str] = {}
 
 
+def _model_key(name: str) -> str:
+    """Canonical key for matching llama-server IDs to local GGUF filenames."""
+    base = Path(str(name or "")).name.lower()
+    if base.endswith(".gguf"):
+        base = base[:-5]
+    return "".join(c for c in base if c.isalnum())
+
+
 def _resolve_model(name: str) -> str:
     """Resolve a config model name (filename or server ID) to a server-registered ID.
 
     Checks (in order):
     1. Runtime mapping (_model_name_map) built by health_check()
     2. Persisted server_model_id in models_config.json
-    3. Falls back to the raw name
+    3. For .gguf files: fall back to the filename itself (llama-server registers
+       loaded models by their GGUF internal name, which is the filename).
+    4. For non-.gguf names: return as-is (already a server ID or model alias).
     """
     if not name:
         return name
@@ -52,20 +62,21 @@ def _resolve_model(name: str) -> str:
     if not name.endswith(".gguf"):
         return name
     # Persisted config mapping
-    if name.endswith(".gguf"):
-        try:
-            import json
-            models_cfg_path = Path(config.llama_models_dir).parent / "models_config.json"
-            if models_cfg_path.exists():
-                with open(models_cfg_path) as f:
-                    mc = json.load(f)
-                sid = mc.get(name, {}).get("server_model_id")
-                if sid:
-                    _model_name_map[name] = sid
-                    return sid
-        except Exception:
-            pass
-
+    try:
+        import json
+        models_cfg_path = Path(__file__).parent / "models_config.json"
+        if models_cfg_path.exists():
+            with open(models_cfg_path) as f:
+                mc = json.load(f)
+            sid = mc.get(name, {}).get("server_model_id")
+            if sid:
+                _model_name_map[name] = sid
+                return sid
+    except Exception:
+        pass
+    # Fallback: the .gguf filename itself is what llama-server registers.
+    # Populate the runtime map so subsequent calls skip the file read.
+    _model_name_map[name] = name
     return name
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -244,9 +255,9 @@ async def health_check() -> dict:
             # Llama-server loads one model at a time; the config stores the .gguf
             # filename but the server registers it by its internal GGUF name.
             active = config.llama_model or ""
-            active_norm = active.lower().replace("-", "").replace("_", "").replace(".", "").replace(":", "")
+            active_norm = _model_key(active)
             for srv in models:
-                srv_norm = srv.lower().replace("-", "").replace("_", "").replace(".", "").replace(":", "")
+                srv_norm = _model_key(srv)
                 # Check if the server ID contains key parts of the config filename
                 if active_norm and (active_norm in srv_norm or srv_norm in active_norm):
                     _model_name_map[active] = srv
@@ -254,9 +265,9 @@ async def health_check() -> dict:
             for loc in local:
                 if loc in _model_name_map:
                     continue
-                loc_norm = loc.lower().replace("-", "").replace("_", "").replace(".", "").replace(":", "")
+                loc_norm = _model_key(loc)
                 for srv in models:
-                    srv_norm = srv.lower().replace("-", "").replace("_", "").replace(".", "").replace(":", "")
+                    srv_norm = _model_key(srv)
                     if loc_norm in srv_norm or srv_norm in loc_norm:
                         _model_name_map[loc] = srv
             target = config.llama_model
@@ -441,7 +452,16 @@ async def describe_image(image_path: str, model: str = None, context: str = None
     """Use llama-server (vision-capable model) to describe an image in detail."""
     global _mock_mode
     if _mock_mode:
-        return "An image was shared."
+        # Vision is independent — check if the server recovered.
+        # Don't let stale _mock_mode from a prior chat failure permanently blind vision.
+        import httpx as _httpx
+        try:
+            async with _httpx.AsyncClient(timeout=5.0) as _hc:
+                await _hc.get(f"{_llama_host()}/v1/models")
+            _mock_mode = False  # Server is back — clear the ratchet
+        except Exception:
+            # Server still down — return informative fallback, not the silent mock
+            return "An image was shared, but the local vision model is unavailable right now."
 
     url = _image_to_data_url(image_path)
     if not url:

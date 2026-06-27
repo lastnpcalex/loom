@@ -251,6 +251,7 @@ function panToNode(msgId) {
     const nodeY = parseFloat(el.style.top);
     const nodeW = el.offsetWidth;
     const nodeH = el.offsetHeight;
+    if (isNaN(nodeX) || isNaN(nodeY) || isNaN(nodeW) || isNaN(nodeH)) return;
     const canvasRect = canvas.getBoundingClientRect();
 
     const targetZoom = Math.max(0.8, Math.min(TREE.zoom, 1.2));
@@ -262,10 +263,10 @@ function panToNode(msgId) {
         const dx = targetPanX - TREE.panX;
         const dy = targetPanY - TREE.panY;
         const dz = targetZoom - TREE.zoom;
-        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5 && Math.abs(dz) < 0.005) {
-            TREE.panX = targetPanX;
-            TREE.panY = targetPanY;
-            TREE.zoom = targetZoom;
+        if (isNaN(dx) || isNaN(dy) || isNaN(dz) || (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5 && Math.abs(dz) < 0.005)) {
+            if (!isNaN(targetPanX)) TREE.panX = targetPanX;
+            if (!isNaN(targetPanY)) TREE.panY = targetPanY;
+            if (!isNaN(targetZoom)) TREE.zoom = targetZoom;
             applyTransform();
             return;
         }
@@ -286,13 +287,16 @@ function panToCanvasNode() {
     const targetZoom = Math.max(0.8, Math.min(TREE.zoom, 1.2));
     const targetPanX = canvasRect.width / 2 - (cp.x + cp.width / 2) * targetZoom;
     const targetPanY = canvasRect.height / 2 - (cp.y + cp.height / 2) * targetZoom;
+    if (isNaN(targetPanX) || isNaN(targetPanY) || isNaN(targetZoom)) return;
     let frame;
     function animate() {
         const dx = targetPanX - TREE.panX;
         const dy = targetPanY - TREE.panY;
         const dz = targetZoom - TREE.zoom;
-        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5 && Math.abs(dz) < 0.005) {
-            TREE.panX = targetPanX; TREE.panY = targetPanY; TREE.zoom = targetZoom;
+        if (isNaN(dx) || isNaN(dy) || isNaN(dz) || (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5 && Math.abs(dz) < 0.005)) {
+            if (!isNaN(targetPanX)) TREE.panX = targetPanX;
+            if (!isNaN(targetPanY)) TREE.panY = targetPanY;
+            if (!isNaN(targetZoom)) TREE.zoom = targetZoom;
             applyTransform(); return;
         }
         TREE.panX += dx * 0.15; TREE.panY += dy * 0.15; TREE.zoom += dz * 0.15;
@@ -356,9 +360,9 @@ function renderBookmarksPanel(targetListId) {
                 if (convId !== State.currentConvId) {
                     await loadConversation(convId);
                 }
-                await switchToBranch(msgId, msgId);
                 State._skipLoadOnChat = true;
                 switchView('chat');
+                await switchToBranch(msgId, msgId);
                 document.getElementById('bookmarks-panel-global')?.classList.add('hidden');
             });
 
@@ -862,6 +866,10 @@ async function renderTree() {
             if (TREE.searchIndex >= 0) {
                 panToNode(TREE.searchMatches[TREE.searchIndex]);
             }
+        } else if (TREE._pendingPanToMsgId) {
+            const msgId = TREE._pendingPanToMsgId;
+            TREE._pendingPanToMsgId = null;
+            panToNode(msgId);
         } else if (TREE._skipCenter) {
             TREE._skipCenter = false;
             applyTransform();

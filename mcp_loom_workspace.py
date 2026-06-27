@@ -297,6 +297,37 @@ def read_text_file(file_path: str, max_chars: int = _DEFAULT_OUTPUT_CHARS) -> st
     return _limit_text(text, output_limit)
 
 
+@mcp.tool()
+def describe_image(image_path: str, context: str = None) -> str:
+    """Describe an image using the local vision model (Llama server).
+
+    Use this when you need to inspect or look at an image file in the repository.
+    image_path must be a path inside the current Loom workspace.
+    """
+    cfg = _cfg()
+    if isinstance(cfg, str):
+        return cfg
+    root, port, _conv_id = cfg
+    try:
+        target = _resolve_inside(root, image_path)
+    except Exception as e:
+        return f"Error: {e}"
+
+    if not target.exists() or not target.is_file():
+        return f"Error: image file not found: {target}"
+
+    payload = {
+        "image_path": str(target),
+        "context": context,
+    }
+
+    try:
+        res = _post_json(port, "/api/local/describe-image", payload, timeout=120)
+        return res.get("description") or "Failed to get image description."
+    except Exception as e:
+        return f"Error describing image: {e}"
+
+
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")

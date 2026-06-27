@@ -12,6 +12,7 @@ Usage:
 """
 
 import asyncio
+import importlib
 import json
 import os
 import re
@@ -45,7 +46,7 @@ import uvicorn
 import httpx
 import io
 
-# Import the same Config the main server uses, so admin spawns Ollama / vLLM
+# Import the same Config the main server uses, so admin spawns Llama Server
 # with whatever the operator has saved in config.json. Falls back gracefully
 # if the import fails (admin still works, just without config-driven tuning).
 try:
@@ -492,10 +493,10 @@ def _hermes_exe_path() -> str:
 async def tool_hermes_status():
     """Probe whether Hermes Agent (ACP mode) is installed and reachable.
 
-    Mirrors the comfyui-status / vLLM probes: checks the `hermes` CLI runs,
-    reports the version + HERMES_HOME, and confirms the local Ollama endpoint
-    (which Hermes is configured to use) is up. Does NOT do a full `hermes acp`
-    JSON-RPC round-trip here — that's heavy for a status poke.
+    Mirrors the comfyui-status probe: checks the `hermes` CLI runs,
+    reports the version + HERMES_HOME, and confirms the local model endpoint
+    is up. Does NOT do a full `hermes acp` JSON-RPC round-trip here — that's
+    heavy for a status poke.
     """
     home = os.environ.get(
         "HERMES_HOME",
@@ -536,17 +537,20 @@ async def tool_hermes_status():
     except Exception as e:
         lines.append(f"Error probing Hermes: {e}")
 
-    # Ollama reachability (Hermes is configured to talk to it via config.yaml).
+    # Llama Server reachability (probes the endpoint Hermes/ACM agents use).
     try:
+        llama_host = (_loom_config.llama_host_url() if _loom_config else "http://localhost:8000").rstrip("/")
         async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get("http://localhost:11434/api/tags")
+            r = await client.get(f"{llama_host}/v1/models")
         if r.status_code == 200:
-            n = len(r.json().get("models", []))
-            lines.append(f"\nOllama: reachable on :11434 ({n} models)")
+            models_data = r.json().get("data", [])
+            n = len(models_data)
+            lines.append(f"\nLlama Server: reachable on {llama_host} ({n} models)")
         else:
-            lines.append(f"\nOllama: :11434 responded {r.status_code}")
+            lines.append(f"\nLlama Server: {llama_host} responded {r.status_code}")
     except Exception:
-        lines.append("\nOllama: NOT reachable on :11434 — Hermes turns will fail")
+        llama_host_display = (_loom_config.llama_host_url() if _loom_config else "http://localhost:8000")
+        lines.append(f"\nLlama Server: NOT reachable on {llama_host_display}")
 
     return JSONResponse({
         "status": "ok" if available else "error",
@@ -970,7 +974,7 @@ def _call_nrol_mcp_tool(name: str, *args, **kwargs) -> dict:
         for key in keys:
             if key in env:
                 os.environ[key] = env[key]
-        from mcp_servers.nrol_ao import server as nrol_mcp
+        nrol_mcp = importlib.import_module("mcp_servers.nrol_ao.server")
         raw = getattr(nrol_mcp, name)(*args, **kwargs)
         try:
             return json.loads(raw)

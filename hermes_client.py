@@ -89,7 +89,7 @@ def default_hermes_exe(hermes_home: str | None = None) -> str:
 # part of the model name, not a provider switch.
 _HERMES_PROVIDER_PREFIXES = frozenset({
     "custom", "openrouter", "nous", "anthropic", "openai", "google",
-    "mistral", "xai", "zai", "ollama", "groq", "cerebras", "bedrock",
+    "mistral", "xai", "zai", "groq", "cerebras", "bedrock",
 })
 
 
@@ -161,7 +161,7 @@ def _loom_model_to_hermes(model: str | None) -> str | None:
 
     Hermes 0.13.0's parser only treats the FIRST colon as a provider delimiter,
     and only when the head matches a known provider, so ``custom:qwen3.6:27b``
-    round-trips correctly without the old ``ollama:`` workaround.
+    round-trips correctly without the old ``custom:`` prefix workaround.
     """
     if not model:
         return None
@@ -175,6 +175,9 @@ def _loom_model_to_hermes(model: str | None) -> str | None:
     except Exception as e:  # noqa: BLE001
         log.debug("[Hermes] _resolve_model(%s) failed: %s", model, e)
         resolved = model
+    # Ensure the resolved ID is what llama-server actually registered.
+    # llama-server registers loaded models by their GGUF internal filename.
+    # _resolve_model() handles the mapping chain: runtime map → config → filename.
     return f"custom:{resolved}"
 
 
@@ -531,7 +534,7 @@ async def run_hermes(
     Args:
         prompt: the fully-rendered user turn (caller bakes in history + persona).
         conv_id: Loom conversation id (for the permission bridge POST body).
-        model: optional Ollama model name; if given, sent via ACP `session/set_model`
+        model: optional llama model name; if given, sent via ACP `session/set_model`
                as ``custom:<model>``. None -> Hermes uses its config.yaml default.
         cwd: working directory the agent operates in. Translated to a forward-slash
              path on the wire (Hermes runs its terminal tool via Git Bash).
@@ -631,13 +634,13 @@ async def run_hermes(
                     if fork_session:
                         log.info("[Hermes] Forking session: %s", resume_session_id)
                         fork_result = await rpc_request_via_reader(
-                            rpc, "session/fork", {"sessionId": resume_session_id}, proc, state)
+                            rpc, "session/fork", {"sessionId": resume_session_id, "cwd": acp_cwd}, proc, state)
                         session_id = (fork_result or {}).get("sessionId") or (fork_result or {}).get("session_id") or ""
                         models_info = (fork_result or {}).get("models") or {}
                     else:
                         log.info("[Hermes] Loading session: %s", resume_session_id)
                         load_result = await rpc_request_via_reader(
-                            rpc, "session/load", {"sessionId": resume_session_id}, proc, state)
+                            rpc, "session/load", {"sessionId": resume_session_id, "cwd": acp_cwd}, proc, state)
                         session_id = resume_session_id
                         models_info = (load_result or {}).get("models") or {}
                 except Exception as e:

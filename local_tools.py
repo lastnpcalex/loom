@@ -1,6 +1,6 @@
 """Tool definitions and execution for Local mode agent.
 
-Provides file-system tools that Ollama models can call via the tool-calling API,
+Provides file-system tools that llama models can call via the tool-calling API,
 giving Local mode the ability to read, list, and write files in the working directory.
 """
 
@@ -30,7 +30,7 @@ SKIP_DIRS = {
     "target", "out", "bin", "obj",
 }
 
-# Tool definitions in Ollama/OpenAI function-calling format
+# Tool definitions in OpenAI function-calling format
 TOOL_DEFINITIONS = [
     {
         "type": "function",

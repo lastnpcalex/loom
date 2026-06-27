@@ -25,6 +25,13 @@ async function apiError(res, method, url) {
     return err;
 }
 
+function isMobileDevice() {
+    const hasMouse = window.matchMedia('(any-pointer: fine)').matches;
+    return window.matchMedia('(pointer: coarse)').matches
+        && window.matchMedia('(max-width: 768px)').matches
+        && !hasMouse;
+}
+
 const API = {
     async get(url) {
         const res = await fetch(url);
@@ -96,6 +103,7 @@ const State = {
         return raw;
     })(),
     branchCount: 1,  // number of response branches to generate (Weave/OODA only)
+    activeGenerations: {},  // gen_id -> { parent_id } of all active generations in this tree
 };
 
 function saveFolderCollapsed() {
@@ -521,7 +529,7 @@ async function checkHealth(retries = 2) {
                     }
                 }
                 if (!loadedGguf) {
-                    loadedGguf = health.target_model || null;
+                    loadedGguf = activeId || health.target_model || null;
                 }
             }
             State.loadedModel = loadedGguf;
@@ -775,17 +783,19 @@ function buildConvItem(conv) {
     const div = document.createElement('div');
     div.className = 'conv-item';
 
-    const isCCMode = conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini';
+    const isCCMode = conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini' || conv.mode === 'umans';
     const ccModel = (conv.cc_model || '').toLowerCase();
     const isNrol = isCCMode && !!conv.nrol_operator;
     const isGemini = isCCMode && !isNrol && ccModel.includes('gemini');
     const isCodex = isCCMode && !isNrol && ccModel.startsWith('codex');
-    const isClaude = isCCMode && !isNrol && !isGemini && !isCodex;
+    const isUmans = isCCMode && !isNrol && ccModel.startsWith('umans-');
+    const isClaude = isCCMode && !isNrol && !isGemini && !isCodex && !isUmans;
     const isLocal = conv.mode === 'local';
     const isHermes = conv.mode === 'hermes';
     const charName = isNrol ? (conv.cc_model || 'NROL-AO')
         : isGemini ? (conv.cc_model || 'Gemini')
         : isCodex ? (conv.cc_model || 'Codex')
+        : isUmans ? (conv.cc_model || 'Umans')
         : isClaude ? (conv.cc_model || 'Claude')
         : isLocal ? (conv.local_model || State.loadedModel || 'Llama')
         : isHermes ? (conv.local_model || State.loadedModel || 'Hermes')
@@ -795,6 +805,7 @@ function buildConvItem(conv) {
     const modeBadge = isNrol ? '<span class="mode-badge" title="NROL-AO epistemic engine operator — typed transitions only">NROL-AO {Operator}</span>'
         : isGemini ? '<span class="mode-badge" title="Antigravity (agy) in the browser">Loom {agy}</span>'
         : isCodex ? '<span class="mode-badge" title="ChatGPT Codex in the browser">Loom {Codex}</span>'
+        : isUmans ? '<span class="mode-badge" title="Claude Code powered by Umans AI (api.code.umans.ai)">Umans {Remote}</span>'
         : isClaude ? '<span class="mode-badge" title="Claude Code in the browser">Loom {Claude}</span>'
         : isLocal ? '<span class="mode-badge" title="Claude Code powered by a local Llama model">Braid {Local}</span>'
         : isHermes ? '<span class="mode-badge" title="Hermes Agent (ACP) powered by a local Llama model">Hermes {Agent}</span>'
@@ -1602,7 +1613,8 @@ function initInlineCCControls() {
                         if (data.status === 'ok') {
                             showToast('Llama Server restarted successfully.');
                             try { await API.post('/api/local/refresh-models', {}); } catch {}
-                            _invalidateModelCaches();
+                            if (typeof _invalidateModelCaches === 'function') _invalidateModelCaches();
+                            await checkHealth();
                         } else {
                             showToast('Llama Server restart failed: ' + (data.output || 'unknown error'), 'error');
                         }
@@ -2140,14 +2152,18 @@ async function populateCCModelDropdowns(selectedValue) {
             sel.appendChild(og);
         }
         if (prev) {
-            // Check if the previous model value is one of the Anthropic/Gemini API models
+            // Check if the previous model value is one of the Anthropic/Gemini/Codex/Umans API models
             const isApi = _ccModelsCache.some(group => group.models.some(m => m.value === prev));
             if (!isApi) {
-                if (loadedModel && _modelsMatch(prev, loadedModel)) {
-                    prev = loadedModel;
-                } else {
-                    // Fallback to sonnet if no matching local model is loaded
-                    prev = 'sonnet';
+                // Check if it's an umans model (umans-* prefix)
+                const isUmans = prev.startsWith('umans-');
+                if (!isUmans) {
+                    if (loadedModel && _modelsMatch(prev, loadedModel)) {
+                        prev = loadedModel;
+                    } else {
+                        // Fallback to sonnet if no matching local model is loaded
+                        prev = 'sonnet';
+                    }
                 }
             }
             sel.value = prev;
@@ -2453,9 +2469,7 @@ function setupEventListeners() {
             _renderLocalSelect(sel, models, selectedModel, (data.backend || '').toUpperCase());
         } catch { sel.innerHTML = `<option value="${selectedModel || ''}">${selectedModel || '(backend unavailable)'}</option>`; }
     }
-    // Backwards-compat shim — older call sites still use the Ollama-named helper.
-    const _populateOllamaSelect = _populateLocalSelect;
-
+  
     async function _populateLocalVisionSelect(selectId, selectedModel) {
         const sel = document.getElementById(selectId);
         if (!sel) return;
@@ -2592,8 +2606,8 @@ function setupEventListeners() {
     // (so llama_model / tuning changes take effect), then
     // calls admin's llama-restart which stops + waits + starts fresh from
     // config. ~30-60s for cold model load. Refreshes model caches when done.
-    document.getElementById('btn-vllm-restart').addEventListener('click', async () => {
-        const btn = document.getElementById('btn-vllm-restart');
+    document.getElementById('btn-llama-restart').addEventListener('click', async () => {
+        const btn = document.getElementById('btn-llama-restart');
         const orig = btn.textContent;
         btn.disabled = true;
         // Save current panel values first so the restart picks them up.
@@ -2608,7 +2622,7 @@ function setupEventListeners() {
                 showToast('Llama Server restarted: ' + (data.output || '').split('\n')[0]);
                 try { await API.post('/api/local/refresh-models', {}); } catch {}
                 _invalidateModelCaches();
-                checkHealth();
+                await checkHealth();
             } else {
                 showToast('Llama Server restart failed: ' + (data.output || 'unknown error'), 'error');
             }
@@ -2631,7 +2645,7 @@ function setupEventListeners() {
         try {
             await API.post('/api/local/refresh-models', {});
             _invalidateModelCaches();
-            checkHealth();
+            await checkHealth();
             await Promise.all([
                 _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), document.getElementById('cfg-braid-model') ? document.getElementById('cfg-braid-model').value : ''),
                 _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), document.getElementById('cfg-hermes-model') ? document.getElementById('cfg-hermes-model').value : ''),
@@ -2911,10 +2925,7 @@ function setupEventListeners() {
     document.getElementById('btn-send').addEventListener('click', sendMessage);
     
     // A device is only considered "mobile" if it lacks a precise pointing device (mouse/trackpad)
-    const hasMouse = window.matchMedia('(any-pointer: fine)').matches;
-    const isMobile = window.matchMedia('(pointer: coarse)').matches
-        && window.matchMedia('(max-width: 768px)').matches
-        && !hasMouse;
+    const isMobile = isMobileDevice();
         
     document.getElementById('user-input').addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
@@ -3739,17 +3750,11 @@ function renderSearchResults(results, query) {
         item.addEventListener('click', async () => {
             resultsEl.classList.add('hidden');
             document.getElementById('home-search-input').value = '';
+            if (r.message_id && typeof TREE !== 'undefined') {
+                TREE._pendingPanToMsgId = r.message_id;
+            }
             await loadConversation(r.conversation_id);
             switchView('tree');
-            if (r.message_id) {
-                // Only pan if the message exists in the rendered tree
-                requestAnimationFrame(() => {
-                    setTimeout(() => {
-                        const node = document.querySelector(`.tree-node-card[data-msg-id="${r.message_id}"]`);
-                        if (node) panToNode(r.message_id);
-                    }, 150);
-                });
-            }
         });
 
         resultsEl.appendChild(item);

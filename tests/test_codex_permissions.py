@@ -336,3 +336,31 @@ def test_permission_scope_gen_id_parses_generation_scope():
 
     assert server._permission_scope_gen_id("gen:42") == 42
     assert server._permission_scope_gen_id("manual") is None
+
+
+def test_permission_hook_denies_image_reads(monkeypatch):
+    import cc_permission_hook
+
+    stdin = io.StringIO(json.dumps({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "tool_input": {"filePath": "some/path/test_image.png"},
+    }))
+    stdout = io.StringIO()
+
+    monkeypatch.setenv("LOOM_CONV_ID", "42")
+    monkeypatch.setenv("LOOM_PORT", "3000")
+    monkeypatch.setenv("LOOM_USE_LLAMA", "1")
+    monkeypatch.setattr(sys, "argv", ["cc_permission_hook.py", "PreToolUse"])
+    monkeypatch.setattr(sys, "stdin", stdin)
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cc_permission_hook.main()
+
+    # The permission hook should exit with sys.exit(0) but deny output
+    assert exit_info.value.code == 0
+    hook_output = json.loads(stdout.getvalue())
+    assert hook_output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "Reading binary image file" in hook_output["hookSpecificOutput"]["permissionDecisionReason"]
+

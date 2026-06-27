@@ -35,7 +35,7 @@ class _FakeAnthropicClient:
         return type(self).response
 
 
-async def test_health_endpoint(client, mock_ollama):
+async def test_health_endpoint(client, mock_llama):
     """GET /api/health returns status info."""
     resp = await client.get("/api/health")
     assert resp.status_code == 200
@@ -44,17 +44,17 @@ async def test_health_endpoint(client, mock_ollama):
     assert "models" in data
 
 
-async def test_local_models_endpoint(client, mock_ollama):
+async def test_local_models_endpoint(client, mock_llama):
     """GET /api/local/models returns the backend-aware model cache.
 
-    (Replaced /api/ollama/models when model listing became cache-based.)"""
+    (Replaced /api/local/models when model listing became cache-based.)"""
     resp = await client.get("/api/local/models")
     assert resp.status_code == 200
     data = resp.json()
     assert "models" in data
 
 
-async def test_create_weave_conversation(client, mock_ollama):
+async def test_create_weave_conversation(client, mock_llama):
     """POST /api/conversations with weave mode."""
     resp = await client.post("/api/conversations", json={
         "title": "Weave Test",
@@ -66,7 +66,7 @@ async def test_create_weave_conversation(client, mock_ollama):
     assert data["mode"] == "weave"
 
 
-async def test_create_local_conversation(client, mock_ollama):
+async def test_create_local_conversation(client, mock_llama):
     """POST /api/conversations with mode=local and local_model set."""
     resp = await client.post("/api/conversations", json={
         "title": "Local Test",
@@ -79,7 +79,7 @@ async def test_create_local_conversation(client, mock_ollama):
     assert data["local_model"] == "qwen3:4b"
 
 
-async def test_create_claude_conversation(client, mock_ollama):
+async def test_create_claude_conversation(client, mock_llama):
     """POST /api/conversations with mode=claude."""
     resp = await client.post("/api/conversations", json={
         "title": "Claude Test",
@@ -93,7 +93,7 @@ async def test_create_claude_conversation(client, mock_ollama):
     assert data["cc_model"] == "opus"
 
 
-async def test_create_nrol_operator_conversation(client, mock_ollama):
+async def test_create_nrol_operator_conversation(client, mock_llama):
     """POST /api/conversations with nrol_operator launches a locked CC profile.
 
     Mode is forced to claude, the flag persists, and project_dir defaults to
@@ -111,7 +111,7 @@ async def test_create_nrol_operator_conversation(client, mock_ollama):
     assert data["project_dir"].replace("\\", "/").endswith("workspaces/nrol_operator")
 
 
-async def test_get_conversation(client, mock_ollama):
+async def test_get_conversation(client, mock_llama):
     """GET /api/conversations/{id} returns the conversation."""
     create_resp = await client.post("/api/conversations", json={"title": "Get Test"})
     conv_id = create_resp.json()["id"]
@@ -122,7 +122,7 @@ async def test_get_conversation(client, mock_ollama):
     assert resp.json()["title"] == "Get Test"
 
 
-async def test_list_conversations(client, mock_ollama):
+async def test_list_conversations(client, mock_llama):
     """GET /api/conversations returns a list."""
     await client.post("/api/conversations", json={"title": "List A"})
     await client.post("/api/conversations", json={"title": "List B"})
@@ -136,7 +136,7 @@ async def test_list_conversations(client, mock_ollama):
     assert "List B" in titles
 
 
-async def test_delete_conversation(client, mock_ollama):
+async def test_delete_conversation(client, mock_llama):
     """DELETE /api/conversations/{id} removes the conversation."""
     create_resp = await client.post("/api/conversations", json={"title": "Delete Me"})
     conv_id = create_resp.json()["id"]

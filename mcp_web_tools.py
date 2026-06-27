@@ -1,7 +1,7 @@
 """MCP server providing web_search and web_fetch tools for local models.
 
 Launched by Claude Code as a stdio subprocess.  Provides DuckDuckGo search
-(via ddgs) and safe page fetching (via trafilatura) so that local Ollama
+(via ddgs) and safe page fetching (via trafilatura) so that local llama
 models get web access without needing the Anthropic API.
 
 Usage:

@@ -55,6 +55,11 @@ def _nrol_mcp_config(conv_id: int, server_port: int, force: bool = False) -> dic
 
     env = {
         "NROL_AO_REPO": str(nrol_repo),
+        **(
+            {"NROL_AO_STATE_DIR": os.environ["NROL_AO_STATE_DIR"]}
+            if os.environ.get("NROL_AO_STATE_DIR", "").strip()
+            else {}
+        ),
         "NROL_AO_ACTIVITY_DIR": os.environ.get(
             "NROL_AO_ACTIVITY_DIR",
             str(nrol_repo / "loom" / "mcp_activity"),
@@ -695,6 +700,16 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
     approval_policy, sandbox_mode = _codex_launch_policies(permission_mode, nrol_operator)
     gen_key = getattr(asyncio.current_task(), "_gen_key", None)
     permission_scope = f"gen:{gen_key[2]}" if gen_key else ""
+    if permission_mode == "plan":
+        plan_instruction = (
+            "You are running in PLAN MODE. Your task is to analyze the codebase and write a comprehensive "
+            "implementation plan to `implementation_plan.md` in the workspace. Do NOT modify any other files "
+            "or run commands that modify the repository. Once the plan is written, present it to the user "
+            "and ask for their approval. After writing the plan, end your turn immediately without performing "
+            "any edits."
+        )
+        prompt = f"{plan_instruction}\n\n{prompt}"
+
     if nrol_operator:
         _ensure_operator_instructions(workspace_root)
     elif not backstage_parent_id:

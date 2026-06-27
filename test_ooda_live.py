@@ -1,9 +1,9 @@
-"""Standalone test: Run the OODA two-pass loop against live Ollama.
+"""Standalone test: Run the OODA two-pass loop against live Llama Server.
 
 Usage:
     python test_ooda_live.py
 
-Requires Ollama running with qwen3.5:9b (or whatever config.ollama_model is set to).
+Requires Llama Server running with a model (see config.llama_model).
 Creates a temporary conversation in the DB, seeds state cards, runs the loop, prints results.
 """
 
@@ -13,7 +13,7 @@ import re
 import time
 
 import database as db
-from ollama_client import sync_chat
+from llama_client import sync_chat
 from ooda_harness import (
     build_ooda_system_prompt,
     parse_ooda_block,

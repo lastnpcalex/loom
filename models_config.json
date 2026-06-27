@@ -50,5 +50,31 @@
     "mmproj": null,
     "extra_args": "",
     "server_model_id": null
+  },
+  "qwen3.5-4b-nvfp4.gguf": {
+    "ctx_size": 100000,
+    "ngl": 999,
+    "kv_quant": "K8_0",
+    "threads": null,
+    "batch": null,
+    "ubatch": null,
+    "flash_attn": true,
+    "mlock": false,
+    "mmproj": "mmproj-qwen3.5-4b-nvfp4-f16.gguf",
+    "extra_args": "",
+    "server_model_id": "qwen3.5-4b-nvfp4.gguf"
+  },
+  "mmproj-qwen3.5-4b-nvfp4-f16.gguf": {
+    "ctx_size": 80000,
+    "ngl": 999,
+    "flash_attn": true,
+    "kv_quant": "none",
+    "threads": null,
+    "batch": null,
+    "ubatch": null,
+    "mlock": false,
+    "mmproj": null,
+    "extra_args": "",
+    "server_model_id": null
   }
 }

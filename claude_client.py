@@ -24,6 +24,70 @@ _AUTO_CONTINUE_PROMPT = (
 )
 
 
+def extract_and_save_tool_image(content_block: dict, conv_id: int, project_dir: str) -> str | None:
+    """Detects if content_block is an image block, saves it to project attachments, and returns its URL."""
+    if not isinstance(content_block, dict):
+        return None
+
+    b64_data = None
+    media_type = "image/png"
+
+    if content_block.get("type") == "image":
+        source = content_block.get("source")
+        if isinstance(source, dict) and source.get("type") == "base64":
+            b64_data = source.get("data")
+            media_type = source.get("media_type", "image/png")
+        else:
+            b64_data = content_block.get("data")
+            media_type = content_block.get("mimeType", "image/png")
+
+    if not b64_data:
+        return None
+
+    try:
+        import base64
+        import hashlib
+
+        # Decode data
+        img_bytes = base64.b64decode(b64_data.strip())
+
+        # Establish directories
+        base = Path(project_dir or ".").resolve()
+        canvas_dir = base / "canvas"
+        attachments_dir = canvas_dir / "_attachments"
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write .gitignore if it doesn't exist
+        gitignore = canvas_dir / ".gitignore"
+        if not gitignore.exists():
+            gitignore.write_text(
+                "# Canvas output is generated per-conversation — don't commit it\n"
+                "*\n"
+                "!.gitignore\n",
+                encoding="utf-8",
+            )
+
+        # Determine filename and extension
+        file_hash = hashlib.sha256(img_bytes).hexdigest()[:16]
+        ext_map = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+        }
+        ext = ext_map.get(media_type, ".png")
+        filename = f"{file_hash}{ext}"
+
+        target = attachments_dir / filename
+        target.write_bytes(img_bytes)
+
+        return f"/api/conversations/{conv_id}/file?path=canvas/_attachments/{filename}"
+    except Exception as e:
+        log.error("Failed to extract and save tool image: %s", e)
+        return None
+
+
 class _CCHandle:
     """Proxy over the active CC subprocess so the caller's reference stays
     valid across auto-continue relaunches. server.py stores this once in
@@ -370,44 +434,82 @@ def _process_event(raw: dict, state: dict | None = None) -> list[dict]:
 
     elif etype == "tool_result":
         content = raw.get("content", "")
+        conv_id = state.get("conv_id") if state else None
+        cwd = state.get("cwd") if state else None
+        image_url = None
         if isinstance(content, list):
             parts = []
             for block in content:
                 if isinstance(block, dict):
-                    parts.append(block.get("text", str(block)))
+                    url = extract_and_save_tool_image(block, conv_id, cwd)
+                    if url:
+                        image_url = url
+                        parts.append(f"[Image saved to {url}]")
+                    else:
+                        parts.append(block.get("text", str(block)))
                 else:
                     parts.append(str(block))
             content = "\n".join(parts)
-        events.append({
+        elif isinstance(content, dict):
+            url = extract_and_save_tool_image(content, conv_id, cwd)
+            if url:
+                image_url = url
+                content = f"[Image saved to {url}]"
+            else:
+                content = str(content)
+        
+        evt_data = {
             "type": "tool_result",
             "content": str(content),
             "tool_id": raw.get("tool_use_id", ""),
-        })
+        }
+        if image_url:
+            evt_data["image_url"] = image_url
+        events.append(evt_data)
 
     elif etype == "user":
         # CC sends tool results as "user" events with content blocks
         message = raw.get("message", {})
         content = message.get("content", [])
+        conv_id = state.get("conv_id") if state else None
+        cwd = state.get("cwd") if state else None
         if isinstance(content, list):
             for block in content:
                 btype = block.get("type", "")
                 if btype == "tool_result":
                     result_content = block.get("content", "")
+                    image_url = None
                     # content can be a list of sub-blocks
                     if isinstance(result_content, list):
                         parts = []
                         for sub in result_content:
                             if isinstance(sub, dict):
-                                parts.append(sub.get("text", str(sub)))
+                                url = extract_and_save_tool_image(sub, conv_id, cwd)
+                                if url:
+                                    image_url = url
+                                    parts.append(f"[Image saved to {url}]")
+                                else:
+                                    parts.append(sub.get("text", str(sub)))
                             else:
                                 parts.append(str(sub))
                         result_content = "\n".join(parts)
-                    events.append({
+                    elif isinstance(result_content, dict):
+                        url = extract_and_save_tool_image(result_content, conv_id, cwd)
+                        if url:
+                            image_url = url
+                            result_content = f"[Image saved to {url}]"
+                        else:
+                            result_content = str(result_content)
+                    
+                    evt_data = {
                         "type": "tool_result",
                         "content": str(result_content),
                         "tool_id": block.get("tool_use_id", ""),
                         "is_error": block.get("is_error", False),
-                    })
+                    }
+                    if image_url:
+                        evt_data["image_url"] = image_url
+                    events.append(evt_data)
 
     elif etype == "result":
         events.append({
@@ -511,11 +613,21 @@ def _loom_append_system_prompt(
     append_system_prompt: str | None,
     backstage_parent_id: int | None = None,
     nrol_operator: bool = False,
+    use_llama: bool = False,
 ) -> str | None:
     """Add the shared Loom contract only for ordinary Claude sessions."""
     if backstage_parent_id or nrol_operator:
         return append_system_prompt
-    return merge_system_prompts(load_loom_agent_prompt(), append_system_prompt) or None
+    contract = load_loom_agent_prompt()
+    if use_llama:
+        image_warning = (
+            "\n\nNever use file-reading tools (like `Read`, `view_file`, or `read_text_file`) on binary image formats (e.g., `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.ico`). "
+            "Reading binary files directly as text wastes context and produces useless output. "
+            "If you need to understand or inspect an image inside the workspace, use the `describe_image` tool from the `loom-workspace` MCP server (which uses the local vision-capable Llama Server model to analyze the image). "
+            "For attached user uploads, look at the system-provided image descriptions in your context, or ask the user."
+        )
+        contract = contract + image_warning
+    return merge_system_prompts(contract, append_system_prompt) or None
 
 
 async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
@@ -523,6 +635,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                      permission_mode: str = "default",
                      resume_session_id: str = None, fork_session: bool = False,
                      use_llama: bool = False,
+                     use_umans: bool = False,
                      backstage_parent_id: int | None = None,
                      nrol_operator: bool = False,
                      extra_mcp_servers: dict | None = None,
@@ -538,6 +651,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     env vars pointing at the local llama-server (which speaks Anthropic's /v1/messages
     natively on port 11434). The model filename (e.g. Qwen3.6-27B-NVFP4.gguf) is set
     as all three DEFAULT_*_MODEL env vars so CC routes to it regardless of preset.
+    When use_umans is True, routes through Umans AI's Anthropic-compatible endpoint
+    (api.code.umans.ai) for remote model access.
     Permission hooks route tool approvals through Loom's HTTP API.
     """
     # Configure the permission hook in the project directory (idempotent, skips if already set)
@@ -565,10 +680,10 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             "Write", "Edit", "NotebookEdit", "Bash",
             "Agent", "Task", "KillShell", "SlashCommand",
         ]
-    # Llama/local models: block built-in WebSearch/WebFetch (require Anthropic API).
+    # Llama/local/umans models: block built-in WebSearch/WebFetch (require Anthropic API).
     # The MCP web-tools server (registered below) provides keyless web_search/web_fetch
     # via DuckDuckGo + trafilatura as the replacement.
-    if use_llama:
+    if use_llama or use_umans:
         disallowed_list += ["WebSearch", "WebFetch"]
     if extra_disallowed_tools:
         disallowed_list += [tool for tool in extra_disallowed_tools if tool not in disallowed_list]
@@ -606,15 +721,28 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         if backstage_md.exists():
             cc_args.extend(["--append-system-prompt", backstage_md.read_text(encoding="utf-8")])
 
-    # Llama/local models: register MCP web-tools so they get web_search/web_fetch
+    # Llama/local/umans models: register MCP web-tools so they get web_search/web_fetch
     # via DuckDuckGo + trafilatura (keyless, no Anthropic API needed).
-    if use_llama:
+    if use_llama or use_umans:
         web_tools_script = Path(__file__).parent / "mcp_web_tools.py"
         if web_tools_script.is_file():
             mcp_servers["web-tools"] = {
                 "type": "stdio",
                 "command": sys.executable,
                 "args": [str(web_tools_script)],
+            }
+        workspace_script = Path(__file__).parent / "mcp_loom_workspace.py"
+        if workspace_script.is_file():
+            mcp_servers["loom-workspace"] = {
+                "type": "stdio",
+                "command": sys.executable,
+                "args": [str(workspace_script)],
+                "env": {
+                    "LOOM_API_URL": f"{protocol}://127.0.0.1:{server_port}",
+                    "LOOM_PORT": str(server_port),
+                    "LOOM_CONV_ID": str(conv_id),
+                    "LOOM_WORKSPACE_ROOT": cwd,
+                }
             }
 
     # NROL-AO: make the engine MCP available to ordinary Loom-launched CC
@@ -673,6 +801,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         append_system_prompt,
         backstage_parent_id=backstage_parent_id,
         nrol_operator=nrol_operator,
+        use_llama=use_llama,
     )
     if append_system_prompt:
         cc_args.extend(["--append-system-prompt", append_system_prompt])
@@ -702,7 +831,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     env["BASH_MAX_TIMEOUT_MS"] = "3600000"      # 60 minutes (default is 10m)
     if extra_env:
         env.update({str(k): str(v) for k, v in extra_env.items() if v is not None})
-    # Always clear ollama-style entrypoint flags — we never use ollama launch anymore.
+    # Always clear legacy entrypoint flags — we never use external model launchers anymore.
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
@@ -723,6 +852,40 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = alias
         # Suppress the per-request attribution hash that defeats KV-cache prefix.
         env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
+        env["LOOM_USE_LLAMA"] = "1"
+    # Umans AI as CC backend: point the Anthropic SDK at Umans' Anthropic-compatible
+    # /v1/messages endpoint. Session resumption works across providers because the
+    # conversation history lives in Loom's DB, not the provider.
+    elif use_umans:
+        # Read API key from environment or .env file
+        _umans_key = os.environ.get("UMANS_API_KEY", "").strip()
+        if not _umans_key:
+            _env_path = Path(__file__).parent / ".env"
+            if _env_path.exists():
+                try:
+                    _text = _env_path.read_text(encoding="utf-8")
+                    for _line in _text.splitlines():
+                        _line = _line.strip()
+                        if _line.startswith("#") or "=" not in _line:
+                            continue
+                        _k, _, _v = _line.partition("=")
+                        if _k.strip() == "UMANS_API_KEY":
+                            _umans_key = _v.strip()
+                            break
+                except Exception:
+                    pass
+        if _umans_key:
+            env["ANTHROPIC_BASE_URL"] = "https://api.code.umans.ai"
+            env["ANTHROPIC_API_KEY"] = _umans_key
+            env["ANTHROPIC_AUTH_TOKEN"] = _umans_key
+            # Model alias for umans (e.g. "umans-coder", "umans-flash")
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = model
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
+            env["LOOM_USE_LLAMA"] = "0"
+            env["LOOM_USE_UMANS"] = "1"
+        else:
+            print("[CC] WARNING: UMANS_API_KEY not set — umans routing will fail")
 
     # If the prompt is too long for a command-line arg (Windows ~32K limit),
     # pipe it via stdin instead of -p
@@ -795,7 +958,10 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         # index map, captured session_id, captured stop_reason. Survives across
         # auto-continue relaunches so the second run knows which session_id
         # to --resume against and so accumulated tool_use blocks don't reset.
-        stream_state: dict = {}
+        stream_state: dict = {
+            "conv_id": conv_id,
+            "cwd": cwd,
+        }
         relaunches = 0
         # Buffer the `result` event across relaunches: the caller treats it
         # as "stream done", so we only emit it after we've decided not to

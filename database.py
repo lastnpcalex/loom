@@ -328,7 +328,7 @@ async def _run_migrations(db):
         "ALTER TABLE conversations ADD COLUMN nsfw INTEGER DEFAULT 0",
         # Phase 4: session resume — store CC session_id per message node
         "ALTER TABLE messages ADD COLUMN cc_session_id TEXT",
-        # Local mode: store selected Ollama model per conversation
+        # Local mode: store selected llama model per conversation
         "ALTER TABLE conversations ADD COLUMN local_model TEXT",
         # Permission mode (default, plan, auto, etc.)
         "ALTER TABLE conversations ADD COLUMN cc_permission_mode TEXT DEFAULT 'default'",

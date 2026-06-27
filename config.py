@@ -19,6 +19,7 @@ _PERSISTED_KEYS = (
     "llama_host", "llama_model", "llama_server_exe", "llama_models_dir",
     "llama_chat_template_file",
     "vision_model",
+    "umans_model",
     "max_context_tokens", "verbatim_window",
     "temperature", "top_p", "max_tokens", "repeat_penalty",
     "db_path",
@@ -32,6 +33,9 @@ class Config:
     llama_host: str = os.getenv("LLAMA_HOST", "http://localhost:8000")
     llama_model: str = os.getenv("LLAMA_MODEL", "Qwen3.6-27B-NVFP4.gguf")
     vision_model: str = os.getenv("VISION_MODEL", "")  # for image description; empty = use llama_model
+
+    # Umans AI connection (remote, Anthropic/OpenAI-compatible endpoint)
+    umans_model: str = os.getenv("UMANS_MODEL", "umans-coder")
 
     # Llama Server binary and models directory
     llama_server_exe: str = os.getenv(

@@ -84,3 +84,14 @@ def test_existing_operator_file_landing_still_uses_dedicated_role(tmp_path):
     ).read_text(encoding="utf-8")
 
     assert (tmp_path / "AGENTS.md").read_text(encoding="utf-8") == operator_md
+
+
+def test_claude_llama_sessions_append_image_warning():
+    import claude_client
+
+    normal = claude_client._loom_append_system_prompt("Extra note", use_llama=False)
+    llama = claude_client._loom_append_system_prompt("Extra note", use_llama=True)
+
+    assert "Never use file-reading tools" not in normal
+    assert "Never use file-reading tools" in llama
+

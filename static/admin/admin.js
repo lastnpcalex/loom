@@ -26,19 +26,56 @@ function setView(name) {
     document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + name));
     document.getElementById('view-title').textContent = VIEW_TITLES[name] || name;
     localStorage.setItem('loom-admin-view', name);
-    if (name === 'overview' && !specsLoaded) loadSpecs();
+    if (name === 'overview') {
+        if (!specsLoaded) loadSpecs();
+        loadLlamaModels({ force: true });
+    }
     if (name === 'terminal') refreshTtyd();
-    if (name === 'servers') loadLlamaModels();
 }
 
 // ── Llama switch-model control ──────────────────────────────────────
-async function loadLlamaModels() {
+function _llamaModelKey(name) {
+    return String(name || '')
+        .split(/[\\/]/).pop()
+        .replace(/\.gguf$/i, '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, '');
+}
+
+function _matchLlamaModelName(name, models) {
+    if (!name) return '';
+    const base = String(name).split(/[\\/]/).pop();
+    if (models.includes(base)) return base;
+    const key = _llamaModelKey(base);
+    return models.find(m => _llamaModelKey(m) === key) || base;
+}
+
+async function loadLlamaModels(opts = {}) {
     const sel = document.getElementById('llama-model-switch');
-    if (!sel || sel.dataset.loaded === '1') return;
+    if (!sel || (!opts.force && sel.dataset.loaded === '1')) return;
     try {
         const r = await fetch('/api/llama-models', { cache: 'no-store' });
         if (!r.ok) return;
         const d = await r.json();
+        const models = d.models || [];
+        const loadedNow = (d.loaded || []).map(m => _matchLlamaModelName(m, models)).filter(Boolean);
+        const configured = _matchLlamaModelName(d.configured, models);
+        const options = models.slice();
+        for (const name of loadedNow) {
+            if (name && !options.includes(name)) options.unshift(name);
+        }
+        if (configured && !options.includes(configured)) options.push(configured);
+        const selected = loadedNow[0] || configured || '';
+        sel.innerHTML = options.map(m => {
+            const marks = [];
+            if (loadedNow.some(l => l === m)) marks.push('loaded');
+            if (m === configured) marks.push('default');
+            return `<option value="${esc(m)}"${m === selected ? ' selected' : ''}>${esc(m)}${marks.length ? ' - ' + marks.join(', ') : ''}</option>`;
+        }).join('') || '<option value="">(no .gguf files found)</option>';
+        sel.dataset.loaded = '1';
+        sel.dataset.loadedModel = loadedNow[0] || '';
+        return;
+        /*
         const loaded = (d.loaded || []).map(m => m.split(/[\\/]/).pop());
         sel.innerHTML = (d.models || []).map(m => {
             const marks = [];
@@ -47,6 +84,7 @@ async function loadLlamaModels() {
             return `<option value="${esc(m)}"${m === d.configured ? ' selected' : ''}>${esc(m)}${marks.length ? ' — ' + marks.join(', ') : ''}</option>`;
         }).join('') || '<option value="">(no .gguf files found)</option>';
         sel.dataset.loaded = '1';
+        */
     } catch (e) { /* admin down or no models dir */ }
 }
 
@@ -58,6 +96,7 @@ async function llamaSwitchModel() {
     const btn = document.getElementById('btn-llama-switch');
     btn.disabled = true;
     await runTool('llama-restart?model=' + encodeURIComponent(model), { target: 'out-llama' });
+    await loadLlamaModels({ force: true });
     btn.disabled = false;
 }
 
@@ -66,6 +105,7 @@ async function llamaUnloadForComfy() {
     const btn = document.getElementById('btn-llama-unload');
     if (btn) btn.disabled = true;
     await runTool('llama-unload', { target: 'out-llama' });
+    await loadLlamaModels({ force: true });
     if (btn) btn.disabled = false;
 }
 
@@ -78,6 +118,7 @@ async function llamaReloadSelected() {
     const btn = document.getElementById('btn-llama-reload');
     if (btn) btn.disabled = true;
     await runTool('llama-reload' + suffix, { target: 'out-llama' });
+    await loadLlamaModels({ force: true });
     if (btn) btn.disabled = false;
 }
 
@@ -119,8 +160,65 @@ function scheduleRefresh(delay = 10000) {
 async function refreshAll() {
     try {
         await Promise.all([refreshInstances(), refreshGenerations(), refreshCronJobs(), refreshPorts()]);
+        const overview = document.getElementById('view-overview');
+        if (overview?.classList.contains('active') && document.activeElement?.id !== 'llama-model-switch') {
+            await loadLlamaModels({ force: true });
+        }
     } catch (e) { /* keep ticking */ }
     scheduleRefresh();
+}
+
+// Maps each server-card head-actions slot to the buttons that should render
+// in each state. Keeps the up/down conditional logic — and the "no Stop button
+// when nothing is running" rule — in one place.
+const SERVER_HEAD_ACTIONS = {
+    llama: {
+        on: [
+            { cls: 'btn btn-cyan', label: '↻ Restart', tool: 'llama-restart' },
+            { cls: 'btn btn-warn', label: '⏹ Stop',    tool: 'llama-stop', confirm: 'Stop Llama Server?' },
+        ],
+        off: [
+            { cls: 'btn btn-green', label: '▶ Start',  tool: 'llama-start' },
+        ],
+        target: 'out-llama',
+    },
+    comfy: {
+        on: [
+            { cls: 'btn btn-warn', label: '⏹ Stop',    tool: 'comfyui-stop', confirm: 'Kill ComfyUI?' },
+        ],
+        off: [
+            { cls: 'btn btn-green', label: '▶ Start',  tool: 'comfyui-start' },
+        ],
+        target: 'out-comfy',
+    },
+    nrol: {
+        on: [
+            { cls: 'btn btn-warn', label: '⏹ Stop',    tool: 'nrol-dashboard-stop', confirm: 'Stop NROL-AO dashboard if Loom admin launched it?' },
+        ],
+        off: [
+            { cls: 'btn btn-green', label: '▶ Start',  tool: 'nrol-dashboard-start' },
+        ],
+        target: 'out-nrol',
+    },
+};
+
+function renderServerHeadActions(key, on) {
+    const slot = document.getElementById('head-actions-' + key);
+    if (!slot) return;
+    const cfg = SERVER_HEAD_ACTIONS[key];
+    if (!cfg) return;
+    const buttons = on ? cfg.on : cfg.off;
+    slot.innerHTML = buttons.map((b, i) =>
+        `<button class="${b.cls}" data-srv="${key}" data-srv-i="${i}">${b.label}</button>`
+    ).join('');
+    slot.querySelectorAll('button').forEach(btn => {
+        const b = buttons[+btn.dataset.srvI];
+        btn.addEventListener('click', () => {
+            const opts = { target: cfg.target };
+            if (b.confirm) confirmTool(b.tool, b.confirm, opts);
+            else runTool(b.tool, opts);
+        });
+    });
 }
 
 async function refreshPorts() {
@@ -137,6 +235,7 @@ async function refreshPorts() {
         const dot = document.getElementById('dot-' + k);
         if (dot) dot.className = 'dot ' + (d[k] ? 'on' : 'off');
     }
+    for (const k of ['llama', 'comfy', 'nrol']) renderServerHeadActions(k, !!d[k]);
     // Keep the terminal iframe in sync if ttyd died or came up elsewhere
     if (document.getElementById('view-terminal').classList.contains('active')) {
         const frame = document.getElementById('ttyd-frame');
@@ -145,38 +244,49 @@ async function refreshPorts() {
     }
 }
 
+function _instanceActionsHtml(s) {
+    const on = s.status === 'online';
+    if (on) {
+        return `<button onclick="doAction('${s.name}', 'restart')" class="btn btn-cyan">↻ Restart</button>
+                <button onclick="doAction('${s.name}', 'shutdown')" class="btn btn-warn">⏹ Shutdown</button>`;
+    }
+    return `<button onclick="doAction('${s.name}', 'start')" class="btn btn-green">▶ Start</button>`;
+}
+
+function _instanceDbHtml(s) {
+    if (s.name === 'main') {
+        const dbs = (window.availableDbs || []).slice();
+        if (!dbs.includes(s.db)) dbs.push(s.db);
+        return `<select class="select" onchange="switchDb(this.value)" style="padding: 1px 4px; font-size: 0.9em;">
+            ${dbs.map(db => `<option value="${esc(db)}"${db === s.db ? ' selected' : ''}>${esc(db)}</option>`).join('')}
+        </select>`;
+    }
+    return `<span>${esc(s.db)}</span>`;
+}
+
 async function refreshInstances() {
     const r = await fetch('/api/status', { cache: 'no-store' });
     if (!r.ok) return;
     const d = await r.json();
-    const host = document.getElementById('instance-cards');
-    host.innerHTML = (d.instances || []).map(s => {
+    const instances = d.instances || [];
+
+    // Mirror state onto the matching server-cards, so the
+    // start/stop/restart controls and PID/DB readouts live there.
+    for (const s of instances) {
         const on = s.status === 'online';
-        const managedTag = s.managed ? ' <span class="tag">managed</span>' : '';
-        let actions = '';
-        if (on) {
-            actions = `<button onclick="doAction('${s.name}', 'restart')" class="btn btn-cyan">↻ Restart</button>
-                       <button onclick="doAction('${s.name}', 'shutdown')" class="btn btn-warn">⏹ Shutdown</button>`;
-        } else {
-            actions = `<button onclick="doAction('${s.name}', 'start')" class="btn btn-green">▶ Start</button>`;
-        }
-        let dbLabel = '';
-        if (s.name === 'main') {
-            const dbs = window.availableDbs || [];
-            if (!dbs.includes(s.db)) dbs.push(s.db);
-            dbLabel = `<select class="select" onchange="switchDb(this.value)" style="padding: 1px 4px; font-size: 0.9em; font-family: inherit; background: var(--bg-card); color: var(--text-main); border: 1px solid var(--border-color); border-radius: 4px; cursor: pointer;">
-                ${dbs.map(db => `<option value="${esc(db)}"${db === s.db ? ' selected' : ''}>${esc(db)}</option>`).join('')}
-            </select>`;
-        } else {
-            dbLabel = `<span>${esc(s.db)}</span>`;
-        }
-        return `<div class="instance-card">
-            <div class="instance-top"><span class="dot ${on ? 'on' : 'off'}"></span>
-                <span class="instance-name">${esc(s.label)}</span>${managedTag}</div>
-            <div class="instance-meta"><span>:${s.port}</span>${dbLabel}<span>${s.pid ? 'PID ' + s.pid : '—'}</span></div>
-            <div class="instance-actions">${actions}</div>
-        </div>`;
-    }).join('');
+        const dot = document.getElementById('dot-' + s.name);
+        if (dot) dot.className = 'dot ' + (on ? 'on' : 'off');
+        const portTag = document.getElementById(s.name + '-port-tag');
+        if (portTag) portTag.textContent = ':' + s.port;
+        const managedSlot = document.getElementById(s.name + '-managed-tag');
+        if (managedSlot) managedSlot.innerHTML = s.managed ? '<span class="tag">managed</span>' : '';
+        const head = document.getElementById('head-actions-' + s.name);
+        if (head) head.innerHTML = _instanceActionsHtml(s);
+        const dbSlot = document.getElementById(s.name + '-db-label');
+        if (dbSlot) dbSlot.innerHTML = _instanceDbHtml(s);
+        const pidSlot = document.getElementById(s.name + '-pid-label');
+        if (pidSlot) pidSlot.textContent = s.pid ? 'PID ' + s.pid : '—';
+    }
 }
 
 async function refreshGenerations() {
@@ -292,13 +402,38 @@ async function killGen(draftId) {
 }
 
 // ── Instance + admin actions ────────────────────────────────────────
+function _writeInstanceStatus(name, text, isError) {
+    // Show progress + completion on both the compact Overview note and the
+    // full Servers-page server-out, so the same "starting, started" widget
+    // feedback the llama/comfy/nrol cards already gave you is mirrored here.
+    const stamp = new Date().toLocaleTimeString();
+    const line = '[' + stamp + '] ' + text;
+    const note = document.getElementById('status-' + name);
+    if (note) {
+        note.textContent = text;
+        note.style.color = isError ? 'var(--red)' : (text.endsWith('...') ? 'var(--amber)' : 'var(--green)');
+    }
+    const out = document.getElementById('out-' + name);
+    if (out) {
+        const existing = out.textContent ? out.textContent + '\n' : '';
+        out.textContent = existing + line;
+        out.classList.toggle('error', !!isError);
+        out.scrollTop = out.scrollHeight;
+    }
+}
+
 async function doAction(name, action) {
-    showToast(action + 'ing ' + name + '...');
+    const verb = { start: 'Starting', restart: 'Restarting', shutdown: 'Shutting down' }[action] || action;
+    _writeInstanceStatus(name, verb + ' ' + name + '...', false);
     try {
         const r = await fetch('/action/' + name + '/' + action, { method: 'POST' });
         const d = await r.json();
-        showToast(d.status || d.error || 'done');
-    } catch (e) { showToast('failed: ' + e); }
+        const msg = d.status || d.error || 'done';
+        const isError = !!d.error;
+        _writeInstanceStatus(name, msg, isError);
+    } catch (e) {
+        _writeInstanceStatus(name, 'failed: ' + e, true);
+    }
     setTimeout(refreshAll, 1500);
 }
 
@@ -369,6 +504,9 @@ async function runTool(name, opts = {}) {
     } catch (e) {
         out.textContent = 'Request failed: ' + e;
         out.classList.add('error');
+    }
+    if (/^llama-/.test(name)) {
+        await loadLlamaModels({ force: true });
     }
     scheduleRefresh(30000);
 }
@@ -555,6 +693,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadMeta();
     const saved = localStorage.getItem('loom-admin-view');
     if (saved && document.getElementById('view-' + saved)) setView(saved);
-    else loadSpecs();  // default view is overview
+    else setView('overview');  // default view is overview
     refreshAll();
 });

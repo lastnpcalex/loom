@@ -52,6 +52,22 @@ CREATE TABLE IF NOT EXISTS proposals (
     deliberation TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_proposals_slug_status ON proposals(slug, status);
+CREATE TABLE IF NOT EXISTS search_query_proposals (
+    id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL,
+    add_queries TEXT NOT NULL,
+    remove_queries TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    coverage_gaps TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    decided_at TEXT,
+    decision_note TEXT,
+    result TEXT,
+    red_team TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_search_query_proposals_slug_status
+    ON search_query_proposals(slug, status);
 """
 
 
@@ -71,6 +87,10 @@ def article_id_for(article: dict) -> str:
 
 def new_proposal_id() -> str:
     return f"prop-{int(time.time() * 1000):x}-{uuid.uuid4().hex[:4]}"
+
+
+def new_search_query_proposal_id() -> str:
+    return f"sqp-{int(time.time() * 1000):x}-{uuid.uuid4().hex[:4]}"
 
 
 class ProposalStore:
@@ -235,3 +255,102 @@ class ProposalStore:
                 ),
             )
         return self.get_proposal(proposal_id)
+
+    # -- search query update proposals --
+
+    def add_search_query_proposal(
+        self,
+        slug: str,
+        add_queries: list[str],
+        remove_queries: list[str],
+        rationale: str,
+        coverage_gaps: list[str],
+        result: dict | None = None,
+    ) -> dict:
+        pid = new_search_query_proposal_id()
+        with contextlib.closing(self._conn()) as conn, conn:
+            conn.execute(
+                "INSERT INTO search_query_proposals "
+                "(id, slug, add_queries, remove_queries, rationale, coverage_gaps, "
+                " status, created_at, result) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    pid,
+                    slug,
+                    json.dumps(add_queries, ensure_ascii=True),
+                    json.dumps(remove_queries, ensure_ascii=True),
+                    rationale,
+                    json.dumps(coverage_gaps, ensure_ascii=True),
+                    _utc_now(),
+                    json.dumps(result, ensure_ascii=True, default=str) if result else None,
+                ),
+            )
+        return self.get_search_query_proposal(pid)
+
+    def get_search_query_proposal(self, proposal_id: str) -> dict | None:
+        with contextlib.closing(self._conn()) as conn, conn:
+            row = conn.execute(
+                "SELECT * FROM search_query_proposals WHERE id = ?", (proposal_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return self._decode_search_query_proposal(dict(row))
+
+    def list_search_query_proposals(
+        self, slug: str = "", status: str = "pending", limit: int = 50
+    ) -> list[dict]:
+        query = "SELECT * FROM search_query_proposals"
+        clauses, params = [], []
+        if slug:
+            clauses.append("slug = ?")
+            params.append(slug)
+        if status and status != "all":
+            clauses.append("status = ?")
+            params.append(status)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
+        with contextlib.closing(self._conn()) as conn, conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._decode_search_query_proposal(dict(r)) for r in rows]
+
+    def mark_search_query_proposal(
+        self, proposal_id: str, status: str, note: str = "", result: dict | None = None
+    ) -> dict | None:
+        with contextlib.closing(self._conn()) as conn, conn:
+            conn.execute(
+                "UPDATE search_query_proposals SET status = ?, decided_at = ?, "
+                "decision_note = ?, result = ? WHERE id = ?",
+                (
+                    status,
+                    _utc_now(),
+                    note,
+                    json.dumps(result, ensure_ascii=True, default=str) if result else None,
+                    proposal_id,
+                ),
+            )
+        return self.get_search_query_proposal(proposal_id)
+
+    def set_search_query_red_team(self, proposal_id: str, red_team: dict) -> dict | None:
+        with contextlib.closing(self._conn()) as conn, conn:
+            conn.execute(
+                "UPDATE search_query_proposals SET red_team = ? WHERE id = ?",
+                (json.dumps(red_team, ensure_ascii=True, default=str), proposal_id),
+            )
+        return self.get_search_query_proposal(proposal_id)
+
+    @staticmethod
+    def _decode_search_query_proposal(record: dict) -> dict:
+        for key in ("add_queries", "remove_queries", "coverage_gaps"):
+            try:
+                record[key] = json.loads(record.get(key) or "[]")
+            except Exception:
+                record[key] = []
+        for key in ("result", "red_team"):
+            if record.get(key):
+                try:
+                    record[key] = json.loads(record[key])
+                except Exception:
+                    pass
+        return record

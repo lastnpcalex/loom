@@ -2617,8 +2617,9 @@ function _agentKindForModel(model, conv) {
         msgModel.startsWith('haiku[') ||
         msgModel.startsWith('claude-')
     ) return 'claude';
+    if (msgModel.startsWith('umans-')) return 'umans';
     if (msgModel.endsWith('.gguf') || msgModel.includes('@llama-server')) return 'local';
-    if (['claude', 'gemini', 'codex', 'local', 'hermes'].includes(mode)) return mode;
+    if (['claude', 'gemini', 'codex', 'local', 'hermes', 'umans'].includes(mode)) return mode;
     return '';
 }
 
@@ -2626,6 +2627,7 @@ function _assistantRoleLabelForModel(model, conv) {
     const agentKind = _agentKindForModel(model, conv);
     if (agentKind === 'gemini') return 'Gemini';
     if (agentKind === 'codex') return 'Codex';
+    if (agentKind === 'umans') return 'Umans';
     if (agentKind === 'local') return 'Braid';
     if (agentKind === 'hermes') return 'Hermes';
     if (agentKind === 'claude') return 'Claude';

@@ -2,7 +2,7 @@
 
 Downloads the quantized GGUF model on first use (~500MB).
 Auto-unloads after idle timeout to free memory.
-Completely independent from Ollama — won't compete for GPU resources.
+Completely independent from llama-server — won't compete for GPU resources.
 """
 
 import asyncio
