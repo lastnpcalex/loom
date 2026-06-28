@@ -1555,9 +1555,17 @@ def _proposal_suppression_reason(
             )
 
     if kind in {"FIRE", "OBSERVE"} and indicator_id:
+        # Match the cross-day judge's window (window_days=45, max_candidates=12
+        # in _judge_cross_day_duplicate) so the mechanical and semantic screens
+        # see the same evidence population — otherwise a candidate just outside
+        # 30d is mechanically let through, then suppressed by the semantic
+        # check that runs right after it. The mechanical screen only suppresses
+        # on strong signals (same_url+score>=1.0+FIRED, or indicator_id in
+        # posteriorImpact), so widening the pool raises recall without lowering
+        # the suppression bar.
         candidates = [
             row for row in _candidate_duplicate_evidence(
-                topic, article, decision, window_days=30, limit=10,
+                topic, article, decision, window_days=45, limit=12,
             )
             if row.get("evidence_id") != evidence_id
         ]
@@ -5296,7 +5304,8 @@ def review_duplicate_candidate(
         store.record(job_id, "completed", task="review_duplicate_candidate", slug=slug,
                      model=out.get("model"),
                      summary={"verdict": out.get("judgment", {}).get("verdict"),
-                              "evidence_id": out.get("judgment", {}).get("evidence_id", "")})
+                              "evidence_id": out.get("judgment", {}).get("evidence_id", "")},
+                     response=out.get("response", ""))
         return _json({"job_id": job_id, **out})
     except Exception as exc:
         try:

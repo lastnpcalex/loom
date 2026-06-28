@@ -2464,8 +2464,9 @@ def test_review_parked_cross_day_duplicate_suppresses_proposal(nrol, topic_path,
          "tag": "EVENT", "claim": "event A confirmed", "reason": "threshold met"},
     ])
     # Stub candidate-evidence so the judge has a prior to compare against.
-    # Accepts both call shapes: mechanical check passes window_days=30, limit=10;
-    # the cross-day judge passes window_days, max_candidates positionally.
+    # Both the mechanical check and the cross-day judge now use 45d/12, so a
+    # single default-tolerant stub covers both call shapes (limit=10 kept as
+    # a tolerant default; never exercised by the mechanical check anymore).
     monkeypatch.setattr(nrol, "_candidate_duplicate_evidence",
         lambda topic, article, decision, window_days=45, max_candidates=12, limit=10, **kw: [{"evidence_id": "ev_prior", "score": 0.8, "reasons": ["same_event"]}])
 
