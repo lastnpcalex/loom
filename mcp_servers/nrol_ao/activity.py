@@ -14,6 +14,10 @@ from typing import Any
 
 _MAX_SNAPSHOT_JOBS = 100
 _MAX_INLINE_CHARS = 2000
+# Per-job ceiling for the compact snapshot. The full event (including any
+# large summary) is preserved in the audit log (activity.jsonl); the snapshot
+# is the dashboard view and must stay small enough to load and return whole.
+_SNAPSHOT_JOB_BUDGET_BYTES = 64 * 1024
 
 
 def utc_now() -> str:
@@ -32,6 +36,55 @@ def _clip(value: Any, limit: int = _MAX_INLINE_CHARS) -> Any:
     if isinstance(value, list):
         return [_clip(v, limit) for v in value]
     return value
+
+
+def _snapshot_summary(summary: Any) -> Any:
+    """Prepare a summary for snapshot persistence.
+
+    The full topic object (summary.topic) is kept verbatim in the audit log
+    and in the tool's return value, but it can run to megabytes. The compact
+    topic_summary is already present alongside it, so drop the full topic here.
+    """
+    if isinstance(summary, dict):
+        return {k: v for k, v in summary.items() if k != "topic"}
+    return summary
+
+
+def _enforce_snapshot_budget(compact: dict) -> dict:
+    """Return a budget-compliant copy of a compact job (used by callers that
+    build fresh dicts). The full event is preserved in the audit log."""
+    try:
+        size = len(json.dumps(compact, ensure_ascii=True, default=str))
+    except Exception:
+        return compact
+    if size <= _SNAPSHOT_JOB_BUDGET_BYTES:
+        return compact
+    out = dict(compact)
+    if "summary" in out:
+        out["summary"] = {
+            "_truncated": "summary dropped to keep snapshot under budget",
+            "_original_bytes": size,
+        }
+    return out
+
+
+def _enforce_snapshot_budget_inplace(job: dict) -> None:
+    """Mutate a stored job dict in place if it exceeds the byte budget.
+
+    Used on the existing-job update path, where update() may have carried a
+    prior bloated summary forward. The full event is in the audit log.
+    """
+    try:
+        size = len(json.dumps(job, ensure_ascii=True, default=str))
+    except Exception:
+        return
+    if size <= _SNAPSHOT_JOB_BUDGET_BYTES:
+        return
+    if "summary" in job:
+        job["summary"] = {
+            "_truncated": "summary dropped to keep snapshot under budget",
+            "_original_bytes": size,
+        }
 
 
 class ActivityStore:
@@ -82,7 +135,7 @@ class ActivityStore:
             "transition": fields.get("transition"),
             "duration_ms": fields.get("duration_ms"),
             "error": fields.get("error"),
-            "summary": _clip(fields.get("summary")),
+            "summary": _clip(_snapshot_summary(fields.get("summary"))),
         }
         compact = {k: v for k, v in compact.items() if v is not None}
         if existing:
@@ -91,10 +144,15 @@ class ActivityStore:
                 existing["started_at"] = now
             if status in {"completed", "failed", "denied"}:
                 existing["finished_at"] = now
+            job = existing
         else:
             if status in {"queued", "running"}:
                 compact["started_at"] = now if status == "running" else None
             jobs.insert(0, compact)
+            job = compact
+        # Backstop: keep the snapshot loadable even if a summary still bloats
+        # a job past the per-job budget (full event is in the audit log).
+        _enforce_snapshot_budget_inplace(job)
         jobs = sorted(jobs, key=lambda j: j.get("updated_at", ""), reverse=True)[:_MAX_SNAPSHOT_JOBS]
         snapshot = {
             "updated_at": now,

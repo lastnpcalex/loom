@@ -403,7 +403,14 @@ function _isOurBranch(data) {
 // or doing tool work — any of these should clear the pre-first-token
 // "still working" indicator so it never lingers when activity is visible.
 const _ACTIVITY_EVENT_TYPES = new Set([
-    'stream_chunk', 'thinking_chunk',
+    'stream_chunk',
+    // NOTE: 'thinking_chunk' is intentionally NOT here. The inline
+    // "waiting for first token…" indicator means "no *text* token yet",
+    // so thinking activity must not strip it — otherwise the indicator
+    // (and its 10s "still working… large context can take 30–90s"
+    // escalation) dies the instant thinking begins, which is exactly
+    // the long-pre-first-token case it exists to narrate. The indicator
+    // is removed separately on real stream_chunk / tool_* / usage>0.
     'tool_start', 'tool_input_chunk', 'tool_result', 'tool_use',
     'permission_request', 'ask_user_question',
     'state_update', 'compact_boundary', 'compact_summary_ready', 'compact_done',

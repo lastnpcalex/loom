@@ -3479,6 +3479,19 @@ def _brief_scan_packet(packet: dict, job_id: str) -> dict:
         proposals_filed = commit_policy.get("proposals_filed") if isinstance(commit_policy, dict) else None
         safe_audit = commit_policy.get("safe_policy_audit") if isinstance(commit_policy, dict) else {}
         downgrades = (safe_audit.get("freshness_downgrades") if isinstance(safe_audit, dict) else []) or []
+        # Map the applied-decision evidence_id onto each downgrade so the
+        # brief gives the operator a row handle, not just a marker. The
+        # downgrade audit carries idx; apply_decisions labels each result
+        # row article="A{idx}" from that same idx, so we join on the label.
+        # Best-effort: a downgrade whose row can't be matched (e.g. bundled
+        # edge case) emits evidence_id=None and the operator falls back to
+        # review_parked on the slug rather than re-reading the full digest.
+        applied_results = (tp.get("applied") or {}).get("results") if isinstance(tp.get("applied"), dict) else None
+        ev_id_by_article = {}
+        if isinstance(applied_results, list):
+            for res in applied_results:
+                if isinstance(res, dict) and res.get("article") and res.get("evidence_id"):
+                    ev_id_by_article[res["article"]] = res["evidence_id"]
         topics_brief.append({
             "slug": tp.get("slug"),
             "title": tp.get("title"),
@@ -3492,8 +3505,11 @@ def _brief_scan_packet(packet: dict, job_id: str) -> dict:
                 or None,
             "freshness_downgrades": len(downgrades),
             "freshness_downgrade_samples": [
-                {"idx": r.get("idx"), "kind": (r.get("original_action") or {}).get("kind"),
-                 "claim": (r.get("claim") or "")[:120]} for r in downgrades[:3]
+                {"idx": r.get("idx"),
+                 "kind": (r.get("original_action") or {}).get("kind"),
+                 "claim": (r.get("claim") or "")[:120],
+                 "evidence_id": ev_id_by_article.get(f"A{_to_int_idx(r.get('idx'))}")}
+                for r in downgrades[:3]
             ],
             "committed": tp.get("committed"),
             "applied": tp.get("applied"),
@@ -3684,6 +3700,12 @@ def _scan_packet_matches(packet: dict, job_id: str, slug: str, min_article_count
 
 def _compact_activity_event(event: dict) -> dict:
     fields = event
+    summary = fields.get("summary")
+    if isinstance(summary, dict):
+        # Mirror ActivityStore.record: the full topic is preserved in the
+        # audit log; the compact snapshot must drop summary.topic, which can
+        # run to megabytes and blow the list_activity transport frame.
+        summary = {k: v for k, v in summary.items() if k != "topic"}
     compact = {
         "job_id": fields.get("job_id"),
         "status": fields.get("status"),
@@ -3694,7 +3716,7 @@ def _compact_activity_event(event: dict) -> dict:
         "transition": fields.get("transition"),
         "duration_ms": fields.get("duration_ms"),
         "error": fields.get("error"),
-        "summary": fields.get("summary"),
+        "summary": summary,
     }
     return {k: v for k, v in compact.items() if v is not None}
 

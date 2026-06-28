@@ -342,6 +342,21 @@ When the human asks to "run the evidence loop", "catch the topic up", or
    or search for dated corroboration, and either run `review_parked` or file
    an explicitly deliberated proposal. Do not summarize a scan with freshness
    downgrades as "no proposals, nothing to do."
+   The brief's `freshness_downgrade_samples` carry an `evidence_id` for each
+   downgraded row — use it with `read_evidence(evidence_ids=...)` or targeted
+   `review_parked` to act on a specific downgrade instead of re-reading the
+   full on-disk digest packet to recover which article `A12` was. The digest
+   packet is the sandbox break-out bait `brief=true` exists to keep you out
+   of; reach for the row handle, not the file.
+   A freshness downgrade is **not** a duplicate candidate. Freshness (missing
+   pubdate) and duplication (re-report of an already-counted event) are
+   orthogonal: an undated article can be a unique event or a re-report; a
+   dated article can be either too. Run `review_duplicate_candidate` only
+   when you independently suspect a re-report of a counted event (per the
+   trigger at the bottom of this loop) — never as a reflexive check on a
+   downgrade, and never because "A12 is a posterior-mover so I can't gloss
+   over it." The freshness gate already parked the row; re-litigating it as
+   a duplicate re-derives a verdict the safe-policy audit already recorded.
 3. **Brief the human on the queue; never just list it.** After any scan or
    `review_parked` files proposals, produce a commit briefing before touching
    the queue:

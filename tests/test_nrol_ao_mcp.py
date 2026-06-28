@@ -1469,6 +1469,47 @@ def test_safe_scan_downgrades_undated_posterior_movers(nrol, topic_path, monkeyp
     topic = _disk_topic(topic_path)
     assert topic["governance"]["flagged_for_indicator_review"]
 
+    # The applied-decision result row surfaces evidence_id so the brief can
+    # give the operator a row handle instead of a downgrade marker they can
+    # only act on by re-reading the full digest packet.
+    applied_results = packet["applied"].get("results") or []
+    assert applied_results, "expected a result row for the downgraded PARK"
+    result_row = next(r for r in applied_results if r.get("article") == "A1")
+    parked_id = topic["governance"]["flagged_for_indicator_review"][-1]
+    assert result_row.get("evidence_id") == parked_id, (
+        f"result evidence_id {result_row.get('evidence_id')!r} != flagged id {parked_id!r}"
+    )
+
+    # brief=true surfaces the same evidence_id on the downgrade sample so an
+    # operator can read_evidence / review_parked on the specific row without
+    # re-reading the full on-disk digest. The freshness gate only downgrades
+    # undated_not_previously_seen articles, so the brief scan uses a fresh
+    # undated article (new URL) to produce a real downgrade end to end.
+    suffix2 = uuid.uuid4().hex[:6]
+    article2 = {
+        "headline": f"Undated threshold claim {suffix2}",
+        "url": f"https://example.test/undated/{suffix2}",
+        "source": "test-wire",
+        "relevance": "synthetic event A confirmed",
+    }
+    monkeypatch.setattr(
+        nrol, "_search_web_articles",
+        lambda query, channel, max_results, **kw: [article2] if channel == "wildcard" else [],
+    )
+    brief = json.loads(nrol.run_news_scan(
+        slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
+        fetch_full_articles=False, deliberate=False, brief=True,
+    ))
+    samples = brief["topics"][0]["freshness_downgrade_samples"]
+    assert samples, "expected at least one freshness-downgrade sample in the brief"
+    assert samples[0]["evidence_id"], (
+        f"brief sample missing evidence_id: {samples[0]!r}"
+    )
+    flagged_after = _disk_topic(topic_path)["governance"]["flagged_for_indicator_review"]
+    assert samples[0]["evidence_id"] in flagged_after, (
+        f"brief sample evidence_id {samples[0]['evidence_id']!r} not in flagged {flagged_after!r}"
+    )
+
 
 def test_scan_deliberation_rescues_park_into_proposal(nrol, topic_path, monkeypatch):
     """The strict matcher's PARK is not the last word: the advocate/rebut/
@@ -3254,3 +3295,38 @@ def test_undo_scan_run_removes_dirty_activity_and_digest_records(nrol, topic_pat
     assert not md_path.exists()
     log_text = nrol._activity_store().log_path.read_text(encoding="utf-8")
     assert job_id not in log_text
+
+
+# ---------------------------------------------------------------------------
+# Snapshot size invariant
+# ---------------------------------------------------------------------------
+
+def test_snapshot_stays_small_when_transition_returns_full_topic(nrol, topic_path):
+    """A FIRE transition with include_topic=True embeds the full topic in the
+    tool's return value (correct), but the persisted activity snapshot must
+    not carry that multi-MB topic in summary.topic. Regression guard for the
+    list_activity transport-frame blowup: the snapshot is loaded whole and
+    returned, so an unbounded summary.topic killed the connection.
+    """
+    out = _submit(
+        nrol, slug=SLUG, transition="FIRE", evidence=_evidence(),
+        indicator_id="ind_binary_mild", commit=True, include_topic=True,
+    )
+    assert out.get("committed") is True, out
+    # The caller still gets the full topic back...
+    assert "topic" in out, "include_topic=True must still return the topic to the caller"
+
+    # ...but the persisted snapshot must drop it.
+    store = nrol._activity_store()
+    snap = json.loads(store.snapshot_path.read_text(encoding="utf-8"))
+    for job in snap.get("jobs", []):
+        summary = job.get("summary")
+        if isinstance(summary, dict):
+            assert "topic" not in summary, (
+                f"job {job.get('job_id')} persisted summary.topic into the snapshot"
+            )
+
+    # And the whole snapshot file stays well under a transport-frame budget.
+    snap_bytes = store.snapshot_path.stat().st_size
+    assert snap_bytes < 256 * 1024, f"snapshot is {snap_bytes} bytes; expected < 256 KB"
+
