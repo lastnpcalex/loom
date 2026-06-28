@@ -136,6 +136,8 @@ let _droppedChunkCount = 0;
             const s = (typeof State !== 'undefined') ? State : null;
             if (!s) { el.style.display = 'none'; return; }
             const verbose = streamDebugEnabled();
+            // Debug off = overlay never shows, even on a real failure.
+            if (!verbose) { el.style.display = 'none'; return; }
             const chunkAge = _lastChunkAt ? ((Date.now() - _lastChunkAt) / 1000).toFixed(1) + 's' : '—';
             const wsState = ['CONNECTING','OPEN','CLOSING','CLOSED'][s.ws ? s.ws.readyState : 3] || '?';
             const stuckRecon = s._reconstructing && _lastChunkAt && (Date.now() - _lastChunkAt) > 5000;
