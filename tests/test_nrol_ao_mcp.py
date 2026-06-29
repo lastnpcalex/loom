@@ -905,8 +905,11 @@ def test_anti_indicator_inversion_lint_multi_target(nrol, topic_path):
 
 def test_run_news_scan_brief_tallies_anti_fire(nrol, topic_path, monkeypatch):
     """brief tallies an anti-indicator FIRE as ANTI_FIRE (distinct visibility),
-    not collapsed into FIRE. Anti-indicators move posteriors the opposite way;
-    the operator must read them differently."""
+    not collapsed into FIRE. Anti-indicators are not a distinct posterior
+    semantic — they move posteriors through the same bayesian_update path as
+    tier indicators, with LRs applied verbatim. The relabel exists for
+    falsification-evidence visibility: an ANTI_FIRE is evidence against its
+    target hypothesis, read as falsification, not hypothesis-strengthening."""
     _seed_anti_indicators(topic_path)
     suffix = uuid.uuid4().hex[:6]
     articles = [

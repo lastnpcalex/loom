@@ -64,10 +64,14 @@ Natural language is perception. Only typed transitions move beliefs.
   - `OBSERVE`: a numeric value for an indicator with an observable block.
   - `SCHEMA_GAP`: relevant evidence the schema cannot express; queues review.
   - `IGNORE`: not relevant. Writes nothing.
-- **Anti-indicators** move posteriors the *opposite* way: firing one
-  *suppresses* its targeted hypothesis (its likelihoods carry the lowest LR
-  on the target H). In scan briefs (`brief=true`) an anti-indicator FIRE is
-  tallied as `ANTI_FIRE` (not `FIRE`) so you read it correctly — it is not
+- **Anti-indicators** are directional indicators whose likelihoods are
+  *authored* to suppress a target hypothesis (the target H carries the lowest
+  LR). They are not a distinct posterior semantic: firing one moves posteriors
+  through the same `bayesian_update` path as any tier indicator, with the LRs
+  applied verbatim — "anti" is a design-time authoring convention, not a
+  runtime inversion. In scan briefs (`brief=true`) an anti-indicator FIRE is
+  tallied as `ANTI_FIRE` (not `FIRE`) so you read it correctly: it is
+  *falsification* evidence against its target hypothesis, not
   hypothesis-strengthening evidence. Anti-indicator LRs are lint-gated at
   `design_topic`: a wrong-inverted anti-indicator (firing would move the
   target H up) is a BLOCKER, and one with no machine-checkable target

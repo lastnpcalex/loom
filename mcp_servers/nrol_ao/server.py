@@ -1239,10 +1239,24 @@ or pure forecast/odds/opinion with no reported factual development.
 
 If an article is plausibly causally related to the topic question, hypotheses,
 or resolution pathway but does not meet an indicator, choose PARK rather than
-IGNORE. If the article is directionally meaningful but the schema has no fitting
-observable or binary threshold, choose SCHEMA_GAP. When uncertain between
-IGNORE and PARK/SCHEMA_GAP, preserve the article with PARK or SCHEMA_GAP so the
-advocate/rebut/jury pass can deliberate it.
+IGNORE. If the article is directionally meaningful but no indicator — including
+anti-indicators — covers the direction with a fitting observable or binary
+threshold, choose SCHEMA_GAP. When uncertain between IGNORE and PARK/SCHEMA_GAP,
+preserve the article with PARK or SCHEMA_GAP so the advocate/rebut/jury pass can
+deliberate it.
+
+Anti-indicators are pre-committed falsification targets: directional indicators
+whose likelihoods are authored so firing suppresses their target hypothesis
+(the target H carries the lowest LR, enforced at design time by the inversion
+lint). They are a first-class FIRE target, not a SCHEMA_GAP fallback. When an
+article reports evidence whose direction matches an anti-indicator's threshold
+and the indicator's LR direction is consistent with the article — e.g. transit
+recovery firing anti_h4_transit_recovery_toward_baseline, which suppresses H4
+and lifts H1/H2 — FIRE the anti-indicator, or OBSERVE it if it carries an
+observable block. Anti-indicators move posteriors through the same directional
+LR machinery as tier indicators; treat them as FIRE/OBSERVE targets whenever
+their threshold is met and direction aligns, not as evidence the schema lacks
+coverage for that direction.
 
 Indirect causal pathways count as topic-relevant. For example, ceasefire
 compliance, attacks, sanctions implementation, diplomatic breakdown/resumption,
@@ -3450,9 +3464,16 @@ def _brief_scan_packet(packet: dict, job_id: str) -> dict:
         decisions = tp.get("decisions") or []
         # Resolve this topic's anti-indicator ids so we can surface anti-indicator
         # matches distinctly (ANTI_FIRE / ANTI_OBSERVE) instead of collapsing them
-        # into FIRE/OBSERVE — they move posteriors the *opposite* way and the
-        # operator must read them differently. Lazy + best-effort: if the topic
-        # can't be loaded, fall back to plain FIRE/OBSERVE.
+        # into FIRE/OBSERVE. Anti-indicators are NOT a distinct posterior
+        # semantic: they flow through the same bayesian_update path as tier
+        # indicators, with their likelihoods applied verbatim. "Anti" is a
+        # design-time authoring convention — the LRs are authored so the target
+        # H carries the lowest value (validated by the inversion lint at
+        # lint_indicators.py:195), so firing suppresses the target H. The relabel
+        # exists for falsification-evidence visibility: an ANTI_FIRE is evidence
+        # against its target hypothesis, and the operator should read it as
+        # falsification, not as hypothesis-strengthening. Lazy + best-effort: if
+        # the topic can't be loaded, fall back to plain FIRE/OBSERVE.
         anti_ids: set[str] = set()
         slug = tp.get("slug") or ""
         if slug:
