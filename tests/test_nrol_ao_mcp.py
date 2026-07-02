@@ -11,6 +11,7 @@ the source repo, synthetic topic state) so no live topic data is touched.
 
 import json
 import os
+import subprocess
 import shutil
 import sys
 import types
@@ -136,6 +137,11 @@ def nrol_repo(tmp_path_factory):
     root = tmp_path_factory.mktemp("nrol_fixture_repo")
     shutil.copy2(SOURCE_REPO / "engine.py", root / "engine.py")
     shutil.copy2(SOURCE_REPO / "governor.py", root / "governor.py")
+    # export_blackhole_snapshot lives at the repo root; publish_black_hole_snapshot
+    # imports it via _import_from_repo.
+    if (SOURCE_REPO / "export_blackhole_snapshot.py").is_file():
+        shutil.copy2(SOURCE_REPO / "export_blackhole_snapshot.py",
+                     root / "export_blackhole_snapshot.py")
     shutil.copytree(
         SOURCE_REPO / "framework",
         root / "framework",
@@ -193,6 +199,37 @@ def _submit(nrol, **kwargs) -> dict:
     # in the deliberation-gate section below.
     kwargs.setdefault("no_deliberation_reason", "capability test")
     return json.loads(nrol.submit_transition(**kwargs))
+
+
+def _seed_coverage_indicators(topic_path: Path) -> None:
+    """Add tier1 observable indicators favoring H2 and H3 to the fixture topic.
+
+    The fixture's two tier1 indicators both favor H1, so the set-level
+    directional-coverage lint (each H needs an observable indicator whose LR
+    vector favors it) blocks any new-indicator add. Seeding H2/H3 coverage lets
+    anti-indicator apply tests isolate the inversion check from the coverage
+    check. Written via direct topic-JSON edit (test setup, not the MCP path).
+    """
+    topic = _disk_topic(topic_path)
+    tier1 = topic["indicators"]["tiers"]["tier1_critical"]
+    existing_ids = {i["id"] for i in tier1}
+    for h, evid in (("H2", "test_cov_h2"), ("H3", "test_cov_h3")):
+        cid = f"ind_cov_{h.lower()}"
+        if cid in existing_ids:
+            continue
+        lrs = {"H1": 0.35, "H2": 0.4, "H3": 0.4}
+        lrs[h] = 0.6  # favor the target H so coverage_toward[H] >= 1
+        tier1.append({
+            "id": cid, "desc": f"coverage for {h}", "status": "NOT_FIRED",
+            "firedDate": None, "note": None, "posteriorEffect": f"{h} up",
+            "likelihoods": lrs, "lr_decay": 1.0, "n_firings": 0,
+            "resolution_class": False, "shape": "per_event_member",
+            "causal_event_id": evid,
+            "observable": {"metric": f"test:cov_{h.lower()}", "family": "logistic",
+                           "threshold_value": 0.5, "baseline": 0.1,
+                           "direction": "higher_strengthens"},
+        })
+    topic_path.write_text(json.dumps(topic, indent=2), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -2887,9 +2924,11 @@ def test_deliberate_candidates_no_candidates_short_circuits(nrol, topic_path):
 
 
 def test_design_gate_flags_duplicate_amplifier(nrol, topic_path):
-    """Explicit lr_decay >= 1.0 is a duplicate amplifier; the design gate
-    (which runs on every save) must warn. The fixture topic carries 1.0 on
-    ind_binary_mild deliberately."""
+    """An explicit lr_decay >= 1.0 declares operator intent that refires apply
+    full LR (correct only for fire-once events); the design gate (which runs
+    on every save) must warn. Runtime decay is disabled (2026-06-29), so this
+    is a schema-design lint on declared intent, not runtime behavior. The
+    fixture topic carries 1.0 on ind_binary_mild deliberately."""
     out = _submit(
         nrol, slug=SLUG, transition="FIRE", evidence=_evidence(),
         indicator_id="ind_binary_mild", commit=True,
@@ -3145,6 +3184,366 @@ RECOMMENDATION: approve
     assert queue[0]["status"] == "applied"
 
 
+def test_red_team_schema_extension_keeps_thinking_with_adequate_budget(
+    nrol, topic_path, monkeypatch
+):
+    """Regression: red_team_schema_extension_proposal must call llama_client.chat
+    with thinking ENABLED and a token budget large enough for thinking to finish
+    AND leave room for the answer.
+
+    Qwen3.6 reasons in reasoning_content then emits VERDICT:/RISK:/... in
+    message.content, sharing one budget. At 2048 the schema red-team prompt
+    (full indicator inventory) couldn't finish thinking (finish_reason=length,
+    0 content → parser defaulted to empty REVISE). Measured: thinking ~2860
+    tokens + answer ~260, so 4096 is the safe floor. Deliberation is preserved;
+    the NO_ANSWER_EMITTED guard catches any future prompt that exceeds budget.
+    """
+    json.loads(nrol.propose_schema_extension(
+        slug=SLUG, kind="add_new_indicator", target="ind_rt_test",
+        tier="tier3_suggestive", desc="rt test indicator",
+        likelihoods={"H1": 0.6, "H2": 0.45, "H3": 0.35},
+        observable={"metric": "test:rt", "family": "logistic",
+                    "threshold_value": 0.5, "baseline": 0.1,
+                    "direction": "higher_strengthens"}))
+
+    captured = {}
+
+    def fake_chat(*args, **kwargs):
+        captured.update(kwargs)
+        return {"text": "VERDICT: APPROVE\nRISK: none\nDIRECTIONALITY: aligned\n"
+                        "DUPLICATE_OR_OVERLAP: none\nRECOMMENDATION: approve\n",
+                "model": "test-rt", "host": "local"}
+
+    monkeypatch.setattr(nrol.llama_client, "chat", fake_chat)
+    out = json.loads(nrol.red_team_schema_extension_proposal(SLUG, 0))
+    assert "error" not in out, out
+    assert out["review"]["verdict"] == "APPROVE"
+    # Thinking stays on (deliberation preserved)...
+    assert captured.get("disable_thinking") is False, captured
+    # ...but the budget must be large enough for thinking + answer.
+    assert captured.get("max_tokens", 0) >= 4096, captured
+
+
+def test_red_team_schema_extension_empty_response_is_reported_not_silent_revise(
+    nrol, topic_path, monkeypatch
+):
+    """When the model returns empty content (the thinking-budget-exhaustion
+    failure shape), the review must not masquerade as a REVISE verdict with
+    empty rationale. It should be clearly marked so an operator isn't fooled
+    into treating a non-answer as a substantive review."""
+    json.loads(nrol.propose_schema_extension(
+        slug=SLUG, kind="add_new_indicator", target="ind_rt_empty",
+        tier="tier3_suggestive", desc="rt empty test",
+        likelihoods={"H1": 0.6, "H2": 0.45, "H3": 0.35},
+        observable={"metric": "test:rte", "family": "logistic",
+                    "threshold_value": 0.5, "baseline": 0.1,
+                    "direction": "higher_strengthens"}))
+
+    # The failure shape: empty content, model exhausted budget in reasoning.
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "", "model": "test-rt", "host": "local",
+                         "finish_reason": "length", "reasoning_chars": 6533},
+    )
+    out = json.loads(nrol.red_team_schema_extension_proposal(SLUG, 0))
+    review = out["review"]
+    # Empty content must NOT silently parse to a substantive-looking REVISE.
+    # The verdict defaults to REVISE (no VERDICT: token), but the tool must
+    # explicitly mark it as a non-answer so an operator reruns rather than
+    # acting on an empty review.
+    assert review["verdict"] == "REVISE"
+    assert review["risk"] == "NO_ANSWER_EMITTED"
+    assert "non-answer" in review["recommendation"].lower()
+
+
+def test_red_team_search_query_update_budget_and_guard(nrol, topic_path, monkeypatch):
+    """Precautionary: red_team_search_query_update keeps thinking on with a
+    4096 budget (enough for thinking + answer on bigger prompts), and flags
+    empty model output as a non-answer rather than silently defaulting."""
+    proposed = json.loads(nrol.propose_search_query_update(
+        slug=SLUG, add=["synthetic event official report"],
+        rationale="guard test", coverage_gaps=["coverage"]))
+    proposal_id = proposed["id"]
+
+    captured = {}
+
+    def fake_chat(*args, **kwargs):
+        captured.update(kwargs)
+        return {"text": "VERDICT: APPROVE\nCOVERAGE: ok\nNEUTRALITY: ok\n"
+                        "OVERFITTING: none\nNOISE: ok\nSCHEMA_AXIS: ok\n"
+                        "RECOMMENDATION: approve\n",
+                "model": "test-sq", "host": "local", "finish_reason": "stop"}
+
+    monkeypatch.setattr(nrol.llama_client, "chat", fake_chat)
+    out = json.loads(nrol.red_team_search_query_update(proposal_id))
+    assert captured.get("disable_thinking") is False  # deliberation kept
+    assert captured.get("max_tokens", 0) >= 4096  # enough for thinking + answer
+    assert out["red_team"]["verdict"] == "APPROVE"
+
+    # And the guard: empty model output is flagged, not silently defaulted.
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "", "model": "test-sq", "host": "local",
+                         "finish_reason": "length", "reasoning_chars": 7000})
+    out2 = json.loads(nrol.red_team_search_query_update(proposal_id))
+    rt = out2["red_team"]
+    assert rt["verdict"] == "REVISE"
+    assert rt["risk"] == "NO_ANSWER_EMITTED"
+
+
+def test_cross_day_duplicate_judge_empty_response_is_conservative(
+    nrol, topic_path, monkeypatch
+):
+    """Precautionary: when the duplicate judge gets empty model output, it must
+    default to UNCERTAIN_DUPLICATE (conservative — suppresses nothing), never
+    UNIQUE_EVENT (which would let a duplicate through). The judge's own
+    docstring biases toward uncertainty."""
+    first = _submit(
+        nrol, slug=SLUG, transition="PARK",
+        evidence=_evidence("convoy launch confirmed", source="test-wire",
+                           url="https://example.test/convoy-guard",
+                           time="2030-01-05T08:00:00+00:00"),
+        reason="seed", commit=True)
+
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": "", "model": "test-dup", "host": "local",
+                         "finish_reason": "length", "reasoning_chars": 7000})
+    out = json.loads(nrol.review_duplicate_candidate(
+        SLUG,
+        article={"headline": "second convoy report"},
+        decision={"action": {"kind": "FIRE", "indicator_id": "ind_binary_mild"}},
+    ))
+    judgment = out.get("judgment") or {}
+    # Conservative default on non-answer: UNCERTAIN, never UNIQUE_EVENT.
+    assert judgment.get("verdict") == "UNCERTAIN_DUPLICATE", judgment
+    assert "NO_ANSWER_EMITTED" in (judgment.get("reason") or "")
+
+
+
+def test_propose_schema_extension_injects_hand_authored_indicator(nrol, topic_path):
+    """An operator can file a hand-authored indicator proposal directly into the
+    review queue — the path run_schema_gap_resolver (LLM) usually fills."""
+    injected = json.loads(nrol.propose_schema_extension(
+        slug=SLUG,
+        kind="add_new_indicator",
+        target="ind_injected_test",
+        tier="tier3_suggestive",
+        desc="Operator-authored window-specific signal.",
+        rationale="Resolver cannot produce causal-reasoning indicators.",
+        likelihoods={"H1": 0.6, "H2": 0.45, "H3": 0.35},
+        observable={
+            "metric": "test:injected", "family": "logistic",
+            "threshold_value": 0.5, "baseline": 0.1, "direction": "higher_strengthens",
+        },
+        shape="per_event_member",
+        causal_event_id="test_injected_ev",
+    ))
+    assert "error" not in injected, injected
+    assert injected["proposal_index"] == 0
+    prop = injected["proposal"]
+    assert prop["kind"] == "add_new_indicator"
+    assert prop["target"] == "ind_injected_test"
+    assert prop["cluster_addressed"] == "operator_injected"
+    assert prop["status"] == "pending_operator_review"
+    # body is the YAML-ish string apply re-parses; structured dicts are ignored.
+    assert "likelihoods: {H1: 0.6" in prop["body"]
+    assert "metric: test:injected" in prop["body"]
+
+    listed = json.loads(nrol.list_schema_extension_proposals(SLUG))
+    assert listed["count"] == 1
+    assert listed["proposals"][0]["target"] == "ind_injected_test"
+
+
+def test_propose_schema_extension_validates_shape(nrol, topic_path):
+    """Inject rejects bad kind, missing likelihoods, duplicate target, bad tier,
+    and unknown target_hypothesis — mirrors apply's gates so the operator fails
+    early instead of at apply time."""
+    base = dict(
+        slug=SLUG, kind="add_new_indicator", target="ind_shape_test",
+        tier="tier3_suggestive",
+        likelihoods={"H1": 0.6, "H2": 0.45, "H3": 0.35},
+        observable={"metric": "test:x", "family": "logistic",
+                    "threshold_value": 0.5, "baseline": 0.1,
+                    "direction": "higher_strengthens"},
+    )
+    # bad kind
+    bad = json.loads(nrol.propose_schema_extension(**{**base, "kind": "bogus"}))
+    assert "error" in bad
+    # missing likelihoods
+    no_lr = json.loads(nrol.propose_schema_extension(
+        slug=SLUG, kind="add_new_indicator", target="ind_no_lr",
+        tier="tier3_suggestive",
+        observable={"metric": "test:x", "family": "logistic",
+                    "threshold_value": 0.5, "direction": "higher_strengthens"}))
+    assert "error" in no_lr
+    # duplicate target (ind_binary_mild is in the fixture)
+    dup = json.loads(nrol.propose_schema_extension(**{**base, "target": "ind_binary_mild"}))
+    assert "error" in dup
+    # bad tier
+    bad_tier = json.loads(nrol.propose_schema_extension(**{**base, "tier": "tier9_imaginary"}))
+    assert "error" in bad_tier
+    # unknown target_hypothesis
+    bad_th = json.loads(nrol.propose_schema_extension(
+        **{**base, "tier": "anti_indicators", "target": "anti_h1_injected",
+           "target_hypothesis": "H9"}))
+    assert "error" in bad_th
+
+
+def test_propose_schema_extension_applies_anti_indicator_end_to_end(
+    nrol, topic_path, monkeypatch
+):
+    """C1 integration proof: an injected anti-indicator with CORRECT inversion
+    applies end-to-end; the structural inversion lint fires at apply time."""
+    # The fixture's tier1 indicators both favor H1, so the directional-coverage
+    # lint (each H needs an observable indicator favoring it) trips when adding
+    # a new indicator. Seed H2/H3 coverage so the apply isn't blocked by an
+    # unrelated set-level check.
+    _seed_coverage_indicators(topic_path)
+
+    injected = json.loads(nrol.propose_schema_extension(
+        slug=SLUG,
+        kind="add_new_indicator",
+        target="anti_h3_injected",
+        tier="anti_indicators",
+        desc="Suppresses H3 when its falsification signal fires.",
+        rationale="Window-specific falsification path the resolver cannot draft.",
+        likelihoods={"H1": 0.6, "H2": 0.5, "H3": 0.2},  # H3 lowest = correct inversion
+        observable={
+            "metric": "test:anti_h3", "family": "logistic",
+            "threshold_value": 0.5, "baseline": 0.1, "direction": "higher_strengthens",
+        },
+        shape="per_event_member",
+        causal_event_id="test_anti_h3_ev",
+        target_hypothesis="H3",
+    ))
+    assert "error" not in injected, injected
+    assert injected["proposal"]["target_hypothesis"] == "H3"
+
+    review_text = """VERDICT: APPROVE
+RISK: low; test-only anti-indicator
+DIRECTIONALITY: H3 carries lowest LR; firing suppresses H3
+DUPLICATE_OR_OVERLAP: none
+RECOMMENDATION: approve
+"""
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": review_text, "model": "test-red-team", "host": "local"},
+    )
+    reviewed = json.loads(nrol.red_team_schema_extension_proposal(SLUG, 0))
+    assert reviewed["review"]["verdict"] == "APPROVE"
+
+    marked = json.loads(nrol.mark_schema_extension_proposal(SLUG, 0, "approved"))
+    assert marked["proposal"]["status"] == "approved"
+
+    before = _disk_posteriors(topic_path)
+    applied = json.loads(nrol.apply_schema_extension_proposal(
+        SLUG, 0, tier="anti_indicators", note="apply injected anti-indicator"))
+    assert "error" not in applied, applied
+    # posteriors untouched — apply changes schema only.
+    assert _disk_posteriors(topic_path) == before
+    topic = _disk_topic(topic_path)
+    anti = topic["indicators"]["anti_indicators"]
+    assert any(i["id"] == "anti_h3_injected" for i in anti)
+    added = next(i for i in anti if i["id"] == "anti_h3_injected")
+    # _tier is a transient lint annotation — must NOT persist.
+    assert "_tier" not in added
+    # target_hypothesis IS a persisted field on anti-indicators.
+    assert added["target_hypothesis"] == "H3"
+
+
+def test_apply_honors_proposal_tier_when_caller_omits_it(
+    nrol, topic_path, monkeypatch
+):
+    """Regression: an anti-indicator filed with tier="anti_indicators" must land
+    in anti_indicators even when apply_schema_extension_proposal is called
+    WITHOUT an explicit tier= argument.
+
+    Before the fix, apply defaulted tier to "tier3_suggestive" and ignored the
+    tier the proposal was filed with — so a correctly-filed anti-indicator
+    silently landed as a tier3 suggestive indicator, bypassing the inversion
+    lint and the anti-indicator governance coverage check. This is the
+    dormant-lint shape resurfacing in a new form.
+    """
+    _seed_coverage_indicators(topic_path)
+
+    json.loads(nrol.propose_schema_extension(
+        slug=SLUG, kind="add_new_indicator", target="anti_h3_notier_arg",
+        tier="anti_indicators", desc="filed as anti; applied without tier arg",
+        rationale="regression test", target_hypothesis="H3",
+        likelihoods={"H1": 0.6, "H2": 0.5, "H3": 0.2},  # H3 lowest
+        observable={"metric": "test:nt", "family": "logistic",
+                    "threshold_value": 0.5, "baseline": 0.1,
+                    "direction": "higher_strengthens"},
+        shape="per_event_member", causal_event_id="nt_ev",
+    ))
+    review_text = "VERDICT: APPROVE\nRISK: none\nDIRECTIONALITY: ok\nDUPLICATE_OR_OVERLAP: none\nRECOMMENDATION: approve\n"
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": review_text, "model": "test-rt", "host": "local"})
+    json.loads(nrol.red_team_schema_extension_proposal(SLUG, 0))
+    json.loads(nrol.mark_schema_extension_proposal(SLUG, 0, "approved"))
+
+    # NOTE: no tier= argument passed — must default to the proposal's authored tier.
+    applied = json.loads(nrol.apply_schema_extension_proposal(SLUG, 0))
+    assert "error" not in applied, applied
+    assert applied["applied"]["tier"] == "anti_indicators", applied
+    # And it actually landed in the anti_indicators list, not tier3_suggestive.
+    topic = _disk_topic(topic_path)
+    assert any(i["id"] == "anti_h3_notier_arg"
+               for i in topic["indicators"]["anti_indicators"]), \
+        "anti-indicator filed as anti_indicators landed in the wrong tier"
+
+
+def test_propose_schema_extension_wrong_inversion_blocked_at_apply(
+    nrol, topic_path, monkeypatch
+):
+    """C1 proof (dangerous direction): an injected anti-indicator whose LRs would
+    move its target UP is blocked by the engine inversion lint at apply — the
+    lint that was dormant on the apply path before the _tier stamp fix."""
+    _seed_coverage_indicators(topic_path)
+
+    injected = json.loads(nrol.propose_schema_extension(
+        slug=SLUG,
+        kind="add_new_indicator",
+        target="anti_h3_wrong_inversion",
+        tier="anti_indicators",
+        desc="Mis-authored: H3 target but H3 has the HIGHEST LR.",
+        rationale="should be blocked",
+        likelihoods={"H1": 0.2, "H2": 0.5, "H3": 0.6},  # H3 highest = wrong inversion
+        observable={
+            "metric": "test:bad_anti", "family": "logistic",
+            "threshold_value": 0.5, "baseline": 0.1, "direction": "higher_strengthens",
+        },
+        shape="per_event_member",
+        causal_event_id="test_bad_anti_ev",
+        target_hypothesis="H3",
+    ))
+    assert "error" not in injected
+
+    review_text = """VERDICT: APPROVE
+RISK: test skips red-team substance; engine lint is the real gate
+DIRECTIONALITY: not checked by LLM here
+DUPLICATE_OR_OVERLAP: none
+RECOMMENDATION: approve (engine lint will block if inversion wrong)
+"""
+    monkeypatch.setattr(
+        nrol.llama_client, "chat",
+        lambda *a, **k: {"text": review_text, "model": "test-red-team", "host": "local"},
+    )
+    json.loads(nrol.red_team_schema_extension_proposal(SLUG, 0))
+    json.loads(nrol.mark_schema_extension_proposal(SLUG, 0, "approved"))
+
+    applied = json.loads(nrol.apply_schema_extension_proposal(
+        SLUG, 0, tier="anti_indicators"))
+    assert "error" in applied, applied
+    assert "wrong direction" in applied["error"].lower() or "inversion" in applied["error"].lower()
+    # nothing was added
+    topic = _disk_topic(topic_path)
+    assert not any(i["id"] == "anti_h3_wrong_inversion"
+                   for i in topic["indicators"]["anti_indicators"])
+
+
 def test_cross_day_duplicate_reviewer_judges_prior_evidence(nrol, topic_path, monkeypatch):
     first = _submit(
         nrol, slug=SLUG, transition="PARK",
@@ -3332,4 +3731,119 @@ def test_snapshot_stays_small_when_transition_returns_full_topic(nrol, topic_pat
     # And the whole snapshot file stays well under a transport-frame budget.
     snap_bytes = store.snapshot_path.stat().st_size
     assert snap_bytes < 256 * 1024, f"snapshot is {snap_bytes} bytes; expected < 256 KB"
+
+
+# ---------------------------------------------------------------------------
+# publish_black_hole_snapshot — programmatic dashboard publish
+# ---------------------------------------------------------------------------
+
+
+def _make_black_hole_repo(tmp_path: Path) -> Path:
+    """A throwaway black-hole repo: git-init'd, with the surface dir + a bare
+    remote named 'origin' on master, so commit/push can be exercised locally."""
+    import subprocess as _sp
+
+    bh = tmp_path / "black-hole"
+    (bh / "surfaces" / "nrol-ao").mkdir(parents=True)
+    (bh / "surfaces" / "nrol-ao" / "index.html").write_text(
+        "<html>surface</html>", encoding="utf-8"
+    )
+    (bh / "surfaces" / "config.json").write_text("{}", encoding="utf-8")
+    _sp.run(["git", "init", "-q", "-b", "master"], cwd=str(bh), check=True)
+    _sp.run(["git", "config", "user.email", "test@nrol"], cwd=str(bh), check=True)
+    _sp.run(["git", "config", "user.name", "Test"], cwd=str(bh), check=True)
+    _sp.run(["git", "add", "."], cwd=str(bh), check=True)
+    _sp.run(["git", "commit", "-q", "-m", "init surface"], cwd=str(bh), check=True)
+    # bare remote
+    remote = tmp_path / "black-hole-remote.git"
+    _sp.run(["git", "init", "-q", "--bare", "-b", "master", str(remote)], check=True)
+    _sp.run(["git", "remote", "add", "origin", str(remote)], cwd=str(bh), check=True)
+    _sp.run(["git", "push", "-q", "origin", "master"], cwd=str(bh), check=True)
+    return bh
+
+
+def test_publish_black_hole_snapshot_regenerate_only(nrol, nrol_repo, topic_path, tmp_path):
+    """commit=False writes data.json, makes no git changes, needs no gate."""
+    bh = _make_black_hole_repo(tmp_path)
+    nrol._DEFAULT_BLACK_HOLE_REPO = bh  # not used; env is the real path
+    os.environ["NROL_AO_BLACK_HOLE_REPO"] = str(bh)
+
+    before_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(bh), capture_output=True, text=True
+    ).stdout.strip()
+
+    out = json.loads(nrol.publish_black_hole_snapshot())
+    assert "error" not in out, out
+    assert out["regenerated"] is True
+    # topic_count reflects whatever topics exist in the session-scoped fixture
+    # repo (other tests may have added some); just assert it's a sane count.
+    assert isinstance(out["topic_count"], int) and out["topic_count"] >= 1
+    assert (bh / "surfaces" / "nrol-ao" / "data.json").is_file()
+
+    # No commit happened: HEAD unchanged.
+    after_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(bh), capture_output=True, text=True
+    ).stdout.strip()
+    assert before_head == after_head
+    assert "commit" not in out  # commit=False → no commit block
+
+
+def test_publish_black_hole_snapshot_commit_stages_only_data_json(
+    nrol, nrol_repo, topic_path, tmp_path
+):
+    """commit=True produces a commit that touches ONLY surfaces/nrol-ao/data.json
+    — never index.html or config.json."""
+    bh = _make_black_hole_repo(tmp_path)
+    os.environ["NROL_AO_BLACK_HOLE_REPO"] = str(bh)
+
+    out = json.loads(nrol.publish_black_hole_snapshot(commit=True))
+    assert "error" not in out, out
+    assert out["commit"]["committed"] is True
+
+    # The new commit must touch only data.json.
+    changed = subprocess.run(
+        ["git", "show", "--stat", "--name-only", "--format=", "HEAD"],
+        cwd=str(bh), capture_output=True, text=True,
+    ).stdout.strip().splitlines()
+    assert changed == ["surfaces/nrol-ao/data.json"], changed
+
+
+def test_publish_black_hole_snapshot_push_denied_without_gate(nrol, nrol_repo, topic_path, tmp_path):
+    """push=True is fail-closed without LOOM_CONV_ID (gate opted out only via
+    NROL_AO_ALLOW_UNGATED_COMMITS=1, which the fixture sets — so flip it off to
+    test the deny path)."""
+    bh = _make_black_hole_repo(tmp_path)
+    os.environ["NROL_AO_BLACK_HOLE_REPO"] = str(bh)
+    os.environ.pop("LOOM_CONV_ID", None)
+    saved = os.environ.pop("NROL_AO_ALLOW_UNGATED_COMMITS", None)
+    try:
+        out = json.loads(nrol.publish_black_hole_snapshot(commit=True, push=True))
+        assert out.get("denied"), out
+        assert out["pushed"] is False
+    finally:
+        if saved is not None:
+            os.environ["NROL_AO_ALLOW_UNGATED_COMMITS"] = saved
+
+
+def test_publish_black_hole_snapshot_push_when_ungated(
+    nrol, nrol_repo, topic_path, tmp_path
+):
+    """push=True with the gate opted out pushes to origin master."""
+    bh = _make_black_hole_repo(tmp_path)
+    os.environ["NROL_AO_BLACK_HOLE_REPO"] = str(bh)
+    os.environ["NROL_AO_ALLOW_UNGATED_COMMITS"] = "1"
+
+    out = json.loads(nrol.publish_black_hole_snapshot(commit=True, push=True))
+    assert "error" not in out, out
+    assert out["commit"]["committed"] is True
+    assert out["push"]["pushed"] is True, out
+
+    # The bare remote now has the data.json commit on master.
+    remote_log = subprocess.run(
+        ["git", "--git-dir", str(tmp_path / "black-hole-remote.git"), "log",
+         "--name-only", "--format=", "master"],
+        capture_output=True, text=True,
+    ).stdout
+    assert "surfaces/nrol-ao/data.json" in remote_log
+
 

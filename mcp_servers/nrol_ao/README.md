@@ -55,6 +55,15 @@ State & status: `nrol_status`, `help`, `list_topics`, `list_hypotheses`,
 `read_topic`, `topic_status`, `read_evidence`, `list_activity`,
 `llama_server_status`, `model_endpoint_status`, `latest_digest`.
 
+Public surface: `publish_black_hole_snapshot` — regenerate the sanitized
+`surfaces/nrol-ao/data.json` snapshot in the black-hole repo from current topic
+state, and optionally `git add`/commit/push to `master` so the live dashboard
+updates. `commit=False,push=False` (default) is a purely programmatic
+regenerate-only refresh (no git mutation, no gate); `push=True` goes through the
+Loom approval gate (fail-closed — it publishes to the public site). Only ever
+stages `surfaces/nrol-ao/data.json`. This is the server's only subprocess
+(`git`) entry point; config the repo path with `NROL_AO_BLACK_HOLE_REPO`.
+
 Topic design & lifecycle: `design_topic` (draft + dynamics sidecar),
 `activate_topic` (human-gated; requires a lint-clean dynamics spec),
 `red_team_topic` (mandatory DRAFT design review), `resolve_topic` (set
@@ -80,8 +89,12 @@ Typed transitions & proposals: `submit_transition` (`PARK`/`FIRE`/`OBSERVE`/
 `acknowledge_parked_reviews`.
 
 Schema governance: `list_schema_gaps`, `run_schema_gap_resolver`,
-`list_schema_extension_proposals`, `red_team_schema_extension_proposal`,
-`mark_schema_extension_proposal`, `apply_schema_extension_proposal`.
+`list_schema_extension_proposals`, `propose_schema_extension` (file a
+hand-authored indicator proposal into the review queue — the operator path for
+window-specific indicators the resolver cannot draft),
+`red_team_schema_extension_proposal`, `mark_schema_extension_proposal`,
+`apply_schema_extension_proposal` (now accepts `anti_indicators` as a tier; the
+engine inversion lint validates LR direction at apply).
 
 Search-query governance: `read_search_queries`,
 `propose_search_query_update`, `red_team_search_query_update`,
@@ -148,3 +161,17 @@ schema-extension proposals, but every proposal must pass
 `red_team_schema_extension_proposal` with verdict `APPROVE` before it can be
 marked approved or applied. `apply_schema_extension_proposal` changes schema
 only; it never replays evidence or moves posteriors.
+
+`propose_schema_extension` files a hand-authored indicator proposal directly
+into the same review queue — the operator path for window-specific indicators
+that require human causal reasoning (e.g. a declaratory anti-indicator tied to
+a specific date band) which the resolver, an LLM over gap clusters, does not
+produce. It validates shape early (mirroring apply's gates), synthesizes the
+YAML-ish `body` string apply re-parses, and is a zero-authority queue append
+(no indicator mutation, no posterior movement, no gate) — the same tier as the
+resolver's persist step. `apply_schema_extension_proposal` now accepts
+`anti_indicators` as a tier; the engine's inversion lint
+(`_check_anti_indicator_inversion`) validates at apply that an anti-indicator's
+target hypothesis carries the lowest LR (so firing suppresses, not lifts — the
+dangerous direction is blocked). The red-team prompt is sharpened to flag
+wrong inversion for anti-indicators too.

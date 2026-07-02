@@ -13,6 +13,7 @@ import json
 import os
 import re
 import ssl
+import subprocess
 import sys
 import uuid
 import time
@@ -31,6 +32,12 @@ from . import llama as llama_client
 mcp = FastMCP("nrol-ao")
 
 _DEFAULT_REPO = Path(r"C:\Claude-Code\NROL-AO\temp-repo")
+# Black-hole public-surface repo: export_blackhole_snapshot writes
+# surfaces/nrol-ao/data.json here; publish_black_hole_snapshot(commit/push=True)
+# stages only that file and pushes to master.
+_DEFAULT_BLACK_HOLE_REPO = Path(
+    r"C:\Users\exast\OneDrive\Documents\Loom-Projects\black-hole"
+)
 _ALLOWED_TRANSITIONS = {"PARK", "FIRE", "OBSERVE", "SCHEMA_GAP", "IGNORE"}
 _MUTATING_TRANSITIONS = {"PARK", "FIRE", "OBSERVE", "SCHEMA_GAP"}
 _MAX_SEARCH_RESULTS_PER_CHANNEL = 6
@@ -85,6 +92,12 @@ def _json(obj: Any) -> str:
 def _repo_path() -> Path:
     configured = os.environ.get("NROL_AO_REPO", "").strip()
     root = Path(configured) if configured else _DEFAULT_REPO
+    return root.resolve()
+
+
+def _black_hole_path() -> Path:
+    configured = os.environ.get("NROL_AO_BLACK_HOLE_REPO", "").strip()
+    root = Path(configured) if configured else _DEFAULT_BLACK_HOLE_REPO
     return root.resolve()
 
 
@@ -1680,6 +1693,161 @@ def nrol_status() -> str:
         return _json({"error": str(exc), "repo": str(_repo_path())})
 
 
+def _git_run(args: list[str], cwd: Path, timeout: int = 60) -> tuple[int, str, str]:
+    """Run a git command in cwd; return (returncode, stdout, stderr).
+
+    The only subprocess user in the server is publish_black_hole_snapshot; this
+    helper keeps the git invocation in one place. Never uses a shell.
+    """
+    proc = subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True,
+        text=True, timeout=timeout,
+    )
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+@mcp.tool()
+def publish_black_hole_snapshot(
+    commit: bool = False,
+    push: bool = False,
+    message: str = "",
+    note: str = "",
+) -> str:
+    """Regenerate the public NROL-AO dashboard snapshot and optionally publish it.
+
+    Always regenerates `<black-hole>/surfaces/nrol-ao/data.json` from current
+    topic state via export_blackhole_snapshot.build_snapshot() (sanitized: no
+    evidence text, no source names, no URLs).
+
+    commit=True stages ONLY surfaces/nrol-ao/data.json and commits it (never
+    index.html, config.json, or git add -A). push=True (requires commit=True)
+    runs `git push origin master` and goes through the Loom approval gate — a
+    push to the public live site is outward-facing and hard to reverse, so it
+    is fail-closed without LOOM_CONV_ID unless NROL_AO_ALLOW_UNGATED_COMMITS=1.
+    On a non-fast-forward rejection the tool reports the conflict and does NOT
+    auto-rebase/stash; surface it for the operator to resolve manually.
+
+    commit=False, push=False is the purely programmatic refresh path: writes a
+    fresh local data.json with no git mutation and no human gate. A scheduled
+    job can use it to keep the local snapshot current.
+    """
+    store = _activity_store()
+    job_id = new_job_id("publish-snapshot")
+    t0 = time.time()
+    try:
+        black_hole = _black_hole_path()
+        if not black_hole.is_dir():
+            raise FileNotFoundError(
+                f"black-hole repo not found at {black_hole}. Set "
+                f"NROL_AO_BLACK_HOLE_REPO to the repo path."
+            )
+        snapshot_dir = black_hole / "surfaces" / "nrol-ao"
+        if not snapshot_dir.is_dir():
+            raise FileNotFoundError(
+                f"black-hole surface dir not found: {snapshot_dir}"
+            )
+
+        # Push is an outward-facing mutation: require the Loom gate.
+        denied = None
+        if push:
+            denied = _ask_loom_permission(
+                "nrol_ao_publish_black_hole_snapshot",
+                {"commit": commit, "push": push, "message": message or "(default)"},
+            )
+            if denied:
+                store.record(
+                    job_id, "denied", task="publish_black_hole_snapshot",
+                    summary={"denied": denied, "commit": commit, "push": push},
+                )
+                return _json({"job_id": job_id, "denied": denied, "pushed": False})
+
+        store.record(
+            job_id, "running", task="publish_black_hole_snapshot",
+            summary={"commit": commit, "push": push},
+        )
+
+        exporter = _import_from_repo("export_blackhole_snapshot")
+        snapshot = exporter.build_snapshot()
+        out_path = snapshot_dir / "data.json"
+        out_path.write_text(
+            json.dumps(snapshot, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+        result = {
+            "regenerated": True,
+            "data_json": str(out_path),
+            "topic_count": snapshot.get("topic_count"),
+            "generated_at": snapshot.get("generated_at"),
+        }
+
+        if commit:
+            rc, out, err = _git_run(
+                ["add", "--", "surfaces/nrol-ao/data.json"], black_hole
+            )
+            if rc != 0:
+                raise RuntimeError(f"git add failed: {err or out}")
+            rc, out, err = _git_run(
+                ["rev-parse", "HEAD"], black_hole
+            )
+            head_before = out
+            commit_msg = message or (
+                f"chore(nrol-ao): refresh public snapshot "
+                f"({snapshot.get('topic_count')} topics, "
+                f"{(snapshot.get('generated_at') or '')[:10]})"
+            )
+            rc, out, err = _git_run(
+                ["commit", "-m", commit_msg, "--", "surfaces/nrol-ao/data.json"],
+                black_hole,
+            )
+            if rc != 0:
+                # Nothing staged / nothing to commit is not fatal for a refresh.
+                result["commit"] = {"committed": False, "note": err or out}
+            else:
+                rc2, out2, _ = _git_run(["rev-parse", "HEAD"], black_hole)
+                result["commit"] = {
+                    "committed": True,
+                    "head_before": head_before,
+                    "head_after": out2,
+                }
+                if push:
+                    rc3, out3, err3 = _git_run(
+                        ["push", "origin", "master"], black_hole, timeout=120
+                    )
+                    if rc3 != 0:
+                        result["push"] = {
+                            "pushed": False,
+                            "error": err3 or out3,
+                            "note": (
+                                "non-fast-forward or rejected — fetch, rebase onto "
+                                "origin/master, and retry; do not force-push"
+                            ),
+                        }
+                    else:
+                        result["push"] = {"pushed": True, "output": out3}
+
+        result["duration_ms"] = int((time.time() - t0) * 1000)
+        store.record(
+            job_id, "completed", task="publish_black_hole_snapshot",
+            duration_ms=result["duration_ms"],
+            summary={
+                "commit": commit, "push": push,
+                "topic_count": snapshot.get("topic_count"),
+                "pushed": bool(result.get("push", {}).get("pushed")),
+            },
+            note=note,
+        )
+        return _json({"job_id": job_id, **result})
+    except Exception as exc:
+        try:
+            store.record(
+                job_id, "failed", task="publish_black_hole_snapshot",
+                error=str(exc), summary={"commit": commit, "push": push},
+            )
+        except Exception:
+            pass
+        return _json({"job_id": job_id, "error": str(exc)})
+
+
 @mcp.tool()
 def help() -> str:
     """Explain the intended NROL-AO MCP workflow and available tools."""
@@ -1732,6 +1900,74 @@ def help() -> str:
                 "Do not invent likelihoods, posteriors, or target probabilities.",
                 "If this MCP server is unavailable, stop and report a setup failure.",
             ],
+            "server_structure": {
+                "bridge_check": (
+                    "Call nrol_status() first to verify the MCP bridge, the "
+                    "configured repo (NROL_AO_REPO), and the black-hole repo. It "
+                    "returns the repo root, topic count, and available transition "
+                    "tools — if it errors or the repo root is wrong, stop and report "
+                    "a setup failure rather than proceeding."
+                ),
+                "boundary": (
+                    "This MCP server is the authority boundary: it is the only path "
+                    "to topic state, evidence, proposals, and posteriors. The "
+                    "operator never reads topic JSON from disk or runs shell "
+                    "commands — file and shell tools are stripped from the session. "
+                    "Everything goes through the tools below."
+                ),
+                "llm_backend": (
+                    "LLM-backed tools (red-teams, run_matcher_with_llama, "
+                    "review_duplicate_candidate, review_parked, deliberation, "
+                    "future_cast, the resolution AAR) call a local llama-server "
+                    "endpoint. Check llama_server_status() if those return empty or "
+                    "timeout — the token-budget reference doc covers the empty-"
+                    "rationale failure mode."
+                ),
+            },
+            "tool_groups": {
+                "Inspect state": [
+                    "nrol_status", "topic_status", "list_topics", "list_hypotheses",
+                    "read_topic", "list_activity", "read_evidence",
+                ],
+                "Triage": ["triage_headline (first, always, before anything else)"],
+                "Scan": ["run_news_scan (pass brief=true in operator mode)"],
+                "Deliberate": ["deliberate_candidates", "review_duplicate_candidate"],
+                "Proposals": [
+                    "submit_article", "propose_match", "commit_match",
+                    "withdraw_proposal", "list_proposals",
+                ],
+                "Transitions": [
+                    "submit_transition (PARK / FIRE / OBSERVE / SCHEMA_GAP / IGNORE)",
+                ],
+                "Search queries": [
+                    "read_search_queries", "propose_search_query_update",
+                    "red_team_search_query_update", "apply_search_query_update",
+                    "withdraw_search_query_update",
+                ],
+                "Schema gaps": [
+                    "list_schema_gaps", "run_schema_gap_resolver",
+                    "propose_schema_extension", "list_schema_extension_proposals",
+                    "red_team_schema_extension_proposal",
+                    "mark_schema_extension_proposal",
+                    "apply_schema_extension_proposal",
+                ],
+                "Parked queue": ["review_parked", "acknowledge_parked_reviews"],
+                "Replay/undo": [
+                    "list_scan_runs", "read_scan_run", "replay_scan_run",
+                    "undo_scan_run",
+                ],
+                "Shadow/calibration": [
+                    "shadow_posteriors", "future_cast", "resolve_topic",
+                    "resolution_brier", "source_calibration_status",
+                    "source_profile", "validate_source_db",
+                    "source_domain_patterns", "log_social_forecast",
+                    "social_user_brier", "list_social_handles",
+                    "list_triage_log", "read_triage_log",
+                ],
+                "Publish": ["publish_black_hole_snapshot"],
+                "Topic design": ["design_topic", "activate_topic"],
+                "Reference": ["help", "read_reference"],
+            },
             "tools": [
                 "nrol_status",
                 "help",
@@ -1765,9 +2001,103 @@ def help() -> str:
                 "read_scan_run",
                 "replay_scan_run",
                 "undo_scan_run",
+                "read_reference",
             ],
         }
     )
+
+
+# --- Reference docs -------------------------------------------------------
+# Deep reference material externalized from the always-on OPERATOR.md prompt
+# (which is injected onto the `claude` command line via --append-system-prompt
+# and must stay small to avoid breaching Windows' 32,767-char CreateProcess
+# limit). These docs are fetched on demand through read_reference(), whose
+# response travels the tool-result channel — not the command line — so it
+# carries no length penalty.
+_DOCS_DIR = Path(__file__).parent / "docs"
+
+# Single source of truth: section name -> filename. The lean OPERATOR.md and
+# the index returned by read_reference(section="") both reference these keys,
+# so adding/renaming a doc is a one-line change here.
+_REFERENCE_DOCS = {
+    "tool-reference": "tool-reference.md",
+    "shadow-tools": "shadow-tools.md",
+    "search-queries": "search-queries.md",
+    "operator-loop": "operator-loop.md",
+    "token-budget": "token-budget.md",
+}
+
+_DOC_SUMMARIES = {
+    "tool-reference": (
+        "Per-tool inventory with footguns (deliberate_candidates output_text "
+        "shape, anti-indicator authoring, brief=true rationale)."
+    ),
+    "shadow-tools": (
+        "shadow_posteriors, future_cast, source trust, triage, social Brier — "
+        "calibration, not action."
+    ),
+    "search-queries": (
+        "Query-authoring guide, coverage axes, retrieval limits, proposal template."
+    ),
+    "operator-loop": (
+        "6-step evidence loop with deep sub-notes: repeat-firing, framing "
+        "traps, draining the parked queue, freshness downgrades."
+    ),
+    "token-budget": (
+        "max_tokens guidance, empty-REVISE failure mode, when to raise the budget."
+    ),
+}
+
+
+@mcp.tool()
+def read_reference(section: str = "") -> str:
+    """Read a deep-reference doc for the NROL-AO operator.
+
+    The lean OPERATOR.md prompt keeps only the always-on guardrails and
+    decision rules; the bulky per-tool footguns, shadow-tool semantics,
+    query-authoring guide, operator-loop sub-notes, and token-budget
+    guidance live in external markdown files beside this server. Call this
+    with the section name to fetch the relevant doc. With no argument (or
+    an unknown name) it returns the index of available sections with a
+    one-line summary of each, so you can discover what is available before
+    fetching.
+
+    These are reference docs, not state. They never move posteriors and are
+    not evidence.
+    """
+    if not section or section not in _REFERENCE_DOCS:
+        return _json(
+            {
+                "available_sections": _DOC_SUMMARIES,
+                "usage": "read_reference(section='<name>') to fetch the full doc.",
+            }
+        )
+    # `section` is a dict key, so "../" cannot reach this lookup; the
+    # resolve()+relative_to() guard is defense-in-depth in case the lookup
+    # is ever changed to be filesystem-based.
+    path = (_DOCS_DIR / _REFERENCE_DOCS[section]).resolve()
+    try:
+        path.relative_to(_DOCS_DIR.resolve())
+    except ValueError:
+        return _json({"error": "path traversal refused", "section": section})
+    if not path.is_file():
+        return _json(
+            {
+                "error": "doc file missing on disk",
+                "section": section,
+                "expected_path": str(path),
+                "available_sections": list(_REFERENCE_DOCS),
+            }
+        )
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return _json({"error": str(exc), "section": section})
+    # Return raw markdown, NOT wrapped in _json(). The reference docs are
+    # prose with embedded code blocks; returning raw text lets the model
+    # read it directly without a JSON encode/decode round-trip for several
+    # KB. A leading header line grounds the response.
+    return f"# reference:{section}\n\n{text}"
 
 
 @mcp.tool()
@@ -1971,7 +2301,7 @@ def red_team_search_query_update(
     proposal_id: str,
     model: str = "",
     temperature: float = 0.2,
-    max_tokens: int = 2048,
+    max_tokens: int = 4096,
     timeout_sec: int = 600,
 ) -> str:
     """MCP red-team gate for a proposed searchQueries update.
@@ -2025,6 +2355,18 @@ def red_team_search_query_update(
         review["model"] = response.get("model")
         review["deterministic"] = deterministic
         review["finish_reason"] = response.get("finish_reason")
+        # Defensive: if the model returned empty content (reasoning-budget
+        # exhaustion on a thinking-enabled model, or a transport hiccup), do NOT
+        # let the parser's default masquerade as a substantive review.
+        if not (response.get("text") or "").strip():
+            review["verdict"] = "REVISE"
+            review["risk"] = "NO_ANSWER_EMITTED"
+            review["recommendation"] = (
+                "Red-team model returned empty content (finish_reason="
+                f"{response.get('finish_reason')!r}, reasoning_chars="
+                f"{response.get('reasoning_chars', 0)}). This is a non-answer, "
+                "not a substantive REVISE — rerun the red-team review."
+            )
         updated = store.set_search_query_red_team(proposal_id, review)
         activity.record(
             job_id,
@@ -2351,8 +2693,13 @@ def run_schema_gap_resolver(
         text = response.get("text", "")
         proposals = resolver.parse_resolver_proposals(text)
         proposals = resolver.validate_proposals_balance(topic, proposals)
+        # Defensive: if the model returned empty content (reasoning-budget
+        # exhaustion on a thinking-enabled model, or a transport hiccup), do NOT
+        # silently persist nothing and report success. Surface the non-answer so
+        # an operator reruns instead of assuming "no gaps found."
+        no_answer = bool(proposals) is False and not text.strip()
         persisted_count = 0
-        if persist and proposals:
+        if persist and proposals and not no_answer:
             updated = resolver.persist_proposals(slug, proposals, validated=False)
             persisted_count = len(
                 updated.get("governance", {}).get("proposed_schema_extensions", []) or []
@@ -2362,6 +2709,13 @@ def run_schema_gap_resolver(
             "model": response.get("model"), "response": text,
             "proposals": proposals, "persisted": bool(persist and proposals),
             "proposed_schema_extensions_count": persisted_count,
+            "no_answer_emitted": no_answer,
+            "note": (
+                "Resolver model returned empty content (finish_reason="
+                f"{response.get('finish_reason')!r}, reasoning_chars="
+                f"{response.get('reasoning_chars', 0)}). No proposals parsed — "
+                "rerun; do not treat as 'no gaps found'."
+            ) if no_answer else None,
         }
         store.record(
             job_id, "completed", task="run_schema_gap_resolver", slug=slug,
@@ -2400,6 +2754,189 @@ def list_schema_extension_proposals(slug: str, status: str = "pending") -> str:
                     continue
             rows.append({"index": i, **proposal})
         return _json({"slug": slug, "count": len(rows), "proposals": rows})
+    except Exception as exc:
+        return _json({"error": str(exc), "slug": slug})
+
+
+def _format_schema_body(
+    desc: str,
+    likelihoods: dict | None,
+    observable: dict | None,
+    shape: str,
+    causal_event_id: str,
+    ladder_group: str,
+    ladder_step: str,
+) -> str:
+    """Build the YAML-ish SCHEMA block that apply_schema_extension_proposal re-parses.
+
+    Mirrors the shape _parse_schema_body expects (server.py): a `SCHEMA:` header
+    with `desc`, `likelihoods: {H1: .., H2: ..}`, an `observable:` block
+    (metric/family/direction strings, threshold_value/baseline floats), and
+    optional shape/causal_event_id/ladder_group/ladder_step. Structured dicts at
+    the proposal top level are IGNORED by apply — only the parsed body matters.
+    """
+    lines = ["SCHEMA:"]
+    if desc:
+        lines.append(f"  desc: {desc}")
+    if likelihoods:
+        lr_parts = ", ".join(f"{k}: {float(v)}" for k, v in likelihoods.items())
+        lines.append(f"  likelihoods: {{{lr_parts}}}")
+    if observable:
+        lines.append("  observable:")
+        for key in ("metric", "family", "direction"):
+            if observable.get(key):
+                lines.append(f"    {key}: {observable[key]}")
+        for key in ("threshold_value", "baseline"):
+            if observable.get(key) is not None:
+                lines.append(f"    {key}: {float(observable[key])}")
+    if shape:
+        lines.append(f"  shape: {shape}")
+    if causal_event_id:
+        lines.append(f"  causal_event_id: {causal_event_id}")
+    if ladder_group:
+        lines.append(f"  ladder_group: {ladder_group}")
+    if ladder_step:
+        lines.append(f"  ladder_step: {ladder_step}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def propose_schema_extension(
+    slug: str,
+    kind: str,
+    target: str,
+    tier: str = "tier3_suggestive",
+    desc: str = "",
+    rationale: str = "",
+    likelihoods: dict | None = None,
+    observable: dict | None = None,
+    shape: str = "",
+    causal_event_id: str = "",
+    target_hypothesis: str = "",
+    ladder_group: str = "",
+    ladder_step: str = "",
+) -> str:
+    """File a hand-authored indicator proposal into the schema-extension queue.
+
+    Appends to governance.proposed_schema_extensions so an operator can red-team
+    it, mark it approved, and apply it via apply_schema_extension_proposal — the
+    same review-first lifecycle the resolver's auto-generated proposals use, but
+    for window-specific indicators that require human causal reasoning (the
+    resolver cannot produce them).
+
+    No mutation to indicators, no posterior movement, no Loom gate — this is a
+    zero-authority queue append, the same tier as run_schema_gap_resolver's
+    persist step. The proposal synthesizes the YAML-ish `body` string that apply
+    re-parses (structured dicts at the top level are ignored by apply).
+
+    kind: add_new_indicator | extend_observable | no_fix.
+    target: indicator id (existing for extend_observable, new for add_new_indicator).
+    tier: one of the topic's tier keys (tier1_critical/tier2_strong/tier3_suggestive)
+          or anti_indicators. Anti-indicators should also pass target_hypothesis
+          (single H or list) so the inversion lint can verify LR direction at apply.
+    likelihoods/observable: structured fields, rendered into body. Required for
+    add_new_indicator.
+    """
+    try:
+        kind_norm = (kind or "").strip().lower()
+        if kind_norm not in {"add_new_indicator", "extend_observable", "no_fix"}:
+            raise ValueError(
+                "kind must be add_new_indicator, extend_observable, or no_fix"
+            )
+        target = (target or "").strip()
+        if not target and kind_norm != "no_fix":
+            raise ValueError("target id is required")
+
+        engine = _import_from_repo("engine")
+        topic = engine.load_topic(slug)
+        if (topic.get("meta", {}).get("status") or "").upper() != "ACTIVE":
+            raise ValueError(
+                f"topic {slug!r} is not ACTIVE (status="
+                f"{topic.get('meta', {}).get('status')}); "
+                "schema extensions target live topics"
+            )
+
+        h_keys = list((topic.get("model", {}).get("hypotheses") or {}).keys())
+        tiers = topic.get("indicators", {}).get("tiers", {}) or {}
+        allowed_tiers = set(tiers.keys()) | {"anti_indicators"}
+        tier = (tier or "").strip()
+        if kind_norm == "add_new_indicator":
+            if tier not in allowed_tiers:
+                raise ValueError(
+                    f"tier must be 'anti_indicators' or one of {sorted(tiers.keys())}"
+                )
+
+        # Validate target existence/duplication, mirroring apply's checks.
+        existing, _ = _find_indicator(topic, target)
+        if kind_norm == "add_new_indicator" and existing is not None:
+            raise ValueError(f"indicator {target!r} already exists on topic")
+        if kind_norm == "extend_observable" and existing is None:
+            raise ValueError(
+                f"extend_observable target {target!r} does not exist on topic"
+            )
+
+        # Validate target_hypothesis against the topic's hypotheses (anti-indicator
+        # inversion lint resolves the suppress-target from this field).
+        th_out = None
+        if target_hypothesis:
+            if isinstance(target_hypothesis, str):
+                th_list = [h.strip().upper() for h in target_hypothesis.split(",") if h.strip()]
+            else:
+                th_list = [str(h).strip().upper() for h in target_hypothesis if str(h).strip()]
+            bad = [h for h in th_list if h not in h_keys]
+            if bad:
+                raise ValueError(
+                    f"target_hypothesis {bad} not in topic hypotheses {h_keys}"
+                )
+            th_out = th_list[0] if len(th_list) == 1 else th_list
+
+        # For add_new_indicator, validate likelihoods + observable presence now
+        # so the operator doesn't reach apply and fail there (mirrors apply gates).
+        if kind_norm == "add_new_indicator":
+            if not likelihoods:
+                raise ValueError("add_new_indicator requires likelihoods")
+            bad_lr_h = [k for k in likelihoods if k not in h_keys]
+            if bad_lr_h:
+                raise ValueError(
+                    f"likelihoods keys {bad_lr_h} not in topic hypotheses {h_keys}"
+                )
+            if not observable:
+                raise ValueError("add_new_indicator requires an observable block")
+
+        body = _format_schema_body(
+            desc, likelihoods, observable, shape, causal_event_id,
+            ladder_group, ladder_step,
+        )
+        proposal = {
+            "kind": kind_norm,
+            "target": target,
+            "tier": tier if kind_norm == "add_new_indicator" else "",
+            "cluster_addressed": "operator_injected",
+            "rationale": rationale or desc or target,
+            "body": body,
+            "proposed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "status": "pending_operator_review",
+        }
+        if th_out is not None:
+            proposal["target_hypothesis"] = th_out
+
+        topic.setdefault("governance", {}).setdefault(
+            "proposed_schema_extensions", []
+        ).append(proposal)
+        engine.save_topic(topic)
+
+        queue = topic["governance"]["proposed_schema_extensions"]
+        index = len(queue) - 1
+        return _json({
+            "slug": slug,
+            "proposal_index": index,
+            "proposal": proposal,
+            "next": (
+                "red_team_schema_extension_proposal (mandatory) → "
+                "mark_schema_extension_proposal approved → "
+                "apply_schema_extension_proposal"
+            ),
+        })
     except Exception as exc:
         return _json({"error": str(exc), "slug": slug})
 
@@ -2478,7 +3015,7 @@ def red_team_schema_extension_proposal(
     proposal_index: int,
     model: str = "",
     temperature: float = 0.2,
-    max_tokens: int = 2048,
+    max_tokens: int = 4096,
     timeout_sec: int = 600,
 ) -> str:
     """Mandatory red-team review for one schema-extension proposal."""
@@ -2502,6 +3039,23 @@ def red_team_schema_extension_proposal(
             "- add a one-sided indicator that amplifies an already over-covered hypothesis",
             "- use vague threshold language or non-observable criteria",
             "- route evidence through an LR vector that points in the wrong direction",
+            "",
+            "ANTI-INDICATOR DIRECTIONALITY (applies when the proposal targets the "
+            "'anti_indicators' tier or its id matches anti_h<digit>_...):",
+            "An anti-indicator's LRs are authored so FIRING SUPPRESSES its targeted "
+            "hypothesis. Verify the inversion is correct:",
+            "- single target (target_hypothesis is one H, e.g. 'H3'): that target H "
+            "must carry the LOWEST LR in the likelihoods vector. If the target H does "
+            "NOT have the lowest LR, firing would move it UP — this is the dangerous "
+            "direction and must be REJECT.",
+            "- multi target (target_hypothesis is a list, e.g. ['H1','H2','H3']): "
+            "every target H LR must be below every non-target H LR, so firing "
+            "suppresses all targets.",
+            "- if target_hypothesis is absent and the id does not encode a target, "
+            "inversion cannot be verified — REVISE and request the field.",
+            "Note: the engine enforces this mechanically at apply (the apply will be "
+            "blocked if inversion is wrong), but catch it here so the operator does "
+            "not waste an apply attempt.",
             "",
             f"TOPIC: {slug}",
             f"QUESTION: {topic.get('meta', {}).get('question', '')}",
@@ -2545,11 +3099,33 @@ def red_team_schema_extension_proposal(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout_sec=timeout_sec,
+            # Deliberation enabled: Qwen3.6 reasons in reasoning_content, then
+            # emits VERDICT:/RISK:/... in message.content. Budget MUST be large
+            # enough for thinking to finish AND leave room for the answer —
+            # measured on the Hormuz schema red-team prompt (~19k chars, 20
+            # indicators): thinking uses ~2860 tokens, answer ~260. At 2048
+            # thinking can't finish (finish_reason=length, 0 content → parser
+            # defaults to empty REVISE). 4096 gives full answers with margin.
+            # The NO_ANSWER_EMITTED guard below catches any future prompt that
+            # pushes thinking past the budget rather than failing silently.
             disable_thinking=False,
         )
         review = _parse_schema_red_team_review(response.get("text", ""))
         review["reviewed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         review["model"] = response.get("model")
+        # Defensive: if the model returned empty content (e.g. reasoning-budget
+        # exhaustion on a thinking-enabled model, or a transport hiccup), do NOT
+        # let the parser's REVISE default masquerade as a substantive review.
+        # Surface the non-answer so an operator reruns instead of acting on it.
+        if not (response.get("text") or "").strip():
+            review["verdict"] = "REVISE"
+            review["risk"] = "NO_ANSWER_EMITTED"
+            review["recommendation"] = (
+                "Red-team model returned empty content (finish_reason="
+                f"{response.get('finish_reason')!r}, reasoning_chars="
+                f"{response.get('reasoning_chars', 0)}). This is a non-answer, "
+                "not a substantive REVISE — rerun the red-team review."
+            )
         proposal["red_team_review"] = review
         proposal["red_team_required"] = True
         if review["verdict"] != "APPROVE" and proposal.get("status") == "approved":
@@ -2627,7 +3203,7 @@ def _parse_schema_body(body: str) -> dict:
 def apply_schema_extension_proposal(
     slug: str,
     proposal_index: int,
-    tier: str = "tier3_suggestive",
+    tier: str = "",
     note: str = "",
 ) -> str:
     """Apply an approved schema-extension proposal to topic indicators.
@@ -2695,8 +3271,24 @@ def apply_schema_extension_proposal(
             if "observable" not in schema:
                 raise ValueError("add_new_indicator proposal has no observable block")
             tiers = topic.setdefault("indicators", {}).setdefault("tiers", {})
-            if tier not in tiers:
-                raise ValueError(f"tier must be one of {sorted(tiers.keys())}")
+            # Resolve the target tier: an explicit `tier` argument wins; else
+            # fall back to the tier the proposal was filed with (propose_schema_extension
+            # stamps this); else tier3_suggestive. Without this, an anti-indicator
+            # filed with tier="anti_indicators" silently lands as tier3_suggestive
+            # when the operator omits the tier arg at apply — bypassing the inversion
+            # lint and the anti-indicator governance coverage check.
+            if not tier:
+                tier = (proposal.get("tier") or "").strip() or "tier3_suggestive"
+            # anti_indicators is a sibling list of tiers (indicator_schema.py),
+            # not a key inside it; engine.add_indicator accepts it as a valid
+            # tier. Allow it here so an approved anti-indicator proposal can be
+            # applied — the engine's inversion lint (_check_anti_indicator_inversion)
+            # validates the LR direction at apply time.
+            allowed_tiers = set(tiers.keys()) | {"anti_indicators"}
+            if tier not in allowed_tiers:
+                raise ValueError(
+                    f"tier must be 'anti_indicators' or one of {sorted(tiers.keys())}"
+                )
             indicator = {
                 "id": target,
                 "desc": schema.get("desc") or proposal.get("rationale") or target,
@@ -2706,12 +3298,23 @@ def apply_schema_extension_proposal(
                 ),
                 "likelihoods": schema["likelihoods"],
                 "observable": schema["observable"],
-                "lr_decay": 0.65,
+                # Decay disabled 2026-06-29 (see engine.apply_indicator_effect):
+                # saturation + [0.005,0.98] clamp bound stacked firings; any
+                # lr_decay < 1.0 deafens at high n_firings. Field retained as
+                # dead metadata; dynamics replaces it structurally.
+                "lr_decay": 1.0,
                 "n_firings": 0,
                 "resolution_class": False,
                 "shape": schema.get("shape") or "per_event_member",
                 "causal_event_id": schema.get("causal_event_id") or target,
             }
+            # Forward target_hypothesis so the engine inversion lint can resolve
+            # the suppress-target for anti-indicators (single H or list). Falls
+            # back to an id heuristic only when absent; multi-target / non-id-
+            # encoded anti-indicators need this field to be verifiable.
+            th = proposal.get("target_hypothesis")
+            if th:
+                indicator["target_hypothesis"] = th
             if schema.get("ladder_group"):
                 indicator["ladder_group"] = schema["ladder_group"]
             if schema.get("ladder_step"):
@@ -5363,7 +5966,7 @@ def _judge_cross_day_duplicate(
     slug: str, topic: dict, article: dict, decision: dict,
     window_days: int = 45, max_candidates: int = 12,
     model: str = "", temperature: float = 0.0,
-    max_tokens: int = 2048, timeout_sec: int = 600,
+    max_tokens: int = 4096, timeout_sec: int = 600,
 ) -> dict:
     """Core duplicate-event judgment (no job logging). Returns the judgment
     dict + candidates, or {error}. Pure-ish: calls the local llama endpoint.
@@ -5408,6 +6011,20 @@ def _judge_cross_day_duplicate(
         timeout_sec=timeout_sec, disable_thinking=False,
     )
     judgment = _parse_duplicate_judgment(response.get("text", ""))
+    # Defensive: if the model returned empty content (reasoning-budget
+    # exhaustion on a thinking-enabled model, or a transport hiccup), do NOT
+    # let the parser's default verdict masquerade as a substantive judgment —
+    # a wrong duplicate call is the dangerous direction (suppresses real evidence).
+    if not (response.get("text") or "").strip():
+        judgment = {
+            "verdict": "UNCERTAIN_DUPLICATE",
+            "reason": (
+                "NO_ANSWER_EMITTED: duplicate judge returned empty content "
+                f"(finish_reason={response.get('finish_reason')!r}, "
+                f"reasoning_chars={response.get('reasoning_chars', 0)}). "
+                "This is a non-answer — rerun; do not treat as UNIQUE_EVENT."
+            ),
+        }
     return {
         "slug": slug, "candidate_count": len(candidates),
         "judgment": judgment, "candidates": candidates,

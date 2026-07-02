@@ -564,7 +564,13 @@ def _configure_permission_hook(cwd: str) -> bool:
     hook_command = f'"{python_exe}" "{hook_path}"'
 
     # Use PreToolUse (not PermissionRequest — that doesn't fire in -p mode)
-    # Matcher ".*" catches all tools; nested hooks array is required
+    # Matcher ".*" catches all tools; nested hooks array is required.
+    # timeout: 900s (15 min). Without this field, CC applies its ~60s default
+    # hook-execution timeout — the hook is killed mid-wait, CC treats the
+    # killed hook as a refusal, and the agent sees "permission not granted"
+    # ~60s after a tool call if the user hasn't approved yet. agy/Codex set
+    # this explicitly (24h/15min); CC must too. Loom's server-side wait is 24h,
+    # so 15min here is the binding constraint for CC sessions.
     new_config = {
         "hooks": {
             "PreToolUse": [
@@ -574,6 +580,7 @@ def _configure_permission_hook(cwd: str) -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
+                            "timeout": 900,
                         }
                     ]
                 }
@@ -592,13 +599,18 @@ def _configure_permission_hook(cwd: str) -> bool:
     # Only write if the hooks section differs (idempotent check)
     existing_hooks = existing.get("hooks", {})
 
-    # Compare: skip write if PreToolUse exists and command is unchanged
-    # The command is nested at PreToolUse[0].hooks[0].command
+    # Compare: skip write only if BOTH command AND timeout match the desired
+    # config. Previously this compared command alone, so a settings file written
+    # before the timeout field existed (CC's ~60s default killed the permission
+    # hook mid-wait — looked like a refusal) never got the timeout stamped in.
     if "PreToolUse" in existing_hooks:
         existing_item = existing_hooks["PreToolUse"][0]
-        existing_cmd = existing_item.get("command", "") or existing_item.get("hooks", [{}])[0].get("command", "")
-        if existing_cmd == hook_command:
-            print(f"[CC] Skipping write: command unchanged")
+        existing_hook = (existing_item.get("hooks", [{}]) or [{}])[0]
+        existing_cmd = existing_hook.get("command", "")
+        existing_timeout = existing_hook.get("timeout")
+        desired_timeout = new_config["hooks"]["PreToolUse"][0]["hooks"][0].get("timeout")
+        if existing_cmd == hook_command and existing_timeout == desired_timeout:
+            print(f"[CC] Skipping write: command + timeout unchanged")
             return False  # Already configured, skip write
 
     # Write settings
