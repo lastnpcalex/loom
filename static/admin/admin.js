@@ -88,6 +88,40 @@ async function loadLlamaModels(opts = {}) {
     } catch (e) { /* admin down or no models dir */ }
 }
 
+// ── Dream Hermes sidecar: Loaded Models visibility ─────────────────────────
+// Renders the dream card's inline status panel (loaded model, VRAM, RAM working
+// set, RAM cached/standby, idle countdown). Fed by /api/dream-models on the
+// refreshAll poll. Separate from loadLlamaModels because the dream sidecar is a
+// different process (nuspy adapter) with its own /health shape.
+async function renderDreamModels() {
+    const panel = document.getElementById('dream-models-panel');
+    if (!panel) return;
+    let d;
+    try {
+        const r = await fetch('/api/dream-models', { cache: 'no-store' });
+        if (!r.ok) { panel.innerHTML = '<span style="color:var(--text-mute);">Dream sidecar status unavailable.</span>'; return; }
+        d = await r.json();
+    } catch (e) { return; }
+    if (!d.running) {
+        panel.innerHTML = '<span style="color:var(--text-mute);">Dream sidecar not running. Click <b>Start Dream</b> to launch (model JIT-loads on first request).</span>';
+        return;
+    }
+    const loaded = d.loaded_model || '<i>none (JIT — loads on first request)</i>';
+    const avail = (d.available || []).join(', ') || 'none';
+    const idleMin = d.idle_secs != null ? Math.floor(d.idle_secs / 60) : null;
+    const timeoutMin = d.idle_timeout_min || 0;
+    const idleStr = idleMin != null
+        ? `${idleMin}m ${d.idle_secs % 60}s${timeoutMin > 0 ? ` / ${timeoutMin}m` : ''}`
+        : '—';
+    const autoUnload = timeoutMin > 0 ? `auto-unloads at ${timeoutMin}m idle` : 'auto-unload off';
+    panel.innerHTML = `
+        <div><b>Loaded:</b> <span style="color:var(--cyan);">${esc(String(loaded))}</span></div>
+        <div><b>Available:</b> ${esc(avail)} · <b>maxtok:</b> ${d.maxtok || 0}</div>
+        <div><b>VRAM used:</b> ${d.vram_used_mb ?? '?'} MB · <b>RAM working set:</b> ${d.ram_working_set_mb ?? '?'} MB · <b>RAM cached (GGUF mmap):</b> ${d.ram_cached_mb ?? '?'} MB</div>
+        <div style="color:var(--text-mute);">Idle: ${idleStr} (${autoUnload}) · PID ${d.pid ?? '?'}</div>
+    `;
+}
+
 async function llamaSwitchModel() {
     const sel = document.getElementById('llama-model-switch');
     const model = sel ? sel.value : '';
@@ -163,6 +197,7 @@ async function refreshAll() {
         const overview = document.getElementById('view-overview');
         if (overview?.classList.contains('active') && document.activeElement?.id !== 'llama-model-switch') {
             await loadLlamaModels({ force: true });
+            await renderDreamModels();
         }
     } catch (e) { /* keep ticking */ }
     scheduleRefresh();
@@ -200,6 +235,15 @@ const SERVER_HEAD_ACTIONS = {
         ],
         target: 'out-nrol',
     },
+    dream: {
+        on: [
+            { cls: 'btn btn-warn', label: '⏹ Unload',  tool: 'dream-unload', confirm: 'Unload Dream (frees VRAM + flushes 17GB from RAM)?' },
+        ],
+        off: [
+            { cls: 'btn btn-green', label: '▶ Start',  tool: 'dream-start' },
+        ],
+        target: 'out-dream',
+    },
 };
 
 function renderServerHeadActions(key, on) {
@@ -227,15 +271,15 @@ async function refreshPorts() {
         const r = await fetch('/api/ports-status', { cache: 'no-store' });
         if (r.ok) d = await r.json();
     } catch (e) { return; }
-    const order = [['main', 'Loom'], ['test', 'Test'], ['llama', 'Llama'], ['nrol', 'NROL'], ['comfy', 'Comfy'], ['ttyd', 'ttyd']];
+    const order = [['main', 'Loom'], ['test', 'Test'], ['llama', 'Llama'], ['dream', 'Dream'], ['nrol', 'NROL'], ['comfy', 'Comfy'], ['ttyd', 'ttyd']];
     document.getElementById('pulse-grid').innerHTML = order
         .map(([k, label]) => `<span class="pulse-item"><span class="dot ${d[k] ? 'on' : 'off'}"></span>${label}</span>`)
         .join('');
-    for (const k of ['llama', 'comfy', 'nrol', 'ttyd']) {
+    for (const k of ['llama', 'comfy', 'nrol', 'ttyd', 'dream']) {
         const dot = document.getElementById('dot-' + k);
         if (dot) dot.className = 'dot ' + (d[k] ? 'on' : 'off');
     }
-    for (const k of ['llama', 'comfy', 'nrol']) renderServerHeadActions(k, !!d[k]);
+    for (const k of ['llama', 'comfy', 'nrol', 'dream']) renderServerHeadActions(k, !!d[k]);
     // Keep the terminal iframe in sync if ttyd died or came up elsewhere
     if (document.getElementById('view-terminal').classList.contains('active')) {
         const frame = document.getElementById('ttyd-frame');
@@ -507,6 +551,9 @@ async function runTool(name, opts = {}) {
     }
     if (/^llama-/.test(name)) {
         await loadLlamaModels({ force: true });
+    }
+    if (/^dream-/.test(name)) {
+        await renderDreamModels();
     }
     scheduleRefresh(30000);
 }

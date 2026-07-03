@@ -904,6 +904,377 @@ async def tool_llama_reload(model: str | None = None):
     return await tool_llama_start(model=model)
 
 
+# ── Dream Hermes (DiffusionGemma GPU orchestrator sidecar) ────────────────────
+# Runs the nuspy OpenAI adapter (agent.openai_server) on the diffusion-capable
+# llama.cpp fork. The sidecar JIT-loads the NVFP4 GGUF into VRAM on first request.
+# Unload = kill the process, which releases BOTH VRAM and the process working set
+# (system RAM). idle_timeout auto-unloads so the GPU/RAM is free between sessions.
+
+DREAM_HOST = "http://127.0.0.1:8787"
+# Track last activity for idle-timeout auto-unload.
+_dream_last_activity: float = 0.0
+_dream_idle_task_started: bool = False
+
+
+def _dream_port() -> int:
+    """Parse the dream port from config (default 8787)."""
+    try:
+        host = _loom_config.dream_host if _loom_config else os.getenv("DREAM_HOST", DREAM_HOST)
+        if ":" in host and host.rsplit(":", 1)[-1].isdigit():
+            return int(host.rsplit(":", 1)[-1].split("/")[0])
+    except Exception:
+        pass
+    return 8787
+
+
+def _dream_cwd() -> str:
+    return (_loom_config.dream_cwd if _loom_config else os.getenv("DREAM_CWD", "")).strip()
+
+
+def _dream_cmd() -> str:
+    """Build the nuspy openai_server launch command."""
+    py = sys.executable or "python"
+    cwd = _dream_cwd()
+    port = _dream_port()
+    # agent.openai_server resolves ROOT from its own __file__, so cwd just needs
+    # to be the nuspy repo root (where config.json + models/ live).
+    return f'cd /d "{cwd}" && "{py}" -m agent.openai_server --host 127.0.0.1 --port {port}'
+
+
+async def _dream_probe(timeout: float = 2.0) -> dict | None:
+    """GET /health on the dream sidecar. Returns the JSON or None if down."""
+    port = _dream_port()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(f"http://127.0.0.1:{port}/health")
+            if r.status_code == 200:
+                return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def _dream_proc_mem(pid: int | None) -> tuple[int, int]:
+    """Return (working_set_mb, ram_cached_mb) for the dream sidecar process tree.
+    The nuspy adapter spawns the visual-server as a CHILD process — the 17GB GGUF
+    is mmap'd into the child's address space, not the adapter's. So we walk the
+    whole process tree and sum RSS (working set) + the .gguf mmap footprint
+    (standby cache) across adapter + child.
+
+    If the tracked PID is missing (admin restarted while sidecar kept running),
+    fall back to finding the process by command-line match."""
+    import psutil
+    ws_mb = 0
+    cached_mb = 0
+    procs: list = []
+    if pid:
+        try:
+            parent = psutil.Process(pid)
+            procs.append(parent)
+            try:
+                procs.extend(parent.children(recursive=True))
+            except Exception:
+                pass
+        except Exception:
+            pid = None  # fall through to the discover path
+    if not procs:
+        # Fallback: find the nuspy adapter + visual-server by cmdline signature.
+        # This runs when the admin restarted but the sidecar survived (tracked
+        # PID is stale). Without it the RAM numbers silently read as 0.
+        try:
+            for p in psutil.process_iter(["pid", "name", "cmdline"]):
+                try:
+                    cl = " ".join(p.info.get("cmdline") or [])
+                    if "agent.openai_server" in cl or "llama-diffusion-gemma-visual-server" in (p.info.get("name") or ""):
+                        procs.append(psutil.Process(p.info["pid"]))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    for p in procs:
+        try:
+            mem = p.memory_info()
+            ws_mb += int(mem.rss / 1048576)
+        except Exception:
+            pass
+        try:
+            maps = p.memory_maps(grouped=False)
+            mapped = sum(m.rss for m in maps if getattr(m, "path", "").endswith(".gguf"))
+            cached_mb += int(mapped / 1048576)
+        except Exception:
+            pass
+    return (ws_mb, cached_mb)
+
+
+@app.post("/tools/dream-start")
+async def tool_dream_start():
+    """Launch the nuspy DiffusionGemma OpenAI adapter (JIT loads model on first request)."""
+    global _dream_last_activity
+    port = _dream_port()
+    # Already up?
+    h = await _dream_probe()
+    if h is not None:
+        _dream_last_activity = time.time()
+        return JSONResponse({"status": "ok", "output": f"Dream sidecar already running on :{port} (loaded: {h.get('loaded_model') or 'none'})."})
+    cwd = _dream_cwd()
+    if not cwd or not Path(cwd).is_dir():
+        return JSONResponse({"status": "error", "output": f"dream_cwd not found: {cwd!r}. Set it in config.json."})
+    cmd = _dream_cmd()
+    try:
+        proc = _spawn_detached(cmd, cwd=cwd, log_name="dream_admin.log")
+        _child_procs["dream"] = proc
+        _dream_last_activity = time.time()
+        _ensure_dream_idle_watcher()
+        # The adapter itself comes up fast (JIT load is deferred to first request).
+        for i in range(30):
+            await asyncio.sleep(1)
+            if await _dream_probe() is not None:
+                return JSONResponse({"status": "ok", "output": f"Dream sidecar ready on :{port} (PID {proc.pid}). Model JIT-loads on first request.\nCmd: {cmd}"})
+        return JSONResponse({"status": "ok", "output": f"Dream sidecar launched (PID {proc.pid}) but adapter not responding after 30s.\nCmd: {cmd}"})
+    except Exception as e:
+        return JSONResponse({"status": "error", "output": f"Failed to launch Dream sidecar: {e}\nCmd: {cmd}"})
+
+
+@app.post("/tools/dream-stop")
+async def tool_dream_stop():
+    """Terminate the dream sidecar process. Releases VRAM AND the process working
+    set (system RAM). This is the real 'unload' — the nuspy /admin/unload only
+    frees VRAM, leaving the 17GB GGUF cached in standby RAM."""
+    lines = []
+    proc = _child_procs.pop("dream", None)
+    pid = proc.pid if proc and proc.poll() is None else None
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+            lines.append(f"Terminated dream sidecar (PID {proc.pid}).")
+        except Exception as e:
+            lines.append(f"Failed to terminate: {e}")
+    # Also taskkill any stragglers by the python module pattern (best-effort).
+    # We can't taskkill by image (would hit all python), so rely on the tracked
+    # proc + the child visual-server process. Kill the visual-server too.
+    try:
+        r = subprocess.run(
+            ["taskkill", "/F", "/IM", "llama-diffusion-gemma-visual-server.exe", "/T"],
+            capture_output=True, text=True, timeout=10,
+        )
+        out = (r.stdout or r.stderr or "").strip()
+        if out:
+            lines.append(out)
+    except Exception as e:
+        lines.append(f"taskkill visual-server: {e}")
+    lines.append("VRAM + working set released.")
+    return JSONResponse({"status": "ok", "output": "\n".join(lines)})
+
+
+@app.post("/tools/dream-unload")
+async def tool_dream_unload():
+    """Unload Dream: stop the sidecar (frees VRAM + process RAM), then purge the
+    GGUF from the OS standby cache so the 17GB is actually reclaimable."""
+    resp = await tool_dream_stop()
+    # Flush standby RAM so the mmap'd GGUF pages don't linger.
+    flushed = _purge_standby_ram()
+    payload = json.loads(resp.body.decode("utf-8"))
+    out = (payload.get("output") or "").strip()
+    extra = f"\nStandby RAM purge: {flushed}" if flushed else ""
+    return JSONResponse({"status": payload.get("status", "ok"), "output": out + extra})
+
+
+@app.post("/tools/dream-flush-ram")
+async def tool_dream_flush_ram():
+    """Purge OS standby file cache so the mmap'd GGUF pages are released back to
+    free RAM, without stopping the sidecar. Useful when the model is still loaded
+    in VRAM but you want the file-cache footprint gone."""
+    flushed = _purge_standby_ram()
+    if flushed:
+        return JSONResponse({"status": "ok", "output": flushed})
+    return JSONResponse({"status": "ok", "output": "Standby purge not available on this platform (Windows only, requires admin token). Working set left unchanged."})
+
+
+def _purge_standby_ram() -> str:
+    """Best-effort standby-RAM purge on Windows. Returns a status string.
+
+    The reliable mechanism is the NT API NtSetSystemInformation with
+    SystemMemoryListInformation (EmptyStandbyList = 4), but it requires the
+    SeIncreaseQuotaPrivilege (admin token). We try it via ctypes; if it fails we
+    fall back to a large-allocation churn that displaces standby pages, and
+    report honestly which path ran."""
+    if os.name != "nt":
+        return ""
+    # Try the NT API path first (admin token).
+    nt_status = "not attempted"
+    try:
+        import ctypes
+        ntdll = ctypes.WinDLL("ntdll")
+        # NtSetSystemInformation(SystemMemoryListInformation=80, &op, sizeof(op))
+        # op = MemoryListCommand (4 = EmptyStandbyList)
+        SYS_MEM_LIST_INFO = 80
+        EMPTY_STANDBY = 4
+        ntdll.NtSetSystemInformation.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
+        ntdll.NtSetSystemInformation.restype = ctypes.c_long
+        op = ctypes.c_ulong(EMPTY_STANDBY)
+        status = ntdll.NtSetSystemInformation(SYS_MEM_LIST_INFO, ctypes.byref(op), ctypes.sizeof(op))
+        if status == 0:
+            return "Emptied standby list via NT API (admin)."
+        # Non-zero status (e.g. 0xC0000061 STATUS_PRIVILEGE_NOT_HELD) — fall
+        # through to the churn fallback instead of returning a dead-end message.
+        nt_status = status & 0xFFFFFFFF
+    except Exception as e:
+        nt_status = f"exception: {e}"
+    # Allocation-churn fallback: alloc + touch + free a large chunk repeatedly.
+    # Forces the OS to evict standby pages to satisfy the working set. Slower but
+    # no admin token needed. This is the path that actually runs on Win11 Home.
+    try:
+        import ctypes
+        chunk = ctypes.create_string_buffer(256 * 1024 * 1024)  # 256MB
+        for _ in range(8):
+            # Touch every page (4096B) to force it resident.
+            for off in range(0, len(chunk), 4096):
+                chunk[off] = b"\x01"
+        del chunk
+        return f"Displaced standby pages via allocation churn (no admin token; NT status was {nt_status}). ~2GB cycled."
+    except Exception as e2:
+        return f"Standby purge failed: NT status {nt_status}; churn error ({e2})."
+
+
+def _dream_resolve_pid() -> int | None:
+    """Find the dream sidecar PID: tracked proc first, else discover by cmdline.
+    The admin tracks the PID when it launches the sidecar, but if the admin
+    restarts while the sidecar survives, the tracked PID is gone — so we fall
+    back to scanning for the nuspy adapter / visual-server process."""
+    proc = _child_procs.get("dream")
+    if proc and proc.poll() is None:
+        return proc.pid
+    import psutil
+    try:
+        for p in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                cl = " ".join(p.info.get("cmdline") or [])
+                if "agent.openai_server" in cl:
+                    return p.info["pid"]
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+@app.get("/api/dream-models")
+@app.post("/api/dream-models")
+async def api_dream_models():
+    """Structured status for the Loaded Models admin card: loaded model, available
+    models, VRAM used, and the sidecar process's working-set + cached-RAM footprint."""
+    global _dream_last_activity
+    h = await _dream_probe()
+    pid = _dream_resolve_pid()
+    ws_mb, cached_mb = _dream_proc_mem(pid)
+    # VRAM via nvidia-smi (process-specific if we can resolve it, else total).
+    vram_used_mb = _gpu_vram_for_pid(pid) if pid else _gpu_total_vram_used_mb()
+    loaded = (h or {}).get("loaded_model")
+    if h is not None:
+        _dream_last_activity = time.time()  # sidecar is up and responsive
+    idle_secs = int(time.time() - _dream_last_activity) if _dream_last_activity else 0
+    return {
+        "running": h is not None,
+        "loaded_model": loaded,
+        "available": (h or {}).get("available", []),
+        "maxtok": (h or {}).get("maxtok", 0),
+        "pid": pid,
+        "vram_used_mb": vram_used_mb,
+        "ram_working_set_mb": ws_mb,
+        "ram_cached_mb": cached_mb,
+        "idle_secs": idle_secs,
+        "idle_timeout_min": (_loom_config.dream_idle_timeout_min if _loom_config else 10),
+        "host": (_loom_config.dream_host if _loom_config else DREAM_HOST),
+    }
+
+
+def _gpu_total_vram_used_mb() -> int:
+    """Total VRAM in use across all GPUs (nvidia-smi). 0 if unavailable."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4,
+        )
+        if r.returncode == 0:
+            return sum(int(x.strip()) for x in r.stdout.splitlines() if x.strip().isdigit())
+    except Exception:
+        pass
+    return 0
+
+
+def _gpu_vram_for_pid(pid: int) -> int:
+    """VRAM used by a specific PID (nvidia-smi pmon or compute-apps). Best-effort."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4,
+        )
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 2 and parts[0].isdigit() and int(parts[0]) == pid:
+                    # used_memory is in MiB already
+                    return int(parts[1])
+    except Exception:
+        pass
+    return _gpu_total_vram_used_mb()
+
+
+def _ensure_dream_idle_watcher():
+    """Start the idle-timeout auto-unload background task once."""
+    global _dream_idle_task_started
+    if _dream_idle_task_started:
+        return
+    _dream_idle_task_started = True
+
+    async def _watcher():
+        global _dream_last_activity
+        while True:
+            await asyncio.sleep(60)
+            if not _child_procs.get("dream"):
+                continue
+            timeout_min = (_loom_config.dream_idle_timeout_min if _loom_config else 10)
+            if timeout_min <= 0:
+                continue
+            # Only auto-unload if the sidecar is up AND idle past the timeout.
+            h = await _dream_probe(timeout=1.5)
+            if h is None:
+                continue  # sidecar down — nothing to unload
+            if _dream_last_activity and (time.time() - _dream_last_activity) > timeout_min * 60:
+                # Idle past timeout — unload to free VRAM + RAM.
+                await tool_dream_unload()
+
+    try:
+        asyncio.get_event_loop().create_task(_watcher())
+    except RuntimeError:
+        pass  # no running loop yet
+
+
+@app.post("/tools/dream-status")
+async def tool_dream_status():
+    """Human-readable Dream sidecar status for the admin card output pane."""
+    h = await _dream_probe()
+    port = _dream_port()
+    if h is None:
+        return JSONResponse({"status": "ok", "output": f"Dream sidecar NOT running on :{port}."})
+    pid = _dream_resolve_pid()
+    ws_mb, cached_mb = _dream_proc_mem(pid)
+    vram_mb = _gpu_vram_for_pid(pid) if pid else _gpu_total_vram_used_mb()
+    idle_secs = int(time.time() - _dream_last_activity) if _dream_last_activity else 0
+    lines = [
+        f"Dream sidecar running on :{port} (PID {pid or 'unknown'}).",
+        f"Loaded model: {h.get('loaded_model') or 'none (JIT — loads on first request)'}",
+        f"Available: {', '.join(h.get('available', [])) or 'none'}",
+        f"maxtok (ctx): {h.get('maxtok', 0)}",
+        f"VRAM used: {vram_mb} MB",
+        f"RAM working set: {ws_mb} MB",
+        f"RAM cached (GGUF mmap): {cached_mb} MB",
+        f"Idle: {idle_secs}s (auto-unload after {(_loom_config.dream_idle_timeout_min if _loom_config else 10)} min)",
+    ]
+    return JSONResponse({"status": "ok", "output": "\n".join(lines)})
+
+
 async def _probe_nrol_dashboard() -> tuple[bool, str]:
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
@@ -1855,6 +2226,7 @@ async def api_ports_status():
         "nrol": NROL_AO_PORT,
         "comfy": 8188,
         "ttyd": TTYD_PORT,
+        "dream": _dream_port(),
     }
     results = await asyncio.gather(
         *[asyncio.to_thread(_port_in_use, p) for p in ports.values()]

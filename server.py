@@ -1479,6 +1479,25 @@ async def _refresh_all_engines_cache() -> dict:
         elif live_models and m == status.get("target_model"):
             is_loaded = True
         out.append({"name": m, "backend": "llama", "loaded": is_loaded})
+
+    # Append the Dream Hermes model (DiffusionGemma on the nuspy sidecar :8787)
+    # if it's available. backend:"dream" lets _handle_hermes_generation route
+    # it to dream_client instead of the Hermes ACP CLI (which only knows the
+    # llama-server endpoint). Probe is cheap (2s timeout); failure just skips.
+    try:
+        import dream_client as _dc
+        dh = await _dc.health(timeout=2.0)
+        if dh is not None:
+            avail = dh.get("available") or []
+            loaded = bool(dh.get("loaded_model"))
+            # The nuspy adapter lists model ids (filename stem); surface as .gguf
+            # so the existing dropdown + cc_model plumbing round-trips cleanly.
+            for mid in avail:
+                fname = mid if mid.endswith(".gguf") else f"{mid}.gguf"
+                out.append({"name": fname, "backend": "dream", "loaded": loaded})
+    except Exception:
+        pass  # dream sidecar down or not configured — skip silently
+
     _ALL_ENGINES_CACHE = {
         "models": out,
         "active_backend": "llama",
@@ -6321,6 +6340,120 @@ async def _handle_umans_generation(
     await _handle_claude_generation(websocket, conv_id, conv, data)
 
 
+async def _handle_dream_generation(
+    websocket: WebSocket, conv_id: int, conv: dict, data: dict
+):
+    """Handle Dream Hermes mode — DiffusionGemma via the nuspy sidecar (:8787).
+
+    Sibling of _handle_hermes_generation, but instead of driving the ACP `hermes`
+    CLI (which only knows the llama-server endpoint), this calls dream_client
+    directly against the nuspy OpenAI adapter. The diffusion model generates in
+    256-token canvas blocks, so we emit one text_delta burst per canvas commit
+    rather than per-token. No session resume / fork — each turn is a fresh
+    one-shot completion (the sidecar holds the model in VRAM across turns via
+    JIT, so cold-load only hits the first request of a session).
+    """
+    import time as _time
+    import dream_client as _dc
+    draft_msg_id = None
+    full_text = ""
+    start_t = _time.time()
+    try:
+        action = data.get("action")
+        parent_id = data.get("parent_id")
+        if action == "generate" and parent_id is None:
+            leaf = await db.get_active_leaf(conv_id)
+            parent_id = leaf["id"] if leaf else None
+
+        project_dir = conv.get("project_dir") or "."
+        branch = await db.get_branch_to_root(parent_id) if parent_id else []
+        # Build a flat prompt from the branch history (same helper Hermes uses).
+        prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
+        # The selected model — default to the configured dream model.
+        model = conv.get("local_model") or config.dream_model or None
+
+        # Draft message ghost node while we generate.
+        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
+        draft_msg_id = draft_msg["id"]
+        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id,
+                                 "draft_msg_id": draft_msg_id})
+        await _ws_send(conv_id, {"type": "status", "text": "Dream Hermes generating (canvas denoising)…"})
+
+        # One-shot completion. dream_chat_sync returns {content, reasoning_content,
+        # usage: {prompt_tokens, completion_tokens, timings:{tokens_per_second,...}}}.
+        res = await _dc.dream_chat_sync(
+            [{"role": "user", "content": prompt}],
+            model=model if model and model != config.dream_model else None,
+            host=config.dream_host,
+            max_tokens=data.get("max_tokens") or 2048,
+        )
+        content = res.get("content") or ""
+        # Emit as a single text_delta burst (diffusion produces whole canvases,
+        # not token streams — one delta per canvas commit is the honest shape).
+        if content:
+            full_text = content
+            await _ws_send(conv_id, {"type": "text_delta", "draft_msg_id": draft_msg_id,
+                                     "delta": content})
+
+        usage = res.get("usage") or {}
+        timings = usage.get("timings") or {}
+        in_tok = usage.get("prompt_tokens", 0)
+        out_tok = usage.get("completion_tokens", 0)
+        if in_tok or out_tok:
+            await _ws_send(conv_id, {"type": "usage",
+                                    "input_tokens": in_tok, "output_tokens": out_tok})
+            await _ws_send(conv_id, {"type": "context_info",
+                                     "total_tokens": in_tok + out_tok})
+
+        if not full_text.strip():
+            if draft_msg_id:
+                await db.delete_branch(draft_msg_id)
+            await _ws_send(conv_id, {"type": "error",
+                                     "error": "Dream returned an empty response — try again"})
+            return
+
+        gen_ms = int((_time.time() - start_t) * 1000)
+        await db.update_message_content(
+            draft_msg_id, content=full_text,
+            cc_session_id=None,  # no ACP session for dream
+            cc_model_used=f"dream:{model}" if model else "dream:default",
+            generation_ms=gen_ms,
+        )
+        await db.set_active_branch(conv_id, draft_msg_id)
+        msg = await db.get_message(draft_msg_id)
+        await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
+        preview = full_text.replace("#", "").replace("*", "").strip()[:120]
+        await _ws_broadcast_all({"type": "branch_landed", "conv_id": conv_id,
+                                 "conv_title": conv.get("title", "Conversation"),
+                                 "message_id": draft_msg_id, "preview": preview})
+
+    except asyncio.CancelledError:
+        if draft_msg_id:
+            if full_text.strip():
+                try:
+                    await db.update_message_content(draft_msg_id, content=full_text)
+                except Exception:
+                    pass
+            else:
+                await db.delete_branch(draft_msg_id)
+        await _ws_send(conv_id, {"type": "cancelled"})
+    except Exception as e:
+        if draft_msg_id and full_text.strip():
+            try:
+                await db.update_message_content(draft_msg_id, content=full_text)
+            except Exception:
+                pass
+        elif draft_msg_id:
+            await db.delete_branch(draft_msg_id)
+        print(f"[Dream] generation error conv={conv_id}: {e}")
+        await _ws_send(conv_id, {"type": "error", "error": str(e)})
+    finally:
+        _gen_key = getattr(asyncio.current_task(), "_gen_key", None)
+        if _gen_key:
+            _active_generations.pop(_gen_key, None)
+            _generation_snapshots.pop(_gen_key, None)
+
+
 async def _handle_hermes_generation(
     websocket: WebSocket, conv_id: int, conv: dict, data: dict
 ):
@@ -6334,6 +6467,15 @@ async def _handle_hermes_generation(
     Not wired into _handle_generation's dispatch yet — that, plus DB-mode
     acceptance and the admin status probe, is Phase 3.
     """
+    # Route to the Dream handler when the selected model is the DiffusionGemma
+    # sidecar. The Hermes ACP CLI only knows the llama-server endpoint, so dream
+    # (a separate :8787 process) needs its own transport via dream_client.
+    local_model = conv.get("local_model") or ""
+    dream_model = getattr(config, "dream_model", "") or ""
+    if local_model and dream_model and local_model.lower() == dream_model.lower():
+        await _handle_dream_generation(websocket, conv_id, conv, data)
+        return
+
     import time as _time
     draft_msg_id = None
     full_text = ""

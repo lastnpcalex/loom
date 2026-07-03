@@ -23,8 +23,13 @@ _PERSISTED_KEYS = (
     "max_context_tokens", "verbatim_window",
     "temperature", "top_p", "max_tokens", "repeat_penalty",
     "db_path",
+    # Dream Hermes — DiffusionGemma GPU orchestrator sidecar (nuspy OpenAI server).
+    # dream_host is the OpenAI-compatible endpoint; dream_cwd is the nuspy repo dir
+    # (holds config.json + models/ + .temp/); dream_idle_timeout_min auto-unloads
+    # the sidecar to free VRAM + system RAM when idle.
+    "dream_host", "dream_model", "dream_cwd", "dream_idle_timeout_min",
 )
-_HOST_KEYS = ("llama_host",)
+_HOST_KEYS = ("llama_host", "dream_host")
 
 
 @dataclass
@@ -97,6 +102,20 @@ class Config:
     hermes_exe: str = os.getenv("HERMES_EXE", "")
     # Master switch for Hermes mode. The Phase-4 UI stays hidden until this is on.
     enable_hermes: bool = _envbool("LOOM_ENABLE_HERMES", False)
+
+    # --- Dream Hermes (DiffusionGemma GPU orchestrator sidecar) ---
+    # Runs the nuspy OpenAI adapter (agent.openai_server) on a diffusion-capable
+    # llama.cpp fork (PR #24423). The sidecar JIT-loads the NVFP4 GGUF into VRAM on
+    # first request and is killed on idle to free both VRAM and the process working
+    # set (system RAM). enable_dream is env-only like enable_hermes.
+    dream_host: str = os.getenv("DREAM_HOST", "http://localhost:8787")
+    dream_model: str = os.getenv("DREAM_MODEL", "diffusiongemma-26b-a4b-it-nvfp4.gguf")
+    dream_cwd: str = os.getenv(
+        "DREAM_CWD",
+        r"C:\Users\exast\OneDrive\Documents\Loom-Projects\llama-diffusion",
+    )
+    dream_idle_timeout_min: int = int(os.getenv("DREAM_IDLE_TIMEOUT_MIN", "10"))
+    enable_dream: bool = _envbool("LOOM_ENABLE_DREAM", False)
 
     def hermes_executable(self) -> str:
         """Resolve the `hermes` CLI path: explicit HERMES_EXE if set, else the

@@ -88,6 +88,23 @@
                         <pre class="server-out" id="out-llama"></pre>
                     </div>
 
+                    <div class="card server-card" data-server="dream">
+                        <div class="card-head">
+                            <h2><span class="dot" id="dot-dream"></span> Dream Hermes <span class="port-tag" id="dream-port-tag">:8787</span></h2>
+                            <div class="head-actions" id="head-actions-dream"></div>
+                        </div>
+                        <div class="action-row">
+                            <button class="btn btn-ghost" onclick="runTool('dream-status', {target:'out-dream'})">Status</button>
+                            <button class="btn btn-warn" id="btn-dream-unload" title="Stop the sidecar — frees VRAM AND the 17GB GGUF from system RAM">Unload + Flush RAM</button>
+                            <button class="btn btn-green" id="btn-dream-reload" title="Start the Dream sidecar (model JIT-loads on first request)">Start Dream</button>
+                            <button class="btn btn-ghost" onclick="runTool('dream-flush-ram', {target:'out-dream'})" title="Purge the GGUF from OS standby RAM without stopping the sidecar">💧 Flush Standby RAM</button>
+                        </div>
+                        <div id="dream-models-panel" class="loaded-models-panel" style="margin-top:8px; padding:6px 10px; font-size:13px; line-height:1.5;">
+                            <span style="color:var(--text-mute);">Checking Dream sidecar…</span>
+                        </div>
+                        <pre class="server-out" id="out-dream"></pre>
+                    </div>
+
                     <div class="card server-card" data-server="comfy">
                         <div class="card-head">
                             <h2><span class="dot" id="dot-comfy"></span> ComfyUI <span class="port-tag">:8188</span></h2>
