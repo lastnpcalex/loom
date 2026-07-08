@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
@@ -198,6 +199,7 @@ class _RpcConn:
         self._proc = proc
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
+        self._backlog: dict[int, dict] = {}
 
     def _alloc_id(self) -> int:
         self._next_id += 1
@@ -221,6 +223,9 @@ class _RpcConn:
         if params is not None:
             msg["params"] = params
         await self._write(msg)
+        backlogged = self._backlog.pop(rid, None)
+        if backlogged is not None:
+            self.resolve_response(backlogged)
         try:
             if timeout is not None:
                 return await asyncio.wait_for(fut, timeout)
@@ -249,7 +254,10 @@ class _RpcConn:
         if rid is None or "method" in msg:
             return False
         fut = self._pending.get(rid)
-        if fut is None or fut.done():
+        if fut is None:
+            self._backlog[rid] = msg
+            return True
+        if fut.done():
             return False
         if "error" in msg:
             fut.set_exception(RuntimeError(f"hermes acp error: {msg['error']}"))
@@ -289,6 +297,54 @@ def _content_to_text(content: Any) -> str:
     if isinstance(content, list):
         return "".join(_block_text(b) for b in content)
     return _block_text(content)
+
+
+_DREAM_THOUGHT_BLOCK_RE = re.compile(
+    r"<\|channel>thought\s*(.*?)<channel\|>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _dream_channel_events(text: str, state: dict | None = None) -> list[dict]:
+    """Convert leaked DiffusionGemma thought channels into Loom events."""
+    if state is not None and state.get("dream_channel_buffer"):
+        text = state.pop("dream_channel_buffer") + text
+
+    if "<|channel>" not in text and "<channel|>" not in text:
+        return [{"type": "text_delta", "text": text}] if text else []
+
+    normalized = text.replace("\r\n", "\n")
+    events: list[dict] = []
+    partial = re.search(r"<\|channel>thought", normalized, re.IGNORECASE)
+    if partial and "<channel|>" not in normalized[partial.start():]:
+        before = normalized[:partial.start()]
+        if before.strip():
+            events.append({"type": "text_delta", "text": before})
+        if state is not None:
+            state["dream_channel_buffer"] = normalized[partial.start():]
+            return events
+
+    cursor = 0
+    matched = False
+    for match in _DREAM_THOUGHT_BLOCK_RE.finditer(normalized):
+        matched = True
+        before = normalized[cursor:match.start()]
+        if before.strip():
+            events.append({"type": "text_delta", "text": before})
+        thought = match.group(1).strip()
+        if thought:
+            events.append({"type": "thinking_delta", "text": thought})
+        cursor = match.end()
+
+    if matched:
+        after = normalized[cursor:]
+        if after.strip():
+            events.append({"type": "text_delta", "text": after})
+        return events
+
+    if normalized.strip() in {"<|channel>", "<channel|>", "thought"}:
+        return []
+    return [{"type": "text_delta", "text": normalized}]
 
 
 # --------------------------------------------------------------------------- #
@@ -368,9 +424,7 @@ def _dispatch_session_update(update: dict, state: dict) -> list[dict]:
     events: list[dict] = []
 
     if kind == "agent_message_chunk":
-        txt = _content_to_text(update.get("content"))
-        if txt:
-            events.append({"type": "text_delta", "text": txt})
+        events.extend(_dream_channel_events(_content_to_text(update.get("content")), state))
     elif kind == "agent_thought_chunk":
         txt = _content_to_text(update.get("content"))
         if txt:
@@ -438,18 +492,17 @@ def _prepare_hermes_prompt(
     the bare ``prompt`` because Hermes already has the session's rolling
     context server-side and only needs the new user turn.
 
-    Today every call goes through with ``is_first_turn=True`` (Loom opens a
-    fresh ACP session per turn). Once per-branch session persistence lands the
-    caller will pass ``False`` for continuation turns and ``True`` for fresh
-    sessions / post-fork first messages (the Rick-and-Morty positionality nudge
-    on Morty's lapel).
+    Callers pass ``is_first_turn=(not use_resume)``: a resume turn forks a
+    session that already holds the conversation history, so re-injecting
+    ``<loom_branch_info>`` would feed the model every prior message twice.
+    Fresh sessions (no ``resume_session_id``, or the resume-failed fallback
+    that opens ``session/new``) get the full orientation block.
     """
     if not is_first_turn:
         return prompt
 
     from loom_agent_prompt import load_loom_agent_prompt
     contract = load_loom_agent_prompt()
-
     if not contract and not branch and not model:
         return prompt
 
@@ -460,6 +513,16 @@ def _prepare_hermes_prompt(
             f"{contract}\n"
             f"</loom_agent_contract>\n\n"
         )
+
+    # NOTE: no tool-call format nudge is injected here. Each backend teaches
+    # tool format itself: the dream (DiffusionGemma) path is text-only and the
+    # nuspy adapter's own system prompt (agent/tools/registry.py render_for_prompt)
+    # documents the <tool name="..."> XML format + parse_tool_calls parses it;
+    # the llama/Prometheus path uses Hermes ACP's native tool-calling. A prior
+    # attempt to add a <hermes_tooling_rules> nudge here contaminated the dream
+    # prompt (model emitted bare tool calls with no prose, tools didn't execute)
+    # and is reverted. Do NOT re-add a nudge without verifying against a live
+    # dream turn's agent.log — see project_hermes_toolcall_hallucination_nudge.
 
     branch_info = ""
     if branch or model:
@@ -511,10 +574,447 @@ def _prepare_hermes_prompt(
 
 
 # --------------------------------------------------------------------------- #
+# Persistent ACP runtime
+# --------------------------------------------------------------------------- #
+
+class _HermesTurn:
+    def __init__(self, conv_id: int, loom_port: int):
+        self.conv_id = conv_id
+        self.loom_port = loom_port
+        self.queue: asyncio.Queue[dict] = asyncio.Queue()
+        self.state: dict = {}
+        self.permission_tasks: set[asyncio.Task] = set()
+
+
+class _HermesAcpRuntime:
+    """Long-lived `hermes acp` process for one Hermes home/executable.
+
+    ACP stdout has exactly one reader. Public turns are serialized with a lock
+    and receive streamed `session/update` events through the active turn queue.
+    """
+
+    def __init__(self, *, exe: str, home: str, cwd: str):
+        self.exe = exe
+        self.home = home
+        self.cwd = cwd
+        self.proc: asyncio.subprocess.Process | None = None
+        self.rpc: _RpcConn | None = None
+        self._reader_task: asyncio.Task | None = None
+        self._stderr_task: asyncio.Task | None = None
+        self._lock = asyncio.Lock()
+        self._start_lock = asyncio.Lock()
+        self._active_turn: _HermesTurn | None = None
+        self._agent_info: dict = {}
+
+    def _cmd(self) -> list[str]:
+        if self.exe.endswith((".py",)) or self.exe in ("python", "python.exe", sys.executable):
+            return [self.exe, "-m", "acp_adapter"]
+        return [self.exe, "acp"]
+
+    def _is_alive(self) -> bool:
+        return self.proc is not None and self.proc.returncode is None
+
+    async def ensure_started(self) -> None:
+        async with self._start_lock:
+            if self._is_alive() and self.rpc is not None:
+                return
+
+            await self.stop(remove=False)
+
+            env = {**os.environ, "HERMES_HOME": self.home, "PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"}
+            work_dir = self.cwd if (self.cwd and os.path.isdir(self.cwd)) else os.getcwd()
+            kwargs = {}
+            if sys.platform == "win32":
+                # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+                kwargs["creationflags"] = 0x08000000 | 0x00000200
+
+            cmd = self._cmd()
+            log.info("[Hermes] starting persistent ACP: %s (cwd=%s, HERMES_HOME=%s)", cmd, work_dir, self.home)
+            self.proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=work_dir,
+                env=env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=_STREAM_LIMIT,
+                **kwargs,
+            )
+            self.rpc = _RpcConn(self.proc)
+            _PROC_RUNTIMES[self.proc.pid] = self
+            self._reader_task = asyncio.create_task(self._reader_loop())
+            self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+            init_result = await self.rpc.request(
+                "initialize",
+                {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {
+                        "fs": {"readTextFile": False, "writeTextFile": False},
+                        "terminal": False,
+                    },
+                    "clientInfo": {"name": "loom", "version": "1"},
+                },
+                timeout=60.0,
+            )
+            self._agent_info = (init_result or {}).get("agentInfo") or {}
+            log.info("[Hermes] persistent ACP connected: %s", self._agent_info)
+
+    async def _drain_stderr(self) -> None:
+        proc = self.proc
+        if proc is None or proc.stderr is None:
+            return
+        async for line in proc.stderr:
+            text = line.decode("utf-8", errors="replace").rstrip()
+            if text:
+                print(f"[Hermes-stderr] {text}")
+
+    async def _reader_loop(self) -> None:
+        proc = self.proc
+        rpc = self.rpc
+        if proc is None or proc.stdout is None or rpc is None:
+            return
+        try:
+            async for raw in proc.stdout:
+                line = raw.rstrip(b"\r\n")
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    log.warning("[Hermes] non-JSON stdout: %r", line[:200])
+                    continue
+
+                if rpc.resolve_response(msg):
+                    continue
+
+                method = msg.get("method")
+                mid = msg.get("id")
+                if method and mid is not None:
+                    await self._handle_agent_request(mid, method, msg.get("params") or {})
+                    continue
+
+                if method == "session/update":
+                    turn = self._active_turn
+                    if turn is None:
+                        continue
+                    update = (msg.get("params") or {}).get("update") or {}
+                    for evt in _dispatch_session_update(update, turn.state):
+                        await turn.queue.put(evt)
+        finally:
+            if rpc is not None:
+                for fut in list(rpc._pending.values()):
+                    if not fut.done():
+                        fut.set_exception(RuntimeError("hermes acp stdout closed"))
+            turn = self._active_turn
+            if turn is not None:
+                await turn.queue.put({"type": "error", "error": "hermes acp exited"})
+
+    async def _handle_agent_request(self, req_id: Any, method: str, params: dict) -> None:
+        assert self.rpc is not None
+        if method in ("session/request_permission", "session/requestPermission"):
+            turn = self._active_turn
+            if turn is None:
+                await self.rpc.respond(req_id, result={"outcome": {"outcome": "cancelled"}})
+                return
+            tc = params.get("toolCall") or params.get("tool_call") or {}
+            await turn.queue.put({
+                "type": "permission_request",
+                "request_id": req_id,
+                "tool_name": tc.get("title") or tc.get("name") or "HermesTool",
+                "tool_input": tc,
+            })
+            task = asyncio.create_task(_bridge_permission(self.rpc, req_id, params, turn.conv_id, turn.loom_port))
+            turn.permission_tasks.add(task)
+            task.add_done_callback(turn.permission_tasks.discard)
+            return
+        if method.startswith("fs/") or method.startswith("terminal/"):
+            await self.rpc.respond(req_id, error={"code": -32601, "message": "not supported by loom client"})
+        else:
+            await self.rpc.respond(req_id, result={})
+
+    async def run_turn(
+        self,
+        prompt: str,
+        *,
+        conv_id: int,
+        model: str | None,
+        cwd: str,
+        loom_port: int,
+        branch: list[dict] | None,
+        resume_session_id: str | None,
+        fork_session: bool,
+    ) -> AsyncGenerator[dict, None]:
+        import time as _time
+
+        async with self._lock:
+            await self.ensure_started()
+            assert self.rpc is not None
+            assert self.proc is not None
+
+            work_dir = cwd if (cwd and os.path.isdir(cwd)) else os.getcwd()
+            acp_cwd = str(Path(work_dir)).replace("\\", "/")
+            turn = _HermesTurn(conv_id, loom_port)
+            self._active_turn = turn
+            t0 = _time.time()
+            session_id = ""
+            prompt_task: asyncio.Task | None = None
+            try:
+                models_info = {}
+                if resume_session_id:
+                    try:
+                        if fork_session:
+                            log.info("[Hermes] Forking session: %s", resume_session_id)
+                            fork_result = await self.rpc.request(
+                                "session/fork",
+                                {"sessionId": resume_session_id, "cwd": acp_cwd},
+                                timeout=60.0,
+                            )
+                            session_id = (fork_result or {}).get("sessionId") or (fork_result or {}).get("session_id") or ""
+                            models_info = (fork_result or {}).get("models") or {}
+                        else:
+                            log.info("[Hermes] Loading session: %s", resume_session_id)
+                            load_result = await self.rpc.request(
+                                "session/load",
+                                {"sessionId": resume_session_id, "cwd": acp_cwd},
+                                timeout=60.0,
+                            )
+                            session_id = resume_session_id
+                            models_info = (load_result or {}).get("models") or {}
+                    except Exception as e:
+                        log.warning("[Hermes] Session resume/fork failed: %s", e)
+                        await self.stop(remove=True)
+                        raise RuntimeError(f"Hermes session resume/fork failed: {e}") from e
+
+                if not session_id:
+                    new_result = await self.rpc.request(
+                        "session/new",
+                        {"cwd": acp_cwd, "mcpServers": _loom_mcp_servers()},
+                        timeout=60.0,
+                    )
+                    session_id = (new_result or {}).get("sessionId") or (new_result or {}).get("session_id") or ""
+                    models_info = (new_result or {}).get("models") or {}
+
+                yield {"type": "session_info", "session_id": session_id,
+                       "model": models_info.get("currentModelId", "")}
+
+                target_model_id = _loom_model_to_hermes(model)
+                # session/set_model triggers a full agent re-init in Hermes
+                # (auxiliary auto-detect + context-length probe), so skip it
+                # when the forked/loaded session already runs the target model.
+                current_model_id = (models_info or {}).get("currentModelId") or ""
+                _norm = lambda m: m.split(":", 1)[1] if m.startswith("custom:") else m  # noqa: E731
+                if target_model_id and _norm(target_model_id) != _norm(current_model_id):
+                    try:
+                        await self.rpc.request(
+                            "session/set_model",
+                            {"sessionId": session_id, "modelId": target_model_id},
+                            timeout=60.0,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("[Hermes] set_model(%s) failed: %s", target_model_id, e)
+
+                prompt_blocks: list[dict] = [{"type": "text", "text": prompt}]
+                prompt_blocks.extend(_collect_current_turn_image_blocks(branch))
+                prompt_task = asyncio.create_task(self.rpc.request(
+                    "session/prompt",
+                    {"sessionId": session_id, "prompt": prompt_blocks},
+                    timeout=None,
+                ))
+
+                while True:
+                    event_task = asyncio.create_task(turn.queue.get())
+                    done, pending = await asyncio.wait(
+                        {prompt_task, event_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if event_task in done:
+                        evt = event_task.result()
+                        yield evt
+                    else:
+                        event_task.cancel()
+
+                    if prompt_task in done:
+                        while not turn.queue.empty():
+                            yield turn.queue.get_nowait()
+                        prompt_failed = False
+                        try:
+                            result = prompt_task.result()
+                        except Exception as e:  # noqa: BLE001
+                            yield {"type": "error", "error": f"hermes prompt failed: {e}"}
+                            result = {}
+                            prompt_failed = True
+                        usage = (result or {}).get("usage") or {}
+                        if usage:
+                            yield {
+                                "type": "usage",
+                                "input_tokens": usage.get("inputTokens", usage.get("input_tokens", 0)),
+                                "output_tokens": usage.get("outputTokens", usage.get("output_tokens", 0)),
+                            }
+                        yield {
+                            "type": "result",
+                            "session_id": session_id,
+                            "stop_reason": (
+                                (result or {}).get("stopReason")
+                                or (result or {}).get("stop_reason")
+                                or ("error" if prompt_failed else "end_turn")
+                            ),
+                            "duration_ms": int((_time.time() - t0) * 1000),
+                            "num_turns": 1,
+                        }
+                        break
+            except asyncio.CancelledError:
+                if prompt_task is not None:
+                    prompt_task.cancel()
+                await self.stop(remove=True)
+                raise
+            finally:
+                if self._active_turn is turn:
+                    self._active_turn = None
+                for task in list(turn.permission_tasks):
+                    task.cancel()
+
+    async def stop(self, *, remove: bool = True) -> None:
+        proc = self.proc
+        self.proc = None
+        self.rpc = None
+        self._active_turn = None
+        if remove:
+            for key, runtime in list(_RUNTIMES.items()):
+                if runtime is self:
+                    _RUNTIMES.pop(key, None)
+        if proc is not None:
+            _PROC_RUNTIMES.pop(proc.pid, None)
+            if proc.returncode is None:
+                if sys.platform == "win32" and isinstance(proc, asyncio.subprocess.Process):
+                    import subprocess
+                    try:
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                       capture_output=True, timeout=5)
+                    except Exception:
+                        proc.kill()
+                else:
+                    proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+        for task in (self._reader_task, self._stderr_task):
+            if task is not None and not task.done():
+                task.cancel()
+        self._reader_task = None
+        self._stderr_task = None
+
+
+_RUNTIMES: dict[tuple[int, int, str, str], _HermesAcpRuntime] = {}
+_PROC_RUNTIMES: dict[int, _HermesAcpRuntime] = {}
+
+
+def _runtime_key(exe: str, home: str) -> tuple[int, int, str, str]:
+    # Include the event loop and subprocess factory identity so tests that
+    # monkeypatch asyncio.create_subprocess_exec do not accidentally share a
+    # runtime across fake processes.
+    return (
+        id(asyncio.get_running_loop()),
+        id(asyncio.create_subprocess_exec),
+        os.path.abspath(home),
+        exe,
+    )
+
+
+async def shutdown_hermes_runtimes() -> None:
+    for runtime in list(_RUNTIMES.values()):
+        await runtime.stop(remove=True)
+
+
+def find_runtime_by_home(home: str) -> "_HermesAcpRuntime | None":
+    """Return the held runtime whose home matches `home`, or None.
+
+    Used by the attendant-clear-on-model-stop binding (admin_server llama/dream
+    stop paths) and the admin Hermes-status endpoint. Home is the identity key:
+    the llama attendant's home is config.hermes_home, the dream attendant's is
+    its -dream home, Prometheus' is its -prometheus home.
+    """
+    target = os.path.abspath(home)
+    for runtime in _RUNTIMES.values():
+        if os.path.abspath(runtime.home) == target:
+            return runtime
+    return None
+
+
+def list_hermes_runtimes() -> list[dict]:
+    """Snapshot of held runtimes for the admin Hermes-status endpoint.
+
+    Read-only — never mutates _RUNTIMES. Reports home, alive state, and pid so
+    the admin UI can show which of the three runtimes is warm without poking
+    process tables.
+    """
+    out = []
+    for runtime in _RUNTIMES.values():
+        proc = runtime.proc
+        out.append({
+            "home": runtime.home,
+            "alive": runtime._is_alive(),
+            "pid": proc.pid if proc is not None else None,
+            "agent_info": runtime._agent_info,
+        })
+    return out
+
+
+async def stop_runtime_by_home(home: str) -> bool:
+    """Stop the held runtime whose home matches `home`. Returns True if stopped.
+
+    The attendant-clear-on-model-stop coupling: when a model server stops, this
+    clears the bound attendant's warm process from _RUNTIMES. The soul (home dir,
+    state.db, memories) survives; only the warm process is lost. On next attendant
+    turn, _RUNTIMES misses and run_hermes re-inits (probe cache skips the
+    expensive context-length probe).
+
+    SAFETY: refuses to stop a runtime with an active turn (runtime._active_turn is
+    not None). run_turn() holds _lock for the duration of a turn and sets
+    _active_turn; stop() does NOT take _lock, so killing mid-turn would terminate
+    the process backing a live generation — corrupting the user's conversation.
+    A backend flip / model-stop that hits a live turn returns False and lets the
+    turn finish against its current (already-spawned) process; the next turn
+    re-routes. This is correct for both attendants (model-stop mid-turn is rare
+    and the soul survives regardless) and Prometheus (the rewritten config.yaml
+    takes effect on the next init regardless).
+    """
+    runtime = find_runtime_by_home(home)
+    if runtime is None:
+        return False
+    if runtime._active_turn is not None:
+        log.warning("[Hermes] refusing to stop runtime (home=%s) — active turn in flight",
+                    runtime.home)
+        return False
+    await runtime.stop(remove=True)
+    return True
+
+
+async def reload_prometheus_backend(home: str) -> bool:
+    """Clear Prometheus' warm runtime so the next turn re-inits against new config.
+
+    The Prometheus router rewrites config.yaml (base_url + default model + api_key)
+    on a backend change, then calls this. We do NOT session/set_model mid-flight:
+    that RPC is per-session (hermes_client.py:817-821) and Hermes reads base_url at
+    process init, not on set_model — so a warm process wouldn't actually move to
+    the new endpoint. Instead, stop the warm process (soul-free: Prometheus has
+    none) and let the next Prometheus turn lazy-init via run_hermes. The probe
+    cache (seeded for both local + cloud by _ensure_prometheus_home) makes that
+    re-init skip the 6.5s context-length probe.
+
+    Returns True if a runtime was cleared, False if Prometheus wasn't warm
+    (nothing to reload — the next turn will init against the new config directly).
+    """
+    return await stop_runtime_by_home(home)
+
+
+
+# --------------------------------------------------------------------------- #
 # Public entry point
 # --------------------------------------------------------------------------- #
 
-async def run_hermes(
+async def _run_hermes_oneshot(
     prompt: str,
     *,
     conv_id: int = 0,
@@ -767,6 +1267,48 @@ async def run_hermes(
     return proc, _event_stream()
 
 
+async def run_hermes(
+    prompt: str,
+    *,
+    conv_id: int = 0,
+    model: str | None = None,
+    cwd: str = ".",
+    loom_port: int = 3000,
+    hermes_exe: str | None = None,
+    hermes_home: str | None = None,
+    system: str | None = None,
+    branch: list[dict] | None = None,
+    resume_session_id: str | None = None,
+    fork_session: bool = False,
+    is_first_turn: bool = True,
+):
+    """Run one prompt turn through a persistent `hermes acp` runtime."""
+    del system  # reserved for parity with other provider clients
+    prompt = _prepare_hermes_prompt(prompt, branch, model, is_first_turn=is_first_turn)
+    exe = hermes_exe or default_hermes_exe(hermes_home)
+    home = hermes_home or os.environ.get(
+        "HERMES_HOME",
+        os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "hermes"),
+    )
+    key = _runtime_key(exe, home)
+    runtime = _RUNTIMES.get(key)
+    if runtime is None:
+        runtime = _HermesAcpRuntime(exe=exe, home=home, cwd=cwd)
+        _RUNTIMES[key] = runtime
+    await runtime.ensure_started()
+    assert runtime.proc is not None
+    return runtime.proc, runtime.run_turn(
+        prompt,
+        conv_id=conv_id,
+        model=model,
+        cwd=cwd,
+        loom_port=loom_port,
+        branch=branch,
+        resume_session_id=resume_session_id,
+        fork_session=fork_session,
+    )
+
+
 async def rpc_request_via_reader(rpc: _RpcConn, method: str, params: dict,
                                  proc: asyncio.subprocess.Process, state: dict,
                                  timeout: float = 60.0) -> Any:
@@ -828,6 +1370,10 @@ async def cancel_hermes(proc: asyncio.subprocess.Process) -> None:
     to take the Git-Bash terminal-tool children with it. (No WSL inner-PID
     bookkeeping needed — that whole class of problem went away with the native
     install.)"""
+    runtime = _PROC_RUNTIMES.get(getattr(proc, "pid", -1))
+    if runtime is not None:
+        await runtime.stop(remove=True)
+        return
     if proc.returncode is not None:
         return
     if sys.platform == "win32":

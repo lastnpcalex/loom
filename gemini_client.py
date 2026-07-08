@@ -87,6 +87,22 @@ def _scan_agy_log_for_error(since_ts: float) -> str | None:
             return "Antigravity is not logged in — run `agy` interactively to sign in"
     if "PERMISSION_DENIED" in text:
         return "Antigravity permission denied — check account access"
+
+    # Planner-loop graceful shutdown: agy's planner repeatedly emits
+    # "PlannerResponse without ModifiedResponse encountered" when it can't
+    # produce a modified response (a planner iteration that doesn't advance
+    # the turn), then tears down its own stream ("Stopping conversation
+    # stream" + "Language server shutting down") without ever exiting the OS
+    # process. Death log had 106 of these; healthy sessions had 0-8. Require
+    # >=10 stall lines AND both cascade lines so a session that emits a few
+    # benign stall lines and recovers (no cascade) is not flagged.
+    if ("Language server shutting down" in text
+            and "Stopping conversation stream" in text):
+        stall_count = text.count("PlannerResponse without ModifiedResponse encountered")
+        if stall_count >= 10:
+            return (f"Antigravity planner loop stalled — {stall_count} "
+                    "PlannerResponse-without-ModifiedResponse iterations; "
+                    "agy tore down the conversation stream without producing a final result")
     return None
 
 
@@ -898,6 +914,8 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                 processed_steps = set()
                 active_tool_calls = []
                 _eof_polls = 0  # heartbeat counter for liveness signal
+                _dead_since = None  # timestamp when agy log first went stale (sustained-dead detector)
+                _fatal_err = None  # fatal error caught by a heartbeat break (carried into the result event)
 
                 while True:
                     line = f.readline()
@@ -1099,19 +1117,23 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                         # for every API call, so a changing mtime means activity
                         # even when the transcript hasn't flushed.
                         _eof_polls += 1
-                        if _eof_polls % 30 == 0 and not full_text:
-                            # Signal liveness if agy is still working
-                            if _is_agy_alive(launch_ts):
-                                elapsed = int(_time.time() - launch_ts)
+                        if _eof_polls % 30 == 0:
+                            elapsed = int(_time.time() - launch_ts)
+                            agy_alive = _is_agy_alive(launch_ts)
+                            # Signal liveness if agy is still working and we
+                            # haven't streamed final text yet. (The error scan
+                            # below runs regardless of full_text — agy can stall
+                            # mid-turn after emitting partial content.)
+                            if agy_alive and not full_text:
                                 queue.put_nowait({
                                     "type": "status",
                                     "text": f"Working ({elapsed}s) — agy is processing, waiting for step to complete...",
                                 })
-                            # Check for fatal errors
-                            elapsed = int(_time.time() - launch_ts)
+                            # Check for fatal errors (429/auth/permission/planner-stall)
                             log_err = _scan_agy_log_for_error(launch_ts)
                             if log_err:
                                 # Fatal error discovered — surface and abort.
+                                _fatal_err = log_err
                                 print(f"[AGY] Live log diagnosis ({elapsed}s): {log_err}")
                                 queue.put_nowait({
                                     "type": "status",
@@ -1125,6 +1147,38 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                                     proc.kill()
                                 break
 
+                            # Sustained-dead detector: agy's planner-loop
+                            # shutdown logs "Language server shutting down"
+                            # but the OS process never exits (proc.returncode
+                            # stays None), so the EOF break never fires and we
+                            # would hang forever emitting "Working". If the log
+                            # has been stale (no mtime change) for 60s sustained
+                            # AND no tool call is in flight, agy is effectively
+                            # dead even though returncode is None. The
+                            # active_tool_calls guard prevents a false positive
+                            # during a legitimate long bash run (up to 20min
+                            # via BASH_DEFAULT_TIMEOUT_MS), during which agy
+                            # writes no log lines but is genuinely busy.
+                            if agy_alive:
+                                _dead_since = None
+                            elif active_tool_calls:
+                                _dead_since = None  # waiting on a tool, not dead
+                            else:
+                                if _dead_since is None:
+                                    _dead_since = _time.time()
+                                elif _time.time() - _dead_since > 60.0:
+                                    msg = (f"Antigravity appears to have shut down "
+                                           f"(no log activity for {int(_time.time() - _dead_since)}s) "
+                                           "without producing a final result")
+                                    _fatal_err = msg
+                                    print(f"[AGY] Sustained-dead break ({elapsed}s): {msg}")
+                                    queue.put_nowait({"type": "status", "text": msg})
+                                    try:
+                                        await asyncio.wait_for(proc.wait(), timeout=5.0)
+                                    except asyncio.TimeoutError:
+                                        proc.kill()
+                                    break
+
                         await asyncio.sleep(0.05)
 
                 post_err = None
@@ -1132,6 +1186,19 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                     post_err = _scan_agy_log_for_error(launch_ts)
                     if post_err:
                         print(f"[AGY] CLI log diagnosis (post-transcript): {post_err}")
+                    elif proc.returncode == 0:
+                        # agy exited cleanly (code 0) but wrote no transcript
+                        # text and left no fatal log signature. Catches rare
+                        # graceful-exit shapes that write nothing at all, so the
+                        # turn surfaces an error instead of a silent success.
+                        post_err = "Antigravity exited cleanly but produced no transcript output"
+                        print(f"[AGY] CLI log diagnosis (post-transcript): {post_err}")
+                # If a heartbeat break caught a fatal error (planner-stall or
+                # sustained-dead), carry it into the result event even when
+                # partial text was streamed — otherwise the result's `error`
+                # field is empty and the UI shows a blank message.
+                if not post_err and _fatal_err:
+                    post_err = _fatal_err
                 queue.put_nowait({
                     "type": "result",
                     "is_error": bool(post_err) or proc.returncode != 0,

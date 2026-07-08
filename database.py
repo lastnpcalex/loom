@@ -143,6 +143,14 @@ CREATE INDEX IF NOT EXISTS idx_active_gen_conv ON active_generations(conv_id);
 """
 
 
+def _is_sqlite_corruption_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "database disk image is malformed" in text
+        or "database is corrupt" in text
+    )
+
+
 async def get_db() -> aiosqlite.Connection:
     global _db
     if _db is None:
@@ -332,6 +340,10 @@ async def _run_migrations(db):
         "ALTER TABLE conversations ADD COLUMN local_model TEXT",
         # Permission mode (default, plan, auto, etc.)
         "ALTER TABLE conversations ADD COLUMN cc_permission_mode TEXT DEFAULT 'default'",
+        # Incognito flag — routes Hermes turns to Prometheus (incognito, always-warm,
+        # cloud-fallback) instead of the ensouled attendant. Orthogonal to cc_model,
+        # like cc_permission_mode. 0 = ensouled (default), 1 = incognito.
+        "ALTER TABLE conversations ADD COLUMN incognito INTEGER DEFAULT 0",
         # Bookmarked message — auto-navigate to this on conversation load (deprecated)
         "ALTER TABLE conversations ADD COLUMN bookmark_msg_id INTEGER",
         # OODA harness toggle
@@ -355,6 +367,11 @@ async def _run_migrations(db):
         # NROL-AO operator mode: CC launch profile with file/shell tools
         # stripped; only the nrol-ao MCP surface (plus web reads) available
         "ALTER TABLE conversations ADD COLUMN nrol_operator INTEGER DEFAULT 0",
+        # Mode tag companion to cc_session_id so the resume walk can skip
+        # session IDs issued by a different backend (e.g. a Hermes session id
+        # on a branch later run as Dream). NULL = legacy/unscoped, treated as
+        # compatible so existing conversations keep resuming.
+        "ALTER TABLE messages ADD COLUMN cc_session_mode TEXT",
     ]
     for sql in migrations:
         try:
@@ -721,6 +738,7 @@ async def update_conversation_fields(conv_id: int, **fields):
         "nsfw",
         "local_model",
         "cc_permission_mode",
+        "incognito",
         "ooda_enabled",
         "canvas_enabled",
         "canvas_slug",
@@ -806,6 +824,7 @@ async def update_message_content(
     cc_session_id: str = None,
     cc_model_used: str = None,
     generation_ms: int = None,
+    cc_session_mode: str = None,
 ):
     """Update a message's content and metadata (used for draft → final)."""
     db = await get_db()
@@ -831,6 +850,9 @@ async def update_message_content(
     if cc_session_id is not None:
         updates.append("cc_session_id = ?")
         params.append(cc_session_id)
+    if cc_session_mode is not None:
+        updates.append("cc_session_mode = ?")
+        params.append(cc_session_mode)
     if cc_model_used is not None:
         updates.append("cc_model_used = ?")
         params.append(cc_model_used)
@@ -1103,8 +1125,8 @@ async def fork_conversation(
     cursor = await db.execute(
         """INSERT INTO conversations (title, character_id, persona_id, lore_ids,
            style_nudge, custom_scene, mode, project_dir, cc_model, cc_effort,
-           local_model, nrol_operator, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           local_model, nrol_operator, incognito, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             title,
             orig.get("character_id"),
@@ -1121,6 +1143,10 @@ async def fork_conversation(
             # operator conversation must stay an operator conversation, or
             # forking is a silent privilege escalation.
             orig.get("nrol_operator", 0) or 0,
+            # Incognito carries into forks: a fork of an incognito (Prometheus)
+            # conversation stays incognito — silently de-souling on fork would be
+            # the exact contamination the incognito flag exists to control.
+            int(orig.get("incognito", 0) or 0),
             now,
             now,
         ),
@@ -1166,13 +1192,26 @@ async def fork_conversation(
 async def get_conversation_tree(conv_id: int) -> list[dict]:
     """Get all messages for a conversation (for tree visualization)."""
     db = await get_db()
-    rows = await db.execute_fetchall(
-        """SELECT id, parent_id, role, substr(content, 1, 200) as preview,
-                  is_active, created_at, token_estimate, summary, image_path, image_alt
-           FROM messages WHERE conversation_id = ?
-           ORDER BY created_at""",
-        (conv_id,),
-    )
+    query = """SELECT id, parent_id, role, substr(content, 1, 200) as preview,
+                      is_active, created_at, token_estimate, summary, image_path, image_alt
+               FROM messages WHERE conversation_id = ?
+               ORDER BY created_at"""
+    try:
+        rows = await db.execute_fetchall(query, (conv_id,))
+    except Exception as e:
+        if "database disk image is malformed" not in str(e).lower():
+            raise
+        # Corrupted crash leftovers can leave stale entries in idx_messages_conv
+        # while the underlying rows are gone. Bypass the index so existing,
+        # readable conversations still load; order by id is a stable fallback.
+        rows = await db.execute_fetchall(
+            """SELECT id, parent_id, role, substr(content, 1, 200) as preview,
+                      is_active, created_at, token_estimate, summary, image_path, image_alt
+               FROM messages NOT INDEXED
+               WHERE conversation_id = ?
+               ORDER BY id""",
+            (conv_id,),
+        )
 
     return [dict(r) for r in rows]
 
@@ -1188,17 +1227,23 @@ async def save_summary(
     token_est = len(content) // 3
     # Upsert: replace existing summary for this branch path
     path_json = json.dumps(branch_path)
-    await db.execute(
-        """INSERT OR REPLACE INTO summaries
-           (conversation_id, branch_path, content, covers_up_to, token_estimate, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (conv_id, path_json, content, covers_up_to, token_est, now),
-    )
-    await db.commit()
-    rows = await db.execute_fetchall(
-        "SELECT * FROM summaries WHERE conversation_id = ? AND branch_path = ?",
-        (conv_id, path_json),
-    )
+    try:
+        await db.execute(
+            """INSERT OR REPLACE INTO summaries
+               (conversation_id, branch_path, content, covers_up_to, token_estimate, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (conv_id, path_json, content, covers_up_to, token_est, now),
+        )
+        await db.commit()
+        rows = await db.execute_fetchall(
+            "SELECT * FROM summaries WHERE conversation_id = ? AND branch_path = ?",
+            (conv_id, path_json),
+        )
+    except Exception as e:
+        if not _is_sqlite_corruption_error(e):
+            raise
+        print(f"[DB] summaries table is corrupt; skipped saving summary for conversation {conv_id}: {e}")
+        return {}
 
     return dict(rows[0]) if rows else {}
 
@@ -1206,12 +1251,18 @@ async def save_summary(
 async def get_summary(conv_id: int, branch_path: list[int] = None) -> Optional[dict]:
     db = await get_db()
     path_json = json.dumps(branch_path or [])
-    rows = await db.execute_fetchall(
-        """SELECT * FROM summaries
-           WHERE conversation_id = ? AND branch_path = ?
-           ORDER BY created_at DESC LIMIT 1""",
-        (conv_id, path_json),
-    )
+    try:
+        rows = await db.execute_fetchall(
+            """SELECT * FROM summaries
+               WHERE conversation_id = ? AND branch_path = ?
+               ORDER BY created_at DESC LIMIT 1""",
+            (conv_id, path_json),
+        )
+    except Exception as e:
+        if not _is_sqlite_corruption_error(e):
+            raise
+        print(f"[DB] summaries table is corrupt; ignoring summary for conversation {conv_id}: {e}")
+        return None
 
     return dict(rows[0]) if rows else None
 

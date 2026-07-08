@@ -106,6 +106,31 @@ const State = {
     activeGenerations: {},  // gen_id -> { parent_id } of all active generations in this tree
 };
 
+function findBranchLeaf(nodes) {
+    if (!nodes || !nodes.length) return null;
+    const ids = new Set(nodes.map(n => n.id));
+    const parentIds = new Set();
+    for (const n of nodes) {
+        if (n.parent_id != null && ids.has(n.parent_id)) parentIds.add(n.parent_id);
+    }
+    let leaf = null;
+    for (const n of nodes) {
+        if (parentIds.has(n.id)) continue;
+        if (!leaf || (n.created_at || 0) > (leaf.created_at || 0)) leaf = n;
+    }
+    return leaf || nodes[nodes.length - 1];
+}
+
+function findActiveConversationLeaf(treeData) {
+    return findBranchLeaf((treeData || []).filter(n => n.is_active));
+}
+
+function findLoadableConversationLeaf(treeData) {
+    const activeLeaf = findActiveConversationLeaf(treeData);
+    if (activeLeaf) return activeLeaf;
+    return findBranchLeaf(treeData || []);
+}
+
 function saveFolderCollapsed() {
     localStorage.setItem('loom-folder-collapsed', JSON.stringify(State.convFolderCollapsed));
 }
@@ -536,10 +561,21 @@ async function checkHealth(retries = 2) {
             if (typeof renderConversationList === 'function') renderConversationList();
             if (typeof renderMessages === 'function') renderMessages();
             if (State.currentConv) {
-                if (State.currentConv.mode === 'hermes' || State.currentConv.mode === 'weave') {
+                if (State.currentConv.mode === 'dream') {
+                    const dreamSel = document.getElementById('dream-model-inline');
+                    if (dreamSel) {
+                        _populateWeaveModelDropdown(dreamSel, State.currentConv.local_model || '', true);
+                    }
+                } else if (State.currentConv.mode === 'hermes' || State.currentConv.mode === 'weave') {
                     const weaveSel = document.getElementById('weave-model-inline');
-                    if (weaveSel) _populateWeaveModelDropdown(weaveSel, State.currentConv.local_model || '');
-                } else if (State.currentConv.mode === 'claude' || State.currentConv.mode === 'local' || State.currentConv.mode === 'codex' || State.currentConv.mode === 'gemini') {
+                    if (weaveSel) {
+                        _populateWeaveModelDropdown(
+                            weaveSel,
+                            State.currentConv.local_model || '',
+                            State.currentConv.mode === 'weave' || State.currentConv.mode === 'hermes'
+                        );
+                    }
+                } else if (State.currentConv.mode === 'claude' || State.currentConv.mode === 'local' || State.currentConv.mode === 'codex' || State.currentConv.mode === 'gemini' || State.currentConv.mode === 'umans') {
                     updateInlineCCControls(State.currentConv);
                 }
             }
@@ -567,10 +603,12 @@ function renderConversationList() {
         convs = convs.filter(c => c.mode === 'local');
     } else if (State.convFilter === 'hermes') {
         convs = convs.filter(c => c.mode === 'hermes');
+    } else if (State.convFilter === 'dream') {
+        convs = convs.filter(c => c.mode === 'dream');
     } else if (State.convFilter === 'nrol') {
         convs = convs.filter(c => !!c.nrol_operator);
     } else if (State.convFilter === 'claude') {
-        convs = convs.filter(c => (c.mode === 'claude' || c.mode === 'codex' || c.mode === 'gemini') && !c.nrol_operator);
+        convs = convs.filter(c => (c.mode === 'claude' || c.mode === 'codex' || c.mode === 'gemini' || c.mode === 'umans') && !c.nrol_operator);
     }
 
     if (convs.length === 0) {
@@ -792,6 +830,8 @@ function buildConvItem(conv) {
     const isClaude = isCCMode && !isNrol && !isGemini && !isCodex && !isUmans;
     const isLocal = conv.mode === 'local';
     const isHermes = conv.mode === 'hermes';
+    const isDream = conv.mode === 'dream';
+    const isDreamWeaver = conv.mode === 'weave' && _isDreamEngineModel(conv.local_model);
     const charName = isNrol ? (conv.cc_model || 'NROL-AO')
         : isGemini ? (conv.cc_model || 'Gemini')
         : isCodex ? (conv.cc_model || 'Codex')
@@ -799,6 +839,7 @@ function buildConvItem(conv) {
         : isClaude ? (conv.cc_model || 'Claude')
         : isLocal ? (conv.local_model || State.loadedModel || 'Llama')
         : isHermes ? (conv.local_model || State.loadedModel || 'Hermes')
+        : isDream ? (conv.local_model || 'Dream Space')
         : conv.character_id
         ? (State.characters.find(c => c.id === conv.character_id)?.name || conv.character_id)
         : 'Freeform';
@@ -809,6 +850,8 @@ function buildConvItem(conv) {
         : isClaude ? '<span class="mode-badge" title="Claude Code in the browser">Loom {Claude}</span>'
         : isLocal ? '<span class="mode-badge" title="Claude Code powered by a local Llama model">Braid {Local}</span>'
         : isHermes ? '<span class="mode-badge" title="Hermes Agent (ACP) powered by a local Llama model">Hermes {Agent}</span>'
+        : isDream ? '<span class="mode-badge" title="Hermes Agent space powered by the Dream DiffusionGemma engine">Dream Space {Agent}</span>'
+        : isDreamWeaver ? '<span class="mode-badge" title="Weave chat using the Dream DiffusionGemma engine directly">Dream Weaver</span>'
         : '<span class="mode-badge" title="Structured roleplay with local models">Weave</span>';
     const starred = conv.starred ? 1 : 0;
     const starChar = starred ? '★' : '☆';
@@ -1051,7 +1094,16 @@ async function loadConversation(convId) {
     ]);
 
     State.currentConv = conv;
+    // Re-evaluate the Hermes model-liveness indicator for this conv's mode.
+    // updateHermesModelIndicator reads the cached per-backend liveness state
+    // (fed by hermes_model_state WS broadcasts) and renders the indicator for
+    // THIS conv's backend only — so a Hermes conv shows llama's state, a Dream
+    // conv shows dream's state. Passing no backend = "re-render from cache".
+    if (typeof updateHermesModelIndicator === 'function') {
+        updateHermesModelIndicator(null, null);
+    }
     State.treeData = treeData;
+    if (typeof markTreeDataFresh === 'function') markTreeDataFresh(convId);
     State.bookmarks = bookmarks || [];
     if (typeof _invalidateSkillsCache === 'function') _invalidateSkillsCache();
 
@@ -1084,11 +1136,11 @@ async function loadConversation(convId) {
         State.branchNames = computeBranchNames(roots, nodeMap, childrenMap);
     }
 
-    // Also load the active branch for chat
-    const activeNodes = treeData.filter(n => n.is_active);
-    if (activeNodes.length > 0) {
-        const leafId = activeNodes[activeNodes.length - 1].id;
-        State.messages = await API.get(`/api/conversations/${convId}/branch/${leafId}`);
+    // Also load the active branch for chat. If active flags were lost, fall
+    // back to an actual tree leaf so persisted DB messages still display.
+    const leaf = findLoadableConversationLeaf(treeData);
+    if (leaf) {
+        State.messages = await API.get(`/api/conversations/${convId}/branch/${leaf.id}`);
     } else {
         State.messages = [];
     }
@@ -1165,7 +1217,7 @@ async function createConversation() {
         return;
     }
 
-    if (mode === 'local' || mode === 'hermes') {
+    if (mode === 'local' || mode === 'hermes' || mode === 'dream') {
         const localModel = document.getElementById('local-model').value;
         if (!localModel) {
             showToast('Select a model', 'error');
@@ -1340,8 +1392,13 @@ async function loadDirBrowser(path) {
 async function updateInlineCCControls(conv) {
     const controls = document.getElementById('cc-inline-controls');
     const weaveControls = document.getElementById('weave-inline-controls');
+    const dreamControls = document.getElementById('dream-inline-controls');
     const statePanelChat = document.getElementById('btn-state-panel-chat');
     if (!controls) return;
+    // Hide all inline control bars up front; the active mode's branch reveals its own.
+    controls.classList.add('hidden');
+    weaveControls?.classList.add('hidden');
+    dreamControls?.classList.add('hidden');
 
     // Weave-only bits inside the weave inline bar — hidden when we borrow that
     // bar for Hermes (which has none of OODA / backstage / branch-state / multi-branch).
@@ -1354,7 +1411,7 @@ async function updateInlineCCControls(conv) {
         _branchCountCtl?.classList.toggle('hidden', !show);
     };
 
-    if (conv && (conv.mode === 'claude' || conv.mode === 'local' || conv.mode === 'codex' || conv.mode === 'gemini')) {
+    if (conv && (conv.mode === 'claude' || conv.mode === 'local' || conv.mode === 'codex' || conv.mode === 'gemini' || conv.mode === 'umans')) {
         const isBraid = conv.mode === 'local';
         const modelName = conv.cc_model || '';
         const agentKind = (typeof _agentKindForModel === 'function') ? _agentKindForModel(modelName, conv) : '';
@@ -1396,6 +1453,20 @@ async function updateInlineCCControls(conv) {
         setBranchCount(1);
         const weaveSel = document.getElementById('weave-model-inline');
         if (weaveSel) _populateWeaveModelDropdown(weaveSel, conv.local_model || '');
+        const incogW = document.getElementById('incognito-toggle-weave');
+        if (incogW) incogW.checked = !!conv.incognito;
+    } else if (conv && conv.mode === 'dream') {
+        // Dream: its own inline bar — single-branch, no OODA/backstage.
+        controls.classList.add('hidden');
+        weaveControls?.classList.add('hidden');
+        dreamControls?.classList.remove('hidden');
+        _setWeaveOnlyBits(false);
+        statePanelChat?.classList.add('hidden');
+        setBranchCount(1);
+        const dreamSel = document.getElementById('dream-model-inline');
+        if (dreamSel) _populateWeaveModelDropdown(dreamSel, conv.local_model || '');
+        const incogD = document.getElementById('incognito-toggle-dream');
+        if (incogD) incogD.checked = !!conv.incognito;
     } else if (conv && conv.mode === 'weave') {
         controls.classList.add('hidden');
         weaveControls?.classList.remove('hidden');
@@ -1412,6 +1483,8 @@ async function updateInlineCCControls(conv) {
         if (weaveSel) {
             _populateWeaveModelDropdown(weaveSel, conv.local_model || '');
         }
+        const incogW2 = document.getElementById('incognito-toggle-weave');
+        if (incogW2) incogW2.checked = !!conv.incognito;
     } else {
         controls.classList.add('hidden');
         weaveControls?.classList.add('hidden');
@@ -1470,37 +1543,63 @@ function _modelsMatch(a, b) {
     return na === nb || na.includes(nb) || nb.includes(na);
 }
 
-// Inline Weave/Braid model dropdown — populated from Llama Server
-async function _populateWeaveModelDropdown(select, currentModel) {
-    if (!select) return;
-    let loadedModel = null;
+function _isDreamEngineModel(model) {
+    const m = (model || '').toLowerCase();
+    return m.includes('diffusiongemma') || m.includes('diffusion-gemma');
+}
+
+function _appendModelOption(select, model, labelPrefix = '') {
+    const opt = document.createElement('option');
+    opt.value = model.name || model;
+    opt.textContent = `${labelPrefix}${model.name || model}`;
+    select.appendChild(opt);
+    return opt;
+}
+
+function _appendModelGroup(select, label, models, labelPrefix = '') {
+    if (!models.length) return;
+    const group = document.createElement('optgroup');
+    group.label = label;
+    for (const model of models) {
+        _appendModelOption(group, model, labelPrefix);
+    }
+    select.appendChild(group);
+}
+
+async function _fetchSelectableLocalModels(includeDream = true) {
     try {
         const data = await API.get('/api/local/all-models');
-        const found = (data.models || []).find(m => m.loaded);
-        if (found) {
-            loadedModel = found.name;
-        }
-    } catch {}
+        const models = data.models || [];
+        return {
+            llama: models.filter(m => (m.backend || 'llama') === 'llama' && m.loaded),
+            dream: includeDream ? models.filter(m => m.backend === 'dream') : [],
+        };
+    } catch {
+        return { llama: [], dream: [] };
+    }
+}
+
+// Inline Weave/Braid model dropdown — populated from Llama Server
+async function _populateWeaveModelDropdown(select, currentModel, includeDream = true) {
+    if (!select) return;
+    const selectable = await _fetchSelectableLocalModels(includeDream);
+    const allModels = [...selectable.llama, ...selectable.dream];
     const prev = select.value;
     select.innerHTML = '<option value="">Local Model</option>';
 
-    if (loadedModel) {
-        const opt = document.createElement('option');
-        opt.value = loadedModel;
-        opt.textContent = loadedModel;
-        select.appendChild(opt);
-    }
+    _appendModelGroup(select, 'Llama Server', selectable.llama);
+    _appendModelGroup(select, 'Dream Engine', selectable.dream);
 
     let target = currentModel || prev || '';
     if (target) {
-        if (loadedModel && _modelsMatch(target, loadedModel)) {
-            target = loadedModel;
-        } else if (target !== loadedModel) {
-            target = '';
-        }
+        const match = allModels.find(m => _modelsMatch(target, m.name));
+        target = match ? match.name : '';
+    }
+    if (!target && allModels.length === 1) {
+        target = allModels[0].name;
     }
     select.value = target;
-    select.title = 'Local model';
+    select.title = includeDream ? 'Local or Dream Engine model' : 'Local model';
 }
 
 function initBranchCountPill() {
@@ -1625,6 +1724,37 @@ function initInlineCCControls() {
                     }
                 }
             } catch { showToast('Failed to update model', 'error'); }
+        });
+    }
+
+    // Incognito toggle (Hermes/Dream only) — routes through Prometheus when on.
+    // Two checkboxes (weave-inline + dream-inline controls) share one handler.
+    const _syncIncognitoToggles = (checked) => {
+        const w = document.getElementById('incognito-toggle-weave');
+        const d = document.getElementById('incognito-toggle-dream');
+        if (w) w.checked = !!checked;
+        if (d) d.checked = !!checked;
+    };
+    for (const toggleId of ['incognito-toggle-weave', 'incognito-toggle-dream']) {
+        const toggle = document.getElementById(toggleId);
+        if (!toggle) continue;
+        toggle.addEventListener('change', async () => {
+            if (!State.currentConvId || !State.currentConv) return;
+            const incognito = toggle.checked ? 1 : 0;
+            try {
+                await API.put(`/api/conversations/${State.currentConvId}`, { incognito });
+                State.currentConv.incognito = incognito;
+                _syncIncognitoToggles(incognito);
+                // Re-eval the model-liveness indicator for the new incognito
+                // state. updateHermesModelIndicator hides the badge when incognito
+                // is on, and re-renders from the cached liveness when off — so
+                // toggling incognito off shows the indicator immediately instead
+                // of waiting for the next WS liveness broadcast.
+                if (typeof updateHermesModelIndicator === 'function') {
+                    updateHermesModelIndicator(null, null);
+                }
+                showToast(incognito ? 'Incognito on — routing through Prometheus' : 'Incognito off — using the ensouled attendant');
+            } catch { showToast('Failed to toggle Incognito', 'error'); }
         });
     }
 
@@ -2091,17 +2221,13 @@ async function fetchLocalModels() {
     const select = document.getElementById('local-model');
     if (!select) return;
     select.innerHTML = '<option value="">Local Model</option>';
-    try {
-        const data = await API.get('/api/local/all-models');
-        const found = (data.models || []).find(m => m.loaded);
-        if (found) {
-            const opt = document.createElement('option');
-            opt.value = found.name;
-            opt.textContent = found.name;
-            select.appendChild(opt);
-        }
-    } catch {
-        // Fall back to just Local Model option
+    const mode = document.querySelector('#mode-toggle .toggle-btn.active')?.dataset.value || '';
+    const selectable = await _fetchSelectableLocalModels(mode === 'weave' || mode === 'hermes' || mode === 'dream');
+    _appendModelGroup(select, 'Llama Server', selectable.llama);
+    _appendModelGroup(select, 'Dream Engine', selectable.dream);
+    const models = [...selectable.llama, ...selectable.dream];
+    if (models.length === 1) {
+        select.value = models[0].name;
     }
 }
 
@@ -2111,12 +2237,14 @@ async function populateCCModelDropdowns(selectedValue) {
     if (!_ccModelsCache) {
         try { _ccModelsCache = await API.get('/api/cc-models'); } catch { return; }
     }
-    // Fetch Llama Server models for local CC.
+    // Fetch the loaded Llama Server model for local CC/Braid. Dream Engine
+    // models are OpenAI-compatible, not Anthropic /v1/messages targets for
+    // Claude Code, so never append them to this selector.
     let llamaModels = [];
     let loadedModel = null;
     try {
         const data = await API.get('/api/local/all-models');
-        const found = (data.models || []).find(m => m.loaded);
+        const found = (data.models || []).find(m => (m.backend || 'llama') === 'llama' && m.loaded);
         if (found) {
             loadedModel = found.name;
             llamaModels = [loadedModel];
@@ -2231,6 +2359,7 @@ function setupEventListeners() {
         try {
             if (State.currentConvId) {
                 State.treeData = await API.get(`/api/conversations/${State.currentConvId}/tree`);
+                if (typeof markTreeDataFresh === 'function') markTreeDataFresh(State.currentConvId);
             }
         } catch (e) {
             console.error('Failed to refresh tree:', e);
@@ -2353,7 +2482,7 @@ function setupEventListeners() {
                 document.getElementById('cc-model-group').classList.remove('hidden');
                 document.getElementById('cc-effort-group').classList.remove('hidden');
                 showWeaveFields(false);
-            } else if (mode === 'local' || mode === 'hermes') {
+            } else if (mode === 'local' || mode === 'hermes' || mode === 'dream') {
                 document.getElementById('local-model-group').classList.remove('hidden');
                 document.getElementById('project-dir-group').classList.remove('hidden');
                 showWeaveFields(false);
@@ -2542,9 +2671,10 @@ function setupEventListeners() {
         await Promise.all([
             _loadModelConfigs(),
             _populateModelDropdown(),
-            _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), localModel),
+            _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), localModel, false),
             _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), localModel),
             _populateWeaveModelDropdown(document.getElementById('cfg-weave-model'), localModel),
+            _populateWeaveModelDropdown(document.getElementById('cfg-dream-model'), localModel),
             populateCCModelDropdowns(conv && conv.cc_model || 'sonnet'),
             _populateKvQuantDropdown(),
             _populateMmprojDropdown(),
@@ -2564,7 +2694,7 @@ function setupEventListeners() {
         const mode = conv ? conv.mode : null;
         const ccModelName = conv ? (conv.cc_model || '') : '';
         const agentKind = (conv && typeof _agentKindForModel === 'function') ? _agentKindForModel(ccModelName, conv) : '';
-        const hasLoomOverrides = mode === 'claude' || mode === 'codex' || mode === 'gemini';
+        const hasLoomOverrides = mode === 'claude' || mode === 'codex' || mode === 'gemini' || mode === 'umans';
         const isActuallyCodex = mode === 'codex' || agentKind === 'codex';
         const isActuallyGemini = mode === 'gemini' || agentKind === 'gemini';
 
@@ -2573,6 +2703,7 @@ function setupEventListeners() {
             'cfg-overrides-braid': mode === 'local',
             'cfg-overrides-hermes': mode === 'hermes',
             'cfg-overrides-weave': mode === 'weave',
+            'cfg-overrides-dream': mode === 'dream',
         };
         for (const [id, active] of Object.entries(overrideGroups)) {
             const group = document.getElementById(id);
@@ -2649,9 +2780,10 @@ function setupEventListeners() {
             _invalidateModelCaches();
             await checkHealth();
             await Promise.all([
-                _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), document.getElementById('cfg-braid-model') ? document.getElementById('cfg-braid-model').value : ''),
+                _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), document.getElementById('cfg-braid-model') ? document.getElementById('cfg-braid-model').value : '', false),
                 _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), document.getElementById('cfg-hermes-model') ? document.getElementById('cfg-hermes-model').value : ''),
                 _populateWeaveModelDropdown(document.getElementById('cfg-weave-model'), document.getElementById('cfg-weave-model') ? document.getElementById('cfg-weave-model').value : ''),
+                _populateWeaveModelDropdown(document.getElementById('cfg-dream-model'), document.getElementById('cfg-dream-model') ? document.getElementById('cfg-dream-model').value : ''),
                 populateCCModelDropdowns(document.getElementById('cfg-cc-model') ? document.getElementById('cfg-cc-model').value : ''),
             ]);
             showToast('Models refreshed');
@@ -2744,7 +2876,7 @@ function setupEventListeners() {
 
         if (conv && State.currentConvId) {
             const updates = {};
-            if (conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini') {
+            if (conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini' || conv.mode === 'umans') {
                 const modelName = valueOf('cfg-cc-model', conv.cc_model || (conv.mode === 'gemini' ? 'Gemini 3.5 Flash (Medium)' : 'sonnet'));
                 const agentKind = (typeof _agentKindForModel === 'function') ? _agentKindForModel(modelName, conv) : '';
                 const isActuallyCodex = conv.mode === 'codex' || agentKind === 'codex';
@@ -2761,6 +2893,8 @@ function setupEventListeners() {
                 updates.local_model = valueOf('cfg-hermes-model', conv.local_model || '');
             } else if (conv.mode === 'weave') {
                 updates.local_model = valueOf('cfg-weave-model', conv.local_model || '');
+            } else if (conv.mode === 'dream') {
+                updates.local_model = valueOf('cfg-dream-model', conv.local_model || '');
             }
             if (Object.keys(updates).length) {
                 const updated = await API.put(`/api/conversations/${State.currentConvId}`, updates);
@@ -3739,8 +3873,8 @@ function renderSearchResults(results, query) {
         const item = document.createElement('div');
         item.className = 'search-result-item';
 
-        const modeClass = r.mode === 'gemini' ? 'claude' : (r.mode || 'weave');
-        const modeLabel = r.mode === 'claude' || r.mode === 'gemini' ? 'Loom' : r.mode === 'local' ? 'Braid' : r.mode === 'hermes' ? 'Hermes' : r.mode === 'codex' ? 'Codex' : 'Weave';
+        const modeClass = r.mode === 'gemini' || r.mode === 'umans' ? 'claude' : (r.mode || 'weave');
+        const modeLabel = r.mode === 'claude' || r.mode === 'gemini' || r.mode === 'umans' ? 'Loom' : r.mode === 'local' ? 'Braid' : r.mode === 'hermes' ? 'Hermes' : r.mode === 'dream' ? 'Dream Space' : r.mode === 'codex' ? 'Codex' : 'Weave';
         const titleHtml = escapeHtml(r.title || 'Untitled').replace(re, '<mark>$1</mark>');
 
         let snippetHtml = '';

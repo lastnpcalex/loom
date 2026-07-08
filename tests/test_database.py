@@ -100,3 +100,43 @@ async def test_list_conversations():
     assert "Second" in titles
     assert "Third" in titles
     assert len(convs) >= 3
+
+
+async def test_cc_session_mode_column_exists():
+    """The cc_session_mode migration ran — column is present on messages."""
+    conn = await db.get_db()
+    cursor = await conn.execute("PRAGMA table_info(messages)")
+    columns = await cursor.fetchall()
+    await conn.close()
+    col_names = [c[1] for c in columns]
+    assert "cc_session_mode" in col_names
+
+
+async def test_cc_session_mode_round_trip_and_null_compat():
+    """update_message_content persists cc_session_mode; NULL is the legacy default.
+
+    The resume walk treats NULL as 'legacy/unscoped, compatible' so existing
+    conversations keep resuming instead of forcing a full-history rebuild.
+    Only a non-NULL mode that mismatches the current backend is skipped.
+    """
+    conv = await db.create_conversation("Mode Tag Test")
+    m1 = await db.add_message(conv["id"], "user", "hello")
+    m2 = await db.add_message(conv["id"], "assistant", "hi", parent_id=m1["id"])
+
+    # Tag m2 as a dream-session message.
+    await db.update_message_content(m2["id"], cc_session_id="dream-sess-1",
+                                   cc_session_mode="dream")
+    fetched = await db.get_message(m2["id"])
+    assert fetched["cc_session_id"] == "dream-sess-1"
+    assert fetched["cc_session_mode"] == "dream"
+
+    # m1 was never tagged — NULL mode, the resume-walk compatibility case.
+    m1_fetched = await db.get_message(m1["id"])
+    assert m1_fetched.get("cc_session_mode") is None
+
+    # The compatibility predicate a resume walk uses: NULL or matching mode.
+    def _compatible(msg_mode, current_mode):
+        return msg_mode is None or msg_mode == current_mode
+    assert _compatible(m1_fetched.get("cc_session_mode"), "dream")   # NULL → compatible
+    assert _compatible(fetched["cc_session_mode"], "dream")          # same mode → compatible
+    assert not _compatible(fetched["cc_session_mode"], "hermes")     # cross-mode → skip

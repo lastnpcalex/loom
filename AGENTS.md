@@ -40,7 +40,7 @@ A Shadow Loom is a self-hosted web interface for branching AI conversations acro
 `loom_agent.md` — Plaintext Loom agent contract (read by loom_agent_prompt.py)
 `skill_scanner.py` — Scan Claude Code skills, built-in commands, user skills for slash-command autocomplete
 `canvas_slug.py` — Human-readable slug generator for canvas URLs (adjective-noun-suffix pattern)
-`ooda_harness.py` — OODA loop harness for Weave RP; XML parser, state executors, two-pass generation
+`ooda_harness.py` — OODA loop harness for Weave RP; XML parser, state executors, single-pass generation with repair fallback
 `backstage.md` — Backstage feature description or design notes
 
 ### Root — Provider Client Adapters
@@ -150,7 +150,7 @@ A Shadow Loom is a self-hosted web interface for branching AI conversations acro
 | Admin panel (frontend) | `static/admin/index.html`, `static/admin/admin.js`, `static/admin/admin.css` |
 | Permission gating | `cc_permission_hook.py` — PreToolUse hook for CC/agy/Codex; browser UI bridge |
 | Loom agent contract | `loom_agent.md` (plaintext), `loom_agent_prompt.py` (loader + merger) |
-| OODA harness | `ooda_harness.py` — two-pass generation: observe-orient-decide-act before RP prose |
+| OODA harness | `ooda_harness.py` — single-pass generation: observe-orient-decide-act before RP prose, with repair fallback for malformed output |
 | Slash commands / skills | `skill_scanner.py` — `BUILTIN_COMMANDS`, `get_all_skills()` scans CC skills |
 | Canvas | `canvas_slug.py` (slug gen), `server.py` routes, `static/canvas-sdk.js` (bridge), `static/tree.js` (meta-root nodes) |
 | Character system | `character_loader.py` (parser), `static/app.js` (CRUD UI), `characters/`, `personas/`, `lore/` |

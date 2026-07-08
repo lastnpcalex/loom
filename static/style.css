@@ -182,6 +182,30 @@ body::after {
     color: var(--text-primary);
 }
 
+/* Hermes model-liveness indicator (chat-space header). Green = local model up
+   (attendant functional); amber = down (attendant unavailable, Prometheus still
+   functional via cloud). Only shown on Hermes-class, non-incognito convs. */
+.hermes-model-indicator {
+    font-size: 12px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 10px;
+    white-space: nowrap;
+    margin-left: 8px;
+    align-self: center;
+}
+.hermes-model-indicator.up {
+    color: #4ade80;
+    background: rgba(74, 222, 128, 0.12);
+}
+.hermes-model-indicator.down {
+    color: #fbbf24;
+    background: rgba(251, 191, 36, 0.14);
+}
+.hermes-model-indicator.hidden {
+    display: none;
+}
+
 /* Breadcrumb trail */
 #breadcrumb-trail {
     display: flex;
@@ -1281,6 +1305,26 @@ body::after {
     cursor: pointer;
 }
 .ooda-toggle-label {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}
+
+/* Incognito toggle (Hermes/Dream) — routes through Prometheus when on */
+.incognito-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.incognito-toggle input[type="checkbox"] {
+    accent-color: #fbbf24;
+    cursor: pointer;
+}
+.incognito-toggle-label {
     font-family: 'Orbitron', sans-serif;
     font-size: 10px;
     letter-spacing: 1px;
@@ -2613,6 +2657,13 @@ body::after {
 #weave-model-inline:hover { border-color: var(--cyan); }
 #weave-model-inline:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 6px rgba(0, 255, 255, 0.2); }
 #weave-model-inline option { background: #1a1a2e; color: var(--text-primary); }
+#weave-model-inline optgroup {
+    background: #0d0d1f;
+    color: var(--text-muted);
+    font-style: normal;
+    font-weight: 600;
+    font-size: 11px;
+}
 .weave-inline-label {
     display: flex;
     align-items: center;
@@ -2944,6 +2995,49 @@ body::after {
     max-width: 800px;
     margin-left: auto;
     margin-right: auto;
+}
+#dream-inline-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 8px;
+    max-width: 800px;
+    margin-left: auto;
+    margin-right: auto;
+}
+#dream-inline-controls select {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    font-size: 12px;
+    padding: 4px 8px;
+    cursor: pointer;
+    transition: var(--transition);
+    flex: 0 1 auto;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+#dream-inline-controls select:hover {
+    border-color: var(--cyan);
+}
+#dream-inline-controls select:focus {
+    outline: none;
+    border-color: var(--cyan);
+    box-shadow: 0 0 6px rgba(0, 255, 255, 0.2);
+}
+#dream-inline-controls select option {
+    background: #1a1a2e;
+    color: var(--text-primary);
+}
+#dream-inline-controls select optgroup {
+    background: #0d0d1f;
+    color: var(--text-muted);
+    font-style: normal;
+    font-weight: 600;
+    font-size: 11px;
 }
 #cc-inline-controls select {
     background: var(--surface);

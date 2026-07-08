@@ -20,6 +20,7 @@
                 <button id="btn-home" title="Return to all conversations">A Shadow Loom ◈</button>
                 <span id="header-separator" class="hidden">/</span>
                 <span id="conv-title" class="hidden"></span>
+                <span id="hermes-model-indicator" class="hermes-model-indicator hidden" title=""></span>
                 <span id="breadcrumb-trail" class="hidden"></span>
                 <button id="btn-to-tree" class="hidden" title="Back to tree view">⟨ Tree</button>
             </div>
@@ -97,6 +98,7 @@
                         <button class="conv-filter-btn" data-filter="local" title="Claude Code powered by a local Llama model">Braid {Local Agents}</button>
                         <button class="conv-filter-btn" data-filter="hermes" title="Hermes Agent (ACP) powered by a local Llama model">Hermes {Agent}</button>
                         <button class="conv-filter-btn" data-filter="weave" title="Structured roleplay with local models">Weave {Chat}</button>
+                        <button class="conv-filter-btn" data-filter="dream" title="Hermes Agent space powered by the Dream DiffusionGemma engine">Dream Space {Agent}</button>
                     </div>
                     <div id="conv-list"></div>
                     <div id="home-empty" style="display:none;">
@@ -236,6 +238,10 @@
                 <select id="weave-model-inline" title="Llama Server model">
                     <option value="">Default</option>
                 </select>
+                <label class="incognito-toggle" title="Incognito — route through Prometheus (always-warm, cloud fallback, no soul). Otherwise the ensouled attendant refuses if its model is down.">
+                    <input type="checkbox" id="incognito-toggle-weave">
+                    <span class="incognito-toggle-label">Incognito</span>
+                </label>
                 <label class="ooda-toggle" title="OODA Harness — cognitive scaffolding for better RP">
                     <input type="checkbox" id="ooda-toggle-inline">
                     <span class="ooda-toggle-label">OODA</span>
@@ -246,6 +252,13 @@
                     <span class="branch-count-icon">⑂</span>
                     <span class="branch-count-value" id="branch-count-value">1</span>
                 </div>
+            </div>
+            <div id="dream-inline-controls" class="hidden">
+                <select id="dream-model-inline" title="Dream Engine DiffusionGemma model"></select>
+                <label class="incognito-toggle" title="Incognito — route through Prometheus (always-warm, cloud fallback, no soul). Otherwise the ensouled attendant refuses if its model is down.">
+                    <input type="checkbox" id="incognito-toggle-dream">
+                    <span class="incognito-toggle-label">Incognito</span>
+                </label>
             </div>
             <div id="cc-inline-controls" class="hidden">
                 <select id="cc-model-inline" title="Model"></select>
@@ -286,6 +299,7 @@
                     <button class="toggle-btn" data-value="local">Braid</button>
                     <button class="toggle-btn" data-value="hermes">Hermes</button>
                     <button class="toggle-btn" data-value="weave">Weave</button>
+                    <button class="toggle-btn" data-value="dream" title="Hermes Agent space powered by the Dream DiffusionGemma engine">Dream Space</button>
                     <button class="toggle-btn" data-value="nrol" title="NROL-AO epistemic engine operator — file/shell tools stripped, typed transitions only">NROL-AO</button>
                 </div>
             </div>
@@ -448,6 +462,13 @@
                     <div class="form-group">
                         <label for="cfg-weave-model">Weave Local Model</label>
                         <select id="cfg-weave-model" class="form-select"></select>
+                    </div>
+                </div>
+                <!-- Dream Engine (DiffusionGemma) overrides -->
+                <div class="settings-overrides" id="cfg-overrides-dream">
+                    <div class="form-group">
+                        <label for="cfg-dream-model">Dream Engine Model</label>
+                        <select id="cfg-dream-model" class="form-select"></select>
                     </div>
                 </div>
             </div>
@@ -721,8 +742,8 @@ assistant: *Another example response*"></textarea>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=14"></script>
-    <script src="/static/app.js?v=95"></script>
-    <script src="/static/chat.js?v=131"></script>
+    <script src="/static/app.js?v=97"></script>
+    <script src="/static/chat.js?v=133"></script>
     <script src="/static/tree.js?v=37"></script>
 </body>
 </html>

@@ -78,6 +78,41 @@ prompt.
   - `SCHEMA_GAP`: relevant evidence the schema cannot express; queues review.
   - `IGNORE`: not relevant. Writes nothing.
 
+## LLM backend routing
+
+Every LLM-job tool that takes a `model` argument (`run_news_scan`,
+`run_matcher_with_llama`, `run_matcher_with_model`, `deliberate_candidates`,
+`review_duplicate_candidate`, `review_parked`, the `red_team_*` gates,
+`run_schema_gap_resolver`, `future_cast`, `resolve_topic`'s AAR) can run on
+one of two local backends:
+
+- **llama-server** (default) — the model configured as Loom's `llama_model`.
+- **Dream Engine** — the DiffusionGemma sidecar. Pass `model="dream"` for its
+  default model, or `model="dream:<id>"` for an explicit one. Much lower
+  per-call latency when its model is resident; the first call after idle pays
+  a JIT model load.
+
+Rules and footguns:
+
+- **No automatic fallback.** A job targeting a down backend fails with a
+  connection error even if the other backend is up. This is deliberate:
+  which model judged what must stay explicit and attributable.
+- **Pre-flight check:** `model_endpoint_status` probes both backends and
+  returns an `ok` flag, reachable models, and the active default for each.
+  Call it before LLM-heavy work (scans, red-team batches) and route
+  explicitly. `llama_server_status` checks only the llama backend.
+- **Attribution:** every LLM job response carries a `backend` field
+  (`"llama"` or `"dream"`) alongside `model`, and activity records keep the
+  model name — calibration history stays per-model.
+- **Calibration hygiene:** prefer one backend for a whole scan run.
+  DiffusionGemma and the llama model have different judgment on matcher
+  verdicts and red-team reviews; mixing them mid-run makes divergence
+  analysis ambiguous. Flag the backend in your brief to the human when it is
+  not the default.
+- The env var `NROL_AO_LLM_BACKEND=dream` flips the default backend for all
+  jobs; that is an operator-of-Loom (human) setting, not something to change
+  from an MCP session.
+
 ## Anti-indicators
 
 **Anti-indicators** are directional indicators whose likelihoods are

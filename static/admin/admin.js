@@ -18,6 +18,59 @@ function showToast(msg) {
     showToast._timer = setTimeout(() => t.style.display = 'none', 3000);
 }
 
+function ensureConfirmModal() {
+    let modal = document.getElementById('confirm-modal');
+    if (modal) return modal;
+    modal = document.createElement('div');
+    modal.id = 'confirm-modal';
+    modal.className = 'confirm-modal';
+    modal.innerHTML = `
+        <div class="confirm-backdrop" data-confirm-cancel></div>
+        <div class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+            <div class="confirm-kicker">Confirm Action</div>
+            <h2 id="confirm-title">Are you sure?</h2>
+            <p id="confirm-message"></p>
+            <div class="confirm-actions">
+                <button class="btn btn-ghost" data-confirm-cancel>Cancel</button>
+                <button class="btn btn-warn" data-confirm-ok>OK</button>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    return modal;
+}
+
+function confirmDialog(message, title = 'Are you sure?') {
+    const modal = ensureConfirmModal();
+    const titleEl = modal.querySelector('#confirm-title');
+    const msgEl = modal.querySelector('#confirm-message');
+    const ok = modal.querySelector('[data-confirm-ok]');
+    const cancelEls = modal.querySelectorAll('[data-confirm-cancel]');
+    titleEl.textContent = title;
+    msgEl.textContent = message;
+    modal.classList.add('open');
+    ok.focus();
+
+    return new Promise(resolve => {
+        const cleanup = (value) => {
+            modal.classList.remove('open');
+            ok.removeEventListener('click', onOk);
+            cancelEls.forEach(el => el.removeEventListener('click', onCancel));
+            document.removeEventListener('keydown', onKey);
+            resolve(value);
+        };
+        const onOk = () => cleanup(true);
+        const onCancel = () => cleanup(false);
+        const onKey = (e) => {
+            if (e.key === 'Escape') cleanup(false);
+            if (e.key === 'Enter') cleanup(true);
+        };
+        ok.addEventListener('click', onOk);
+        cancelEls.forEach(el => el.addEventListener('click', onCancel));
+        document.addEventListener('keydown', onKey);
+    });
+}
+
 // ── View switching ──────────────────────────────────────────────────
 const VIEW_TITLES = { overview: 'Overview', servers: 'Servers', terminal: 'Terminal', tools: 'Tools', cron: 'Cron Jobs', guide: 'User Guide' };
 
@@ -29,6 +82,8 @@ function setView(name) {
     if (name === 'overview') {
         if (!specsLoaded) loadSpecs();
         loadLlamaModels({ force: true });
+        renderMemoryServices();
+        loadDbStorage();
     }
     if (name === 'terminal') refreshTtyd();
 }
@@ -88,45 +143,85 @@ async function loadLlamaModels(opts = {}) {
     } catch (e) { /* admin down or no models dir */ }
 }
 
-// ── Dream Hermes sidecar: Loaded Models visibility ─────────────────────────
-// Renders the dream card's inline status panel (loaded model, VRAM, RAM working
-// set, RAM cached/standby, idle countdown). Fed by /api/dream-models on the
-// refreshAll poll. Separate from loadLlamaModels because the dream sidecar is a
-// different process (nuspy adapter) with its own /health shape.
-async function renderDreamModels() {
-    const panel = document.getElementById('dream-models-panel');
-    if (!panel) return;
-    let d;
-    try {
-        const r = await fetch('/api/dream-models', { cache: 'no-store' });
-        if (!r.ok) { panel.innerHTML = '<span style="color:var(--text-mute);">Dream sidecar status unavailable.</span>'; return; }
-        d = await r.json();
-    } catch (e) { return; }
-    if (!d.running) {
-        panel.innerHTML = '<span style="color:var(--text-mute);">Dream sidecar not running. Click <b>Start Dream</b> to launch (model JIT-loads on first request).</span>';
-        return;
-    }
-    const loaded = d.loaded_model || '<i>none (JIT — loads on first request)</i>';
-    const avail = (d.available || []).join(', ') || 'none';
-    const idleMin = d.idle_secs != null ? Math.floor(d.idle_secs / 60) : null;
-    const timeoutMin = d.idle_timeout_min || 0;
-    const idleStr = idleMin != null
-        ? `${idleMin}m ${d.idle_secs % 60}s${timeoutMin > 0 ? ` / ${timeoutMin}m` : ''}`
-        : '—';
-    const autoUnload = timeoutMin > 0 ? `auto-unloads at ${timeoutMin}m idle` : 'auto-unload off';
-    panel.innerHTML = `
-        <div><b>Loaded:</b> <span style="color:var(--cyan);">${esc(String(loaded))}</span></div>
-        <div><b>Available:</b> ${esc(avail)} · <b>maxtok:</b> ${d.maxtok || 0}</div>
-        <div><b>VRAM used:</b> ${d.vram_used_mb ?? '?'} MB · <b>RAM working set:</b> ${d.ram_working_set_mb ?? '?'} MB · <b>RAM cached (GGUF mmap):</b> ${d.ram_cached_mb ?? '?'} MB</div>
-        <div style="color:var(--text-mute);">Idle: ${idleStr} (${autoUnload}) · PID ${d.pid ?? '?'}</div>
+// Memory services: shared visibility for local processes that intentionally
+// park GPU or system RAM (Llama, Dream/DiffusionGemma, ComfyUI).
+function fmtMb(mb) {
+    if (mb === null || mb === undefined) return '-';
+    const n = Number(mb) || 0;
+    return n >= 1024 ? (n / 1024).toFixed(n >= 10240 ? 1 : 2) + ' GB' : Math.round(n) + ' MB';
+}
+
+function memoryStateLabel(state) {
+    return {
+        warm: 'Warm',
+        ready: 'Ready',
+        orphan: 'Orphan',
+        off: 'Off',
+    }[state] || state || 'Unknown';
+}
+
+function memoryStateHint(s) {
+    if (s.state === 'warm') return 'loaded and intentionally parked for reuse';
+    if (s.state === 'ready') return 'process is running; model loads on demand';
+    if (s.state === 'orphan') return 'process exists but the service probe failed';
+    return 'not running';
+}
+
+function renderMemoryPanel(s) {
+    const loaded = (s.loaded || []).filter(Boolean);
+    const loadedText = loaded.length ? loaded.join(', ') : (s.state === 'ready' ? 'none loaded yet' : 'none');
+    const pidText = (s.pids || []).length ? (s.pids || []).join(', ') : '-';
+    const idle = s.idle_secs != null
+        ? Math.floor(s.idle_secs / 60) + 'm ' + (s.idle_secs % 60) + 's'
+        : '-';
+    const timeout = s.idle_timeout_min > 0 ? 'auto-unloads at ' + s.idle_timeout_min + 'm idle' : 'auto-unload off';
+    const extra = s.key === 'dream'
+        ? `<div class="memory-row memory-muted">Idle: ${esc(idle)} (${esc(timeout)})</div>`
+        : '';
+    return `
+        <div class="memory-top">
+            <span class="memory-state memory-${esc(s.state)}">${esc(memoryStateLabel(s.state))}</span>
+            <span class="memory-muted">${esc(memoryStateHint(s))}</span>
+        </div>
+        <div class="memory-row"><b>Loaded:</b> <span class="memory-loaded">${esc(loadedText)}</span></div>
+        <div class="memory-grid">
+            <div><span>GPU</span><b>${esc(fmtMb(s.gpu_mb))}</b></div>
+            <div><span>Active RAM</span><b>${esc(fmtMb(s.active_ram_mb))}</b></div>
+            <div><span>Reserved RAM</span><b>${esc(fmtMb(s.reserved_ram_mb))}</b></div>
+            <div><span>Reclaimable Cache</span><b>${esc(fmtMb(s.cache_mb))}</b></div>
+        </div>
+        ${extra}
+        <div class="memory-row memory-muted">PID: ${esc(pidText)} - ${esc(s.release_action || '')}</div>
     `;
 }
 
+async function renderMemoryServices() {
+    let data;
+    try {
+        const r = await fetch('/api/memory-services', { cache: 'no-store' });
+        if (!r.ok) return;
+        data = await r.json();
+    } catch (e) { return; }
+    const byKey = {};
+    (data.services || []).forEach(s => { byKey[s.key] = s; });
+    for (const key of ['llama', 'dream', 'comfy']) {
+        const panel = document.getElementById(key + '-memory-panel');
+        if (!panel) continue;
+        const svc = byKey[key];
+        panel.innerHTML = svc
+            ? renderMemoryPanel(svc)
+            : '<span class="memory-muted">Memory state unavailable.</span>';
+    }
+}
+
+async function renderDreamModels() {
+    await renderMemoryServices();
+}
 async function llamaSwitchModel() {
     const sel = document.getElementById('llama-model-switch');
     const model = sel ? sel.value : '';
     if (!model) { showToast('Pick a model first'); return; }
-    if (!confirm('Restart llama-server with ' + model + '? Cold load takes ~30-90s.')) return;
+    if (!await confirmDialog('Restart llama-server with ' + model + '? Cold load takes ~30-90s.', 'Restart Llama')) return;
     const btn = document.getElementById('btn-llama-switch');
     btn.disabled = true;
     await runTool('llama-restart?model=' + encodeURIComponent(model), { target: 'out-llama' });
@@ -135,7 +230,7 @@ async function llamaSwitchModel() {
 }
 
 async function llamaUnloadForComfy() {
-    if (!confirm('Unload Llama model and free VRAM for ComfyUI? This stops llama-server until you reload it.')) return;
+    if (!await confirmDialog('Unload Llama Server and release its model memory? This stops llama-server until you reload it.', 'Unload Llama')) return;
     const btn = document.getElementById('btn-llama-unload');
     if (btn) btn.disabled = true;
     await runTool('llama-unload', { target: 'out-llama' });
@@ -148,13 +243,121 @@ async function llamaReloadSelected() {
     const model = sel ? sel.value : '';
     const suffix = model ? '?model=' + encodeURIComponent(model) : '';
     const label = model || 'the configured default model';
-    if (!confirm('Reload llama-server with ' + label + '? Cold load takes ~30-90s.')) return;
+    if (!await confirmDialog('Reload llama-server with ' + label + '? Cold load takes ~30-90s.', 'Reload Llama')) return;
     const btn = document.getElementById('btn-llama-reload');
     if (btn) btn.disabled = true;
     await runTool('llama-reload' + suffix, { target: 'out-llama' });
     await loadLlamaModels({ force: true });
     if (btn) btn.disabled = false;
 }
+
+// ── Hermes runtime management (Prometheus + attendants) ──────────────────
+// Hits the admin /api/hermes/* relay endpoints, which forward to the main
+// Loom server's _RUNTIMES. Three runtimes: Prometheus (incognito, always-warm,
+// cloud-fallback) + llama/dream attendants (ensouled, model-bound).
+async function fetchHermesStatus() {
+    try {
+        const r = await fetch('/api/hermes/status', { cache: 'no-store' });
+        if (!r.ok) return null;
+        return await r.json();
+    } catch (e) { return null; }
+}
+
+function renderHermesRuntimePanel(status) {
+    const panel = document.getElementById('hermes-runtime-panel');
+    if (!panel) return;
+    if (!status || !status.hermes_available) {
+        panel.innerHTML = '<span class="memory-muted">Hermes adapter unavailable' +
+            (status && status.import_error ? ' (' + esc(String(status.import_error)) + ')' : '') + '.</span>';
+        return;
+    }
+    const dot = (up) => up ? '🟢' : '⚫';
+    const m = status.models || {};
+    const llamaUp = m.llama && m.llama.up;
+    const dreamUp = m.dream && m.dream.up;
+    const llamaAtt = m.llama && m.llama.attendant;
+    const dreamAtt = m.dream && m.dream.attendant;
+    const prom = status.prometheus || {};
+    const parts = [];
+    parts.push('<div class="rt-row"><b>Models:</b> ' +
+        `llama ${dot(llamaUp)} ${llamaUp ? 'up' : 'down'} · ` +
+        `dream ${dot(dreamUp)} ${dreamUp ? 'up' : 'down'}</div>`);
+    parts.push('<div class="rt-row"><b>Llama attendant:</b> ' +
+        (llamaAtt && llamaAtt.alive ? `warm (PID ${llamaAtt.pid})` : 'cold (re-inits on next turn)') + '</div>');
+    parts.push('<div class="rt-row"><b>Dream attendant:</b> ' +
+        (dreamAtt && dreamAtt.alive ? `warm (PID ${dreamAtt.pid})` : 'cold (re-inits on next turn)') + '</div>');
+    parts.push('<div class="rt-row"><b>Prometheus:</b> ' +
+        (prom.alive ? `warm (PID ${prom.pid})` : 'cold — will init on next incognito turn') +
+        (prom.held ? '' : ' · not held') + '</div>');
+    panel.innerHTML = parts.join('');
+}
+
+async function hermesStatus() {
+    const out = document.getElementById('out-hermes');
+    if (out) { out.classList.remove('error'); out.textContent = 'Probing Hermes runtimes…'; }
+    const s = await fetchHermesStatus();
+    renderHermesRuntimePanel(s);
+    if (out) {
+        if (!s) { out.textContent = 'Main server unreachable.'; out.classList.add('error'); }
+        else if (!s.hermes_available) { out.textContent = 'Hermes adapter unavailable: ' + (s.import_error || '?'); out.classList.add('error'); }
+        else { out.textContent = JSON.stringify(s, null, 2); }
+    }
+}
+
+async function prometheusRestart() {
+    if (!await confirmDialog('Restart Prometheus? Re-routes the backend (rewrites config) and clears the warm runtime; it re-inits on the next incognito turn.', 'Restart Prometheus')) return;
+    const btn = document.getElementById('btn-prometheus-restart');
+    if (btn) btn.disabled = true;
+    try {
+        const r = await fetch('/api/hermes/prometheus/restart', { method: 'POST' });
+        const d = await r.json();
+        const out = document.getElementById('out-hermes');
+        if (out) out.textContent = d.status === 'ok'
+            ? `Prometheus re-routed → backend: ${d.backend}, model: ${d.model}\nWarm runtime cleared; re-inits on next incognito turn.`
+            : ('Error: ' + (d.error || JSON.stringify(d)));
+    } catch (e) {
+        const out = document.getElementById('out-hermes');
+        if (out) { out.textContent = 'Request failed: ' + e; out.classList.add('error'); }
+    }
+    await hermesStatus();
+    if (btn) btn.disabled = false;
+}
+
+async function prometheusStop() {
+    if (!await confirmDialog('Stop Prometheus\' warm runtime? It stays down until the next incognito turn re-inits it.', 'Stop Prometheus')) return;
+    const btn = document.getElementById('btn-prometheus-stop');
+    if (btn) btn.disabled = true;
+    try {
+        const r = await fetch('/api/hermes/prometheus/stop', { method: 'POST' });
+        const d = await r.json();
+        const out = document.getElementById('out-hermes');
+        if (out) out.textContent = d.status === 'ok'
+            ? `Prometheus stopped (cleared: ${d.cleared}).`
+            : ('Error: ' + (d.error || JSON.stringify(d)));
+    } catch (e) {
+        const out = document.getElementById('out-hermes');
+        if (out) { out.textContent = 'Request failed: ' + e; out.classList.add('error'); }
+    }
+    await hermesStatus();
+    if (btn) btn.disabled = false;
+}
+
+async function attendantStop(backend) {
+    if (!await confirmDialog(`Force-clear the ${backend} attendant's warm process? The soul (home/state.db) survives; it re-inits on the next turn.`, `Clear ${backend} attendant`)) return;
+    try {
+        const r = await fetch('/api/hermes/attendant/stop?backend=' + backend, { method: 'POST' });
+        const d = await r.json();
+        const out = document.getElementById('out-hermes');
+        if (out) out.textContent = d.status === 'ok'
+            ? `${backend} attendant cleared (cleared: ${d.cleared}).`
+            : ('Error: ' + (d.error || JSON.stringify(d)));
+    } catch (e) {
+        const out = document.getElementById('out-hermes');
+        if (out) { out.textContent = 'Request failed: ' + e; out.classList.add('error'); }
+    }
+    await hermesStatus();
+}
+
 
 // ── Meta / quick links ──────────────────────────────────────────────
 async function loadMeta() {
@@ -168,6 +371,8 @@ async function loadMeta() {
     if (llamaTag) llamaTag.textContent = ':' + META.llama_port;
     const nrolTag = document.getElementById('nrol-port-tag');
     if (nrolTag) nrolTag.textContent = ':' + META.nrol_port;
+    const dreamTag = document.getElementById('dream-port-tag');
+    if (dreamTag) dreamTag.textContent = ':' + META.dream_port;
     const ttydTag = document.getElementById('ttyd-port-tag');
     if (ttydTag) ttydTag.textContent = ':' + META.ttyd.port;
 
@@ -193,12 +398,15 @@ function scheduleRefresh(delay = 10000) {
 
 async function refreshAll() {
     try {
-        await Promise.all([refreshInstances(), refreshGenerations(), refreshCronJobs(), refreshPorts()]);
+        await Promise.all([refreshInstances(), refreshGenerations(), refreshCronJobs(), refreshPorts(), loadDbStorage()]);
         const overview = document.getElementById('view-overview');
         if (overview?.classList.contains('active') && document.activeElement?.id !== 'llama-model-switch') {
             await loadLlamaModels({ force: true });
             await renderDreamModels();
         }
+        // Keep the Hermes runtime panel fresh without blocking the periodic loop
+        // — a slow/unreachable main server must not stall refreshAll.
+        fetchHermesStatus().then(renderHermesRuntimePanel).catch(() => {});
     } catch (e) { /* keep ticking */ }
     scheduleRefresh();
 }
@@ -209,20 +417,20 @@ async function refreshAll() {
 const SERVER_HEAD_ACTIONS = {
     llama: {
         on: [
-            { cls: 'btn btn-cyan', label: '↻ Restart', tool: 'llama-restart' },
-            { cls: 'btn btn-warn', label: '⏹ Stop',    tool: 'llama-stop', confirm: 'Stop Llama Server?' },
+            { cls: 'btn btn-cyan', label: 'Restart', tool: 'llama-restart' },
+            { cls: 'btn btn-warn', label: 'Unload', tool: 'llama-unload', confirm: 'Unload Llama Server and release its model memory?' },
         ],
         off: [
-            { cls: 'btn btn-green', label: '▶ Start',  tool: 'llama-start' },
+            { cls: 'btn btn-green', label: 'Start',  tool: 'llama-start' },
         ],
         target: 'out-llama',
     },
     comfy: {
         on: [
-            { cls: 'btn btn-warn', label: '⏹ Stop',    tool: 'comfyui-stop', confirm: 'Kill ComfyUI?' },
+            { cls: 'btn btn-warn', label: 'Unload', tool: 'comfyui-stop', confirm: 'Unload ComfyUI by stopping its process?' },
         ],
         off: [
-            { cls: 'btn btn-green', label: '▶ Start',  tool: 'comfyui-start' },
+            { cls: 'btn btn-green', label: 'Start',  tool: 'comfyui-start' },
         ],
         target: 'out-comfy',
     },
@@ -231,16 +439,17 @@ const SERVER_HEAD_ACTIONS = {
             { cls: 'btn btn-warn', label: '⏹ Stop',    tool: 'nrol-dashboard-stop', confirm: 'Stop NROL-AO dashboard if Loom admin launched it?' },
         ],
         off: [
-            { cls: 'btn btn-green', label: '▶ Start',  tool: 'nrol-dashboard-start' },
+            { cls: 'btn btn-green', label: 'Start',  tool: 'nrol-dashboard-start' },
         ],
         target: 'out-nrol',
     },
     dream: {
         on: [
-            { cls: 'btn btn-warn', label: '⏹ Unload',  tool: 'dream-unload', confirm: 'Unload Dream (frees VRAM + flushes 17GB from RAM)?' },
+            { cls: 'btn btn-cyan', label: 'Restart', tool: 'dream-restart', confirm: 'Restart Dream Engine? This unloads Dream, releases cache, then starts it again.' },
+            { cls: 'btn btn-warn', label: 'Unload', tool: 'dream-unload', confirm: 'Unload Dream Engine and release reclaimable model cache?' },
         ],
         off: [
-            { cls: 'btn btn-green', label: '▶ Start',  tool: 'dream-start' },
+            { cls: 'btn btn-green', label: 'Start',  tool: 'dream-start' },
         ],
         target: 'out-dream',
     },
@@ -271,7 +480,7 @@ async function refreshPorts() {
         const r = await fetch('/api/ports-status', { cache: 'no-store' });
         if (r.ok) d = await r.json();
     } catch (e) { return; }
-    const order = [['main', 'Loom'], ['test', 'Test'], ['llama', 'Llama'], ['dream', 'Dream'], ['nrol', 'NROL'], ['comfy', 'Comfy'], ['ttyd', 'ttyd']];
+    const order = [['main', 'Loom'], ['test', 'Test'], ['llama', 'Llama'], ['dream', 'Dream Engine'], ['nrol', 'NROL'], ['comfy', 'Comfy'], ['ttyd', 'ttyd']];
     document.getElementById('pulse-grid').innerHTML = order
         .map(([k, label]) => `<span class="pulse-item"><span class="dot ${d[k] ? 'on' : 'off'}"></span>${label}</span>`)
         .join('');
@@ -426,7 +635,7 @@ async function toggleCron(id, enabled) {
 }
 
 async function archiveCron(id) {
-    if (!confirm('Archive cron job #' + id + '?')) return;
+    if (!await confirmDialog('Archive cron job #' + id + '?', 'Archive Cron Job')) return;
     try {
         const r = await fetch('/api/cron-proxy/' + id, { method: 'DELETE' });
         showToast(r.ok ? 'cron archived' : 'cron archive failed');
@@ -435,7 +644,7 @@ async function archiveCron(id) {
 }
 
 async function killGen(draftId) {
-    if (!confirm('Kill generation #' + draftId + '?')) return;
+    if (!await confirmDialog('Kill generation #' + draftId + '?', 'Kill Generation')) return;
     showToast('killing #' + draftId);
     try {
         const r = await fetch('/api/generations-proxy/' + draftId + '/kill', { method: 'POST' });
@@ -505,8 +714,8 @@ async function adminAction(action) {
 }
 
 // ── Tools ───────────────────────────────────────────────────────────
-function confirmTool(name, msg, opts) {
-    if (confirm(msg)) runTool(name, opts);
+async function confirmTool(name, msg, opts) {
+    if (await confirmDialog(msg)) runTool(name, opts);
 }
 
 async function runTool(name, opts = {}) {
@@ -551,9 +760,13 @@ async function runTool(name, opts = {}) {
     }
     if (/^llama-/.test(name)) {
         await loadLlamaModels({ force: true });
+        await renderMemoryServices();
     }
     if (/^dream-/.test(name)) {
-        await renderDreamModels();
+        await renderMemoryServices();
+    }
+    if (/^comfyui-|^clear-vram$|^memory-status$/.test(name)) {
+        await renderMemoryServices();
     }
     scheduleRefresh(30000);
 }
@@ -681,7 +894,7 @@ async function ttydStart() {
 }
 
 async function ttydStop() {
-    if (!confirm('Stop the web terminal?')) return;
+    if (!await confirmDialog('Stop the web terminal?', 'Stop Terminal')) return;
     try {
         const r = await fetch('/tools/ttyd-stop', { method: 'POST' });
         const d = await r.json();
@@ -721,13 +934,70 @@ async function loadDatabases() {
     } catch (e) { /* ignore */ }
 }
 
+async function loadDbStorage() {
+    const folder = document.getElementById('db-folder');
+    const filename = document.getElementById('db-filename');
+    const current = document.getElementById('db-current');
+    if (!folder || !filename || !current) return;
+    try {
+        const r = await fetch('/api/db-storage', { cache: 'no-store' });
+        if (!r.ok) return;
+        const d = await r.json();
+        if (document.activeElement !== folder) folder.value = d.folder || '';
+        if (document.activeElement !== filename) filename.value = d.filename || 'loom.db';
+        const size = d.size_bytes ? ` (${(d.size_bytes / 1048576).toFixed(1)} MB)` : '';
+        current.classList.toggle('warn', !!d.onedrive);
+        current.textContent = `Current: ${d.resolved || d.configured || 'unknown'}${size}${d.onedrive ? ' - OneDrive path' : ''}`;
+    } catch (e) {
+        current.textContent = 'Database storage unavailable: ' + e;
+        current.classList.add('warn');
+    }
+}
+
+async function saveDbStorage() {
+    const folder = document.getElementById('db-folder')?.value.trim();
+    const filename = document.getElementById('db-filename')?.value.trim();
+    const copyCurrent = !!document.getElementById('db-copy-current')?.checked;
+    const restart = !!document.getElementById('db-restart-main')?.checked;
+    if (!folder || !filename) {
+        showToast('folder and file are required');
+        return;
+    }
+    const msg = copyCurrent
+        ? 'Save this DB location, stop Main Loom, copy the current SQLite files, then restart Main Loom?'
+        : 'Save this DB location and restart Main Loom? If the DB does not exist, a new empty DB will be created.';
+    if (!await confirmDialog(msg, 'Change Database Location')) return;
+    const btn = document.getElementById('btn-db-save');
+    if (btn) btn.disabled = true;
+    try {
+        const r = await fetch('/api/db-storage', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ folder, filename, copy_current: copyCurrent, restart }),
+        });
+        const d = await r.json();
+        if (r.ok) {
+            showToast('database location saved' + (d.restarted ? ' and Main Loom restarted' : ''));
+            await loadDatabases();
+            await loadDbStorage();
+            setTimeout(refreshAll, 1500);
+        } else {
+            showToast('database change failed: ' + (d.error || 'unknown error'));
+        }
+    } catch (e) {
+        showToast('database change failed: ' + e);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
 // ── Boot ────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
     document.querySelectorAll('.nav-item').forEach(b =>
         b.addEventListener('click', () => setView(b.dataset.view)));
     document.getElementById('btn-admin-restart').addEventListener('click', () => adminAction('restart'));
-    document.getElementById('btn-admin-shutdown').addEventListener('click', () => {
-        if (confirm('Shut down the admin server?')) adminAction('shutdown');
+    document.getElementById('btn-admin-shutdown').addEventListener('click', async () => {
+        if (await confirmDialog('Shut down the admin server?', 'Shutdown Admin')) adminAction('shutdown');
     });
     document.getElementById('btn-specs-refresh').addEventListener('click', loadSpecs);
     document.getElementById('btn-ttyd-start').addEventListener('click', ttydStart);
@@ -735,8 +1005,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('btn-llama-switch').addEventListener('click', llamaSwitchModel);
     document.getElementById('btn-llama-unload').addEventListener('click', llamaUnloadForComfy);
     document.getElementById('btn-llama-reload').addEventListener('click', llamaReloadSelected);
+    document.getElementById('btn-hermes-status').addEventListener('click', hermesStatus);
+    document.getElementById('btn-prometheus-restart').addEventListener('click', prometheusRestart);
+    document.getElementById('btn-prometheus-stop').addEventListener('click', prometheusStop);
+    document.getElementById('btn-attendant-llama-stop').addEventListener('click', () => attendantStop('llama'));
+    document.getElementById('btn-attendant-dream-stop').addEventListener('click', () => attendantStop('dream'));
+    document.getElementById('btn-db-refresh').addEventListener('click', loadDbStorage);
+    document.getElementById('btn-db-save').addEventListener('click', saveDbStorage);
 
     await loadDatabases();
+    await loadDbStorage();
     await loadMeta();
     const saved = localStorage.getItem('loom-admin-view');
     if (saved && document.getElementById('view-' + saved)) setView(saved);

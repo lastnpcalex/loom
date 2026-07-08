@@ -32,7 +32,46 @@ const TREE = {
     searchMatches: [],
     searchIndex: -1,
     searchQuery: '',
+    treeDataConvId: null,
+    treeDataFetchedAt: 0,
+    treeFetchPromise: null,
 };
+
+function markTreeDataFresh(convId = State.currentConvId) {
+    TREE.treeDataConvId = convId || null;
+    TREE.treeDataFetchedAt = Date.now();
+}
+
+function invalidateTreeData() {
+    TREE.treeDataFetchedAt = 0;
+    TREE.treeDataConvId = null;
+}
+
+async function refreshTreeData({ force = false, maxAgeMs = 15000 } = {}) {
+    const convId = State.currentConvId;
+    if (!convId) return State.treeData || [];
+
+    const now = Date.now();
+    const hasData = Array.isArray(State.treeData) && State.treeData.length > 0;
+    const sameConv = TREE.treeDataConvId === convId;
+    const fresh = sameConv && (now - TREE.treeDataFetchedAt) < maxAgeMs;
+    if (!force && hasData && fresh) return State.treeData;
+
+    if (TREE.treeFetchPromise && sameConv) return TREE.treeFetchPromise;
+
+    TREE.treeFetchPromise = API.get(`/api/conversations/${convId}/tree`)
+        .then(data => {
+            if (State.currentConvId === convId) {
+                State.treeData = data;
+                markTreeDataFresh(convId);
+            }
+            return data;
+        })
+        .finally(() => {
+            if (TREE.treeDataConvId === convId) TREE.treeFetchPromise = null;
+        });
+    return TREE.treeFetchPromise;
+}
 
 // ── Canvas Pan/Zoom ──
 
@@ -625,10 +664,12 @@ async function renderTree() {
     const savedVertical = localStorage.getItem('loom-tree-vertical');
     if (savedVertical !== null) TREE.vertical = savedVertical === 'true';
 
-    // Always re-fetch tree data to pick up new Gemma summaries
+    // Keep tree renders cheap. Most callers already have fresh tree data; this
+    // fetches on first render or after the short cache window instead of on
+    // every render pass.
     if (State.currentConvId) {
         try {
-            State.treeData = await API.get(`/api/conversations/${State.currentConvId}/tree`);
+            await refreshTreeData();
         } catch (e) {
             console.error('Failed to refresh tree data:', e);
         }
@@ -970,6 +1011,7 @@ function createNode(node, branchNames) {
             try {
                 await API.del(`/api/conversations/${State.currentConvId}/messages/${data.id}`);
                 showToast('Branch deleted');
+                invalidateTreeData();
                 await renderTree();
             } catch (err) {
                 showToast('Failed to delete branch', 'error');

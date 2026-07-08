@@ -1068,7 +1068,7 @@ def _run_debate(
             packet["note"] = "no candidates to deliberate"
             return {}, packet
 
-        def _stage(name: str, prompt: str, system: str) -> str:
+        def _stage(name: str, prompt: str, system: str) -> tuple[str, dict]:
             response = llama_client.chat(
                 prompt,
                 system_prompt=system,
@@ -1076,7 +1076,9 @@ def _run_debate(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout_sec=timeout_sec,
-                disable_thinking=False,  # Deliberation requires reasoning mode enabled!
+                # Deliberation requires reasoning mode enabled. Dream/DiffusionGemma
+                # still gets its thought-channel budget inside llama_client.chat().
+                disable_thinking=False,
             )
             text = response.get("text", "")
             if store is not None:
@@ -1087,12 +1089,34 @@ def _run_debate(
                     slug=slug,
                     model=response.get("model"),
                     summary={"stage": name, "output_chars": len(text),
-                             "finish_reason": response.get("finish_reason")},
+                             "finish_reason": response.get("finish_reason"),
+                             "reasoning_chars": response.get("reasoning_chars", 0),
+                             "backend": response.get("backend")},
                     response=text,
                 )
-            return text
+            return text, response
 
-        adv_text = _stage(
+        def _parse_failure(stage: str, text: str, response: dict, expected: str) -> str:
+            finish = response.get("finish_reason") or "?"
+            reasoning_chars = response.get("reasoning_chars", 0)
+            model_id = response.get("model") or "default"
+            backend = response.get("backend") or "unknown"
+            if not (text or "").strip():
+                return (
+                    f"{stage} returned no content "
+                    f"(finish_reason={finish}, reasoning_chars={reasoning_chars}, "
+                    f"model={model_id}, backend={backend}) - no {expected} parsed; "
+                    "nothing applied (fail closed)"
+                )
+            return (
+                f"{stage} returned no parseable {expected} blocks "
+                f"(output_chars={len(text)}, finish_reason={finish}, "
+                f"reasoning_chars={reasoning_chars}, model={model_id}, "
+                f"backend={backend}) - raw output recorded in activity ledger; "
+                "nothing applied (fail closed)"
+            )
+
+        adv_text, adv_response = _stage(
             "advocate",
             news.build_advocate_prompt(topic, articles, candidates),
             "You are the ADVOCATE in the NROL-AO debate. Return only ADVOCATE "
@@ -1102,11 +1126,11 @@ def _run_debate(
         packet["advocate_proposals"] = len(advocate_moves)
         packet["argue_moves"] = len([m for m in advocate_moves if m.get("verdict") in ("COMMIT", "ARGUE_MOVE")])
         if not advocate_moves:
-            packet["note"] = "advocate found no defensible proposals"
+            packet["error"] = _parse_failure("advocate", adv_text, adv_response, "ADVOCATE")
             return {}, packet
 
         strict_reasons = news.get_strict_reasons_map(decisions)
-        reb_text = _stage(
+        reb_text, reb_response = _stage(
             "rebut",
             news.build_rebut_prompt(topic, articles, advocate_moves, strict_reasons),
             "You are the REBUTTAL in the NROL-AO debate. Return only REBUT "
@@ -1114,14 +1138,20 @@ def _run_debate(
         )
         rebuts = news.parse_rebut_output(reb_text)
         packet["rebuttals"] = len(rebuts)
+        if not rebuts:
+            packet["error"] = _parse_failure("rebut", reb_text, reb_response, "REBUT")
+            return {}, packet
 
-        jury_text = _stage(
+        jury_text, jury_response = _stage(
             "jury",
             news.build_jury_prompt(topic, articles, advocate_moves, rebuts),
             "You are the JURY in the NROL-AO debate. Return only JURY blocks "
             "in the requested format.",
         )
         jury = news.parse_jury_output(jury_text)
+        if not jury:
+            packet["error"] = _parse_failure("jury", jury_text, jury_response, "JURY")
+            return {}, packet
         packet["jury_verdicts"] = {
             str(i): v.get("verdict_raw", "") for i, v in jury.items()
         }
@@ -1228,7 +1258,12 @@ def _deliberation_stamp_from_debate(decision: dict, debate_packet: dict | None) 
     A debate that errored or saw zero candidates yields NO record — an empty
     debate must not mint gate-passing stamps.
     """
-    if not debate_packet or debate_packet.get("error") or not debate_packet.get("candidates"):
+    if (
+        not debate_packet
+        or debate_packet.get("error")
+        or not debate_packet.get("candidates")
+        or not debate_packet.get("advocate_proposals")
+    ):
         return {}
     idx = decision.get("idx")
     verdict = (debate_packet.get("jury_verdicts") or {}).get(str(idx), "")
@@ -1693,17 +1728,64 @@ def nrol_status() -> str:
         return _json({"error": str(exc), "repo": str(_repo_path())})
 
 
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process and all its descendants. Windows-only; no-op fallback.
+
+    This is the critical piece `subprocess.run(timeout=)` cannot do on its
+    own: on Windows a git child (credential manager, gpg-agent, editor)
+    inherits the stdout/stderr pipe and keeps it open, so a timed read in
+    subprocess.run never reaches its timeout check until that grandchild
+    exits — the publish_black_hole_snapshot hang. taskkill /T /F is the
+    only reliable way to release a pipe held by a grandchild here.
+    """
+    try:
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(pid)],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        # Best-effort: never let cleanup masking shadow the real error.
+        try:
+            os.kill(pid, 9)
+        except Exception:
+            pass
+
+
 def _git_run(args: list[str], cwd: Path, timeout: int = 60) -> tuple[int, str, str]:
     """Run a git command in cwd; return (returncode, stdout, stderr).
 
     The only subprocess user in the server is publish_black_hole_snapshot; this
     helper keeps the git invocation in one place. Never uses a shell.
+
+    Uses Popen + communicate(timeout=) rather than subprocess.run so that a
+    timeout kills the whole git process tree (see _kill_process_tree). Plain
+    subprocess.run(timeout=) cannot interrupt a Windows git whose child
+    (credential manager / gpg-agent / editor) holds the captured pipe open,
+    which previously turned a 60s timeout into an unkillable 7m+ hang that
+    only ended when the operator killed the MCP server, leaving an orphan
+    "running" job. On timeout this returns (124, "", "<timeout message>") so
+    the caller records a real failure instead of a ghost.
     """
-    proc = subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True,
-        text=True, timeout=timeout,
+    proc = subprocess.Popen(
+        ["git", *args], cwd=str(cwd),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
     )
-    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, out.strip(), err.strip()
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc.pid)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:
+            out, err = "", ""
+        msg = (
+            f"git {' '.join(args)} timed out after {timeout}s and was killed. "
+            f"If this was a push/commit, a credential manager or editor child "
+            f"likely held git's pipe open. stderr so far: {(err or '').strip()}"
+        )
+        return 124, (out or "").strip(), msg
 
 
 @mcp.tool()
@@ -1918,9 +2000,16 @@ def help() -> str:
                 "llm_backend": (
                     "LLM-backed tools (red-teams, run_matcher_with_llama, "
                     "review_duplicate_candidate, review_parked, deliberation, "
-                    "future_cast, the resolution AAR) call a local llama-server "
-                    "endpoint. Check llama_server_status() if those return empty or "
-                    "timeout — the token-budget reference doc covers the empty-"
+                    "future_cast, the resolution AAR) call a local model endpoint. "
+                    "TWO backends exist: llama-server (default) and the Dream "
+                    "Engine (DiffusionGemma sidecar) — pass model='dream' (or "
+                    "'dream:<id>') to any LLM-job tool to use the latter. There is "
+                    "NO automatic fallback: if the backend a job targets is down, "
+                    "the job errors even when the other backend is up. Call "
+                    "model_endpoint_status() before LLM-heavy work (scans, "
+                    "red-teams) to see which backends are live, and pick "
+                    "explicitly. If a job returns empty or times out on a live "
+                    "backend, the token-budget reference doc covers the empty-"
                     "rationale failure mode."
                 ),
             },
@@ -2108,14 +2197,24 @@ def llama_server_status() -> str:
 
 @mcp.tool()
 def model_endpoint_status() -> str:
-    """Check the local model endpoint used by MCP-side deliberation jobs."""
+    """Check the local model endpoints used by MCP-side deliberation jobs."""
     return _json(
         {
             "default_provider": "model-agnostic",
+            "default_backend": os.environ.get("NROL_AO_LLM_BACKEND", "llama"),
             "local_endpoint": llama_client.status(),
+            "dream_endpoint": llama_client.dream_status(),
             "notes": [
                 "run_news_scan uses this endpoint for MCP-side matcher deliberation.",
                 "build_* and apply_* tools are debug/manual override surfaces, not the primary scan path.",
+                'Pass model="dream" (or "dream:<id>") to any LLM-job tool to route it '
+                "through the Dream Engine (DiffusionGemma sidecar); "
+                "NROL_AO_LLM_BACKEND=dream flips the default for all jobs.",
+                "NO automatic fallback: a job targeting a down backend errors even "
+                "if the other backend is up. Check the ok flags above and route "
+                "explicitly before LLM-heavy runs.",
+                "Job responses record which backend actually ran (backend field), "
+                "so calibration history stays attributable per model.",
             ],
         }
     )

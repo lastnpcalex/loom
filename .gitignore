@@ -13,6 +13,9 @@ env/
 *.db
 *.db-wal
 *.db-shm
+*.db.bak-*
+*.db-wal.bak-*
+*.db-shm.bak-*
 loom_cron.db*
 
 # Uploaded files
@@ -85,6 +88,11 @@ attached_*.webp
 # User config (persisted settings from UI; per-bot variants like config-Kayleighbot.json)
 config.json
 config-*.json
+
+# OneDrive sync conflicts / per-bot duplicate copies (e.g. admin-Kayleighbot.js,
+# app-Kayleighbot.js, index-Kayleighbot.html). These are OneDrive-generated
+# duplicates, not source — never track anything with the Kayleighbot suffix.
+*Kayleighbot*
 
 # Screenshots
 Screenshot*.png

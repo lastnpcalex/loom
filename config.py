@@ -25,11 +25,26 @@ _PERSISTED_KEYS = (
     "db_path",
     # Dream Hermes — DiffusionGemma GPU orchestrator sidecar (nuspy OpenAI server).
     # dream_host is the OpenAI-compatible endpoint; dream_cwd is the nuspy repo dir
-    # (holds config.json + models/ + .temp/); dream_idle_timeout_min auto-unloads
-    # the sidecar to free VRAM + system RAM when idle.
-    "dream_host", "dream_model", "dream_cwd", "dream_idle_timeout_min",
+    # (holds config.json + models/ + .temp/). dream_idle_timeout_min is disabled
+    # by default; manual unload is safer than killing long cold-start jobs.
+    "dream_host", "dream_model", "dream_cwd", "dream_server_exe",
+    "dream_model_path", "dream_context_size", "dream_diffusion_steps",
+    "dream_cuda_mmq_max_x", "dream_flash_attn", "dream_cache_type_k",
+    "dream_cache_type_v", "dream_swa_full", "dream_idle_timeout_min",
 )
 _HOST_KEYS = ("llama_host", "dream_host")
+
+
+def _normalize_host(val: str) -> str:
+    """http:// prefix + pin localhost → 127.0.0.1.
+
+    Windows resolves "localhost" IPv6-first and both local model servers
+    (llama-server and the Dream sidecar) bind IPv4-only, so every fresh TCP
+    connect via "localhost" eats a ~2s ::1 fallback before reaching them.
+    """
+    if val and not val.startswith(("http://", "https://")):
+        val = f"http://{val}"
+    return val.replace("//localhost", "//127.0.0.1") if val else val
 
 
 @dataclass
@@ -41,6 +56,17 @@ class Config:
 
     # Umans AI connection (remote, Anthropic/OpenAI-compatible endpoint)
     umans_model: str = os.getenv("UMANS_MODEL", "umans-coder")
+
+    # Prometheus cloud fallback — the always-warm incognito Hermes runtime falls
+    # back to the Umans OpenAI-compatible endpoint when no local model is up. These
+    # are env-only (install-specific, like hermes_home) so they stay out of the
+    # persisted config.json. The key env var is UMANS_API_KEY (same one claude_client
+    # reads at :893 for the Anthropic-format path); Prometheus uses the OpenAI path.
+    prometheus_cloud_base_url: str = os.getenv(
+        "UMANS_BASE_URL", "https://api.code.umans.ai/v1"
+    )
+    prometheus_cloud_model: str = os.getenv("UMANS_MODEL", "umans-glm-5.2")
+    prometheus_cloud_context: int = int(os.getenv("PROMETHEUS_CLOUD_CONTEXT", "200000"))
 
     # Llama Server binary and models directory
     llama_server_exe: str = os.getenv(
@@ -106,15 +132,37 @@ class Config:
     # --- Dream Hermes (DiffusionGemma GPU orchestrator sidecar) ---
     # Runs the nuspy OpenAI adapter (agent.openai_server) on a diffusion-capable
     # llama.cpp fork (PR #24423). The sidecar JIT-loads the NVFP4 GGUF into VRAM on
-    # first request and is killed on idle to free both VRAM and the process working
-    # set (system RAM). enable_dream is env-only like enable_hermes.
-    dream_host: str = os.getenv("DREAM_HOST", "http://localhost:8787")
-    dream_model: str = os.getenv("DREAM_MODEL", "diffusiongemma-26b-a4b-it-nvfp4.gguf")
+    # first request. enable_dream is env-only like enable_hermes. Automatic idle
+    # unload is disabled by default because it can surprise chat generations.
+    # Default 127.0.0.1 (IPv4) + 8787 (the live sidecar port). The legacy
+    # "http://localhost:18081" default was wrong on both axes: 18081 is a dead
+    # port, and "localhost" resolves IPv6-first on Windows while the sidecar
+    # listens on IPv4 only — each request ate a ~2s ::1 connect fallback.
+    # See _chat_host_for_model (llama_client.py) + _dream_openai_base_url
+    # (server.py) which both rewrite localhost->127.0.0.1 as a belt-and-braces
+    # measure, but the source default should be correct too.
+    dream_host: str = os.getenv("DREAM_HOST", "http://127.0.0.1:8787")
+    dream_model: str = os.getenv("DREAM_MODEL", "diffusiongemma-26b-a4b-it-nvfp4")
     dream_cwd: str = os.getenv(
         "DREAM_CWD",
-        r"C:\Users\exast\OneDrive\Documents\Loom-Projects\llama-diffusion",
+        r"C:\tmp\llama-diffusion-gemma-pr",
     )
-    dream_idle_timeout_min: int = int(os.getenv("DREAM_IDLE_TIMEOUT_MIN", "10"))
+    dream_server_exe: str = os.getenv(
+        "DREAM_SERVER_EXE",
+        r"C:\tmp\llama-diffusion-gemma-pr\build\bin\llama-diffusion-gemma-server.exe",
+    )
+    dream_model_path: str = os.getenv(
+        "DREAM_MODEL_PATH",
+        r"C:\Users\exast\OneDrive\Documents\Loom-Projects\llama-diffusion\models\diffusiongemma-26b-a4b-it-nvfp4.gguf",
+    )
+    dream_context_size: int = int(os.getenv("DREAM_CONTEXT_SIZE", "131072"))
+    dream_diffusion_steps: int = int(os.getenv("DREAM_DIFFUSION_STEPS", "48"))
+    dream_cuda_mmq_max_x: int = int(os.getenv("DREAM_CUDA_MMQ_MAX_X", "64"))
+    dream_flash_attn: str = os.getenv("DREAM_FLASH_ATTN", "on")
+    dream_cache_type_k: str = os.getenv("DREAM_CACHE_TYPE_K", "q8_0")
+    dream_cache_type_v: str = os.getenv("DREAM_CACHE_TYPE_V", "q8_0")
+    dream_swa_full: bool = _envbool("DREAM_SWA_FULL", False)
+    dream_idle_timeout_min: int = int(os.getenv("DREAM_IDLE_TIMEOUT_MIN", "0"))
     enable_dream: bool = _envbool("LOOM_ENABLE_DREAM", False)
 
     def hermes_executable(self) -> str:
@@ -131,10 +179,7 @@ class Config:
 
     def llama_host_url(self) -> str:
         """Return the Llama Server host URL with http:// prefix."""
-        host = self.llama_host
-        if host and not host.startswith(("http://", "https://")):
-            host = f"http://{host}"
-        return host
+        return _normalize_host(self.llama_host)
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in _PERSISTED_KEYS}
@@ -152,8 +197,8 @@ class Config:
                         val = bool(val)
                 else:
                     val = type(cur)(d[key])
-                if key in _HOST_KEYS and val and not val.startswith(("http://", "https://")):
-                    val = f"http://{val}"
+                if key in _HOST_KEYS:
+                    val = _normalize_host(val)
                 setattr(self, key, val)
         self.save()
 
@@ -184,8 +229,8 @@ class Config:
                         val = bool(val)
                 else:
                     val = type(cur)(saved[key])
-                if key in _HOST_KEYS and val and not val.startswith(("http://", "https://")):
-                    val = f"http://{val}"
+                if key in _HOST_KEYS:
+                    val = _normalize_host(val)
                 setattr(self, key, val)
             print(f"[CONFIG] Loaded settings from config.json")
         except FileNotFoundError:

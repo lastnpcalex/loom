@@ -1,10 +1,16 @@
-"""Standalone test: Run the OODA two-pass loop against live Llama Server.
+"""Standalone test: Run the OODA loop against live Llama Server (single-pass + optional second pass on failure).
 
 Usage:
     python test_ooda_live.py
 
 Requires Llama Server running with a model (see config.llama_model).
 Creates a temporary conversation in the DB, seeds state cards, runs the loop, prints results.
+
+NOTE: The production path (_handle_ooda_generation in server.py) now runs
+single-pass with repair_ooda_block as the first fallback when parse_ooda_block
+returns None, and only fires a second sync_chat pass when repair also fails AND
+no prose was extracted. The two-pass branch below is retained as an integration
+exploration of the second-pass path.
 """
 
 import asyncio

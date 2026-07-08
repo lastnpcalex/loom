@@ -109,6 +109,41 @@ def _llama_host() -> str:
     return config.llama_host_url()
 
 
+def _model_matches(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    def norm(s: str) -> str:
+        s = Path(str(s)).name.lower()
+        if s.endswith(".gguf"):
+            s = s[:-5]
+        return "".join(c for c in s if c.isalnum())
+    na = norm(a)
+    nb = norm(b)
+    return na == nb or na in nb or nb in na
+
+
+def _is_dream_model(model: str | None) -> bool:
+    return bool(model and getattr(config, "dream_model", "") and _model_matches(model, config.dream_model))
+
+
+def _chat_host_for_model(model: str | None) -> str:
+    if _is_dream_model(model):
+        # Default to the real sidecar port (8787). The legacy 18081 port survives
+        # only in config.py's env default; if DREAM_HOST is unset, falling back to
+        # 18081 sends Weave (sync_chat / stream_chat OODA passes) to a dead port.
+        host = getattr(config, "dream_host", "") or "http://127.0.0.1:8787"
+        if host and not host.startswith(("http://", "https://")):
+            host = f"http://{host}"
+        # localhost -> 127.0.0.1: the DiffusionGemma sidecar listens on IPv4 only,
+        # but Windows resolves "localhost" IPv6-first, so every HTTP request eats a
+        # ~2s ::1 connect fallback. Weave makes several requests per turn (OODA
+        # pass + repair pass), so this compounds. Mirrors _dream_openai_base_url
+        # in server.py — keep both rewrites in lockstep.
+        host = host.replace("//localhost", "//127.0.0.1")
+        return host.rstrip("/")
+    return _llama_host()
+
+
 def _parse_image_paths(image_path) -> list[str]:
     """Parse image_path: handles single string, JSON array string, or list."""
     if not image_path:
@@ -310,14 +345,15 @@ async def stream_chat(
       {"type": "usage", "input_tokens": N, "output_tokens": N} as the final event.
     """
     global _mock_mode
-    if _mock_mode:
+    raw_model = model or config.llama_model
+    if _mock_mode and not _is_dream_model(raw_model):
         print("[LLAMA] WARNING: running in MOCK MODE")
         async for tok in _mock_stream(messages):
             yield tok
         return
-
-    target_model = _resolve_model(model or config.llama_model)
-    print(f"[LLAMA] Sending {len(messages)} messages to {target_model}")
+    target_model = config.dream_model if _is_dream_model(raw_model) else _resolve_model(raw_model)
+    chat_host = _chat_host_for_model(raw_model)
+    print(f"[LLAMA] Sending {len(messages)} messages to {target_model} via {chat_host}")
 
     effective_max = max_tokens or config.max_tokens
     win = verbatim_window if verbatim_window is not None else config.verbatim_window
@@ -333,11 +369,14 @@ async def stream_chat(
         "repeat_penalty": repeat_penalty if repeat_penalty is not None else config.repeat_penalty,
     }
 
+    # Dream sidecar cold-loads (JIT load of the 17GB NVFP4 GGUF) can exceed the
+    # default 300s timeout. Mirror dream_client.REQUEST_TIMEOUT (600s) for dream.
+    _stream_timeout = 600.0 if _is_dream_model(raw_model) else 300.0
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(_stream_timeout, connect=10.0)) as client:
             async with client.stream(
                 "POST",
-                f"{_llama_host()}/v1/chat/completions",
+                f"{chat_host}/v1/chat/completions",
                 json=payload,
                 headers={"Accept": "text/event-stream"},
             ) as response:
@@ -407,7 +446,7 @@ async def stream_chat(
                 }
                 return
     except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as e:
-        raise RuntimeError(f"Cannot reach Llama Server at {_llama_host()}: {e}")
+        raise RuntimeError(f"Cannot reach local chat backend at {chat_host}: {e}")
 
 
 async def sync_chat(
@@ -419,10 +458,13 @@ async def sync_chat(
 ) -> str:
     """Non-streaming chat completion (summarization, OODA passes, etc.)."""
     global _mock_mode
-    if _mock_mode:
+    raw_model = model or config.llama_model
+    # Dream backend is independent — don't skip it because the local llama server
+    # fell into mock mode. Dream failures re-raise rather than setting _mock_mode.
+    if _mock_mode and not _is_dream_model(raw_model):
         return "Summary: The conversation continues with escalating tension and mutual wariness."
-
-    target_model = _resolve_model(model or config.llama_model)
+    target_model = config.dream_model if _is_dream_model(raw_model) else _resolve_model(raw_model)
+    chat_host = _chat_host_for_model(raw_model)
     payload = {
         "model": target_model,
         "messages": _build_messages(messages, verbatim_window=config.verbatim_window),
@@ -433,9 +475,12 @@ async def sync_chat(
     if think is not None:
         payload["chat_template_kwargs"] = {"enable_thinking": bool(think)}
 
+    # Dream sidecar cold-loads can exceed the default 300s timeout; mirror
+    # dream_client.REQUEST_TIMEOUT (600s) for dream models (OODA sync passes).
+    _sync_timeout = 600.0 if _is_dream_model(raw_model) else 300.0
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
-            resp = await client.post(f"{_llama_host()}/v1/chat/completions", json=payload)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(_sync_timeout, connect=10.0)) as client:
+            resp = await client.post(f"{chat_host}/v1/chat/completions", json=payload)
             resp.raise_for_status()
             data = resp.json()
             choices = data.get("choices") or []
@@ -443,7 +488,11 @@ async def sync_chat(
                 return ""
             msg = choices[0].get("message") or {}
             return msg.get("content") or msg.get("reasoning_content") or ""
-    except (httpx.ConnectError, httpx.ConnectTimeout, OSError):
+    except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as _e:
+        if _is_dream_model(raw_model):
+            raise RuntimeError(
+                f"Dream sidecar unreachable at {chat_host} — is DiffusionGemma running?"
+            ) from _e
         _mock_mode = True
         return "Summary: The conversation continues with escalating tension and mutual wariness."
 

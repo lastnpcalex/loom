@@ -19,6 +19,13 @@ import database as db
 import hermes_client
 
 
+@pytest.fixture(autouse=True)
+async def _clean_hermes_runtimes():
+    await hermes_client.shutdown_hermes_runtimes()
+    yield
+    await hermes_client.shutdown_hermes_runtimes()
+
+
 # --------------------------------------------------------------------------- #
 # Fake asyncio subprocess
 # --------------------------------------------------------------------------- #
@@ -167,8 +174,7 @@ async def test_run_hermes_translates_a_turn(monkeypatch):
     """initialize -> session/new -> a thought chunk, a text chunk, a tool round-trip,
     a usage_update, then session/prompt returns. run_hermes should yield the
     expected Loom event types in order."""
-    frames = [
-        _INIT_RESP, _NEW_RESP,
+    prompt_frames = [
         _su({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "hmm"}}),
         _su({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Hello"}}),
         _su({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": " world"}}),
@@ -179,7 +185,22 @@ async def test_run_hermes_translates_a_turn(monkeypatch):
         _su({"sessionUpdate": "usage_update", "size": 65536, "used": 2048}),
         _PROMPT_RESP,
     ]
-    factory, proc = _make_fake_subprocess(frames)
+    fake_proc_holder = {}
+
+    def _on_stdin_write(data: bytes) -> None:
+        req = json.loads(data.decode("utf-8"))
+        proc = fake_proc_holder.get("proc")
+        if proc is None:
+            return
+        if req.get("method") == "session/new":
+            proc.stdout.feed_line(_NEW_RESP)
+        elif req.get("method") == "session/prompt":
+            for frame in prompt_frames:
+                proc.stdout.feed_line(frame)
+            proc.stdout.feed_eof()
+
+    factory, proc = _make_fake_subprocess([_INIT_RESP], stdin_on_write=_on_stdin_write, feed_eof=False)
+    fake_proc_holder["proc"] = proc
     monkeypatch.setattr(asyncio, "create_subprocess_exec", factory)
 
     got_proc, stream = await hermes_client.run_hermes(
@@ -207,6 +228,65 @@ async def test_run_hermes_translates_a_turn(monkeypatch):
     assert result_evt["stop_reason"] == "end_turn"
     usage_evts = [e for e in events if e["type"] == "usage"]
     assert usage_evts and usage_evts[-1]["output_tokens"] == 56
+
+
+async def test_run_hermes_reuses_persistent_runtime(monkeypatch):
+    """Two turns for the same Hermes home/exe should share one ACP process."""
+    factory_calls = 0
+    prompts_seen = 0
+    fake_proc_holder = {}
+
+    def _resp(req: dict, result: dict) -> bytes:
+        return _frame({"jsonrpc": "2.0", "id": req["id"], "result": result})
+
+    def _on_stdin_write(data: bytes) -> None:
+        nonlocal prompts_seen
+        req = json.loads(data.decode("utf-8"))
+        proc = fake_proc_holder.get("proc")
+        if proc is None:
+            return
+        method = req.get("method")
+        if method == "session/new":
+            proc.stdout.feed_line(_resp(req, {
+                "sessionId": f"sess-{req['id']}",
+                "models": {"availableModels": [], "currentModelId": "custom:qwen3.6:27b"},
+            }))
+        elif method == "session/prompt":
+            prompts_seen += 1
+            proc.stdout.feed_line(_su({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": f"turn-{prompts_seen}"},
+            }, session_id=f"sess-{req['id']}"))
+            proc.stdout.feed_line(_resp(req, {
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+            }))
+
+    async def _factory(*args, **kwargs):
+        nonlocal factory_calls
+        factory_calls += 1
+        stdout = _FakeStreamReader()
+        stderr = _FakeStreamReader()
+        stderr.feed_eof()
+        stdin = _FakeStreamWriter(on_write=_on_stdin_write)
+        proc = _FakeProc(stdin, stdout, stderr)
+        fake_proc_holder["proc"] = proc
+        stdout.feed_line(_INIT_RESP)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _factory)
+
+    proc1, stream1 = await hermes_client.run_hermes(
+        "one", conv_id=1, model=None, cwd=".", loom_port=3001, hermes_exe="hermes")
+    events1 = [e async for e in stream1]
+    proc2, stream2 = await hermes_client.run_hermes(
+        "two", conv_id=1, model=None, cwd=".", loom_port=3001, hermes_exe="hermes")
+    events2 = [e async for e in stream2]
+
+    assert proc1 is proc2
+    assert factory_calls == 1
+    assert [e["text"] for e in events1 if e["type"] == "text_delta"] == ["turn-1"]
+    assert [e["text"] for e in events2 if e["type"] == "text_delta"] == ["turn-2"]
 
 
 async def test_permission_bridge_does_not_block_stream(monkeypatch):
@@ -248,12 +328,6 @@ async def test_permission_bridge_does_not_block_stream(monkeypatch):
                                   "options": [
                                       {"optionId": "allow_once", "kind": "allow_once", "name": "Allow once"},
                                       {"optionId": "deny", "kind": "reject_once", "name": "Deny"}]}})
-    frames = [
-        _INIT_RESP, _NEW_RESP,
-        _su({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "before"}}),
-        perm_req,
-        _su({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "after"}}),
-    ]
     stdin_writes: list[bytes] = []
 
     # When the bridge's reply for id 99 lands on stdin, let the "agent" finish.
@@ -261,13 +335,21 @@ async def test_permission_bridge_does_not_block_stream(monkeypatch):
 
     def _on_stdin_write(data: bytes) -> None:
         stdin_writes.append(data)
-        if b'"id": 99' in data or b'"id":99' in data:
-            proc = fake_proc_holder.get("proc")
-            if proc is not None:
-                proc.stdout.feed_line(_PROMPT_RESP)
-                proc.stdout.feed_eof()
+        proc = fake_proc_holder.get("proc")
+        if proc is None:
+            return
+        req = json.loads(data.decode("utf-8"))
+        if req.get("method") == "session/new":
+            proc.stdout.feed_line(_NEW_RESP)
+        elif req.get("method") == "session/prompt":
+            proc.stdout.feed_line(_su({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "before"}}))
+            proc.stdout.feed_line(perm_req)
+            proc.stdout.feed_line(_su({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "after"}}))
+        elif req.get("id") == 99:
+            proc.stdout.feed_line(_PROMPT_RESP)
+            proc.stdout.feed_eof()
 
-    factory, proc = _make_fake_subprocess(frames, stdin_on_write=_on_stdin_write, feed_eof=False)
+    factory, proc = _make_fake_subprocess([_INIT_RESP], stdin_on_write=_on_stdin_write, feed_eof=False)
     fake_proc_holder["proc"] = proc
     monkeypatch.setattr(asyncio, "create_subprocess_exec", factory)
 
@@ -301,3 +383,48 @@ async def test_permission_bridge_does_not_block_stream(monkeypatch):
     assert reply["id"] == 99
     assert reply["result"]["outcome"]["outcome"] == "selected"
     assert reply["result"]["outcome"]["optionId"] == "allow_once"
+
+
+# --------------------------------------------------------------------------- #
+# is_first_turn / context-duplication regression (RC1)
+# --------------------------------------------------------------------------- #
+# On a resume turn, session/fork already populated Hermes' server-side session
+# with the conversation history. Re-injecting <loom_branch_info> (which carries
+# a 100-char preview of EVERY branch message) would feed the model every prior
+# message twice. Callers pass is_first_turn=(not use_resume); this locks that
+# _prepare_hermes_prompt honors the flag and returns the bare prompt when False.
+
+async def test_prepare_hermes_prompt_first_turn_injects_branch_info():
+    """is_first_turn=True wraps the prompt with contract + branch_info."""
+    branch = [
+        {"id": 1, "parent_id": None, "role": "user", "content": "hello"},
+        {"id": 2, "parent_id": 1, "role": "assistant", "content": "hi there"},
+    ]
+    out = hermes_client._prepare_hermes_prompt(
+        "do the thing", branch=branch, model="custom:diffusiongemma-26b",
+        is_first_turn=True,
+    )
+    assert "<loom_branch_info>" in out
+    assert "<user_task>" in out
+    assert "do the thing" in out
+
+
+async def test_prepare_hermes_prompt_resume_turn_is_bare():
+    """is_first_turn=False returns the bare prompt — no branch_info, no contract.
+
+    This is the RC1 fix: a forked session already holds the history server-side,
+    so the model must NOT see <loom_branch_info> again.
+    """
+    branch = [
+        {"id": 1, "parent_id": None, "role": "user", "content": "hello"},
+        {"id": 2, "parent_id": 1, "role": "assistant", "content": "hi there"},
+    ]
+    out = hermes_client._prepare_hermes_prompt(
+        "do the next thing", branch=branch, model="custom:diffusiongemma-26b",
+        is_first_turn=False,
+    )
+    # Bare prompt only — no duplication of branch history into the model context.
+    assert out == "do the next thing"
+    assert "<loom_branch_info>" not in out
+    assert "<loom_agent_contract>" not in out
+    assert "<dream_tooling_rules>" not in out

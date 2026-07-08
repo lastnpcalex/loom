@@ -193,6 +193,41 @@ def _evidence(text: str = "", **extra) -> dict:
     }
 
 
+def _valid_debate_outputs(indices=(1,)) -> list[str]:
+    advocate = ""
+    rebut = ""
+    jury = ""
+    for idx in indices:
+        advocate += (
+            f"ADVOCATE\nARTICLE: A{idx}\nVERDICT: COMMIT\n"
+            "PROPOSED_ACTION: PARK\nCITE: fixture\n"
+            "INFERENCE: none\nREASON: fixture debate\n"
+        )
+        rebut += (
+            f"REBUT\nARTICLE: A{idx}\nVERDICT: COMMIT\n"
+            "OBJECTION: none\nCORRECTED_ACTION: PARK\n"
+            "REASON: fixture rebuttal\n"
+        )
+        jury += (
+            f"JURY\nARTICLE: A{idx}\nVERDICT: COMMIT\n"
+            "RATIONALE: fixture jury\n"
+        )
+    return [advocate, rebut, jury]
+
+
+def _chat_sequence(*texts: str):
+    calls = {"n": 0}
+
+    def fake_chat(*a, **k):
+        idx = min(calls["n"], len(texts) - 1)
+        calls["n"] += 1
+        return {"text": texts[idx], "model": "test-llm", "host": "local",
+                "backend": "llama", "finish_reason": "stop", "reasoning_chars": 0}
+
+    fake_chat.calls = calls
+    return fake_chat
+
+
 def _submit(nrol, **kwargs) -> dict:
     # Capability tests probe the engine/gate machinery directly; the
     # deliberation gate is waived by default here and exercised explicitly
@@ -757,7 +792,7 @@ def test_safe_policy_scan_parks_and_files_proposals(nrol, topic_path, monkeypatc
     )
     monkeypatch.setattr(
         nrol.llama_client, "chat",
-        lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local"},
+        _chat_sequence("canned", *_valid_debate_outputs((1, 2))),
     )
     fw = nrol._import_from_repo("framework.news_observation_pipeline")
     monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
@@ -1828,8 +1863,7 @@ def test_THE_LOOP_parked_evidence_moves_posteriors_end_to_end(nrol, topic_path, 
     monkeypatch.setattr(nrol, "_fetch_article_excerpt", lambda url, mc, **kw: "")
     monkeypatch.setattr(
         nrol.llama_client, "chat",
-        lambda *a, **k: {"text": "canned", "model": "t", "host": "l",
-                         "finish_reason": "stop", "reasoning_chars": 0},
+        _chat_sequence("canned", *_valid_debate_outputs((1,))),
     )
     fw = nrol._import_from_repo("framework.news_observation_pipeline")
     monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
@@ -2488,8 +2522,7 @@ def test_review_parked_timestamps_without_clearing(nrol, topic_path, monkeypatch
     )
     monkeypatch.setattr(
         nrol.llama_client, "chat",
-        lambda *a, **k: {"text": "canned", "model": "test-llm", "host": "local",
-                         "finish_reason": "stop", "reasoning_chars": 0},
+        _chat_sequence("canned", *_valid_debate_outputs((1, 2))),
     )
     fw = nrol._import_from_repo("framework.news_observation_pipeline")
     monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
@@ -2537,8 +2570,11 @@ def test_review_parked_cross_day_duplicate_suppresses_proposal(nrol, topic_path,
         lambda url, max_chars, **kw: "FULL TEXT: event A confirmed at threshold.")
     # The semantic duplicate judge returns DUPLICATE_OF for the cross-day check.
     monkeypatch.setattr(nrol.llama_client, "chat",
-        lambda *a, **k: {"text": "VERDICT: DUPLICATE_OF ev_prior\nREASON: same launch, different outlet",
-                         "model": "test-llm", "host": "local", "finish_reason": "stop"})
+        _chat_sequence(
+            "canned",
+            *_valid_debate_outputs((1,)),
+            "VERDICT: DUPLICATE_OF ev_prior\nREASON: same launch, different outlet",
+        ))
     fw = nrol._import_from_repo("framework.news_observation_pipeline")
     monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
         {"idx": 1, "action": {"kind": "FIRE", "indicator_id": "ind_binary_mild"},
@@ -2576,8 +2612,11 @@ def test_review_parked_cross_day_unique_still_files(nrol, topic_path, monkeypatc
     monkeypatch.setattr(nrol, "_fetch_article_excerpt",
         lambda url, max_chars, **kw: "FULL TEXT: event A confirmed at threshold.")
     monkeypatch.setattr(nrol.llama_client, "chat",
-        lambda *a, **k: {"text": "VERDICT: UNIQUE_EVENT\nREASON: genuinely new event",
-                         "model": "test-llm", "host": "local", "finish_reason": "stop"})
+        _chat_sequence(
+            "canned",
+            *_valid_debate_outputs((1,)),
+            "VERDICT: UNIQUE_EVENT\nREASON: genuinely new event",
+        ))
     fw = nrol._import_from_repo("framework.news_observation_pipeline")
     monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
         {"idx": 1, "action": {"kind": "FIRE", "indicator_id": "ind_binary_mild"},
@@ -2609,7 +2648,7 @@ def test_schema_change_makes_reviewed_items_due_again(nrol, topic_path, monkeypa
         {"idx": 1, "action": {"kind": "PARK"}, "tag": "EVENT",
          "claim": "nothing", "reason": "no threshold"},
     ])
-    out = json.loads(nrol.review_parked(slug=SLUG, dry_run=False))
+    out = json.loads(nrol.review_parked(slug=SLUG, dry_run=False, deliberate=False))
     assert "error" not in out, out
     assert out["debt_after"]["due_count"] == 0
 
@@ -2620,7 +2659,7 @@ def test_schema_change_makes_reviewed_items_due_again(nrol, topic_path, monkeypa
     first_tier[0]["desc"] = first_tier[0]["desc"] + " (threshold revised)"
     topic_path.write_text(json.dumps(topic, indent=2), encoding="utf-8")
 
-    again = json.loads(nrol.review_parked(slug=SLUG, dry_run=True))
+    again = json.loads(nrol.review_parked(slug=SLUG, dry_run=True, deliberate=False))
     assert again["considered"] >= 1
     status = json.loads(nrol.topic_status(slugs=[SLUG]))
     debt = status["topics"][0]["parkedReviewDebt"]
@@ -3044,6 +3083,141 @@ def test_scan_debate_failure_leaves_window_open(nrol, topic_path, monkeypatch):
 
     topic_after = _disk_topic(topic_path)
     assert topic_after.get("meta", {}).get("lastScanned") == last_scanned_before
+
+
+def test_debate_empty_advocate_output_fails_closed(nrol, topic_path, monkeypatch):
+    """A reasoning model that emits only thought-channel content must not mint
+    a NO_BLOCK deliberation stamp."""
+    news = nrol._import_from_repo("framework.news_observation_pipeline")
+    topic = _disk_topic(topic_path)
+    articles = [{
+        "headline": "Metric print",
+        "url": "https://example.test/debate-empty-advocate",
+        "source": "test-wire",
+        "date": "2026-06-10",
+        "relevance": "metric reported at 55 percent",
+    }]
+    decisions = [{
+        "idx": 1,
+        "action": {"kind": "PARK"},
+        "claim": "metric reported",
+        "reason": "strict matcher unsure",
+    }]
+
+    monkeypatch.setattr(
+        nrol.llama_client,
+        "chat",
+        lambda *a, **k: {"text": "", "model": "dream", "backend": "dream",
+                         "finish_reason": "length", "reasoning_chars": 8192},
+    )
+
+    overrides, packet = nrol._run_debate(
+        topic, articles, decisions, news,
+        model="dream", temperature=0.2, max_tokens=4096, timeout_sec=600,
+    )
+
+    assert overrides == {}
+    assert packet["advocate_proposals"] == 0
+    assert "error" in packet
+    assert "advocate returned no content" in packet["error"]
+    assert "finish_reason=length" in packet["error"]
+    assert nrol._deliberation_stamp_from_debate(decisions[0], packet) == {}
+
+
+def test_debate_unparseable_rebut_output_fails_closed(nrol, topic_path, monkeypatch):
+    """A rebuttal stage that emits prose instead of REBUT blocks is a parser
+    failure, not a valid zero-objection rebuttal."""
+    news = nrol._import_from_repo("framework.news_observation_pipeline")
+    topic = _disk_topic(topic_path)
+    articles = [{
+        "headline": "Metric print",
+        "url": "https://example.test/debate-bad-rebut",
+        "source": "test-wire",
+        "date": "2026-06-10",
+        "relevance": "metric reported at 55 percent",
+    }]
+    decisions = [{
+        "idx": 1,
+        "action": {"kind": "PARK"},
+        "claim": "metric reported",
+        "reason": "strict matcher unsure",
+    }]
+    stage_outputs = [
+        "ADVOCATE\nARTICLE: A1\nVERDICT: ARGUE_MOVE\n"
+        "PROPOSED_ACTION: OBSERVE ind_observable_metric AT 55\n"
+        "CITE: 55 percent\nINFERENCE: none\nREASON: direct metric\n",
+        "The advocate seems mostly right, but I am not using the required format.",
+    ]
+    calls = {"n": 0}
+
+    def staged_chat(*a, **k):
+        text = stage_outputs[calls["n"]]
+        calls["n"] += 1
+        return {"text": text, "model": "test-llm", "backend": "llama",
+                "finish_reason": "stop", "reasoning_chars": 0}
+
+    monkeypatch.setattr(nrol.llama_client, "chat", staged_chat)
+
+    overrides, packet = nrol._run_debate(
+        topic, articles, decisions, news,
+        model="", temperature=0.2, max_tokens=4096, timeout_sec=600,
+    )
+
+    assert overrides == {}
+    assert calls["n"] == 2
+    assert packet["advocate_proposals"] == 1
+    assert packet["rebuttals"] == 0
+    assert "rebut returned no parseable REBUT blocks" in packet["error"]
+    assert nrol._deliberation_stamp_from_debate(decisions[0], packet) == {}
+
+
+def test_debate_empty_jury_output_fails_closed(nrol, topic_path, monkeypatch):
+    """A missing jury verdict is not equivalent to NO_BLOCK."""
+    news = nrol._import_from_repo("framework.news_observation_pipeline")
+    topic = _disk_topic(topic_path)
+    articles = [{
+        "headline": "Metric print",
+        "url": "https://example.test/debate-empty-jury",
+        "source": "test-wire",
+        "date": "2026-06-10",
+        "relevance": "metric reported at 55 percent",
+    }]
+    decisions = [{
+        "idx": 1,
+        "action": {"kind": "PARK"},
+        "claim": "metric reported",
+        "reason": "strict matcher unsure",
+    }]
+    stage_outputs = [
+        "ADVOCATE\nARTICLE: A1\nVERDICT: ARGUE_MOVE\n"
+        "PROPOSED_ACTION: OBSERVE ind_observable_metric AT 55\n"
+        "CITE: 55 percent\nINFERENCE: none\nREASON: direct metric\n",
+        "REBUT\nARTICLE: A1\nVERDICT: COMMIT\n"
+        "OBJECTION:\nCORRECTED_ACTION:\nREASON: citation is sound\n",
+        "",
+    ]
+    calls = {"n": 0}
+
+    def staged_chat(*a, **k):
+        text = stage_outputs[calls["n"]]
+        calls["n"] += 1
+        return {"text": text, "model": "dream", "backend": "dream",
+                "finish_reason": "length" if not text else "stop",
+                "reasoning_chars": 9000 if not text else 0}
+
+    monkeypatch.setattr(nrol.llama_client, "chat", staged_chat)
+
+    overrides, packet = nrol._run_debate(
+        topic, articles, decisions, news,
+        model="dream", temperature=0.2, max_tokens=4096, timeout_sec=600,
+    )
+
+    assert overrides == {}
+    assert calls["n"] == 3
+    assert packet["rebuttals"] == 1
+    assert "jury returned no content" in packet["error"]
+    assert packet["jury_verdicts"] == {}
+    assert nrol._deliberation_stamp_from_debate(decisions[0], packet) == {}
 
 
 def test_review_parked_debate_failure_aborts_without_recording(nrol, topic_path, monkeypatch):
@@ -3847,3 +4021,227 @@ def test_publish_black_hole_snapshot_push_when_ungated(
     assert "surfaces/nrol-ao/data.json" in remote_log
 
 
+
+
+# ── LLM backend routing ──
+# Invariant: chat() must route through resolve_backend(), so model="dream"
+# reaches the Dream Engine and plain models reach llama-server. Guards the
+# "helper exists but nothing calls it" failure mode this wiring shipped with.
+
+
+def test_resolve_backend_maps_dream_and_llama(monkeypatch):
+    from mcp_servers.nrol_ao import llama as lc
+
+    monkeypatch.delenv("NROL_AO_LLM_BACKEND", raising=False)
+    backend, host, _ = lc.resolve_backend("dream")
+    assert backend == "dream"
+    assert host == lc.dream_host()
+
+    backend, _, model = lc.resolve_backend("dream:explicit-id")
+    assert backend == "dream"
+    assert model == "explicit-id"
+
+    backend, host, _ = lc.resolve_backend("some.gguf")
+    assert backend == "llama"
+    assert host == lc.llama_host()
+
+    monkeypatch.setenv("NROL_AO_LLM_BACKEND", "dream")
+    backend, _, _ = lc.resolve_backend("")
+    assert backend == "dream"
+
+
+def test_chat_routes_dream_model_to_dream_host(monkeypatch):
+    from mcp_servers.nrol_ao import llama as lc
+
+    seen = {}
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"},
+                                 "finish_reason": "stop"}]}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, json=None):
+            seen["url"] = url
+            seen["model"] = (json or {}).get("model")
+            return _FakeResponse()
+
+    monkeypatch.delenv("NROL_AO_LLM_BACKEND", raising=False)
+    monkeypatch.setattr(lc.httpx, "Client", _FakeClient)
+
+    out = lc.chat("hi", model="dream")
+    assert out["backend"] == "dream"
+    assert seen["url"].startswith(lc.dream_host())
+    assert seen["model"] == lc.dream_model()
+
+    out = lc.chat("hi", model="")
+    assert out["backend"] == "llama"
+    assert seen["url"].startswith(lc.llama_host())
+
+
+def test_chat_strips_dream_channel_tags_from_content(monkeypatch):
+    """DiffusionGemma's nuspy adapter can leak the reasoning channel into
+    message.content as <|channel>thought...<channel|> markup. chat() must
+    strip it on the dream backend so structured-output parsers see clean
+    text, and must fold the extracted thought into reasoning_chars."""
+    from mcp_servers.nrol_ao import llama as lc
+
+    leaked_content = (
+        "<|channel>thought I should consider the article carefully<channel|>"
+        "DECISION\nARTICLE: A1\nACTION: PARK\nREASON: threshold not met"
+    )
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": leaked_content},
+                                 "finish_reason": "stop"}]}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, json=None):
+            return _FakeResponse()
+
+    monkeypatch.setattr(lc.httpx, "Client", _FakeClient)
+
+    out = lc.chat("hi", model="dream")
+    assert out["backend"] == "dream"
+    assert "<|channel>" not in out["text"], out["text"]
+    assert "<channel|>" not in out["text"], out["text"]
+    assert out["text"].startswith("DECISION"), out["text"]
+    # The leaked thought must be reflected in reasoning_chars (not dropped).
+    assert out["reasoning_chars"] > 0, out
+    assert "consider the article carefully" not in out["text"]
+
+
+def test_chat_dream_always_budgets_for_thought_channel(monkeypatch):
+    """On the dream backend, disable_thinking can't suppress reasoning
+    (DiffusionGemma ignores chat_template_kwargs). chat() must instead bump
+    max_tokens so the thought channel doesn't starve content into
+    finish_reason=length, and must NOT send the Qwen-specific kwarg."""
+    from mcp_servers.nrol_ao import llama as lc
+
+    seen = {}
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"},
+                                 "finish_reason": "stop"}]}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, json=None):
+            seen["payload"] = json
+            return _FakeResponse()
+
+    monkeypatch.setattr(lc.httpx, "Client", _FakeClient)
+
+    lc.chat("hi", model="dream", disable_thinking=True, max_tokens=2048)
+    payload = seen["payload"]
+    # Thought budget applied — max_tokens must exceed the caller's 2048.
+    assert payload["max_tokens"] > 2048, payload
+    # Qwen-specific kwarg must NOT be sent to DiffusionGemma.
+    assert "chat_template_kwargs" not in payload, payload
+
+    # Deliberation calls use disable_thinking=False; Dream still needs the
+    # thought-channel budget in that mode. The budget is operator-tunable.
+    seen.clear()
+    monkeypatch.setenv("NROL_AO_DREAM_THOUGHT_BUDGET", "512")
+    lc.chat("hi", model="dream", disable_thinking=False, max_tokens=2048)
+    payload = seen["payload"]
+    assert payload["max_tokens"] == 2560, payload
+    assert "chat_template_kwargs" not in payload, payload
+
+    # Sanity check: on the llama backend, disable_thinking still sends the
+    # kwarg and does NOT bump max_tokens.
+    seen.clear()
+    lc.chat("hi", model="", disable_thinking=True, max_tokens=2048)
+    payload = seen["payload"]
+    assert payload["max_tokens"] == 2048, payload
+    assert payload.get("chat_template_kwargs") == {"enable_thinking": False}, payload
+
+
+def test_matcher_parses_cleanly_when_dream_leaks_thoughts(nrol, topic_path, monkeypatch):
+    """End-to-end: when the dream backend leaks <|channel>thought...<channel|>
+    markup into matcher output, the channel-tag stripping in chat() must leave
+    parse_matcher_output with clean DECISION blocks it can parse. Proves the
+    fix works at a real call site, not just the client layer."""
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    real_parser = fw.parse_matcher_output
+
+    # Simulate DiffusionGemma leaking a thought channel before the DECISION
+    # block. This is the exact corruption shape that would silently produce
+    # decisions == [] without the chat() fix.
+    leaked_matcher_text = (
+        "<|channel>thought A1 is about a binary indicator firing<channel|>"
+        "DECISION\n"
+        "ARTICLE: A1\n"
+        "ACTION: PARK\n"
+        "TAG: EVENT\n"
+        "CLAIM: event A confirmed\n"
+        "REASON: threshold not met yet\n"
+    )
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": leaked_matcher_text},
+                                 "finish_reason": "stop"}]}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, json=None):
+            return _FakeResponse()
+
+    monkeypatch.setattr(nrol.llama_client.httpx, "Client", _FakeClient)
+
+    out = nrol.llama_client.chat("matcher prompt", model="dream")
+    # The stripped text must parse to a real decision, not [].
+    decisions = real_parser(out["text"])
+    assert len(decisions) == 1, (decisions, out["text"])
+    assert decisions[0]["idx"] == 1, decisions
+    assert decisions[0]["action"]["kind"] == "PARK", decisions
+    assert "<|channel>" not in out["text"], out["text"]

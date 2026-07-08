@@ -709,3 +709,386 @@ def test_codex_client_resume_and_fork(tmp_path):
     assert method == "thread/start"
     assert params["sessionStartSource"] == "startup"
     assert params["threadSource"] == "user"
+
+
+# --------------------------------------------------------------------------- #
+# Dream/Hermes cross-mode session isolation (RC2)
+# --------------------------------------------------------------------------- #
+# The resume walk in _handle_dream_generation must skip a cc_session_id whose
+# cc_session_mode is non-NULL and not "dream" — a Hermes (llama) session id is
+# meaningless in the Dream home's state.db, and forking it there is how a
+# foreign conversation's tree leaks into a Dream session. NULL mode = legacy,
+# treated as compatible so existing conversations keep resuming.
+
+async def test_dream_resume_walk_skips_foreign_mode_session(monkeypatch):
+    """A branch carrying a Hermes-mode session id must NOT be forked for Dream."""
+    import server
+    import database as db
+
+    conv = await db.create_conversation("Dream Isolation", mode="dream", project_dir=".")
+    u1 = await db.add_message(conv["id"], "user", "first turn")
+    # Prior assistant message tagged as a HERMES session — e.g. the conv was
+    # run as Hermes mode before being switched to Dream.
+    a1 = await db.add_message(
+        conv["id"], "assistant", "hermes reply", parent_id=u1["id"],
+        cc_session_id="hermes-sess-1",
+    )
+    await db.update_message_content(a1["id"], cc_session_mode="hermes")
+    u2 = await db.add_message(conv["id"], "user", "dream turn", parent_id=a1["id"])
+
+    captured: dict = {}
+
+    async def fake_run_hermes(prompt, *args, **kwargs):
+        captured["prompt"] = prompt
+        captured["kwargs"] = kwargs
+        captured["resume_session_id"] = kwargs.get("resume_session_id")
+        captured["is_first_turn"] = kwargs.get("is_first_turn", True)
+
+        class _Proc:
+            returncode = 0
+            pid = 4321
+            async def wait(self):
+                return 0
+
+        async def _events():
+            yield {"type": "session_info", "session_id": "dream-sess-new",
+                   "model": "diffusiongemma"}
+            yield {"type": "text_delta", "text": "dream reply"}
+            yield {"type": "result", "session_id": "dream-sess-new",
+                   "stop_reason": "end_turn", "duration_ms": 10, "num_turns": 1}
+
+        return _Proc(), _events()
+
+    monkeypatch.setattr(server.hermes_client, "run_hermes", fake_run_hermes)
+    # Avoid touching the filesystem for Dream home creation.
+    monkeypatch.setattr(server, "_ensure_dream_hermes_home", lambda: "/tmp/dream-home")
+
+    await server._handle_dream_generation(
+        websocket=None,
+        conv_id=conv["id"],
+        conv=await db.get_conversation(conv["id"]),
+        data={"action": "generate", "parent_id": u2["id"]},
+    )
+
+    # The Hermes-mode session id was skipped → no resume, fresh session/new,
+    # and is_first_turn must be True (full orientation for the fresh session).
+    assert captured["resume_session_id"] is None, (
+        "Dream resume walk forked a foreign-mode (hermes) session id — "
+        "this is the cross-context leak. resume_session_id should be None."
+    )
+    assert captured["is_first_turn"] is True, (
+        "Fresh session after skipping a foreign-mode id needs full orientation."
+    )
+
+
+async def test_dream_resume_walk_picks_up_same_mode_session(monkeypatch):
+    """A branch carrying a Dream-mode session id IS resumed, with is_first_turn=False."""
+    import server
+    import database as db
+
+    conv = await db.create_conversation("Dream Resume", mode="dream", project_dir=".")
+    u1 = await db.add_message(conv["id"], "user", "first turn")
+    a1 = await db.add_message(
+        conv["id"], "assistant", "dream reply", parent_id=u1["id"],
+        cc_session_id="dream-sess-1",
+    )
+    await db.update_message_content(a1["id"], cc_session_mode="dream")
+    u2 = await db.add_message(conv["id"], "user", "second turn", parent_id=a1["id"])
+
+    captured: dict = {}
+
+    async def fake_run_hermes(prompt, *args, **kwargs):
+        captured["resume_session_id"] = kwargs.get("resume_session_id")
+        captured["is_first_turn"] = kwargs.get("is_first_turn", True)
+        captured["prompt"] = prompt
+
+        class _Proc:
+            returncode = 0
+            pid = 4322
+            async def wait(self):
+                return 0
+
+        async def _events():
+            yield {"type": "session_info", "session_id": "dream-sess-2",
+                   "model": "diffusiongemma"}
+            yield {"type": "text_delta", "text": "continued"}
+            yield {"type": "result", "session_id": "dream-sess-2",
+                   "stop_reason": "end_turn", "duration_ms": 10, "num_turns": 1}
+
+        return _Proc(), _events()
+
+    monkeypatch.setattr(server.hermes_client, "run_hermes", fake_run_hermes)
+    monkeypatch.setattr(server, "_ensure_dream_hermes_home", lambda: "/tmp/dream-home")
+
+    await server._handle_dream_generation(
+        websocket=None,
+        conv_id=conv["id"],
+        conv=await db.get_conversation(conv["id"]),
+        data={"action": "generate", "parent_id": u2["id"]},
+    )
+
+    # Same-mode session is resumed (forked) and is_first_turn=False — no
+    # <loom_branch_info> duplication since the fork already holds the history.
+    assert captured["resume_session_id"] == "dream-sess-1"
+    assert captured["is_first_turn"] is False
+    # Bare continuation prompt only — the latest user message, not the full history.
+    assert captured["prompt"] == "second turn"
+
+
+async def test_dream_resume_walk_null_mode_is_compatible(monkeypatch):
+    """Legacy rows with NULL cc_session_mode are treated as compatible (resume)."""
+    import server
+    import database as db
+
+    conv = await db.create_conversation("Dream Legacy", mode="dream", project_dir=".")
+    u1 = await db.add_message(conv["id"], "user", "first turn")
+    # No cc_session_mode tagged — legacy row predating the migration.
+    a1 = await db.add_message(
+        conv["id"], "assistant", "legacy reply", parent_id=u1["id"],
+        cc_session_id="legacy-sess-1",
+    )
+    u2 = await db.add_message(conv["id"], "user", "next turn", parent_id=a1["id"])
+
+    captured: dict = {}
+
+    async def fake_run_hermes(prompt, *args, **kwargs):
+        captured["resume_session_id"] = kwargs.get("resume_session_id")
+        captured["is_first_turn"] = kwargs.get("is_first_turn", True)
+
+        class _Proc:
+            returncode = 0
+            pid = 4323
+            async def wait(self):
+                return 0
+
+        async def _events():
+            yield {"type": "session_info", "session_id": "dream-sess-3",
+                   "model": "diffusiongemma"}
+            yield {"type": "text_delta", "text": "ok"}
+            yield {"type": "result", "session_id": "dream-sess-3",
+                   "stop_reason": "end_turn", "duration_ms": 10, "num_turns": 1}
+
+        return _Proc(), _events()
+
+    monkeypatch.setattr(server.hermes_client, "run_hermes", fake_run_hermes)
+    monkeypatch.setattr(server, "_ensure_dream_hermes_home", lambda: "/tmp/dream-home")
+
+    await server._handle_dream_generation(
+        websocket=None,
+        conv_id=conv["id"],
+        conv=await db.get_conversation(conv["id"]),
+        data={"action": "generate", "parent_id": u2["id"]},
+    )
+
+    # NULL mode = legacy/unscoped → compatible, so the session is resumed.
+    assert captured["resume_session_id"] == "legacy-sess-1"
+    assert captured["is_first_turn"] is False
+
+
+# --- agy planner-loop / sustained-dead detection -----------------------------
+# Regression coverage for the "agy dies but Loom hangs forever" fix in
+# gemini_client.py. agy's planner-loop shutdown logs "Language server shutting
+# down" but the OS process never exits (proc.returncode stays None), so the
+# EOF break never fires and Loom would hang emitting "Working (Ns)" forever.
+# The fix detects the stall signature in _scan_agy_log_for_error and a
+# sustained-dead-log condition in the heartbeat. These tests mock the agy
+# subprocess and write fake CLI logs + transcripts; agy is never invoked.
+
+def _agy_log_filename_for_now():
+    """Build a cli-YYYYMMDD_HHMMSS.log filename whose parsed ts is ~now."""
+    import time
+    t = time.localtime()
+    return time.strftime("cli-%Y%m%d_%H%M%S.log", t)
+
+
+def _write_fake_agy_log(tmp_path, body: str):
+    """Write a fake agy cli log so _scan_agy_log_for_error / _is_agy_alive find it."""
+    log_dir = tmp_path / ".gemini" / "antigravity-cli" / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    p = log_dir / _agy_log_filename_for_now()
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def _write_fake_transcript(tmp_path, conv_id, lines):
+    """Write a fake transcript.jsonl under the brain/<conv_id>/ path the tailer scans."""
+    base = tmp_path / ".gemini" / "antigravity-cli" / "brain" / str(conv_id)
+    logs = base / ".system_generated" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    p = logs / "transcript.jsonl"
+    p.write_text("".join(l + "\n" for l in lines), encoding="utf-8")
+    return p
+
+
+class _StuckMockProcess:
+    """Mock agy process whose returncode stays None (simulates agy's
+    stuck-but-not-exited state after planner-loop graceful shutdown)."""
+
+    def __init__(self):
+        import asyncio
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self.returncode = None  # never exits — the bug's core shape
+
+    async def wait(self):
+        # Hangs forever (as the real agy does); the kill path uses proc.kill()
+        import asyncio
+        await asyncio.Future()
+
+    def kill(self):
+        self.returncode = -9
+
+
+def _patch_agy_subprocess(monkeypatch, mock_proc):
+    import asyncio
+    import gemini_client
+
+    async def mock_create_subprocess_exec(*args, **kwargs):
+        return mock_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", mock_create_subprocess_exec)
+    monkeypatch.setattr(gemini_client, "_find_agy_exe", lambda: "agy")
+    return gemini_client
+
+
+def test_scan_agy_log_detects_planner_stall(tmp_path, monkeypatch):
+    """_scan_agy_log_for_error returns a planner-stall message when >=10
+    'PlannerResponse without ModifiedResponse' lines + both shutdown-cascade
+    lines are present, and returns None for a benign log."""
+    import time
+    import gemini_client
+
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    # Benign log: a few stall lines, no shutdown cascade → not fatal
+    benign = ("PlannerResponse without ModifiedResponse encountered\n" * 5)
+    _write_fake_agy_log(tmp_path, benign)
+    launch_ts = time.time()
+    assert gemini_client._scan_agy_log_for_error(launch_ts) is None
+
+    # Fatal log: >=10 stall lines + both cascade lines → planner-stall error
+    fatal = (
+        "PlannerResponse without ModifiedResponse encountered\n" * 50
+        + "conversation_manager.go:478] Stopping conversation stream\n"
+        + "server.go:2308] Language server shutting down\n"
+    )
+    _write_fake_agy_log(tmp_path, fatal)
+    err = gemini_client._scan_agy_log_for_error(launch_ts)
+    assert err is not None
+    assert "planner loop stalled" in err.lower()
+    assert "50" in err  # stall count surfaced
+
+
+@pytest.mark.asyncio
+async def test_tailer_breaks_on_planner_stall_signature(tmp_path, monkeypatch):
+    """When agy's log shows the planner-stall shutdown signature, the tailer
+    breaks (doesn't hang) and the result event carries is_error with the
+    planner-stall message — even though proc.returncode stays None."""
+    import asyncio
+    import time
+
+    mock_proc = _StuckMockProcess()
+    gemini_client = _patch_agy_subprocess(monkeypatch, mock_proc)
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    # A transcript with one PLANNER_RESPONSE step so full_text gets content
+    # (verifies the error scan runs even after partial text). Then the tailer
+    # hits EOF and the heartbeat fires every ~1.5s.
+    _write_fake_transcript(tmp_path, conv_id=7, lines=[
+        '{"type":"PLANNER_RESPONSE","step_index":1,"content":"partial thinking"}',
+    ])
+
+    # Pre-write the fatal agy log (stall signature already present).
+    fatal = (
+        "PlannerResponse without ModifiedResponse encountered\n" * 50
+        + "conversation_manager.go:478] Stopping conversation stream\n"
+        + "server.go:2308] Language server shutting down\n"
+    )
+    _write_fake_agy_log(tmp_path, fatal)
+
+    # Drive run_gemini with an outer timeout — must complete, not hang.
+    proc, event_stream = await asyncio.wait_for(
+        gemini_client.run_gemini(
+            prompt="test",
+            cwd=str(tmp_path),
+            conv_id=7,
+        ),
+        timeout=20,
+    )
+
+    events = []
+    async for evt in event_stream:
+        events.append(evt)
+        if evt is None:
+            break
+        if isinstance(evt, dict) and evt.get("type") == "result":
+            break
+
+    result = next(e for e in events if isinstance(e, dict) and e.get("type") == "result")
+    assert result["is_error"] is True
+    assert "planner loop stalled" in (result.get("error") or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_tailer_breaks_on_sustained_dead_log(tmp_path, monkeypatch):
+    """When agy's log goes stale (no mtime change) for 60s+ with no active
+    tool call and proc.returncode still None, the sustained-dead detector
+    breaks the tailer instead of hanging forever."""
+    import asyncio
+    import time
+    import gemini_client
+
+    mock_proc = _StuckMockProcess()
+    _patch_agy_subprocess(monkeypatch, mock_proc)
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    _write_fake_transcript(tmp_path, conv_id=8, lines=[
+        '{"type":"PLANNER_RESPONSE","step_index":1,"content":"partial"}',
+    ])
+
+    # A benign log (no stall signature) so the planner detector doesn't fire —
+    # only the sustained-dead path should trigger. Set its mtime 70s in the
+    # past so _is_agy_alive returns False immediately.
+    log_path = _write_fake_agy_log(tmp_path, "I0706 20:00:00.000000 1 server.go:1322] Starting\n")
+    stale = time.time() - 70
+    import os
+    os.utime(log_path, (stale, stale))
+
+    # Fast-forward time so the 60s sustained-dead window elapses in ~2s of
+    # real test time. The heartbeat checks every 30 polls (~1.5s); two
+    # heartbeats past the threshold is enough. _is_agy_alive and the heartbeat
+    # both call time.time() via a local `import time as _time`, so patching
+    # time.time on the time module itself reaches all call sites.
+    real_time = time.time
+    t0 = real_time()
+
+    def fast_time():
+        # Advance ~35s per real second, so 60s sustained threshold is crossed
+        # in under 2s of wall-clock test time.
+        return t0 + (real_time() - t0) * 35.0
+
+    monkeypatch.setattr(time, "time", fast_time)
+
+    proc, event_stream = await asyncio.wait_for(
+        gemini_client.run_gemini(
+            prompt="test",
+            cwd=str(tmp_path),
+            conv_id=8,
+        ),
+        timeout=20,
+    )
+
+    events = []
+    async for evt in event_stream:
+        events.append(evt)
+        if evt is None:
+            break
+        if isinstance(evt, dict) and evt.get("type") == "result":
+            break
+
+    result = next(e for e in events if isinstance(e, dict) and e.get("type") == "result")
+    assert result["is_error"] is True
+    assert "shut down" in (result.get("error") or "").lower() or "no log activity" in (result.get("error") or "").lower()

@@ -22,6 +22,9 @@ let _wsReconnectDelay = 2000;
 let _wsReconnectTimer = null;
 
 function connectWebSocket(convId, _attempt) {
+    if (!_attempt) {
+        _queuedGeneration = null;
+    }
     // Cancel any pending reconnect timer
     if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null; }
 
@@ -244,27 +247,10 @@ async function loadMessages(convId) {
         const treeData = await API.get(`/api/conversations/${convId}/tree`);
         State.treeData = treeData;  // keep branch indicators in sync
         hideRetryBar();
-        const activeNodes = treeData.filter(n => n.is_active);
-        if (activeNodes.length > 0) {
-            // The leaf is the active node whose id is no other active node's
-            // parent_id. Picking by max(id) breaks when a system message
-            // (e.g. mid-stream auto-compact marker) is inserted with a higher
-            // id than its assistant child — the marker would be misidentified
-            // as the leaf, and /branch/<marker> walks UP to root, dropping
-            // the actual reply from State.messages.
-            const activeIds = new Set(activeNodes.map(n => n.id));
-            const activeParents = new Set(
-                activeNodes.map(n => n.parent_id).filter(p => p != null && activeIds.has(p))
-            );
-            const leaves = activeNodes.filter(n => !activeParents.has(n.id));
-            // In a clean tree there's exactly one leaf. If somehow multiple,
-            // prefer the deepest by created_at as a tiebreaker.
-            const leaf = leaves.length === 1
-                ? leaves[0]
-                : leaves.sort((a, b) => (b.created_at || 0) - (a.created_at || 0))[0];
-            const leafId = leaf ? leaf.id : activeNodes[activeNodes.length - 1].id;
-            State.messages = await API.get(`/api/conversations/${convId}/branch/${leafId}`);
-        } else {
+        const leaf = findActiveConversationLeaf(treeData);
+        if (leaf) {
+            State.messages = await API.get(`/api/conversations/${convId}/branch/${leaf.id}`);
+        } else if (!State.messages.length) {
             State.messages = [];
         }
         // Cheap change detection: if the message id list is identical to what
@@ -698,7 +684,7 @@ function handleWSMessage(data) {
                 _streamFlushTimer = null;
                 hideRetryBar();
                 hidePlanBar();
-                appendStreamingMessage(data.cc_model);
+                appendStreamingMessage(data.cc_model || data.local_model);
             } else if (isOnOurBranch) {
                 // Parallel sibling — count it but don't render
                 State._parallelCount = (State._parallelCount || 0) + 1;
@@ -1142,9 +1128,78 @@ function handleWSMessage(data) {
             if (State.ws) State.ws._needsSync = false;
             break;
 
+        case 'hermes_model_state':
+            // Liveness broadcast for the Hermes chat-space header indicator.
+            // `up` reflects the local model server (llama/dream) state, which
+            // transitively reflects attendant availability. Prometheus is
+            // implicitly always-up (cloud fallback) — no indicator for it.
+            // Cache the latest state per backend so a conv switch can render
+            // immediately without waiting for the next broadcast.
+            _HERMES_MODEL_STATE[data.backend] = !!data.up;
+            updateHermesModelIndicator(data.backend, data.up);
+            break;
+
         case 'pong':
             // Heartbeat ack — no UI action needed; onmessage already updated _lastActivity.
             break;
+    }
+}
+
+// Latest known liveness per Hermes backend, fed by hermes_model_state WS
+// broadcasts. Lets updateHermesModelIndicator render immediately on a conv
+// switch (in loadConversation) without waiting for the next broadcast.
+const _HERMES_MODEL_STATE = { llama: null, dream: null };
+
+/**
+ * Render the Hermes "local model up/down" indicator on the chat-space header.
+ * Green = attendant functional; amber = local model down (attendant unavailable,
+ * Prometheus still functional via cloud). Only shown for Hermes-class convs
+ * (hermes/dream) that are NOT incognito — incognito convs route through
+ * Prometheus (always-functional) and don't need a model-liveness indicator.
+ *
+ * The label + liveness are derived from the CURRENT conversation's mode, not
+ * from whichever backend broadcast arrived last. The server broadcasts both
+ * llama and dream state; a Hermes conv must show llama's state (never "Dream
+ * down"), and a Dream conv must show dream's state. `backend` (the broadcast
+ * that triggered this call) is ignored unless it matches the conv's mode —
+ * non-matching broadcasts still cache their state but don't re-render.
+ */
+function updateHermesModelIndicator(backend, up) {
+    const badge = document.getElementById('hermes-model-indicator');
+    if (!badge) return;
+    const mode = State.currentConv && State.currentConv.mode;
+    const incognito = State.currentConv && State.currentConv.incognito;
+    // Only Hermes-class, non-incognito convs show the model-liveness indicator.
+    if (mode !== 'hermes' && mode !== 'dream') {
+        badge.classList.add('hidden');
+        return;
+    }
+    if (incognito) {
+        badge.classList.add('hidden');
+        return;
+    }
+    // If this broadcast is for the OTHER backend, don't re-render — the conv
+    // cares only about its own model's liveness. The state is still cached above.
+    if (backend && mode === 'hermes' && backend !== 'llama') return;
+    if (backend && mode === 'dream' && backend !== 'dream') return;
+    // Read the cached state for THIS conv's backend (may be null before the
+    // first matching broadcast lands — hide until then).
+    const myBackend = mode === 'dream' ? 'dream' : 'llama';
+    const myUp = _HERMES_MODEL_STATE[myBackend];
+    if (myUp === null || myUp === undefined) {
+        badge.classList.add('hidden');
+        return;
+    }
+    badge.classList.remove('hidden');
+    const label = myBackend === 'dream' ? 'Dream' : 'llama';
+    if (myUp) {
+        badge.className = 'hermes-model-indicator up';
+        badge.textContent = `● ${label} up`;
+        badge.title = `Local ${label} model is up — attendant functional.`;
+    } else {
+        badge.className = 'hermes-model-indicator down';
+        badge.textContent = `● ${label} down`;
+        badge.title = `Local ${label} model is down — attendant unavailable. Toggle Incognito to route through Prometheus (cloud, always-functional).`;
     }
 }
 
@@ -1332,6 +1387,7 @@ const _HERMES_SLASH_COMMANDS = [
 function _getModeLabel(conv) {
     if (!conv) return 'system';
     const mode = conv.mode || 'weave';
+    if (mode.toLowerCase() === 'weave') return mode;
     const agentKind = _agentKindForModel(conv.cc_model || conv.local_model || '', conv);
     if (agentKind) return agentKind;
     return mode;
@@ -2570,7 +2626,7 @@ function _flushPendingGenerate() {
 /** Attach cc_model/effort/permission to a WS message from current UI state */
 function _attachCCSettings(msg) {
     const conv = State.currentConv;
-    if (!conv || (conv.mode !== 'claude' && conv.mode !== 'local' && conv.mode !== 'codex' && conv.mode !== 'gemini')) return;
+    if (!conv || (conv.mode !== 'claude' && conv.mode !== 'local' && conv.mode !== 'codex' && conv.mode !== 'gemini' && conv.mode !== 'umans')) return;
     const modelSel = document.getElementById('cc-model-inline');
     const effortSel = document.getElementById('cc-effort-inline');
     const permSel = document.getElementById('cc-permission-mode-inline');
@@ -2636,17 +2692,19 @@ function _agentKindForModel(model, conv) {
     ) return 'claude';
     if (msgModel.startsWith('umans-')) return 'umans';
     if (msgModel.endsWith('.gguf') || msgModel.includes('@llama-server')) return 'local';
-    if (['claude', 'gemini', 'codex', 'local', 'hermes', 'umans'].includes(mode)) return mode;
+    if (['claude', 'gemini', 'codex', 'local', 'hermes', 'umans', 'dream'].includes(mode)) return mode;
     return '';
 }
 
 function _assistantRoleLabelForModel(model, conv) {
+    if ((conv?.mode || '').toLowerCase() === 'weave') return getCharacterName();
     const agentKind = _agentKindForModel(model, conv);
     if (agentKind === 'gemini') return 'Gemini';
     if (agentKind === 'codex') return 'Codex';
     if (agentKind === 'umans') return 'Umans';
     if (agentKind === 'local') return 'Braid';
     if (agentKind === 'hermes') return 'Hermes';
+    if (agentKind === 'dream') return 'Dream Space';
     if (agentKind === 'claude') return 'Claude';
     return getCharacterName();
 }
@@ -2660,6 +2718,15 @@ function createMessageElement(msg, cost, elapsed) {
     const isErrorMsg = msg.role === 'assistant' && msg.content?.startsWith('[Error:');
     const isDraft = msg.role === 'assistant' && !msg.content?.trim() && !isErrorMsg;
     const isDescribeMsg = msg.role === 'system' && typeof msg.content === 'string' && msg.content.trimStart().startsWith('[Image description —');
+    // A queued message is one that's been POSTed to the DB (so it has an id and
+    // a role) but is waiting for the current stream to end before it generates.
+    // It renders with a queue-bar (Edit/Cancel) that calls editQueuedMessage
+    // (in-place save). The standard action row below would otherwise also
+    // render the ✎ pencil → editMessage → "Send as new branch", which is the
+    // wrong affordance for a queued message and surprises the user with a new
+    // root branch when they only meant to tweak the queued text. Suppress the
+    // standard actions for queued messages; the queue-bar handles editing.
+    const isQueued = !!_queuedGeneration && _queuedGeneration.id === msg.id;
     const div = document.createElement('div');
     div.className = `message ${msg.role}${isErrorMsg ? ' message-error' : ''}${isDraft ? ' message-generating' : ''}${isDescribeMsg ? ' message-describing' : ''}`;
     div.dataset.msgId = msg.id;
@@ -2669,7 +2736,7 @@ function createMessageElement(msg, cost, elapsed) {
     const isClaudeMode = agentKind === 'claude';
     const isLocalMode = agentKind === 'local';
     const isHermesMode = agentKind === 'hermes';
-    const isCliAgentMode = ['claude', 'gemini', 'codex', 'local', 'hermes'].includes(agentKind);
+    const isCliAgentMode = ['claude', 'gemini', 'codex', 'local', 'hermes', 'umans'].includes(agentKind);
     const roleLabel = msg.role === 'system' ? 'System'
         : msg.role === 'user' ? 'You'
         : _assistantRoleLabelForModel(msgModel, State.currentConv);
@@ -2702,6 +2769,12 @@ function createMessageElement(msg, cost, elapsed) {
         actionsHtml = '<button onclick="regenerateMessage(' + msg.id + ')" title="Regenerate">&#x21BB;</button>' +
             '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
             '<button onclick="copyMessage(' + msg.id + ')" title="Copy">&#x29C9;</button>' + bmBtn;
+    } else if (isQueued) {
+        // Queued user message: editing goes through the queue-bar's Edit button
+        // (editQueuedMessage → in-place save), NOT the standard ✎ pencil
+        // (editMessage → "Send as new branch"). Render no standard actions;
+        // the queue-bar appended by the caller is the sole affordance.
+        actionsHtml = '';
     } else {
         actionsHtml = '<button onclick="editMessage(' + msg.id + ')" title="Edit">&#x270E;</button>' +
             '<button onclick="forkFromMessage(' + msg.id + ')" title="Fork">&#x2325;</button>' +
@@ -3147,6 +3220,13 @@ function getCharacterName() {
     if (!State.currentConvId) return 'Assistant';
     const conv = State.conversations.find(c => c.id === State.currentConvId);
     if (!conv) return 'Assistant';
+    if ((conv.mode || 'weave').toLowerCase() === 'weave') {
+        if (conv.character_id) {
+            const char = State.characters.find(c => c.id === conv.character_id);
+            return char ? char.name : 'Assistant';
+        }
+        return conv.local_model || 'Assistant';
+    }
     const ccModel = conv.cc_model || '';
     const agentKind = _agentKindForModel(ccModel || conv.local_model || '', conv);
     if (agentKind === 'codex') return 'Codex';
@@ -3540,7 +3620,11 @@ function appendStreamingMessage(ccModel) {
     const container = document.getElementById('messages');
     streamingDiv = document.createElement('div');
     streamingDiv.className = 'message assistant streaming';
-    const label = _assistantRoleLabelForModel(ccModel || State.currentConv?.cc_model, State.currentConv);
+    const isWeave = (State.currentConv?.mode || '').toLowerCase() === 'weave';
+    const modelForLabel = isWeave
+        ? (ccModel || State.currentConv?.local_model || State.currentConv?.cc_model)
+        : (ccModel || State.currentConv?.cc_model || State.currentConv?.local_model);
+    const label = _assistantRoleLabelForModel(modelForLabel, State.currentConv);
     streamingDiv.innerHTML = '<div class="message-header">' +
         '<span class="message-role">' + escapeHtml(label) + '</span>' +
         '</div>' +
@@ -4607,7 +4691,7 @@ function closeCanvasFullview() {
     }
     // Restore canvas toggle button
     const canvasBtn = document.getElementById('btn-canvas-toggle');
-    if (canvasBtn && (State.currentConv?.mode === 'claude' || State.currentConv?.mode === 'gemini')) canvasBtn.classList.remove('hidden');
+    if (canvasBtn && (State.currentConv?.mode === 'claude' || State.currentConv?.mode === 'gemini' || State.currentConv?.mode === 'umans')) canvasBtn.classList.remove('hidden');
 }
 
 async function toggleCanvas() {

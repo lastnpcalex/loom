@@ -1,10 +1,17 @@
 """OODA Harness for Weave RP mode.
 
-Two-pass generation loop:
-  Pass 1 (Orient): Model emits structured <ooda> block with observations,
-                    state reads, orientation, state updates, and a decision.
-  Pass 2 (Act):    Server resolves states, feeds enriched context back,
-                    model generates final prose.
+Single-pass generation with repair fallback:
+  Pass:    Model emits a structured <ooda> block (observe, state reads,
+           orient, state updates, decide) followed by 1-3 paragraphs of
+           in-character prose, in one shot.
+  Repair:  If parse_ooda_block returns None (truncated </ooda>, or loose
+           update_state tags with no wrapper), repair_ooda_block attempts a
+           regex-level recovery before state deltas are lost.
+  Fallback:Only if repair also fails AND no prose was extracted does the
+           server run a second sync_chat pass asking the model to re-emit a
+           valid block. This keeps the common case single-pass (low latency)
+           while recovering the state-tracking guarantees the two-pass design
+           originally provided.
 
 Inspired by metacog (tools as cognitive scaffolding) and popup-mcp
 (amortize latency into fewer, richer passes).
@@ -131,6 +138,11 @@ def build_ooda_system_prompt(base_system_prompt: str, state_cards: list[dict],
 
 # ── XML Parser ──
 
+def _strip_think_blocks(text: str) -> str:
+    """Strip think reasoning blocks and trim. Shared by parse + repair."""
+    return re.sub(r'<think>[\s\S]*?</think>\s*', '', text).strip()
+
+
 def parse_ooda_block(text: str) -> Optional[dict]:
     """Parse an <ooda>...</ooda> block from model output.
 
@@ -138,7 +150,7 @@ def parse_ooda_block(text: str) -> Optional[dict]:
     Returns None if no <ooda> block found.
     """
     # Strip <think> blocks first
-    text = re.sub(r'<think>[\s\S]*?</think>\s*', '', text).strip()
+    text = _strip_think_blocks(text)
 
     match = re.search(r'<ooda>(.*?)</ooda>', text, re.DOTALL)
     if not match:
@@ -201,6 +213,41 @@ def parse_ooda_block(text: str) -> Optional[dict]:
     return result
 
 
+def repair_ooda_block(text: str) -> Optional[dict]:
+    """Attempt to recover an OODA block from truncated/malformed model output.
+
+    Covers the two common failure modes that cause parse_ooda_block to return
+    None (and thus silently drop state deltas):
+
+    1. Unclosed <ooda> — the model ran out of tokens (or the canvas committed
+       mid-block) before emitting </ooda>. We append a closing tag and re-parse.
+    2. Loose <update_state .../> or <create_state> tags emitted with no
+       <ooda> wrapper at all. We wrap the whole output synthetically and
+       re-parse so the deltas survive.
+
+    Returns the parsed dict, or None if nothing could be recovered.
+    """
+    cleaned = _strip_think_blocks(text)
+
+    # Case 1: unclosed <ooda>
+    if "<ooda>" in cleaned and "</ooda>" not in cleaned:
+        repaired = cleaned + "\n</ooda>"
+        r = parse_ooda_block(repaired)
+        if r and (r["observe"] or r["updates"] or r["creates"] or r["reads"]):
+            return r
+
+    # Case 2: loose update/create tags with no <ooda> wrapper at all
+    if "<ooda>" not in cleaned and (
+        re.search(r"<update_state\s", cleaned) or re.search(r"<create_state\s", cleaned)
+    ):
+        synthetic = "<ooda>\n" + cleaned + "\n</ooda>"
+        r = parse_ooda_block(synthetic)
+        if r and (r["updates"] or r["creates"]):
+            return r
+
+    return None
+
+
 # ── Tool Executors ──
 
 async def execute_ooda_reads(conv_id: int, reads: list[dict]) -> list[dict]:
@@ -243,11 +290,11 @@ async def execute_ooda_updates(conv_id: int, updates: list[dict], creates: list[
     return changed
 
 
-# ── Pass 2 Context Builder ──
+# ── Post-OODA Prose Extraction ──
 
 def extract_post_ooda_prose(text: str) -> str:
     """Extract any prose the model wrote after the </ooda> closing tag."""
-    text = re.sub(r'<think>[\s\S]*?</think>\s*', '', text).strip()
+    text = _strip_think_blocks(text)
     match = re.search(r'</ooda>\s*(.*)', text, re.DOTALL)
     if match:
         prose = match.group(1).strip()
@@ -258,7 +305,12 @@ def extract_post_ooda_prose(text: str) -> str:
 
 
 def build_pass2_context(ooda_result: dict, resolved_states: list[dict]) -> str:
-    """Build the context message for Pass 2 from OODA analysis + resolved state data.
+    """Build the context message for a second pass from OODA analysis + resolved state data.
+
+    Legacy helper. The production single-pass path no longer calls this; the
+    server-side second-pass fallback (in _handle_ooda_generation) uses an inline
+    user-message instruction instead. Retained for test_ooda_live.py and as an
+    optional context builder if a future design wants the richer framing.
 
     Framed as in-world state refresh, not meta-instructions, to keep the model in RP mode.
     """

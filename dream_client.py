@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from typing import AsyncGenerator, Optional
 
@@ -33,6 +34,46 @@ DEFAULT_HOST = "http://127.0.0.1:8787"
 DEFAULT_MAX_TOKENS = 2048
 CANVAS = 256
 REQUEST_TIMEOUT = 600.0  # 10 min — cold loads take a while
+
+_DREAM_THOUGHT_BLOCK_RE = re.compile(
+    r"<\|channel>thought\s*(.*?)<channel\|>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_channel_scaffold(text: str) -> tuple[str, str]:
+    """Return (reasoning, content), extracting Dream thought-channel markup."""
+    if "<|channel>" not in text and "<channel|>" not in text:
+        return "", text
+
+    normalized = text.replace("\r\n", "\n")
+    thoughts: list[str] = []
+    content_parts: list[str] = []
+    cursor = 0
+    matched = False
+    for match in _DREAM_THOUGHT_BLOCK_RE.finditer(normalized):
+        matched = True
+        before = normalized[cursor:match.start()]
+        if before.strip():
+            content_parts.append(before)
+        thought = match.group(1).strip()
+        if thought:
+            thoughts.append(thought)
+        cursor = match.end()
+
+    if matched:
+        after = normalized[cursor:]
+        if after.strip():
+            content_parts.append(after)
+        return "\n\n".join(thoughts), "".join(content_parts)
+
+    if normalized.strip() in {"<|channel>", "<channel|>", "thought"}:
+        return "", ""
+    return "", normalized
+
+
+def _strip_channel_scaffold(text: str) -> str:
+    return _split_channel_scaffold(text)[1]
 
 
 def _resolve_host(host: Optional[str]) -> str:
@@ -74,18 +115,53 @@ def _blocks_for(max_tokens: Optional[int]) -> int:
 
 
 async def health(host: Optional[str] = None, timeout: float = 3.0) -> Optional[dict]:
-    """GET /health on the dream sidecar. Returns the JSON dict or None if down.
+    """Probe the dream endpoint. Returns normalized status or None if down.
 
-    Response shape: {status, loaded_model, maxtok, available: [...]}
+    The dedicated llama.cpp DiffusionGemma server returns only {"status":"ok"}
+    from /health, so fill in model details from /v1/models when needed.
     """
     h = _resolve_host(host)
+    models: list[dict] = []
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.get(f"{h}/health")
             if r.status_code == 200:
-                return r.json()
+                try:
+                    d = r.json()
+                    if isinstance(d, dict) and (d.get("available") or d.get("loaded_model")):
+                        return d
+                except Exception:
+                    d = {"status": "ok"}
+                mr = await client.get(f"{h}/v1/models")
+                if mr.status_code == 200:
+                    models = mr.json().get("data", [])
     except Exception:
-        pass
+        models = await list_models(h, timeout=timeout)
+    if not models:
+        models = await list_models(h, timeout=timeout)
+    if models:
+        ids = [str(m.get("id") or m.get("name") or "") for m in models if isinstance(m, dict)]
+        ids = [m for m in ids if m]
+        ctx_lengths = [
+            int(m.get("context_length") or m.get("max_model_len") or 0)
+            for m in models
+            if isinstance(m, dict)
+        ]
+        slot_ctx = 0
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                sr = await client.get(f"{h}/slots")
+                if sr.status_code == 200:
+                    slots = sr.json()
+                    slot_ctx = max([int(s.get("n_ctx") or 0) for s in slots if isinstance(s, dict)] or [0])
+        except Exception:
+            pass
+        return {
+            "status": "ok",
+            "loaded_model": ids[0] if len(ids) == 1 else None,
+            "available": ids,
+            "maxtok": slot_ctx or max(ctx_lengths or [0]),
+        }
     return None
 
 
@@ -165,6 +241,7 @@ async def dream_chat(
                     # yield only the final answer content (callers wanting
                     # reasoning should use dream_chat_sync).
                     piece = delta.get("content") or ""
+                    piece = _strip_channel_scaffold(piece)
                     if piece:
                         sent_final += piece
                         yield piece
@@ -212,18 +289,22 @@ async def dream_chat_sync(
         d = r.json()
     choice = (d.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
-    # The nuspy adapter splits reasoning from final answer via the
-    # <|channel>thought...<channel|> marker; reasoning_content holds the
-    # thinking, content holds the answer.
+    # The nuspy adapter may split reasoning into reasoning_content, or leak it
+    # as <|channel>thought...<channel|> inside content. Normalize both shapes.
+    extracted_reasoning, content = _split_channel_scaffold(msg.get("content") or "")
+    reasoning = msg.get("reasoning_content") or ""
+    if extracted_reasoning:
+        reasoning = (reasoning.rstrip() + "\n\n" + extracted_reasoning).strip() if reasoning else extracted_reasoning
     return {
-        "content": msg.get("content") or "",
-        "reasoning_content": msg.get("reasoning_content") or "",
+        "content": content,
+        "reasoning_content": reasoning,
         "finish_reason": choice.get("finish_reason"),
         "usage": d.get("usage") or {},
+        "timings": d.get("timings") or {},
     }
 
 
-async def dream_bench(host: Optional[str] = None, *, warm: bool = False) -> dict:
+async def dream_bench(host: Optional[str] = None, *, warm: bool = False, model: Optional[str] = None) -> dict:
     """Benchmark the dream sidecar: measure TTFT + tok/s for a short generation.
 
     If warm=False (default) and the model is NOT yet loaded, this triggers the
@@ -244,19 +325,24 @@ async def dream_bench(host: Optional[str] = None, *, warm: bool = False) -> dict
     t0 = time.perf_counter()
     res = await dream_chat_sync(
         [{"role": "user", "content": prompt}],
+        model=model,
         max_tokens=512,
         host=h,
     )
     wall_s = time.perf_counter() - t0
 
     after = await health(h)
-    timings = (res.get("usage") or {}).get("timings") or {}
+    timings = (res.get("usage") or {}).get("timings") or res.get("timings") or {}
+    completion_tokens = (res.get("usage") or {}).get("completion_tokens", 0)
+    tok_s = timings.get("tokens_per_second") or timings.get("predicted_per_second") or 0.0
+    if not tok_s and completion_tokens and wall_s > 0:
+        tok_s = completion_tokens / wall_s
     return {
         "cold_load": cold_load,
         "wall_s": round(wall_s, 2),
         "ttft_s": round(wall_s, 2),  # non-streaming: TTFT ≈ wall (one canvas burst)
-        "tok_s": timings.get("tokens_per_second", 0.0),
-        "completion_tokens": (res.get("usage") or {}).get("completion_tokens", 0),
+        "tok_s": tok_s,
+        "completion_tokens": completion_tokens,
         "denoising_steps": timings.get("denoising_steps", 0),
         "decode_ms": timings.get("decode_ms", 0),
         "prompt_tokens": (res.get("usage") or {}).get("prompt_tokens", 0),
@@ -275,6 +361,7 @@ async def _cli():
     ap.add_argument("--host", default=os.getenv("DREAM_HOST", DEFAULT_HOST))
     ap.add_argument("--prompt", default="Say hello in one short sentence.")
     ap.add_argument("--max-tokens", type=int, default=512)
+    ap.add_argument("--model", default=os.getenv("DREAM_MODEL", ""))
     ap.add_argument("--warm", action="store_true", help="bench: assume model already loaded")
     args = ap.parse_args()
 
@@ -287,6 +374,7 @@ async def _cli():
     elif args.cmd == "chat":
         res = await dream_chat_sync(
             [{"role": "user", "content": args.prompt}],
+            model=args.model or None,
             max_tokens=args.max_tokens,
             host=args.host,
         )
@@ -296,15 +384,15 @@ async def _cli():
         print("USAGE:", json.dumps(res["usage"], indent=2))
     elif args.cmd == "bench":
         print(f"Running bench against {args.host} (warm={args.warm})...")
-        r = await dream_bench(args.host, warm=args.warm)
+        r = await dream_bench(args.host, warm=args.warm, model=args.model or None)
         print(json.dumps(r, indent=2))
         # GO/NO-GO gate
         if r["tok_s"] >= 5 and r["ttft_s"] < 30:
-            print("\n✅ GO: tok/s >= 5 and TTFT < 30s — CPU/GPU orchestrator viable.")
+            print("\nGO: tok/s >= 5 and TTFT < 30s - CPU/GPU orchestrator viable.")
         elif r["tok_s"] > 0:
-            print(f"\n⚠️  MARGINAL: tok/s={r['tok_s']} ttft={r['ttft_s']}s — review thresholds.")
+            print(f"\nMARGINAL: tok/s={r['tok_s']} ttft={r['ttft_s']}s - review thresholds.")
         else:
-            print("\n❌ NO-GO: no tok/s reported — sidecar error?")
+            print("\nNO-GO: no tok/s reported - sidecar error?")
 
 
 if __name__ == "__main__":

@@ -46,6 +46,13 @@ import uvicorn
 import httpx
 import io
 
+
+def _run_subprocess(cmd, **kwargs):
+    """Wrapper around subprocess.run that suppresses console windows on Windows."""
+    if sys.platform == "win32":
+        kwargs.setdefault("creationflags", getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+    return subprocess.run(cmd, **kwargs)
+
 # Import the same Config the main server uses, so admin spawns Llama Server
 # with whatever the operator has saved in config.json. Falls back gracefully
 # if the import fails (admin still works, just without config-driven tuning).
@@ -99,6 +106,43 @@ INSTANCES = {
     "main": {"port": 3000, "label": "Main Loom", "db": "loom.db"},
     "test": {"port": 3001, "label": "Test Server", "db": "loom_test.db"},
 }
+
+
+async def _relay_to_main(path: str, *, method: str = "POST", timeout: float = 3.0) -> dict | None:
+    """Relay an HTTP call to the MAIN Loom server process.
+
+    The admin_server is a separate process from the main server, so it can't see
+    the main server's in-memory _RUNTIMES (hermes_client.py:917). The
+    attendant-clear-on-model-stop binding + the Hermes-management panel both
+    relay through here. Best-effort: returns None on any failure (the model stop
+    itself must NOT be blocked by a relay hiccup). Tries HTTPS first (main uses
+    SSL) then HTTP, mirroring check_instance at admin_server.py:164.
+
+    Port resolution: main reads its port from LOOM_PORT (config.py:102, default
+    3000). The INSTANCES table hardcodes 3000, so if main is running on a
+    non-default LOOM_PORT the relay would silently miss the _RUNTIMES owner.
+    Prefer LOOM_PORT env, then INSTANCES, then 3000.
+    """
+    try:
+        port = int(os.getenv("LOOM_PORT", "") or INSTANCES["main"]["port"])
+    except (ValueError, TypeError):
+        port = 3000
+    for scheme in ("https", "http"):
+        try:
+            async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+                if method == "POST":
+                    resp = await client.post(f"{scheme}://localhost:{port}{path}")
+                else:
+                    resp = await client.get(f"{scheme}://localhost:{port}{path}")
+                if resp.status_code < 500:
+                    try:
+                        return resp.json()
+                    except Exception:
+                        return {"status": "ok", "http_status": resp.status_code}
+        except Exception:
+            continue
+    return None
+
 
 
 def _load_initial_main_db():
@@ -196,7 +240,7 @@ async def check_instance(name: str, info: dict) -> dict:
 async def tool_auth_status():
     """Check Claude auth status."""
     try:
-        proc = subprocess.run(
+        proc = _run_subprocess(
             ["claude", "-p", "respond with only: auth ok"],
             capture_output=True, text=True, timeout=15,
             cwd=str(Path(__file__).parent),
@@ -231,7 +275,7 @@ async def tool_auth_refresh():
 
     # First check if auth already works
     try:
-        r = subprocess.run(
+        r = _run_subprocess(
             ["claude", "-p", "respond with only: ok"],
             capture_output=True, text=True, timeout=15,
             cwd=str(Path(__file__).parent),
@@ -245,12 +289,17 @@ async def tool_auth_refresh():
         pass  # Auth is broken, proceed with login
 
     # Start `claude auth login` and capture the URL
+    popen_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.PIPE,
+        "text": True,
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     proc = subprocess.Popen(
         ["claude", "auth", "login"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.PIPE,
-        text=True,
+        **popen_kwargs
     )
     _auth_login_proc = proc
 
@@ -351,7 +400,7 @@ async def tool_clear_vram():
     except Exception:
         lines.append("Llama Server not reachable (already stopped).")
     try:
-        r = subprocess.run(
+        r = _run_subprocess(
             ["taskkill", "/F", "/IM", "llama-server.exe", "/T"],
             capture_output=True, text=True, timeout=10,
         )
@@ -558,6 +607,61 @@ async def tool_hermes_status():
         "version": version,
         "output": "\n".join(lines),
     })
+
+
+# ── Hermes runtime management (Prometheus + attendants) ──────────────────────
+# Relays to the MAIN Loom server process, which owns the in-memory _RUNTIMES
+# (hermes_client.py:917). The admin panel uses these to manage the three Hermes
+# runtimes: Prometheus (start/stop/restart/status) + the two attendants
+# (check/stop). Attendant-stop on model-stop is wired separately into the
+# llama-unload / dream-stop paths (see _relay_to_main usage there).
+
+@app.get("/api/hermes/status")
+async def api_hermes_status():
+    """Relayed Hermes runtime status (three runtimes + model liveness)."""
+    result = await _relay_to_main("/api/hermes/status", method="GET", timeout=5.0)
+    if result is None:
+        return JSONResponse({"status": "error", "error": "main server unreachable"},
+                             status_code=502)
+    return JSONResponse(result)
+
+
+@app.post("/api/hermes/prometheus/stop")
+async def api_hermes_prometheus_stop():
+    """Stop Prometheus' warm runtime (independent of model servers)."""
+    result = await _relay_to_main("/api/hermes/prometheus/stop", method="POST")
+    if result is None:
+        return JSONResponse({"status": "error", "error": "main server unreachable"},
+                             status_code=502)
+    return JSONResponse(result)
+
+
+@app.post("/api/hermes/prometheus/restart")
+async def api_hermes_prometheus_restart():
+    """Restart Prometheus: re-route backend (rewrite config), clear warm runtime."""
+    result = await _relay_to_main("/api/hermes/prometheus/restart", method="POST")
+    if result is None:
+        return JSONResponse({"status": "error", "error": "main server unreachable"},
+                             status_code=502)
+    return JSONResponse(result)
+
+
+@app.post("/api/hermes/attendant/stop")
+async def api_hermes_attendant_stop(backend: str = "llama"):
+    """Force-stop an attendant's warm runtime (clears from _RUNTIMES).
+
+    `backend` is "llama" or "dream". Same path the model-stop binding uses, but
+    exposed as an explicit admin action so an attendant can be cleared without
+    stopping the model server underneath (e.g. to force a clean re-init).
+    """
+    if backend not in ("llama", "dream"):
+        return JSONResponse({"status": "error", "error": f"unknown backend: {backend}"},
+                             status_code=400)
+    result = await _relay_to_main(f"/api/hermes/attendant/clear?backend={backend}", method="POST")
+    if result is None:
+        return JSONResponse({"status": "error", "error": "main server unreachable"},
+                             status_code=502)
+    return JSONResponse(result)
 
 
 @app.post("/tools/comfyui-free")
@@ -850,7 +954,7 @@ async def tool_llama_stop():
         except Exception as e:
             lines.append(f"Failed to terminate tracked proc: {e}")
     try:
-        r = subprocess.run(
+        r = _run_subprocess(
             ["taskkill", "/F", "/IM", "llama-server.exe", "/T"],
             capture_output=True, text=True, timeout=10,
         )
@@ -858,6 +962,14 @@ async def tool_llama_stop():
         lines.append(out or f"taskkill exit {r.returncode}")
     except Exception as e:
         lines.append(f"taskkill failed: {e}")
+    # Attendant-clear-on-model-stop coupling: llama-server is going down, so the
+    # llama attendant's warm Hermes process (pointed at this /v1) must be cleared
+    # from the MAIN server's _RUNTIMES — otherwise it outlives the dead endpoint.
+    # Relayed to the main process (admin can't see its in-memory runtimes). Best-
+    # effort: a relay hiccup must NOT block the model stop.
+    relay = await _relay_to_main("/api/hermes/attendant/clear?backend=llama")
+    if relay and relay.get("cleared"):
+        lines.append(f"Cleared llama attendant runtime (main: {relay.get('cleared')}).")
     return JSONResponse({"status": "ok", "output": "\n".join(lines) or "No Llama Server processes found."})
 
 
@@ -905,8 +1017,13 @@ async def tool_llama_reload(model: str | None = None):
 
 
 # ── Dream Hermes (DiffusionGemma GPU orchestrator sidecar) ────────────────────
-# Runs the nuspy OpenAI adapter (agent.openai_server) on the diffusion-capable
-# llama.cpp fork. The sidecar JIT-loads the NVFP4 GGUF into VRAM on first request.
+# Runs the standalone C++ llama-diffusion-gemma-server.exe — the tool-aware HTTP
+# server (format_chat_request renders tools= into the chat template +
+# parse_diffusion_gemma_text_tool_calls parses the model output into OpenAI
+# tool_calls). The legacy Python nuspy adapter (agent.openai_server) was tool-blind
+# (dropped tools=, returned text only) and is no longer used. The C++ server loads
+# the NVFP4 GGUF into VRAM at startup (no JIT), so the first request after start
+# pays the cold load (~30-60s) but /health only answers once the model is resident.
 # Unload = kill the process, which releases BOTH VRAM and the process working set
 # (system RAM). idle_timeout auto-unloads so the GPU/RAM is free between sessions.
 
@@ -932,13 +1049,37 @@ def _dream_cwd() -> str:
 
 
 def _dream_cmd() -> str:
-    """Build the nuspy openai_server launch command."""
-    py = sys.executable or "python"
+    """Build the DiffusionGemma server launch command.
+
+    Uses the standalone C++ llama-diffusion-gemma-server.exe — NOT the Python
+    nuspy adapter (agent.openai_server). The C++ server is the tool-aware one:
+    format_chat_request() renders `tools=` into the chat template and
+    parse_diffusion_gemma_text_tool_calls() parses the model's
+    `<|tool_call>call:name{json}<tool_call|>` output back into OpenAI
+    `tool_calls`. The Python adapter drops `tools=` (not in its pydantic
+    request model) and returns raw text — so tool use dies there
+    (tool_turns=0 across every turn). See the 07-07 regression: the Python
+    adapter was launched at 16:20 and every dream turn from 16:21 onward
+    had tool_turns=0 despite the model emitting tool-call markup.
+
+    The C++ server loads the model at startup (no JIT), so the first request
+    is NOT fast — but it's the only path that parses tool calls. The
+    idle-watcher still unloads it on timeout to free VRAM.
+    """
     cwd = _dream_cwd()
     port = _dream_port()
-    # agent.openai_server resolves ROOT from its own __file__, so cwd just needs
-    # to be the nuspy repo root (where config.json + models/ live).
-    return f'cd /d "{cwd}" && "{py}" -m agent.openai_server --host 127.0.0.1 --port {port}'
+    exe = (_loom_config.dream_server_exe if _loom_config
+           else os.getenv("DREAM_SERVER_EXE", ""))
+    model = (_loom_config.dream_model_path if _loom_config
+             else os.getenv("DREAM_MODEL_PATH", ""))
+    if not exe:
+        exe = r"C:\tmp\llama-diffusion-gemma-pr\build\bin\llama-diffusion-gemma-server.exe"
+    if not model:
+        model = (r"C:\Users\exast\OneDrive\Documents\Loom-Projects\llama-diffusion"
+                 r"\models\diffusiongemma-26b-a4b-it-nvfp4.gguf")
+    # -m <gguf> is the standard llama.cpp model flag (common_params_parse).
+    # --host/--port are server-only flags pulled out of argv before common_params_parse.
+    return f'cd /d "{cwd}" && "{exe}" -m "{model}" --host 127.0.0.1 --port {port}'
 
 
 async def _dream_probe(timeout: float = 2.0) -> dict | None:
@@ -985,7 +1126,15 @@ def _dream_proc_mem(pid: int | None) -> tuple[int, int]:
             for p in psutil.process_iter(["pid", "name", "cmdline"]):
                 try:
                     cl = " ".join(p.info.get("cmdline") or [])
-                    if "agent.openai_server" in cl or "llama-diffusion-gemma-visual-server" in (p.info.get("name") or ""):
+                    name = p.info.get("name") or ""
+                    # Match all three server variants so RAM tracking survives a
+                    # server swap: the standalone C++ HTTP server (tool-aware, the
+                    # one _dream_cmd launches), the stdin-driven visual-server
+                    # (legacy Python adapter's child), and the Python adapter itself.
+                    if ("agent.openai_server" in cl
+                            or "llama-diffusion-gemma-server" in cl
+                            or "llama-diffusion-gemma-visual-server" in name
+                            or name == "llama-diffusion-gemma-server.exe"):
                         procs.append(psutil.Process(p.info["pid"]))
                 except Exception:
                     pass
@@ -1008,7 +1157,8 @@ def _dream_proc_mem(pid: int | None) -> tuple[int, int]:
 
 @app.post("/tools/dream-start")
 async def tool_dream_start():
-    """Launch the nuspy DiffusionGemma OpenAI adapter (JIT loads model on first request)."""
+    """Launch the C++ llama-diffusion-gemma-server (tool-aware HTTP server). Loads the
+    GGUF at startup; /health answers once the model is resident (~30-60s cold)."""
     global _dream_last_activity
     port = _dream_port()
     # Already up?
@@ -1025,12 +1175,15 @@ async def tool_dream_start():
         _child_procs["dream"] = proc
         _dream_last_activity = time.time()
         _ensure_dream_idle_watcher()
-        # The adapter itself comes up fast (JIT load is deferred to first request).
-        for i in range(30):
+        # The C++ server loads the 17GB GGUF at startup (no JIT), so /health can
+        # take a while to respond. Poll up to 120s — the model load itself is
+        # ~30-60s cold; /health only answers once the HTTP listener is up, which
+        # happens AFTER the load completes.
+        for i in range(120):
             await asyncio.sleep(1)
             if await _dream_probe() is not None:
-                return JSONResponse({"status": "ok", "output": f"Dream sidecar ready on :{port} (PID {proc.pid}). Model JIT-loads on first request.\nCmd: {cmd}"})
-        return JSONResponse({"status": "ok", "output": f"Dream sidecar launched (PID {proc.pid}) but adapter not responding after 30s.\nCmd: {cmd}"})
+                return JSONResponse({"status": "ok", "output": f"Dream sidecar ready on :{port} (PID {proc.pid}). C++ tool-aware server; model loaded at startup.\nCmd: {cmd}"})
+        return JSONResponse({"status": "ok", "output": f"Dream sidecar launched (PID {proc.pid}) but server not responding on :{port} after 120s (cold model load can be slow — check dream_admin.log).\nCmd: {cmd}"})
     except Exception as e:
         return JSONResponse({"status": "error", "output": f"Failed to launch Dream sidecar: {e}\nCmd: {cmd}"})
 
@@ -1049,20 +1202,30 @@ async def tool_dream_stop():
             lines.append(f"Terminated dream sidecar (PID {proc.pid}).")
         except Exception as e:
             lines.append(f"Failed to terminate: {e}")
-    # Also taskkill any stragglers by the python module pattern (best-effort).
-    # We can't taskkill by image (would hit all python), so rely on the tracked
-    # proc + the child visual-server process. Kill the visual-server too.
-    try:
-        r = subprocess.run(
-            ["taskkill", "/F", "/IM", "llama-diffusion-gemma-visual-server.exe", "/T"],
-            capture_output=True, text=True, timeout=10,
-        )
-        out = (r.stdout or r.stderr or "").strip()
-        if out:
-            lines.append(out)
-    except Exception as e:
-        lines.append(f"taskkill visual-server: {e}")
+    # Also taskkill any stragglers by image name (best-effort). The tracked proc
+    # is the parent we spawned, but a crashed/restarted admin can leave the
+    # server orphaned. Kill BOTH C++ server variants so VRAM actually frees:
+    #   - llama-diffusion-gemma-server.exe        (standalone HTTP server, tool-aware — the one we launch)
+    #   - llama-diffusion-gemma-visual-server.exe (stdin-driven child of the legacy Python adapter)
+    for img in ("llama-diffusion-gemma-server.exe",
+                "llama-diffusion-gemma-visual-server.exe"):
+        try:
+            r = _run_subprocess(
+                ["taskkill", "/F", "/IM", img, "/T"],
+                capture_output=True, text=True, timeout=10,
+            )
+            out = (r.stdout or r.stderr or "").strip()
+            if out:
+                lines.append(out)
+        except Exception as e:
+            lines.append(f"taskkill {img}: {e}")
     lines.append("VRAM + working set released.")
+    # Attendant-clear-on-model-stop coupling (dream): the dream sidecar is going
+    # down, so the dream attendant's warm Hermes process must be cleared from the
+    # MAIN server's _RUNTIMES. Same relay pattern as the llama stop path above.
+    relay = await _relay_to_main("/api/hermes/attendant/clear?backend=dream")
+    if relay and relay.get("cleared"):
+        lines.append(f"Cleared dream attendant runtime (main: {relay.get('cleared')}).")
     return JSONResponse({"status": "ok", "output": "\n".join(lines)})
 
 
@@ -1140,7 +1303,10 @@ def _dream_resolve_pid() -> int | None:
     """Find the dream sidecar PID: tracked proc first, else discover by cmdline.
     The admin tracks the PID when it launches the sidecar, but if the admin
     restarts while the sidecar survives, the tracked PID is gone — so we fall
-    back to scanning for the nuspy adapter / visual-server process."""
+    back to scanning for the server process. Matches all three variants:
+    llama-diffusion-gemma-server.exe (the tool-aware C++ server we launch),
+    llama-diffusion-gemma-visual-server.exe (legacy Python adapter's child), and
+    the legacy agent.openai_server Python module itself."""
     proc = _child_procs.get("dream")
     if proc and proc.poll() is None:
         return proc.pid
@@ -1149,7 +1315,11 @@ def _dream_resolve_pid() -> int | None:
         for p in psutil.process_iter(["pid", "name", "cmdline"]):
             try:
                 cl = " ".join(p.info.get("cmdline") or [])
-                if "agent.openai_server" in cl:
+                name = p.info.get("name") or ""
+                if ("agent.openai_server" in cl
+                        or "llama-diffusion-gemma-server" in cl
+                        or name == "llama-diffusion-gemma-server.exe"
+                        or "llama-diffusion-gemma-visual-server" in name):
                     return p.info["pid"]
             except Exception:
                 pass
@@ -1191,7 +1361,7 @@ async def api_dream_models():
 def _gpu_total_vram_used_mb() -> int:
     """Total VRAM in use across all GPUs (nvidia-smi). 0 if unavailable."""
     try:
-        r = subprocess.run(
+        r = _run_subprocess(
             ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=4,
         )
@@ -1205,7 +1375,7 @@ def _gpu_total_vram_used_mb() -> int:
 def _gpu_vram_for_pid(pid: int) -> int:
     """VRAM used by a specific PID (nvidia-smi pmon or compute-apps). Best-effort."""
     try:
-        r = subprocess.run(
+        r = _run_subprocess(
             ["nvidia-smi", "--query-compute-apps=pid,used_memory",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=4,
@@ -1253,20 +1423,49 @@ def _ensure_dream_idle_watcher():
 
 @app.post("/tools/dream-status")
 async def tool_dream_status():
-    """Human-readable Dream sidecar status for the admin card output pane."""
+    """Human-readable Dream sidecar status for the admin card output pane.
+
+    The C++ llama-diffusion-gemma-server returns only {"status":"ok"} from
+    /health (no model/ctx metadata), unlike the legacy Python nuspy adapter
+    which embedded loaded_model/available/maxtok. So we derive the model id +
+    context from /v1/models + config when the health payload is bare. This keeps
+    the admin card accurate across both server variants.
+    """
     h = await _dream_probe()
     port = _dream_port()
     if h is None:
         return JSONResponse({"status": "ok", "output": f"Dream sidecar NOT running on :{port}."})
+    # Health schema differs by server: the Python adapter returns
+    # loaded_model/available/maxtok; the C++ server returns only {"status":"ok"}.
+    # Fall back to /v1/models + config for the bare-health case.
+    loaded_model = h.get("loaded_model")
+    available = h.get("available", [])
+    maxtok = h.get("maxtok", 0)
+    if not loaded_model:
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                mr = await client.get(f"http://127.0.0.1:{port}/v1/models")
+                if mr.status_code == 200:
+                    data = mr.json().get("data", [])
+                    ids = [str(m.get("id") or "") for m in data if isinstance(m, dict)]
+                    ids = [i for i in ids if i]
+                    if ids:
+                        # The C++ server only lists the one loaded model.
+                        loaded_model = ids[0] if len(ids) == 1 else None
+                        available = available or ids
+        except Exception:
+            pass
+    if not maxtok:
+        maxtok = (_loom_config.dream_context_size if _loom_config else 0) or 0
     pid = _dream_resolve_pid()
     ws_mb, cached_mb = _dream_proc_mem(pid)
     vram_mb = _gpu_vram_for_pid(pid) if pid else _gpu_total_vram_used_mb()
     idle_secs = int(time.time() - _dream_last_activity) if _dream_last_activity else 0
     lines = [
         f"Dream sidecar running on :{port} (PID {pid or 'unknown'}).",
-        f"Loaded model: {h.get('loaded_model') or 'none (JIT — loads on first request)'}",
-        f"Available: {', '.join(h.get('available', [])) or 'none'}",
-        f"maxtok (ctx): {h.get('maxtok', 0)}",
+        f"Loaded model: {loaded_model or 'none'}",
+        f"Available: {', '.join(available) or 'none'}",
+        f"maxtok (ctx): {maxtok}",
         f"VRAM used: {vram_mb} MB",
         f"RAM working set: {ws_mb} MB",
         f"RAM cached (GGUF mmap): {cached_mb} MB",
@@ -1411,7 +1610,7 @@ async def tool_nrol_status():
         lines.append(f"\nLlama Server: not reachable on :{llama_port}: {e}")
 
     try:
-        proc = subprocess.run(
+        proc = _run_subprocess(
             ["claude", "mcp", "list"],
             cwd=str(Path(__file__).parent),
             capture_output=True,
@@ -1570,7 +1769,7 @@ async def tool_nrol_mcp_smoke():
         "from mcp_servers.nrol_ao import server; print(server.nrol_status())",
     ]
     try:
-        proc = subprocess.run(
+        proc = _run_subprocess(
             cmd,
             cwd=str(Path(__file__).parent),
             env=_nrol_env(),
@@ -1606,7 +1805,7 @@ async def tool_nrol_mcp_register():
         str(Path(__file__).parent / "nrol_ao_mcp_server.py"),
     ]
     try:
-        proc = subprocess.run(
+        proc = _run_subprocess(
             cmd,
             cwd=str(Path(__file__).parent),
             env=_nrol_env(),
@@ -1691,7 +1890,7 @@ async def tool_comfyui_stop():
             "Write-Output (\"Killed PID \" + $p.ProcessId) } } "
             "else { Write-Output 'no-match' }"
         )
-        r = subprocess.run(
+        r = _run_subprocess(
             ["powershell", "-NoProfile", "-Command", ps_script],
             capture_output=True, text=True, timeout=15,
         )
@@ -1738,7 +1937,7 @@ async def tool_comfyui_fix_deps():
     """Run pip upgrade for huggingface-hub and transformers in the ComfyUI Python env."""
     try:
         r = await asyncio.to_thread(
-            subprocess.run,
+            _run_subprocess,
             ["py", "-3.12", "-m", "pip", "install", "huggingface-hub>=0.34.0", "transformers", "-U"],
             capture_output=True, text=True, timeout=180, cwd=COMFYUI_LAUNCH_CWD,
         )
@@ -1772,7 +1971,7 @@ async def tool_disk_usage():
 def _run_powershell_cmd_sync(cmd: str) -> str:
     """Run a PowerShell command synchronously."""
     try:
-        proc = subprocess.run(
+        proc = _run_subprocess(
             ["powershell", "-NoProfile", "-Command", cmd],
             capture_output=True, text=True, timeout=8,
             cwd=str(Path(__file__).parent)
@@ -1841,7 +2040,7 @@ async def tool_system_specs():
     # Try nvidia-smi first
     try:
         def _run_nvidia_smi():
-            return subprocess.run(
+            return _run_subprocess(
                 ["nvidia-smi", "--query-gpu=gpu_name,memory.total,memory.used,memory.free,driver_version", "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=5,
                 cwd=str(Path(__file__).parent)
@@ -2181,7 +2380,7 @@ async def tool_ttyd_stop():
         proc.kill()
         lines.append(f"Killed tracked ttyd (PID {proc.pid}).")
     try:
-        r = subprocess.run(
+        r = _run_subprocess(
             ["taskkill", "/F", "/IM", "ttyd.exe", "/T"],
             capture_output=True, text=True, timeout=10,
         )

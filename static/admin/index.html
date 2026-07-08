@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/assets/admin.css?v=4">
+    <link rel="stylesheet" href="/assets/admin.css?v=6">
 </head>
 <body>
     <div class="bg-glow bg-glow-1"></div>
@@ -76,33 +76,53 @@
                         </div>
                         <div class="action-row">
                             <button class="btn btn-ghost" onclick="runTool('llama-status', {target:'out-llama'})">Status</button>
-                            <button class="btn btn-warn" id="btn-llama-unload" title="Stop llama-server to release model VRAM for ComfyUI">Unload for ComfyUI</button>
+                            <button class="btn btn-warn" id="btn-llama-unload" title="Stop llama-server and release model memory">Unload</button>
                             <button class="btn btn-green" id="btn-llama-reload" title="Start llama-server again with the selected/default model">Reload Llama</button>
-                            <button class="btn btn-ghost" onclick="runTool('clear-vram', {target:'out-llama'})">💥 Clear VRAM</button>
+                            <button class="btn btn-ghost" onclick="runTool('clear-vram', {target:'out-llama'})">Release VRAM</button>
                             <span class="action-spacer"></span>
                             <select id="llama-model-switch" class="select" title="Switch llama-server to another GGUF (stop + reload, ~30-90s)">
                                 <option value="">Loading models…</option>
                             </select>
                             <button class="btn btn-cyan" id="btn-llama-switch" title="Restart llama-server with the selected model">⇆ Switch model</button>
                         </div>
+                        <div id="llama-memory-panel" class="memory-panel">
+                            <span class="memory-muted">Checking memory state...</span>
+                        </div>
                         <pre class="server-out" id="out-llama"></pre>
                     </div>
 
                     <div class="card server-card" data-server="dream">
                         <div class="card-head">
-                            <h2><span class="dot" id="dot-dream"></span> Dream Hermes <span class="port-tag" id="dream-port-tag">:8787</span></h2>
+                            <h2><span class="dot" id="dot-dream"></span> Dream Engine <span class="port-tag" id="dream-port-tag"></span></h2>
                             <div class="head-actions" id="head-actions-dream"></div>
                         </div>
                         <div class="action-row">
                             <button class="btn btn-ghost" onclick="runTool('dream-status', {target:'out-dream'})">Status</button>
-                            <button class="btn btn-warn" id="btn-dream-unload" title="Stop the sidecar — frees VRAM AND the 17GB GGUF from system RAM">Unload + Flush RAM</button>
-                            <button class="btn btn-green" id="btn-dream-reload" title="Start the Dream sidecar (model JIT-loads on first request)">Start Dream</button>
-                            <button class="btn btn-ghost" onclick="runTool('dream-flush-ram', {target:'out-dream'})" title="Purge the GGUF from OS standby RAM without stopping the sidecar">💧 Flush Standby RAM</button>
+                            <button class="btn btn-ghost" onclick="runTool('dream-flush-ram', {target:'out-dream'})" title="Release reclaimable model cache without stopping Dream">Release Cache</button>
                         </div>
-                        <div id="dream-models-panel" class="loaded-models-panel" style="margin-top:8px; padding:6px 10px; font-size:13px; line-height:1.5;">
-                            <span style="color:var(--text-mute);">Checking Dream sidecar…</span>
+                        <div id="dream-memory-panel" class="memory-panel">
+                            <span class="memory-muted">Checking memory state...</span>
                         </div>
                         <pre class="server-out" id="out-dream"></pre>
+                    </div>
+
+                    <div class="card server-card" data-server="hermes">
+                        <div class="card-head">
+                            <h2><span class="dot" id="dot-hermes"></span> Hermes Runtimes <span class="port-tag" id="hermes-port-tag"></span></h2>
+                            <div class="head-actions" id="head-actions-hermes"></div>
+                        </div>
+                        <div class="action-row">
+                            <button class="btn btn-ghost" id="btn-hermes-status" title="Status of Prometheus + the two attendants + model liveness">Status</button>
+                            <button class="btn btn-cyan" id="btn-prometheus-restart" title="Re-route Prometheus backend (rewrite config) and clear warm runtime">Restart Prometheus</button>
+                            <button class="btn btn-warn" id="btn-prometheus-stop" title="Stop Prometheus' warm runtime (independent of model servers)">Stop Prometheus</button>
+                            <span class="action-spacer"></span>
+                            <button class="btn btn-ghost" id="btn-attendant-llama-stop" title="Force-clear the llama attendant's warm process (soul survives)">Clear Llama Att.</button>
+                            <button class="btn btn-ghost" id="btn-attendant-dream-stop" title="Force-clear the dream attendant's warm process (soul survives)">Clear Dream Att.</button>
+                        </div>
+                        <div id="hermes-runtime-panel" class="memory-panel">
+                            <span class="memory-muted">Checking Hermes runtimes…</span>
+                        </div>
+                        <pre class="server-out" id="out-hermes"></pre>
                     </div>
 
                     <div class="card server-card" data-server="comfy">
@@ -112,9 +132,12 @@
                         </div>
                         <div class="action-row">
                             <button class="btn btn-ghost" onclick="runTool('comfyui-status', {target:'out-comfy'})">Status</button>
-                            <button class="btn btn-ghost" onclick="runTool('comfyui-free', {target:'out-comfy'})">💥 Free VRAM</button>
+                            <button class="btn btn-ghost" onclick="runTool('comfyui-free', {target:'out-comfy'})">Release VRAM</button>
                             <button class="btn btn-ghost" onclick="runTool('comfyui-log', {target:'out-comfy', method:'GET'})">Log</button>
                             <button class="btn btn-ghost" onclick="runTool('comfyui-fix-deps', {target:'out-comfy'})">Fix deps</button>
+                        </div>
+                        <div id="comfy-memory-panel" class="memory-panel">
+                            <span class="memory-muted">Checking memory state...</span>
                         </div>
                         <pre class="server-out" id="out-comfy"></pre>
                     </div>
@@ -144,6 +167,37 @@
                         <thead><tr><th>Conv</th><th>Draft</th><th>PID</th><th>Status</th><th>Mode</th><th>Age</th><th></th></tr></thead>
                         <tbody id="generations-body"></tbody>
                     </table>
+                </div>
+
+                <div class="card">
+                    <div class="card-head">
+                        <h2>Database Storage</h2>
+                        <button class="btn btn-ghost" id="btn-db-refresh">Refresh</button>
+                    </div>
+                    <div class="db-storage-grid">
+                        <label>
+                            <span>Folder</span>
+                            <input id="db-folder" class="text-input" type="text" spellcheck="false" placeholder="C:\LoomData">
+                        </label>
+                        <label>
+                            <span>File</span>
+                            <input id="db-filename" class="text-input" type="text" spellcheck="false" placeholder="loom.db">
+                        </label>
+                    </div>
+                    <div class="db-current" id="db-current">Loading database path...</div>
+                    <div class="action-row">
+                        <label class="check-inline">
+                            <input id="db-copy-current" type="checkbox" checked>
+                            <span>Copy current DB into this folder before switching</span>
+                        </label>
+                        <label class="check-inline">
+                            <input id="db-restart-main" type="checkbox" checked>
+                            <span>Restart Main Loom after saving</span>
+                        </label>
+                        <span class="action-spacer"></span>
+                        <button class="btn btn-cyan" id="btn-db-save">Save DB Location</button>
+                    </div>
+                    <div class="empty-note">Use a local, unsynced folder such as <code>C:\LoomData</code>. Copying requires Main Loom to stop first so SQLite files are not copied mid-write.</div>
                 </div>
 
                 <div class="card">
@@ -188,7 +242,8 @@
                 <div class="card">
                     <div class="card-head"><h2>Maintenance</h2></div>
                     <div class="tools-grid">
-                        <button class="tool-btn" onclick="runTool('clear-vram')"><span class="icon">💥</span> Clear VRAM<span class="label">Unload all models</span></button>
+                        <button class="tool-btn" onclick="runTool('clear-vram')"><span class="icon">GPU</span> Release Llama VRAM<span class="label">Unload llama-server</span></button>
+                        <button class="tool-btn" onclick="runTool('memory-status')"><span class="icon">RAM</span> Memory Status<span class="label">Show parked services</span></button>
                         <button class="tool-btn" onclick="runTool('disk-usage')"><span class="icon">💾</span> Disk Usage<span class="label">DB &amp; log sizes</span></button>
                         <button class="tool-btn" onclick="runTool('system-specs')"><span class="icon">💻</span> System Specs<span class="label">CPU / RAM / VRAM</span></button>
                     </div>
@@ -290,6 +345,6 @@
     </div>
 
     <div id="toast"></div>
-    <script src="/assets/admin.js?v=7"></script>
+    <script src="/assets/admin.js?v=9"></script>
 </body>
 </html>

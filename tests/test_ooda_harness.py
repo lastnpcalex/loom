@@ -4,6 +4,7 @@ import json
 import pytest
 from ooda_harness import (
     parse_ooda_block,
+    repair_ooda_block,
     extract_post_ooda_prose,
     build_ooda_system_prompt,
     build_pass2_context,
@@ -117,6 +118,102 @@ class TestParseOodaBlock:
         result = parse_ooda_block(text)
         assert len(result["reads"]) == 4
         assert len(result["updates"]) == 3
+
+
+# ── Repair Tests ──
+
+class TestRepairOodaBlock:
+    """repair_ooda_block recovers state deltas when parse_ooda_block returns None.
+
+    Covers the two failure modes that previously caused the harness to silently
+    drop state updates: unclosed <ooda> (model ran out of tokens) and loose
+    <update_state/> tags emitted with no <ooda> wrapper at all.
+    """
+
+    async def test_unclosed_ooda_block(self):
+        """Model truncated before </ooda> — repair should close + re-parse."""
+        text = (
+            "<ooda>\n"
+            "  <observe>The stranger approached cautiously.</observe>\n"
+            '  <update_state schema="character_state" label="Vera" '
+            'field="current_mood" value="alarmed"/>\n'
+            "  <decide>Keep distance, speak curtly.</decide>"
+            # NOTE: no </ooda> — model ran out of tokens
+        )
+        # parse_ooda_block must fail (no closing tag)
+        assert parse_ooda_block(text) is None
+        repaired = repair_ooda_block(text)
+        assert repaired is not None
+        assert "stranger approached" in repaired["observe"]
+        assert "Keep distance" in repaired["decide"]
+        assert len(repaired["updates"]) == 1
+        assert repaired["updates"][0]["field"] == "current_mood"
+        assert repaired["updates"][0]["value"] == "alarmed"
+
+    async def test_loose_update_tags_no_wrapper(self):
+        """Model emitted <update_state/> tags with no <ooda> wrapper at all."""
+        text = (
+            'Some preamble the model wrote.\n'
+            '<update_state schema="character_state" label="Vera" '
+            'field="current_mood" value="angry"/>\n'
+            '<update_state schema="scene_state" label="current" '
+            'field="atmosphere" value="tense"/>\n'
+            'Then some prose.'
+        )
+        assert parse_ooda_block(text) is None
+        repaired = repair_ooda_block(text)
+        assert repaired is not None
+        assert len(repaired["updates"]) == 2
+        labels = {u["label"] for u in repaired["updates"]}
+        assert labels == {"Vera", "current"}
+
+    async def test_well_formed_returns_none(self):
+        """Already-well-formed input should not need repair — returns None."""
+        text = (
+            "<ooda>\n"
+            "  <observe>Test.</observe>\n"
+            '  <update_state schema="character_state" label="Vera" '
+            'field="mood" value="calm"/>\n'
+            "  <decide>Act.</decide>\n"
+            "</ooda>"
+        )
+        # parse_ooda_block already succeeds, so repair is not invoked in prod;
+        # but if called directly it must not double-repair.
+        assert parse_ooda_block(text) is not None
+        assert repair_ooda_block(text) is None
+
+    async def test_pure_prose_returns_none(self):
+        """No OODA tags at all — nothing to recover."""
+        text = "Just prose, no tags here. The wind picked up outside."
+        assert parse_ooda_block(text) is None
+        assert repair_ooda_block(text) is None
+
+    async def test_think_blocks_stripped_before_repair(self):
+        """Reasoning blocks prefixing a truncated <ooda> must not block repair."""
+        # Use the exact think-tag characters the model emits and that
+        # ooda_harness._strip_think_blocks recognizes.
+        text = (
+            "<think>Let me think about what Vera would do.</think>"
+            "<ooda>\n"
+            "  <observe>The stranger approached.</observe>\n"
+            '  <update_state schema="character_state" label="Vera" '
+            'field="current_mood" value="wary"/>\n'
+            "  <decide>Step back.</decide>"
+            # no </ooda>
+        )
+        assert parse_ooda_block(text) is None
+        repaired = repair_ooda_block(text)
+        assert repaired is not None
+        assert "stranger approached" in repaired["observe"]
+        assert len(repaired["updates"]) == 1
+        assert repaired["updates"][0]["value"] == "wary"
+
+    async def test_unclosed_ooda_empty_returns_none(self):
+        """Unclosed <ooda> with no recoverable content should return None."""
+        text = "<ooda>\n   \n"  # unclosed but empty
+        assert parse_ooda_block(text) is None
+        # repair tries to close + parse, but there's no observe/updates/creates
+        assert repair_ooda_block(text) is None
 
 
 class TestExtractPostOodaProse:

@@ -118,6 +118,14 @@ dashboard monitoring, and only mutates topic JSON when called with
 `commit=true`. With other providers, it records the job and returns the matcher
 prompt plus the follow-up `apply_matcher_output` handoff.
 
+Every LLM-job tool that takes a `model` argument also accepts `model="dream"`
+(or `model="dream:<id>"`) to route the job through the Dream Engine — the
+DiffusionGemma OpenAI-compatible sidecar on `dream_host` (default `:8787`) —
+instead of llama-server. Setting `NROL_AO_LLM_BACKEND=dream` flips the default
+backend for all jobs without per-call arguments. `model_endpoint_status`
+reports both endpoints and the active default; `chat` job responses carry a
+`backend` field so activity records show where a deliberation actually ran.
+
 For news refreshes, prefer `run_news_scan`. It is the MCP-side worker path:
 the server selects stale topics, performs web search, strips tracker query
 parameters for duplicate detection, dedupes articles, fetches readable article

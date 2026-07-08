@@ -66,6 +66,15 @@ call any tool without `help`; `help` is the curated view, not a prerequisite.
 Triage is first, always: `triage_headline` before any other action on new
 information.
 
+**LLM backends.** LLM-job tools (scans, red-teams, deliberation, dup review,
+future-cast) run on one of two local backends: llama-server (default) or the
+Dream Engine (DiffusionGemma) via `model="dream"`. There is **no automatic
+fallback** — a job targeting a down backend errors even if the other is up.
+Before LLM-heavy work, call `model_endpoint_status` and check the `ok` flags;
+if only Dream is live, pass `model="dream"` explicitly. Prefer one backend for
+a whole scan run — job records stamp which backend ran, and mixing models
+mid-run muddies calibration attribution.
+
 ## Operator Loop
 
 When the human asks to "run the evidence loop", "catch the topic up", or

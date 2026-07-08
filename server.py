@@ -57,10 +57,10 @@ from local_llm import health_check, stream_chat, sync_chat, describe_image
 from ooda_harness import (
     build_ooda_system_prompt,
     parse_ooda_block,
+    repair_ooda_block,
     extract_post_ooda_prose,
     execute_ooda_reads,
     execute_ooda_updates,
-    build_pass2_context,
 )
 from prompt_engine import (
     build_system_prompt,
@@ -71,7 +71,15 @@ from prompt_engine import (
 from context_manager import get_context_for_generation
 import claude_client
 import gemini_client
-import hermes_client
+try:
+    import hermes_client
+    _HERMES_IMPORT_ERROR: ModuleNotFoundError | None = None
+except ModuleNotFoundError as e:
+    if e.name != "hermes_client":
+        raise
+    hermes_client = None
+    _HERMES_IMPORT_ERROR = e
+    print(f"[STARTUP] Hermes adapter unavailable; Hermes/Dream modes disabled: {e}")
 import codex_client
 import model_context
 import local_summary
@@ -97,6 +105,7 @@ CRON_DENY_PATTERNS = (
     "diskpart",
 )
 _cron_scheduler_task: asyncio.Task | None = None
+_hermes_state_task: asyncio.Task | None = None
 _cron_running: set[int] = set()
 
 # ── Canvas CLAUDE.md template ──
@@ -176,9 +185,47 @@ document.getElementById('run-btn').addEventListener('click', () => {
 """
 
 
+async def _hermes_model_state_loop():
+    """Periodically broadcast Hermes model-server liveness to all WS clients.
+
+    Feeds the chat-space header indicator (server.py:4031 _ws_broadcast_all).
+    Probes llama (/v1/models) + dream (/health) every ~15s and broadcasts a
+    hermes_model_state event per backend when the state changes (or on the first
+    tick after startup). The indicator only renders for Hermes-class, non-incognito
+    convs (handled client-side in updateHermesModelIndicator).
+    """
+    last = {"llama": None, "dream": None}
+    while True:
+        try:
+            if hermes_client is not None:
+                llama_up = await _probe_llama_live()
+                # Dream probe uses a SHORT timeout (0.5s): the sidecar is
+                # single-GPU-serialized, so /health can block behind an active
+                # generation or cold-load. A long timeout here competes with
+                # user turns for the GPU lock's attention and stalls TTFT.
+                # 0.5s is enough to catch "sidecar process is up" without
+                # queueing behind GPU work; a busy sidecar just reports down
+                # transiently, which is fine for the indicator.
+                dream_up = await _probe_dream_live(timeout=0.5)
+                if last["llama"] is None or last["llama"] != llama_up:
+                    last["llama"] = llama_up
+                    await _ws_broadcast_all({"type": "hermes_model_state",
+                                            "backend": "llama", "up": llama_up})
+                if last["dream"] is None or last["dream"] != dream_up:
+                    last["dream"] = dream_up
+                    await _ws_broadcast_all({"type": "hermes_model_state",
+                                            "backend": "dream", "up": dream_up})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass  # never let the loop die on a probe hiccup
+        await asyncio.sleep(15)
+
+
 @asynccontextmanager
 async def lifespan(app):
     global _cron_scheduler_task
+    global _hermes_state_task
     await db.init_db()
     await _cron_init_db()
     # Clean up stale draft messages (empty assistant msgs older than 30 min)
@@ -240,6 +287,7 @@ async def lifespan(app):
 
     asyncio.create_task(_refresh_remote_models_on_startup())
     _cron_scheduler_task = asyncio.create_task(_cron_scheduler_loop())
+    _hermes_state_task = asyncio.create_task(_hermes_model_state_loop())
     yield
     if _cron_scheduler_task:
         _cron_scheduler_task.cancel()
@@ -247,6 +295,17 @@ async def lifespan(app):
             await _cron_scheduler_task
         except asyncio.CancelledError:
             pass
+    if _hermes_state_task:
+        _hermes_state_task.cancel()
+        try:
+            await _hermes_state_task
+        except asyncio.CancelledError:
+            pass
+    if hermes_client is not None:
+        try:
+            await hermes_client.shutdown_hermes_runtimes()
+        except Exception as e:
+            print(f"[SHUTDOWN] Hermes runtime cleanup failed: {e}")
     await db.close_db()
 
 
@@ -1380,6 +1439,144 @@ async def api_admin_status():
     return await api_server_status("admin")
 
 
+# ── Hermes runtime management (Prometheus + attendants) ──────────────────────
+# Three Hermes runtimes live in this process's _RUNTIMES (hermes_client.py:917):
+#   - Llama attendant (home = config.hermes_home, ensouled, model-bound)
+#   - Dream attendant (home = -dream suffix, ensouled, model-bound)
+#   - Prometheus     (home = -prometheus suffix, incognito, always-warm)
+# The admin_server is a SEPARATE process (port 8000) and can't see _RUNTIMES
+# directly, so the admin Hermes-management UI relays to these endpoints. The
+# attendant-clear-on-model-stop binding also relays here: when admin stops
+# llama/dream, it POSTs /api/hermes/attendant/clear so the bound attendant's
+# warm process is cleared from THIS process's _RUNTIMES.
+
+def _hermes_runtime_for_attendant(backend: str) -> dict | None:
+    """Return the held runtime for an attendant backend, or None.
+
+    `backend` is "llama" or "dream". Read-only snapshot for the status endpoint.
+    """
+    if hermes_client is None:
+        return None
+    if backend == "llama":
+        home = config.hermes_home
+    elif backend == "dream":
+        home = _ensure_dream_hermes_home()
+    else:
+        return None
+    rt = hermes_client.find_runtime_by_home(home)
+    if rt is None:
+        return None
+    proc = rt.proc
+    return {
+        "home": rt.home,
+        "alive": rt._is_alive(),
+        "pid": proc.pid if proc is not None else None,
+        "agent_info": rt._agent_info,
+    }
+
+
+@app.post("/api/hermes/attendant/clear")
+async def api_hermes_attendant_clear(backend: str = "llama"):
+    """Clear the bound attendant's warm runtime when its model server stops.
+
+    The attendant-clear-on-model-stop coupling: admin's llama-unload / dream-stop
+    paths POST here so the soul-bearing process doesn't outlive the model it
+    talks to. The soul (home dir, state.db, memories) survives — only the warm
+    process is cleared. Next attendant turn re-inits (probe cache skips the
+    expensive context-length probe).
+    """
+    if hermes_client is None:
+        return JSONResponse({"status": "ok", "cleared": False, "reason": "hermes_unavailable"})
+    if backend == "llama":
+        home = config.hermes_home
+    elif backend == "dream":
+        home = _ensure_dream_hermes_home()
+    else:
+        return JSONResponse({"status": "error", "error": f"unknown backend: {backend}"}, status_code=400)
+    cleared = await hermes_client.stop_runtime_by_home(home)
+    # Broadcast the model-down state so the UI indicator flips.
+    await _ws_broadcast_all({
+        "type": "hermes_model_state",
+        "backend": backend,
+        "up": False,
+    })
+    return JSONResponse({"status": "ok", "cleared": cleared, "backend": backend})
+
+
+@app.get("/api/hermes/status")
+async def api_hermes_status():
+    """Status of all three Hermes runtimes for the admin Hermes-management panel.
+
+    Reports liveness of the two local model servers (transitively = attendant
+    availability) + the held runtime state for each of the three. Prometheus is
+    implicitly always-functional (cloud fallback); its held-runtime state shows
+    whether the warm process is currently up.
+    """
+    if hermes_client is None:
+        return JSONResponse({
+            "hermes_available": False,
+            "import_error": str(_HERMES_IMPORT_ERROR) if _HERMES_IMPORT_ERROR else None,
+        })
+    llama_up = await _probe_llama_live()
+    dream_up = await _probe_dream_live()
+    prometheus_home = _prometheus_home_path()
+    prom_rt = hermes_client.find_runtime_by_home(prometheus_home)
+    prom_proc = prom_rt.proc if prom_rt else None
+    return JSONResponse({
+        "hermes_available": True,
+        "models": {
+            "llama": {"up": llama_up, "attendant": _hermes_runtime_for_attendant("llama")},
+            "dream": {"up": dream_up, "attendant": _hermes_runtime_for_attendant("dream")},
+        },
+        "prometheus": {
+            "home": prometheus_home,
+            "held": prom_rt is not None,
+            "alive": prom_rt._is_alive() if prom_rt else False,
+            "pid": prom_proc.pid if prom_proc else None,
+        },
+        "runtimes": hermes_client.list_hermes_runtimes(),
+    })
+
+
+@app.post("/api/hermes/prometheus/stop")
+async def api_hermes_prometheus_stop():
+    """Stop Prometheus' warm runtime (independent of model servers)."""
+    if hermes_client is None:
+        return JSONResponse({"status": "error", "error": "hermes_unavailable"}, status_code=503)
+    home = _prometheus_home_path()
+    cleared = await hermes_client.stop_runtime_by_home(home)
+    return JSONResponse({"status": "ok", "cleared": cleared, "home": home})
+
+
+@app.post("/api/hermes/prometheus/restart")
+async def api_hermes_prometheus_restart():
+    """Restart Prometheus: re-route the backend (rewrite config) and FORCE-clear
+    the warm runtime, even if the backend signature is unchanged.
+
+    Distinct from the routing path (route_prometheus_backend called on turn
+    dispatch), which only reloads when the signature changed. This is the
+    explicit admin "restart" intent — e.g. clear a wedged warm process even when
+    the backend is the same. stop_runtime_by_home refuses to kill a runtime with
+    an active turn, so `reloaded` reports whether the clear actually happened.
+    """
+    if hermes_client is None:
+        return JSONResponse({"status": "error", "error": "hermes_unavailable"}, status_code=503)
+    backend = await route_prometheus_backend(force=True)
+    return JSONResponse({
+        "status": "ok",
+        "backend": backend["backend"],
+        "model": backend["model"],
+        "base_url": backend["base_url"],
+        "home": backend["home"],
+        "reloaded": backend.get("reloaded", True),
+        "note": ("warm runtime cleared; re-inits on next Prometheus turn"
+                 if backend.get("reloaded")
+                 else "warm runtime NOT cleared (active turn in flight); "
+                      "re-inits against new config on the next turn anyway"),
+    })
+
+
+
 
 # ── Local model list cache ────────────────────────────────────────────────
 # Serves the .gguf file list from disk so the UI model dropdown is instant.
@@ -1449,6 +1646,7 @@ async def api_local_refresh_models():
     Settings; also called after llama-server starts/stops."""
     await _refresh_local_models_cache()
     await _refresh_vision_models_cache()
+    await _refresh_all_engines_cache()
     return {
         "models": _LOCAL_MODELS_CACHE.get("models", []),
         "vision_models": _VISION_MODELS_CACHE.get("models", []),
@@ -1461,6 +1659,7 @@ async def api_local_refresh_models():
 # Used by the Braid/Weave inline dropdown.
 
 _ALL_ENGINES_CACHE: dict | None = None
+_ALL_ENGINES_CACHE_TTL_SEC = 10
 
 
 async def _refresh_all_engines_cache() -> dict:
@@ -1480,21 +1679,30 @@ async def _refresh_all_engines_cache() -> dict:
             is_loaded = True
         out.append({"name": m, "backend": "llama", "loaded": is_loaded})
 
-    # Append the Dream Hermes model (DiffusionGemma on the nuspy sidecar :8787)
-    # if it's available. backend:"dream" lets _handle_hermes_generation route
-    # it to dream_client instead of the Hermes ACP CLI (which only knows the
-    # llama-server endpoint). Probe is cheap (2s timeout); failure just skips.
+    # Append Dream Engine models from an OpenAI-compatible DiffusionGemma
+    # endpoint. backend:"dream" routes direct generation through dream_client.
+    # of the Hermes ACP CLI.
+    dream_seen: set[str] = set()
+    dream_model = (getattr(config, "dream_model", "") or "").strip()
+    if dream_model:
+        out.append({"name": dream_model, "backend": "dream", "loaded": False})
+        dream_seen.add(dream_model)
+
     try:
         import dream_client as _dc
-        dh = await _dc.health(timeout=2.0)
+        dh = await _dc.health(config.dream_host, timeout=2.0)
         if dh is not None:
             avail = dh.get("available") or []
             loaded = bool(dh.get("loaded_model"))
-            # The nuspy adapter lists model ids (filename stem); surface as .gguf
-            # so the existing dropdown + cc_model plumbing round-trips cleanly.
             for mid in avail:
-                fname = mid if mid.endswith(".gguf") else f"{mid}.gguf"
-                out.append({"name": fname, "backend": "dream", "loaded": loaded})
+                name = str(mid)
+                if name in dream_seen:
+                    for model in out:
+                        if model.get("backend") == "dream" and model.get("name") == name:
+                            model["loaded"] = loaded
+                    continue
+                out.append({"name": name, "backend": "dream", "loaded": loaded})
+                dream_seen.add(name)
     except Exception:
         pass  # dream sidecar down or not configured — skip silently
 
@@ -1510,7 +1718,10 @@ async def _refresh_all_engines_cache() -> dict:
 async def api_local_all_models():
     """Returns all local .gguf models plus live llama-server models.
     Used by the inline dropdown for model selection."""
-    if _ALL_ENGINES_CACHE is None:
+    if (
+        _ALL_ENGINES_CACHE is None
+        or time.time() - float(_ALL_ENGINES_CACHE.get("fetched_at", 0)) > _ALL_ENGINES_CACHE_TTL_SEC
+    ):
         await _refresh_all_engines_cache()
     return _ALL_ENGINES_CACHE
 
@@ -1963,7 +2174,7 @@ async def api_create_conversation(data: dict = None):
     )
     if nrol_operator:
         fields["nrol_operator"] = 1
-    if mode in ("local", "hermes") and local_model:
+    if mode in ("local", "hermes", "weave", "dream") and local_model:
         fields["local_model"] = local_model
     await db.update_conversation_fields(conv["id"], **fields)
     # Refresh conv data
@@ -2120,6 +2331,10 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["cc_effort"] = data["cc_effort"]
     if "cc_permission_mode" in data:
         fields["cc_permission_mode"] = data["cc_permission_mode"]
+    if "incognito" in data:
+        # Incognito routes Hermes-class turns to Prometheus (always-warm,
+        # cloud-fallback, no soul). 0 = ensouled attendant, 1 = Prometheus.
+        fields["incognito"] = int(bool(data["incognito"]))
     if "local_model" in data:
         fields["local_model"] = data["local_model"]
     if "ooda_enabled" in data:
@@ -4023,7 +4238,7 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 if proc:
                     await claude_client.cancel_claude(proc)
                 hproc = _active_hermes_procs.pop(conv_id, None)
-                if hproc:
+                if hproc and hermes_client is not None:
                     await hermes_client.cancel_hermes(hproc)
                 # Clean up pending permissions from memory and DB
                 for rid in list(_pending_hook_permissions):
@@ -4101,7 +4316,7 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 # different branches would race the same child. (Including "local"
                 # here fixes a latent Braid bug — it was previously treated like
                 # Weave/OODA and allowed to spawn parallel CC subprocesses.)
-                is_subprocess_agent = mode in ("claude", "local", "hermes")
+                is_subprocess_agent = mode in ("claude", "local", "hermes", "dream")
 
                 if is_subprocess_agent:
                     # Only one agent generation per conversation
@@ -4672,6 +4887,14 @@ def models_match(a: str, b: str) -> bool:
 
 async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
     """Handle a generation request over WebSocket — routes by conversation mode."""
+    parent_id = data.get("parent_id")
+    if parent_id is not None:
+        parent_msg = await db.get_message(parent_id)
+        if not parent_msg or parent_msg.get("conversation_id") != conv_id:
+            print(f"[WS-WARN] parent_id {parent_id} does not belong to conv_id {conv_id}! Fallback to active leaf.")
+            leaf = await db.get_active_leaf(conv_id)
+            data["parent_id"] = leaf["id"] if leaf else None
+
     conv = await db.get_conversation(conv_id)
     if conv and conv.get("local_model") and config.llama_model:
         local_model = conv["local_model"]
@@ -4694,6 +4917,30 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
 
     mode = conv.get("mode", "weave") if conv else "weave"
 
+    # ── Hermes-class routing: Prometheus (incognito) vs attendants (ensouled) ──
+    # mode "hermes" → llama attendant; mode "dream" → dream attendant. Both are
+    # ensouled (carry a soul, model-bound). A conversation-level `incognito` flag
+    # overrides either to Prometheus (incognito, always-warm, cloud-fallback) —
+    # no soul, no memory, always functional. An ensouled turn whose model is down
+    # REFUSES with a Loom-specific error: no generation, no silent fallback to
+    # Prometheus (silent de-souling mid-conversation is the exact contamination
+    # the design exists to prevent). The user must toggle incognito explicitly
+    # to take the always-functional no-soul path.
+    if mode in ("hermes", "dream"):
+        if conv.get("incognito"):
+            await _handle_prometheus_generation(websocket, conv_id, conv, data)
+            return
+        # Ensouled: refuse if the bound model server is down. ONLY probe llama
+        # here — llama-server answers /v1/models instantly even under load.
+        # The dream sidecar is single-GPU-serialized: a /health probe during
+        # cold-load or generation blocks behind the GPU lock, adding seconds
+        # to TTFT (the 2s→12s regression) AND false-negatives (busy ≠ down).
+        # Dream's own request fails fast if the sidecar is truly down, so no
+        # pre-probe is needed — the refuse path is llama-only.
+        if mode == "hermes" and not await _probe_llama_live():
+            await _refuse_ensouled_model_down(websocket, conv_id, "llama", config.llama_model)
+            return
+
     if mode in ("claude", "gemini", "codex"):
         await _handle_claude_generation(websocket, conv_id, conv, data)
         return
@@ -4709,6 +4956,20 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
     if mode == "hermes":
         await _handle_hermes_generation(websocket, conv_id, conv, data)
         return
+
+    if mode == "dream":
+        await _handle_dream_generation(websocket, conv_id, conv, data)
+        return
+
+    # NOTE: A dream-model short-circuit used to live here, routing weave convs
+    # that picked the DiffusionGemma model to _handle_dream_completion. It was
+    # removed so dream-model weave convs flow into _handle_ooda_generation /
+    # _handle_weave_generation, which build the full structured prompt
+    # (character + style + state cards + persona/lore) via prompt_engine and
+    # pass it to llama_client.stream_chat/sync_chat — and llama_client already
+    # routes dream models to config.dream_host transparently
+    # (_is_dream_model / _chat_host_for_model). _handle_dream_completion is
+    # retained below but no longer reached from this dispatcher.
 
     # Backstage convs always go through OODA so state card tools are available.
     # The model is picked from cc-inline-controls in the UI and sent as cc_model;
@@ -6021,6 +6282,22 @@ async def _handle_claude_generation(
                 content_blocks[-1]["text"] = content_blocks[-1]["text"].rstrip() + error_note
             else:
                 content_blocks.append({"type": "text", "text": error_note})
+        elif result_info.get("is_error") and not full_text and content_blocks:
+            # Agent died after tool calls but produced no final text (e.g. agy
+            # planner-loop shutdown — the agent did real work via tool_use
+            # blocks, then died before emitting any text/content event).
+            # Without this branch the draft commits content='' with the tool
+            # blocks invisible in chat, because the empty-response gate above
+            # (line 6024) only fires when there are NO tool_use blocks. Save
+            # the tool work as the visible content so the user can read what
+            # happened instead of staring at a blank message.
+            n_tools = sum(1 for b in content_blocks if b.get("type") == "tool_use")
+            error_note = (
+                f"\n\n---\n[Turn interrupted: agent exited after {n_tools} tool call(s) "
+                f"without producing a final response — {result_info.get('error') or 'agent exited unexpectedly'}]"
+            )
+            full_text = error_note.strip()
+            content_blocks.append({"type": "text", "text": error_note})
 
         # CC streamed an error response (e.g. "You've hit your org's monthly
         # usage limit") as assistant text. Augment the saved draft so the user
@@ -6084,6 +6361,7 @@ async def _handle_claude_generation(
             turn_input_tokens=input_tokens,
             turn_output_tokens=output_tokens,
             cc_session_id=new_session_id or None,
+            cc_session_mode="claude",
             cc_model_used=model_used_field,
             generation_ms=_gen_ms,
         )
@@ -6340,23 +6618,28 @@ async def _handle_umans_generation(
     await _handle_claude_generation(websocket, conv_id, conv, data)
 
 
-async def _handle_dream_generation(
+async def _handle_dream_completion(
     websocket: WebSocket, conv_id: int, conv: dict, data: dict
 ):
-    """Handle Dream Hermes mode — DiffusionGemma via the nuspy sidecar (:8787).
+    """Dream Engine generation — one-shot OpenAI completion. (DEPRECATED for Weave)
 
-    Sibling of _handle_hermes_generation, but instead of driving the ACP `hermes`
-    CLI (which only knows the llama-server endpoint), this calls dream_client
-    directly against the nuspy OpenAI adapter. The diffusion model generates in
-    256-token canvas blocks, so we emit one text_delta burst per canvas commit
-    rather than per-token. No session resume / fork — each turn is a fresh
-    one-shot completion (the sidecar holds the model in VRAM across turns via
-    JIT, so cold-load only hits the first request of a session).
+    Used for Weave conversations that pick the Dream Engine model. No agent
+    loop, no tools, no ACP session — just direct diffusion generation via
+    dream_client.
+
+    DEPRECATED: dream-model weave convs now flow through _handle_ooda_generation
+    / _handle_weave_generation, which build the full structured prompt via
+    prompt_engine and rely on llama_client's transparent dream-host routing.
+    This handler is retained for reference and potential explicit invocation
+    but is no longer reached from _handle_generation. It also relies on
+    _build_claude_history_prompt which strips character/system/style/state
+    context — the very limitation the new routing fixes.
     """
     import time as _time
     import dream_client as _dc
     draft_msg_id = None
     full_text = ""
+    content_blocks: list[dict] = []
     start_t = _time.time()
     try:
         action = data.get("action")
@@ -6367,36 +6650,35 @@ async def _handle_dream_generation(
 
         project_dir = conv.get("project_dir") or "."
         branch = await db.get_branch_to_root(parent_id) if parent_id else []
-        # Build a flat prompt from the branch history (same helper Hermes uses).
         prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
-        # The selected model — default to the configured dream model.
         model = conv.get("local_model") or config.dream_model or None
 
-        # Draft message ghost node while we generate.
         draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
         draft_msg_id = draft_msg["id"]
         await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id,
-                                 "draft_msg_id": draft_msg_id})
-        await _ws_send(conv_id, {"type": "status", "text": "Dream Hermes generating (canvas denoising)…"})
+                                 "draft_msg_id": draft_msg_id,
+                                 "local_model": model})
+        await _ws_send(conv_id, {"type": "status", "text": "Dream Engine generating (canvas denoising)…"})
 
-        # One-shot completion. dream_chat_sync returns {content, reasoning_content,
-        # usage: {prompt_tokens, completion_tokens, timings:{tokens_per_second,...}}}.
         res = await _dc.dream_chat_sync(
             [{"role": "user", "content": prompt}],
-            model=model if model and model != config.dream_model else None,
+            model=model,
             host=config.dream_host,
             max_tokens=data.get("max_tokens") or 2048,
         )
+        reasoning = res.get("reasoning_content") or ""
+        if reasoning:
+            content_blocks.append({"type": "thinking", "text": reasoning})
+            await _ws_send(conv_id, {"type": "thinking_chunk", "content": reasoning})
+
         content = res.get("content") or ""
-        # Emit as a single text_delta burst (diffusion produces whole canvases,
-        # not token streams — one delta per canvas commit is the honest shape).
         if content:
             full_text = content
+            content_blocks.append({"type": "text", "text": content})
             await _ws_send(conv_id, {"type": "text_delta", "draft_msg_id": draft_msg_id,
                                      "delta": content})
 
         usage = res.get("usage") or {}
-        timings = usage.get("timings") or {}
         in_tok = usage.get("prompt_tokens", 0)
         out_tok = usage.get("completion_tokens", 0)
         if in_tok or out_tok:
@@ -6405,7 +6687,7 @@ async def _handle_dream_generation(
             await _ws_send(conv_id, {"type": "context_info",
                                      "total_tokens": in_tok + out_tok})
 
-        if not full_text.strip():
+        if not full_text.strip() and not content_blocks:
             if draft_msg_id:
                 await db.delete_branch(draft_msg_id)
             await _ws_send(conv_id, {"type": "error",
@@ -6415,7 +6697,8 @@ async def _handle_dream_generation(
         gen_ms = int((_time.time() - start_t) * 1000)
         await db.update_message_content(
             draft_msg_id, content=full_text,
-            cc_session_id=None,  # no ACP session for dream
+            content_blocks=json.dumps(content_blocks) if content_blocks else None,
+            cc_session_id=None,
             cc_model_used=f"dream:{model}" if model else "dream:default",
             generation_ms=gen_ms,
         )
@@ -6428,6 +6711,883 @@ async def _handle_dream_generation(
                                  "message_id": draft_msg_id, "preview": preview})
 
     except asyncio.CancelledError:
+        if draft_msg_id:
+            if full_text.strip() or content_blocks:
+                try:
+                    await db.update_message_content(
+                        draft_msg_id,
+                        content=full_text,
+                        content_blocks=json.dumps(content_blocks) if content_blocks else None,
+                    )
+                except Exception:
+                    pass
+            else:
+                await db.delete_branch(draft_msg_id)
+        await _ws_send(conv_id, {"type": "cancelled"})
+    except Exception as e:
+        if draft_msg_id and (full_text.strip() or content_blocks):
+            try:
+                await db.update_message_content(
+                    draft_msg_id,
+                    content=full_text,
+                    content_blocks=json.dumps(content_blocks) if content_blocks else None,
+                )
+            except Exception:
+                pass
+        elif draft_msg_id:
+            await db.delete_branch(draft_msg_id)
+        print(f"[Dream] completion error conv={conv_id}: {e}")
+        await _ws_send(conv_id, {"type": "error", "error": str(e)})
+    finally:
+        _gen_key = getattr(asyncio.current_task(), "_gen_key", None)
+        if _gen_key:
+            _active_generations.pop(_gen_key, None)
+            _generation_snapshots.pop(_gen_key, None)
+
+
+def _dream_openai_base_url() -> str:
+    """Dream endpoint as an OpenAI-compatible base URL (with /v1)."""
+    host = (getattr(config, "dream_host", "") or "").strip() or "http://localhost:18081"
+    if not host.startswith(("http://", "https://")):
+        host = f"http://{host}"
+    # On Windows, "localhost" resolves IPv6-first and the sidecar only listens
+    # on IPv4 — every HTTP request eats a ~2s ::1 connect fallback. Hermes makes
+    # ~10 such requests per agent init, which is where Dream Space's 20s/turn
+    # went. Pin to 127.0.0.1.
+    host = host.replace("//localhost", "//127.0.0.1")
+    host = host.rstrip("/")
+    return host if host.endswith("/v1") else f"{host}/v1"
+
+
+def _ensure_dream_hermes_home() -> str:
+    """Create/maintain a SEPARATE Hermes home for Dream Space.
+
+    Dream Space runs the full Hermes ACP loop (tools, memory, sessions,
+    SOUL.md) with the model provider pointed at the Dream DiffusionGemma
+    endpoint. It gets its own home so its state.db / sessions / memories are
+    independent from the llama-backed Hermes agent. SOUL.md + .env are seeded
+    from the llama Hermes home on FIRST creation only; after that the Dream
+    soul is independent so the Dream agent can be instructed separately.
+    """
+    home = os.getenv("DREAM_HERMES_HOME", "").strip()
+    if not home:
+        base_home = Path(config.hermes_home)
+        home = str(base_home.with_name(f"{base_home.name}-dream"))
+    root = Path(home)
+    root.mkdir(parents=True, exist_ok=True)
+
+    model = (getattr(config, "dream_model", "") or "diffusion-gemma").strip()
+    context = int(getattr(config, "dream_context_size", 131072) or 131072)
+    cfg = (
+        "# Hermes Agent config generated by Loom for Dream Space.\n"
+        "# This home points Hermes' custom OpenAI-compatible provider at the\n"
+        "# Dream DiffusionGemma endpoint; the llama-backed Hermes home is\n"
+        "# separate and unaffected.\n\n"
+        "model:\n"
+        f'  default: "{model}"\n'
+        '  provider: "custom"\n'
+        f'  base_url: "{_dream_openai_base_url()}"\n'
+        f"  context_length: {context}\n\n"
+        "memory:\n"
+        "  memory_enabled: true\n"
+        "  user_profile_enabled: true\n"
+        "  nudge_interval: 0\n"
+        "  flush_min_turns: 0\n\n"
+        "skills:\n"
+        "  creation_nudge_interval: 0\n\n"
+        "curator:\n"
+        "  enabled: false\n\n"
+        "session_reset:\n"
+        "  mode: none\n"
+    )
+    cfg_path = root / "config.yaml"
+    try:
+        old = cfg_path.read_text(encoding="utf-8") if cfg_path.exists() else ""
+    except Exception:
+        old = ""
+    if old != cfg:
+        cfg_path.write_text(cfg, encoding="utf-8")
+
+    # Seed Hermes' context-length probe cache. The diffusion server exposes no
+    # context-length metadata, so Hermes' per-agent-init probe fails after ~6.5s
+    # every single turn ("probe-down" in agent.log). A cache hit skips the probe
+    # entirely — same mechanism the llama home relies on. Key format matches
+    # what Hermes writes on a successful probe: "<model>@<base_url>/".
+    cache_entry = f"{model}@{_dream_openai_base_url()}/: {context}"
+    cache_path = root / "context_length_cache.yaml"
+    try:
+        cache_old = cache_path.read_text(encoding="utf-8") if cache_path.exists() else ""
+    except Exception:
+        cache_old = ""
+    if cache_entry not in cache_old:
+        if cache_old.strip().startswith("context_lengths:"):
+            cache_path.write_text(cache_old.rstrip("\n") + f"\n  {cache_entry}\n", encoding="utf-8")
+        else:
+            cache_path.write_text(f"context_lengths:\n  {cache_entry}\n", encoding="utf-8")
+
+    # Seed SOUL.md + .env from the llama Hermes home on first creation only.
+    # After that the Dream SOUL.md is independent — edits to the llama Hermes
+    # soul do NOT propagate, so the Dream agent can be instructed separately.
+    base_home = Path(config.hermes_home)
+    for fname in ("SOUL.md", ".env"):
+        dst = root / fname
+        if dst.exists():
+            continue  # Dream soul is independent once seeded
+        src = base_home / fname
+        try:
+            if src.exists():
+                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            pass  # Hermes will auto-seed defaults if missing
+
+    return str(root)
+
+
+def _read_umans_api_key() -> str:
+    """Read the Umans API key from env or the repo .env file.
+
+    Mirrors claude_client.py:893-908 — Prometheus' cloud fallback needs the key
+    written into config.yaml (api_key), and that read has to happen at the same
+    layer (server.py) rather than inside the Anthropic-SDK env-injection path.
+    """
+    key = os.environ.get("UMANS_API_KEY", "").strip()
+    if key:
+        return key
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        try:
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                if k.strip() == "UMANS_API_KEY":
+                    return v.strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _prometheus_home_path() -> str:
+    """Resolve the Prometheus home dir — config.hermes_home + '-prometheus' suffix.
+
+    Sibling of the dream home suffix at server.py:6563. Stays under %LOCALAPPDATA%
+    (off OneDrive) because state.db sync corruption is the OneDrive failure mode
+    (config.py:114 precedent for the base home).
+    """
+    home = os.getenv("PROMETHEUS_HERMES_HOME", "").strip()
+    if home:
+        return home
+    base_home = Path(config.hermes_home)
+    return str(base_home.with_name(f"{base_home.name}-prometheus"))
+
+
+def _ensure_prometheus_home() -> str:
+    """Create/maintain the incognito Prometheus Hermes home DIR + probe cache.
+
+    This does NOT write config.yaml — that is owned entirely by
+    _write_prometheus_config (the only caller that knows the chosen backend).
+    Previously this also seeded config.yaml with a backend guess, which caused a
+    double-write on the dream path: _ensure_prometheus_home(cloud=False) wrote a
+    LLAMA config (its `else` branch), then _write_prometheus_config immediately
+    overwrote it with the dream config — redundant I/O + a brief window where
+    config.yaml held llama values. Now config.yaml is written exactly once, by
+    the writer that has the real backend.
+
+    Seeds the context-length probe cache for ALL THREE possible backends (cloud +
+    llama + dream) so a warm re-init on any of them skips the 6.5s probe. The
+    cache is backend-agnostic (one file, three keys), so it's correct to seed
+    here regardless of which backend is currently routed.
+    """
+    root = Path(_prometheus_home_path())
+    root.mkdir(parents=True, exist_ok=True)
+
+    # Seed the context-length probe cache for ALL THREE possible backends. Hermes'
+    # probe fails after ~6.5s every turn on endpoints that expose no context
+    # metadata (Umans + local llama + dream all qualify); a cache hit skips it
+    # entirely. Key format matches what Hermes writes on a successful probe:
+    # "<model>@<base_url>/". The router can land Prometheus on any of the three,
+    # so all three are seeded — a missing dream entry would stall every
+    # dream-backend Prometheus turn on the probe.
+    cache_entries = []
+    # Cloud entry — always seed; Prometheus is cloud-functional by default.
+    cloud_model = config.prometheus_cloud_model
+    cloud_url = config.prometheus_cloud_base_url.rstrip("/")
+    cache_entries.append(f"{cloud_model}@{cloud_url}/: {config.prometheus_cloud_context}")
+    # Local llama entry — seed so a router flip to local skips the probe too.
+    local_model = config.llama_model
+    local_url = config.llama_host_url().rstrip("/") + "/v1"
+    local_ctx = int(getattr(config, "max_context_tokens", 32768) or 32768)
+    cache_entries.append(f"{local_model}@{local_url}/: {local_ctx}")
+    # Dream entry — seed so a router flip to dream (dream up, llama down) skips
+    # the probe. The dream /v1 base_url is the DiffusionGemma sidecar endpoint.
+    dream_model = (getattr(config, "dream_model", "") or "diffusion-gemma").strip()
+    dream_url = _dream_openai_base_url()
+    dream_ctx = int(getattr(config, "dream_context_size", 131072) or 131072)
+    cache_entries.append(f"{dream_model}@{dream_url}/: {dream_ctx}")
+
+    cache_path = root / "context_length_cache.yaml"
+    try:
+        cache_old = cache_path.read_text(encoding="utf-8") if cache_path.exists() else ""
+    except Exception:
+        cache_old = ""
+    if not cache_old.strip().startswith("context_lengths:"):
+        cache_old = "context_lengths:\n"
+    # Dedup by exact key match. The key is the "<model>@<base_url>/" portion
+    # (everything before the ": <context>" value). base_url contains "://" so a
+    # naive split-on-first-colon reduces the key to "<model>@https" and falsely
+    # matches any same-scheme URL. We parse the existing lines into a set of
+    # present keys (stripped of indentation) and compare exactly — so a model
+    # that's a prefix of another (e.g. "llama" vs "llama-large") does NOT cause
+    # the longer entry to be skipped as a duplicate.
+    def _cache_key(entry: str) -> str:
+        return entry.rsplit(": ", 1)[0] if ": " in entry else entry
+    present_keys: set[str] = set()
+    for line in cache_old.splitlines():
+        s = line.strip()
+        if s and not s.startswith("context_lengths:") and ": " in s:
+            present_keys.add(_cache_key(s))
+    missing = [e for e in cache_entries if _cache_key(e) not in present_keys]
+    if missing:
+        cache_path.write_text(
+            cache_old.rstrip("\n") + "\n" + "\n".join(f"  {e}" for e in missing) + "\n",
+            encoding="utf-8",
+        )
+
+    # NO SOUL.md seed — Prometheus is incognito by design. Do not copy from the
+    # llama Hermes home (the dream generator does at server.py:6619-6629; Prometheus
+    # deliberately skips this so it carries no persistent identity).
+
+    return str(root)
+
+
+async def _probe_llama_live(timeout: float = 2.0) -> bool:
+    """Is llama-server up? GET /v1/models (mirrors admin_server.py:436)."""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(f"{config.llama_host_url()}/v1/models")
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
+async def _probe_dream_live(timeout: float = 2.0) -> bool:
+    """Is the dream sidecar up? GET /health (mirrors admin_server.py:961)."""
+    try:
+        host = config.dream_host if config.dream_host else "http://127.0.0.1:8787"
+        if host and not host.startswith(("http://", "https://")):
+            host = f"http://{host}"
+        host = host.replace("//localhost", "//127.0.0.1")
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(f"{host.rstrip('/')}/health")
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
+async def _prometheus_pick_backend() -> dict:
+    """Probe local model liveness → decide Prometheus' backend.
+
+    Returns {backend: "llama"|"dream"|"cloud", base_url, model, api_key, context}.
+    Preference order: llama > dream > cloud. The local attendant for whichever
+    model is up is the natural Prometheus backend (same /v1, already warm);
+    cloud is the always-functional fallback when neither local model is up.
+    """
+    if await _probe_llama_live():
+        return {
+            "backend": "llama",
+            "base_url": config.llama_host_url().rstrip("/") + "/v1",
+            "model": config.llama_model,
+            "api_key": "",
+            "context": int(getattr(config, "max_context_tokens", 32768) or 32768),
+        }
+    if await _probe_dream_live():
+        return {
+            "backend": "dream",
+            "base_url": _dream_openai_base_url(),
+            "model": (getattr(config, "dream_model", "") or "diffusion-gemma").strip(),
+            "api_key": "",
+            "context": int(getattr(config, "dream_context_size", 131072) or 131072),
+        }
+    return {
+        "backend": "cloud",
+        "base_url": config.prometheus_cloud_base_url.rstrip("/"),
+        "model": config.prometheus_cloud_model,
+        "api_key": _read_umans_api_key(),
+        "context": config.prometheus_cloud_context,
+    }
+
+
+def _write_prometheus_config(backend: dict) -> str:
+    """Rewrite Prometheus' config.yaml for the chosen backend. Returns home path.
+
+    Sole owner of config.yaml. _ensure_prometheus_home (called below) only
+    ensures the home dir + probe cache exist — it no longer writes config.yaml
+    itself, which avoids a double-write + transient-wrong-config race on the
+    dream path (see _ensure_prometheus_home docstring).
+    """
+    home = _ensure_prometheus_home()
+    root = Path(home)
+    model = backend["model"]
+    base_url = backend["base_url"]
+    context = backend["context"]
+    api_key = backend.get("api_key", "") or ""
+
+    cfg = (
+        "# Hermes Agent config generated by Loom for Prometheus.\n"
+        "# Prometheus is the incognito, always-warm runtime: no soul, no memory,\n"
+        "# no SOUL.md. The base_url below is set by the cloud-fallback router\n"
+        f"# (current backend: {backend['backend']}).\n\n"
+        "model:\n"
+        f'  default: "{model}"\n'
+        '  provider: "custom"\n'
+        f'  base_url: "{base_url}"\n'
+        f"  context_length: {context}\n"
+        + (f'  api_key: "{api_key}"\n' if api_key else "  api_key: \"\"\n")
+        + "\n"
+        "memory:\n"
+        "  memory_enabled: false\n"
+        "  user_profile_enabled: false\n"
+        "  nudge_interval: 0\n"
+        "  flush_min_turns: 0\n\n"
+        "skills:\n"
+        "  creation_nudge_interval: 0\n\n"
+        "curator:\n"
+        "  enabled: false\n\n"
+        "session_reset:\n"
+        "  mode: none\n"
+    )
+    (root / "config.yaml").write_text(cfg, encoding="utf-8")
+    return home
+
+
+def _backend_signature(backend: dict) -> str:
+    """A stable signature of the chosen backend's *connection* identity.
+
+    Used as the .loom_backend marker so ANY meaningful change — base_url (e.g.
+    llama_host moved from :8000 to :8001 while still "llama"), model, context
+    length, or api_key (cloud key rotated) — triggers a warm-runtime reload. The
+    coarse `backend` label alone is insufficient: a same-class base_url change
+    would rewrite config.yaml but leave the warm process pointed at the dead old
+    endpoint (Hermes reads base_url at process init, not on set_model).
+
+    api_key is hashed (not stored in the marker as plaintext) — the marker is a
+    sidecar file in the home dir, not secrets storage, but we still avoid writing
+    keys to disk when a boolean presence is enough to detect rotation.
+    """
+    import hashlib
+    key = (backend.get("api_key") or "").strip()
+    key_sig = "set" if key else "empty"
+    if key:
+        # Short hash so a rotated key is detectable without storing it.
+        key_sig = "set:" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+    return "|".join([
+        backend.get("backend", ""),
+        backend.get("base_url", ""),
+        backend.get("model", ""),
+        str(backend.get("context", "")),
+        key_sig,
+    ])
+
+
+async def route_prometheus_backend(*, force: bool = False) -> dict:
+    """Decide Prometheus' backend, rewrite its config, clear the warm runtime if
+    the backend signature changed.
+
+    Called on Prometheus turn dispatch (incognito conversations) and from the
+    admin Prometheus-restart endpoint. Returns the chosen backend dict so the
+    caller can pass the right model id into run_hermes.
+
+    If the warm Prometheus runtime was pointing at a different backend signature
+    (base_url / model / context / api_key — not just the coarse label), we stop
+    it (stop_runtime_by_home) so the next turn re-inits against the new config —
+    Hermes reads base_url at process init, not on session/set_model, so a warm
+    process wouldn't actually move otherwise. Probe cache makes re-init cheap.
+
+    `force=True` (admin Restart button) always clears the warm runtime + bumps
+    the marker, even when the signature is unchanged — that's the explicit
+    "restart" intent, vs. the routing path's "only reload if changed".
+    """
+    backend = await _prometheus_pick_backend()
+    home = _write_prometheus_config(backend)
+    sig = _backend_signature(backend)
+    marker = Path(home) / ".loom_backend"
+    prev = ""
+    try:
+        if marker.exists():
+            prev = marker.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    needs_reload = force or prev != sig
+    if needs_reload:
+        # stop_runtime_by_home refuses to kill a runtime with an active turn
+        # (hermes_client.stop_runtime_by_home) — a backend flip must NOT corrupt
+        # a live Prometheus turn. It returns False in that case. CRITICAL: only
+        # write the new signature marker if the clear actually succeeded (or
+        # there was no warm runtime to clear). Writing the marker on a refused
+        # stop would mark the new backend as current while the OLD warm process
+        # keeps running — so later turns see signature-match and reuse the stale
+        # process pointed at the dead old endpoint indefinitely.
+        cleared = True
+        if hermes_client is not None:
+            cleared = await hermes_client.stop_runtime_by_home(home)
+            # cleared is False when a runtime existed but had an active turn.
+            # No runtime → stop_runtime_by_home returns False too, but in that
+            # case there's nothing stale to reuse, so the marker is safe to bump.
+            had_runtime = hermes_client.find_runtime_by_home(home) is not None
+            cleared = cleared or not had_runtime
+        if cleared:
+            try:
+                marker.write_text(sig, encoding="utf-8")
+            except Exception:
+                pass
+    # `reloaded` is True only when we actually cleared the warm runtime (or there
+    # was none to clear) AND bumped the marker. A refused stop (active turn)
+    # leaves reloaded=False so the caller knows the warm process is stale and
+    # the next turn will re-attempt the reload.
+    return {**backend, "home": home, "reloaded": needs_reload and cleared}
+
+
+async def _refuse_ensouled_model_down(
+    websocket: WebSocket, conv_id: int, backend: str, model_name: str
+):
+    """Refuse an ensouled Hermes turn whose model server is down.
+
+    NO generation, NO silent fallback to Prometheus. The error names the down
+    model and points the user to the two paths: start it (via admin) or toggle
+    incognito for an always-functional no-soul path. Silent fallback would lose
+    the soul mid-conversation — the exact contamination the design prevents.
+
+    Called BEFORE the attendant handler creates a draft message, so we emit only
+    an error event (no stream_start/result pair) — there's no ghost node to close.
+    The `ensouled_refusal` flag lets the UI render this distinctly from a generic
+    transport error.
+    """
+    label = "llama-server" if backend == "llama" else "the Dream sidecar"
+    err = (
+        f"The {label} backing this conversation's soul is down (model: "
+        f"{model_name}). This ensouled conversation refuses to generate rather "
+        f"than silently fall back to a soulless path. Either start {label} via "
+        f"the admin dashboard, or toggle this conversation to Incognito to route "
+        f"through Prometheus (always-functional, no soul, cloud fallback)."
+    )
+    await _ws_send(conv_id, {"type": "error", "error": err, "ensouled_refusal": True,
+                             "backend": backend, "model": model_name})
+
+
+async def _handle_prometheus_generation(
+    websocket: WebSocket, conv_id: int, conv: dict, data: dict
+):
+    """Handle an incognito Hermes turn via Prometheus (always-warm, cloud-fallback).
+
+    Sibling of _handle_hermes_generation, but: (1) routes the backend first
+    (local /v1 if a model is up, else Umans cloud), (2) runs against the
+    Prometheus home (no soul, no memory, no SOUL.md), (3) always opens a fresh
+    session each turn — Prometheus is incognito, so it does NOT carry session
+    history across turns the way ensouled attendants do.
+    """
+    if hermes_client is None:
+        await _ws_send(conv_id, {
+            "type": "error",
+            "error": f"Prometheus unavailable: Hermes adapter failed to import ({_HERMES_IMPORT_ERROR})",
+        })
+        return
+
+    import time as _time
+    draft_msg_id = None
+    full_text = ""
+    proc = None
+    start_t = _time.time()
+    try:
+        action = data.get("action")
+        parent_id = data.get("parent_id")
+        if action == "generate" and parent_id is None:
+            leaf = await db.get_active_leaf(conv_id)
+            parent_id = leaf["id"] if leaf else None
+
+        project_dir = conv.get("project_dir") or "."
+        if project_dir != "." and not os.path.isdir(project_dir):
+            await _ws_send(conv_id, {"type": "error",
+                                     "error": f"Working directory not found: {project_dir}"})
+            return
+
+        branch = await db.get_branch_to_root(parent_id) if parent_id else []
+        prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
+
+        # Route the backend: probe local models, rewrite Prometheus config, clear
+        # the warm runtime if the backend moved. Returns home + chosen model.
+        backend = await route_prometheus_backend()
+        prometheus_home = backend["home"]
+        model = f"custom:{backend['model']}" if backend.get("model") else None
+
+        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
+        draft_msg_id = draft_msg["id"]
+        backend_tag = backend["backend"]
+        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id,
+                                 "draft_msg_id": draft_msg_id,
+                                 "local_model": backend["model"],
+                                 "prometheus_backend": backend_tag})
+        await _ws_send(conv_id, {"type": "status",
+                                 "text": f"Prometheus generating ({backend_tag})…"})
+
+        try:
+            proc, event_stream = await hermes_client.run_hermes(
+                prompt,
+                conv_id=conv_id,
+                model=model,
+                cwd=project_dir,
+                loom_port=config.port,
+                hermes_exe=config.hermes_executable(),
+                hermes_home=prometheus_home,
+                branch=branch,
+                # Prometheus is incognito: no session resume across turns. A
+                # fresh session each turn is correct — there's no soul/memory to
+                # preserve server-side, and history is replayed via the prompt.
+                resume_session_id=None,
+                fork_session=False,
+                is_first_turn=True,
+            )
+        except Exception as e:
+            if draft_msg_id:
+                await db.delete_branch(draft_msg_id)
+            await _ws_send(conv_id, {"type": "error",
+                                     "error": f"Failed to start Prometheus: {e}"})
+            return
+
+        # Register the active generation so it shows in the admin active-gens
+        # panel AND is reaped as a tracked orphan if the server restarts mid-turn
+        # (mirrors _handle_hermes_generation at server.py:7737). The finally block
+        # below unregisters it; without this register, the unregister is a no-op
+        # and a crashed Prometheus turn leaves an invisible orphan.
+        try:
+            await db.register_active_generation(
+                draft_msg_id=draft_msg_id, conv_id=conv_id, pid=proc.pid,
+                project_dir=project_dir, mode="prometheus",
+            )
+        except Exception as e:
+            print(f"[Prometheus] Failed to register active generation: {e}")
+
+        async for event in event_stream:
+            etype = event.get("type", "")
+            if etype == "text_delta":
+                full_text += event.get("text", "")
+            elif etype == "error":
+                await _ws_send(conv_id, event)
+            elif etype == "result":
+                # Persist the assistant turn.
+                if draft_msg_id and full_text.strip():
+                    await db.update_message_content(draft_msg_id, content=full_text)
+                await _ws_send(conv_id, event)
+            else:
+                await _ws_send(conv_id, event)
+
+        if draft_msg_id and not full_text.strip():
+            try:
+                await db.delete_branch(draft_msg_id)
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        # On Python 3.14+, asyncio.CancelledError is NOT an Exception subclass,
+        # so the `except Exception` block below does NOT catch it — without this
+        # explicit handler, cancellation would skip the partial-save/delete
+        # cleanup and leave an empty draft or lose accumulated full_text. Re-raise
+        # after cleanup so the cancellation propagates to the task caller.
+        if draft_msg_id and full_text.strip():
+            try:
+                await db.update_message_content(draft_msg_id, content=full_text)
+            except Exception:
+                pass
+        elif draft_msg_id:
+            try:
+                await db.delete_branch(draft_msg_id)
+            except Exception:
+                pass
+        raise
+    except Exception as e:
+        if draft_msg_id and full_text.strip():
+            try:
+                await db.update_message_content(draft_msg_id, content=full_text)
+            except Exception:
+                pass
+        elif draft_msg_id:
+            await db.delete_branch(draft_msg_id)
+        print(f"[Prometheus] generation error conv={conv_id}: {e}")
+        await _ws_send(conv_id, {"type": "error", "error": str(e)})
+    finally:
+        _gen_key = getattr(asyncio.current_task(), "_gen_key", None)
+        if _gen_key:
+            _active_generations.pop(_gen_key, None)
+            _generation_snapshots.pop(_gen_key, None)
+        try:
+            if draft_msg_id:
+                await db.unregister_active_generation(draft_msg_id)
+        except Exception:
+            pass
+
+
+async def _handle_dream_generation(
+    websocket: WebSocket, conv_id: int, conv: dict, data: dict
+):
+    """Handle Dream Space — an agentic Hermes loop powered by Dream Engine.
+
+    Full Hermes ACP (tools, memory, sessions, SOUL.md) with the model backend
+    pointed at the Dream DiffusionGemma endpoint via a separate Hermes home.
+    Sibling of _handle_hermes_generation — same event handling, different home.
+    """
+    if hermes_client is None:
+        await _ws_send(conv_id, {
+            "type": "error",
+            "error": f"Dream Space unavailable: Hermes adapter failed to import ({_HERMES_IMPORT_ERROR})",
+        })
+        return
+
+    import time as _time
+    import json
+    draft_msg_id = None
+    full_text = ""
+    proc = None
+    start_t = _time.time()
+    try:
+        action = data.get("action")
+        parent_id = data.get("parent_id")
+        if action == "generate" and parent_id is None:
+            leaf = await db.get_active_leaf(conv_id)
+            parent_id = leaf["id"] if leaf else None
+
+        project_dir = conv.get("project_dir") or "."
+        if project_dir != "." and not os.path.isdir(project_dir):
+            await _ws_send(conv_id, {"type": "error",
+                                     "error": f"Working directory not found: {project_dir}"})
+            return
+
+        # Build the prompt from the branch.
+        branch = await db.get_branch_to_root(parent_id) if parent_id else []
+
+        resume_session_id = None
+        use_resume = False
+        fork_session = True  # Always fork to keep branch history isolated
+
+        if branch:
+            for msg in reversed(branch):
+                if msg.get("cc_session_id"):
+                    # Skip session IDs issued by a different backend — a Hermes
+                    # or Claude Code session id is meaningless in the Dream
+                    # home's state.db. NULL mode = legacy/unscoped, compatible.
+                    mode = msg.get("cc_session_mode")
+                    if mode is not None and mode != "dream":
+                        continue
+                    resume_session_id = msg["cc_session_id"]
+                    break
+
+        if resume_session_id:
+            use_resume = True
+            latest_user_content = ""
+            for msg in reversed(branch):
+                if msg["role"] == "user":
+                    latest_user_content = msg["content"]
+                    break
+            prompt = latest_user_content or "(continue)"
+        else:
+            prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
+
+        # Dream home is separate from the llama Hermes home, but pass the model
+        # explicitly so Hermes does not need to infer it from provider defaults.
+        dream_home = _ensure_dream_hermes_home()
+        model = f"custom:{config.dream_model}" if config.dream_model else None
+
+        # Draft message so the tree shows a ghost node while streaming.
+        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
+        draft_msg_id = draft_msg["id"]
+        await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id,
+                                 "draft_msg_id": draft_msg_id,
+                                 "local_model": config.dream_model})
+        await _ws_send(conv_id, {"type": "status", "text": "Dream Space generating…"})
+
+        try:
+            proc, event_stream = await hermes_client.run_hermes(
+                prompt,
+                conv_id=conv_id,
+                model=model,
+                cwd=project_dir,
+                loom_port=config.port,
+                hermes_exe=config.hermes_executable(),
+                hermes_home=dream_home,
+                branch=branch,
+                resume_session_id=resume_session_id if use_resume else None,
+                fork_session=fork_session,
+                # Resume turns fork a session that already holds the conversation
+                # history server-side; re-injecting <loom_branch_info> would feed
+                # the model every prior message twice. Fresh sessions (use_resume
+                # False) get the full orientation block.
+                is_first_turn=not use_resume,
+            )
+        except Exception as e:
+            if use_resume:
+                print(f"[Dream] Resume failed ({e}), falling back to full history")
+                await _ws_send(conv_id, {"type": "status", "text": "Session resume failed — rebuilding from history..."})
+                use_resume = False
+                prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
+                try:
+                    proc, event_stream = await hermes_client.run_hermes(
+                        prompt,
+                        conv_id=conv_id,
+                        model=model,
+                        cwd=project_dir,
+                        loom_port=config.port,
+                        hermes_exe=config.hermes_executable(),
+                        hermes_home=dream_home,
+                        branch=branch,
+                        # Fallback opens a fresh session/new — it needs the full
+                        # branch orientation since there is no forked history.
+                        is_first_turn=True,
+                    )
+                except Exception as e2:
+                    if draft_msg_id:
+                        await db.delete_branch(draft_msg_id)
+                    await _ws_send(conv_id, {"type": "error", "error": f"Failed to start Dream Space: {e2}"})
+                    return
+            else:
+                if draft_msg_id:
+                    await db.delete_branch(draft_msg_id)
+                await _ws_send(conv_id, {"type": "error", "error": f"Failed to start Dream Space: {e}"})
+                return
+
+        _active_hermes_procs[conv_id] = proc
+        try:
+            await db.register_active_generation(
+                draft_msg_id=draft_msg_id, conv_id=conv_id, pid=proc.pid,
+                project_dir=project_dir, mode="dream",
+            )
+        except Exception as e:
+            print(f"[Dream] Failed to register active generation: {e}")
+
+        content_blocks: list[dict] = []
+        current_block = None
+        new_session_id = ""
+        total_input_tokens = 0
+        total_output_tokens = 0
+        result_info: dict = {}
+
+        async for evt in event_stream:
+            etype = evt.get("type")
+            if etype == "session_info":
+                new_session_id = evt.get("session_id", "") or new_session_id
+                try:
+                    await db.update_active_generation_session(draft_msg_id, new_session_id)
+                except Exception:
+                    pass
+                resolved = (evt.get("model") or "").strip()
+                for prefix in ("custom:",):
+                    if resolved.startswith(prefix):
+                        resolved = resolved[len(prefix):].strip()
+                        break
+                if resolved and not conv.get("local_model"):
+                    conv["local_model"] = resolved
+                    try:
+                        await db.update_conversation_fields(conv_id, local_model=resolved)
+                    except Exception:
+                        pass
+                    await _ws_send(conv_id, {"type": "conv_field_update", "local_model": resolved})
+            elif etype == "hermes_commands":
+                cmds = evt.get("commands") or []
+                if cmds:
+                    await _ws_send(conv_id, {"type": "hermes_commands", "commands": cmds})
+            elif etype == "text_delta":
+                full_text += evt["text"]
+                if current_block and current_block["type"] == "text":
+                    current_block["text"] += evt["text"]
+                else:
+                    current_block = {"type": "text", "text": evt["text"]}
+                    content_blocks.append(current_block)
+                await _ws_send(conv_id, {"type": "stream_chunk", "content": evt["text"]})
+            elif etype == "thinking_delta":
+                if current_block and current_block["type"] == "thinking":
+                    current_block["text"] += evt["text"]
+                else:
+                    current_block = {"type": "thinking", "text": evt["text"]}
+                    content_blocks.append(current_block)
+                await _ws_send(conv_id, {"type": "thinking_chunk", "content": evt["text"]})
+            elif etype == "tool_start":
+                current_block = {"type": "tool_use", "name": evt["name"],
+                                 "tool_id": evt.get("tool_id", ""), "input": "", "result": ""}
+                content_blocks.append(current_block)
+                await _ws_send(conv_id, {"type": "tool_start", "name": evt["name"],
+                                         "tool_id": evt.get("tool_id", "")})
+            elif etype == "tool_input_delta":
+                if current_block and current_block["type"] == "tool_use":
+                    current_block["input"] += evt["json"]
+                await _ws_send(conv_id, {"type": "tool_input_chunk", "content": evt["json"],
+                                         "tool_id": evt.get("tool_id", "")})
+            elif etype == "tool_result":
+                tool_id = evt.get("tool_id", "")
+                image_url = evt.get("image_url")
+                for block in reversed(content_blocks):
+                    if block["type"] == "tool_use" and block.get("tool_id") == tool_id:
+                        block["result"] = evt.get("content", "")
+                        if image_url:
+                            block["image_url"] = image_url
+                        break
+                current_block = None
+                tool_result_msg = {
+                    "type": "tool_result",
+                    "content": evt.get("content", ""),
+                    "tool_id": tool_id
+                }
+                if image_url:
+                    tool_result_msg["image_url"] = image_url
+                if evt.get("is_error"):
+                    tool_result_msg["is_error"] = True
+                await _ws_send(conv_id, tool_result_msg)
+                await db.update_message_content(draft_msg_id, content=full_text,
+                                                content_blocks=json.dumps(content_blocks))
+            elif etype == "usage":
+                total_input_tokens = evt.get("input_tokens", 0) or total_input_tokens
+                total_output_tokens += evt.get("output_tokens", 0)
+                await _ws_send(conv_id, {"type": "usage", "input_tokens": total_input_tokens,
+                                         "output_tokens": total_output_tokens})
+            elif etype == "hermes_usage_update":
+                used = evt.get("used")
+                if used is not None:
+                    await _ws_send(conv_id, {"type": "context_info", "total_tokens": used})
+            elif etype == "plan_update":
+                await _ws_send(conv_id, {"type": "status", "text": "Dream Space updated its plan."})
+            elif etype == "error":
+                await _ws_send(conv_id, {"type": "status", "text": f"Dream: {evt.get('error', '')}"})
+            elif etype == "result":
+                result_info = evt
+                new_session_id = evt.get("session_id", "") or new_session_id
+
+        _active_hermes_procs.pop(conv_id, None)
+
+        if not full_text.strip() and not content_blocks:
+            if draft_msg_id:
+                await db.delete_branch(draft_msg_id)
+            await _ws_send(conv_id, {"type": "error",
+                                     "error": "Dream returned an empty response — try again"})
+            return
+
+        gen_ms = int((_time.time() - start_t) * 1000)
+        await db.update_message_content(
+            draft_msg_id, content=full_text, content_blocks=json.dumps(content_blocks),
+            cc_session_id=new_session_id or None,
+            cc_session_mode="dream",
+            cc_model_used=f"dream:{config.dream_model}",
+            generation_ms=gen_ms,
+        )
+        await db.set_active_branch(conv_id, draft_msg_id)
+        msg = await db.get_message(draft_msg_id)
+        await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
+        preview = (full_text or "").replace("#", "").replace("*", "").strip()[:120]
+        await _ws_broadcast_all({"type": "branch_landed", "conv_id": conv_id,
+                                 "conv_title": conv.get("title", "Conversation"),
+                                 "message_id": draft_msg_id, "preview": preview})
+
+    except asyncio.CancelledError:
+        if proc is not None:
+            try:
+                await hermes_client.cancel_hermes(proc)
+            except Exception:
+                pass
         if draft_msg_id:
             if full_text.strip():
                 try:
@@ -6453,6 +7613,14 @@ async def _handle_dream_generation(
             _active_generations.pop(_gen_key, None)
             _generation_snapshots.pop(_gen_key, None)
 
+        # Clear the SQLite active generation row so it doesn't clutter the
+        # admin "Active Generations" panel with dead sessions.
+        try:
+            if 'draft_msg_id' in locals() and draft_msg_id:
+                await db.unregister_active_generation(draft_msg_id)
+        except Exception:
+            pass
+
 
 async def _handle_hermes_generation(
     websocket: WebSocket, conv_id: int, conv: dict, data: dict
@@ -6467,13 +7635,11 @@ async def _handle_hermes_generation(
     Not wired into _handle_generation's dispatch yet — that, plus DB-mode
     acceptance and the admin status probe, is Phase 3.
     """
-    # Route to the Dream handler when the selected model is the DiffusionGemma
-    # sidecar. The Hermes ACP CLI only knows the llama-server endpoint, so dream
-    # (a separate :8787 process) needs its own transport via dream_client.
-    local_model = conv.get("local_model") or ""
-    dream_model = getattr(config, "dream_model", "") or ""
-    if local_model and dream_model and local_model.lower() == dream_model.lower():
-        await _handle_dream_generation(websocket, conv_id, conv, data)
+    if hermes_client is None:
+        await _ws_send(conv_id, {
+            "type": "error",
+            "error": f"Hermes unavailable: adapter failed to import ({_HERMES_IMPORT_ERROR})",
+        })
         return
 
     import time as _time
@@ -6504,6 +7670,12 @@ async def _handle_hermes_generation(
         if branch:
             for msg in reversed(branch):
                 if msg.get("cc_session_id"):
+                    # Skip session IDs issued by a different backend — a Dream
+                    # or Claude Code session id is meaningless in the llama
+                    # Hermes home's state.db. NULL mode = legacy/unscoped, compatible.
+                    mode = msg.get("cc_session_mode")
+                    if mode is not None and mode != "hermes":
+                        continue
                     resume_session_id = msg["cc_session_id"]
                     break
 
@@ -6538,6 +7710,11 @@ async def _handle_hermes_generation(
                 branch=branch,
                 resume_session_id=resume_session_id if use_resume else None,
                 fork_session=fork_session,
+                # Resume turns fork a session that already holds the conversation
+                # history server-side; re-injecting <loom_branch_info> would feed
+                # the model every prior message twice. Fresh sessions (use_resume
+                # False) get the full orientation block.
+                is_first_turn=not use_resume,
             )
         except Exception as e:
             if use_resume:
@@ -6555,6 +7732,9 @@ async def _handle_hermes_generation(
                         hermes_exe=config.hermes_executable(),
                         hermes_home=config.hermes_home,
                         branch=branch,
+                        # Fallback opens a fresh session/new — it needs the full
+                        # branch orientation since there is no forked history.
+                        is_first_turn=True,
                     )
                 except Exception as e2:
                     if draft_msg_id:
@@ -6703,6 +7883,7 @@ async def _handle_hermes_generation(
         await db.update_message_content(
             draft_msg_id, content=full_text, content_blocks=json.dumps(content_blocks),
             cc_session_id=new_session_id or None,
+            cc_session_mode="hermes",
             cc_model_used=f"hermes:{model}" if model else "hermes:default",
             generation_ms=gen_ms,
         )
@@ -6760,19 +7941,15 @@ async def _handle_hermes_generation(
                 _pending_hook_permissions.pop(rid, None)
                 await db.delete_pending_permission(rid)
 
-        # Existing Hermes process cleanup
+        # Persistent Hermes ACP runtimes stay alive across turns. Explicit
+        # cancellation still terminates the runtime in the CancelledError path.
         _active_hermes_procs.pop(conv_id, None)
-        if proc is not None and proc.returncode is None:
-            try:
-                await hermes_client.cancel_hermes(proc)
-            except Exception:
-                pass
 
 
 async def _handle_ooda_generation(
     websocket: WebSocket, conv_id: int, conv: dict, data: dict
 ):
-    """Handle OODA-enhanced Weave generation — two-pass with state card scaffolding."""
+    """Handle OODA-enhanced Weave generation — single-pass with repair fallback."""
     import re as _re
 
     draft_msg_id = None
@@ -6902,8 +8079,8 @@ async def _handle_ooda_generation(
         )
         _ooda_start_t = _time.time()
 
-        # ── Pass 1: Orient ──
-        print(f"[OODA] Pass 1: Orient...")
+        # ── OODA pass (single-shot: model emits <ooda> block + prose together) ──
+        print(f"[OODA] Generating OODA block + prose...")
         await _ws_send(
             conv_id,
             {
@@ -6921,11 +8098,24 @@ async def _handle_ooda_generation(
             raise asyncio.CancelledError()
         cleaned_pass1 = _re.sub(r"<think>[\s\S]*?</think>", "", raw_pass1)
         cleaned_pass1 = _re.sub(r"<think>[\s\S]*?</think>\s*", "", cleaned_pass1).strip()
-        print(f"[OODA] Pass 1 done: {len(cleaned_pass1)} chars")
+        print(f"[OODA] Generation done: {len(cleaned_pass1)} chars")
         print(f"[OODA] Raw OODA output:\n{cleaned_pass1[:1500]}")
 
         # Parse OODA block
         ooda = parse_ooda_block(cleaned_pass1)
+        if ooda is None:
+            # Fallback stage 1: regex-repair truncated/loose OODA tags so
+            # state deltas aren't lost when the model omits </ooda> or emits
+            # <update_state/> tags with no <ooda> wrapper.
+            ooda = repair_ooda_block(cleaned_pass1)
+            if ooda:
+                print("[OODA] parse failed, repair_ooda_block recovered partial block")
+                await _ws_send(
+                    conv_id,
+                    {"type": "status",
+                     "text": "OODA: recovered partial block (repair)",
+                     "parent_id": parent_id},
+                )
 
         if ooda:
             # Emit OODA steps as tool blocks for visibility
@@ -7010,6 +8200,55 @@ async def _handle_ooda_generation(
             final_prose = _re.sub(r"<ooda>[\s\S]*?</ooda>\s*", "", final_prose).strip()
             # Strip truncated/unclosed ooda blocks (model ran out of tokens)
             final_prose = _re.sub(r"<ooda>[\s\S]*$", "", final_prose).strip()
+
+        # ── Fallback stage 2: second model pass when repair failed AND no prose ──
+        # This is the only path that costs an extra model call. It fires when the
+        # first pass produced neither a parseable OODA block nor any usable
+        # prose — the rare total-malfunction case (e.g. model refused the OODA
+        # format entirely). Keeps the common case single-pass.
+        if not final_prose.strip() and not ooda:
+            print("[OODA] Pass 1 produced no OODA block and no prose — running repair pass")
+            await _ws_send(
+                conv_id,
+                {"type": "status",
+                 "text": "OODA: re-prompting (malformed output)...",
+                 "parent_id": parent_id},
+            )
+            repair_messages = list(messages) + [{
+                "role": "user",
+                "content": (
+                    "Your previous output did not contain a valid <ooda>...</ooda> block. "
+                    "Emit a complete <ooda> block with <observe>, <orient>, <decide>, and any "
+                    "<read_state>/<update_state>/<create_state> tags, followed by 1-3 "
+                    "paragraphs of in-character prose. Do not include any other commentary."
+                ),
+            }]
+            raw_pass2 = await sync_chat(
+                repair_messages, max_tokens=2048, think=False, model=weave_model
+            )
+            if asyncio.current_task().cancelled():
+                raise asyncio.CancelledError()
+            cleaned_pass2 = _re.sub(r"<think>[\s\S]*?</think>", "", raw_pass2)
+            cleaned_pass2 = _re.sub(r"<think>[\s\S]*?</think>\s*", "", cleaned_pass2).strip()
+            ooda2 = parse_ooda_block(cleaned_pass2)
+            if ooda2 is None:
+                ooda2 = repair_ooda_block(cleaned_pass2)
+            if ooda2:
+                ooda = ooda2
+                resolved2 = await execute_ooda_reads(conv_id, ooda["reads"])
+                print(
+                    f"[OODA] Repair pass recovered: {len(resolved2)} reads, "
+                    f"{len(ooda['updates'])} updates, {len(ooda['creates'])} creates"
+                )
+                if ooda["updates"] or ooda["creates"]:
+                    await _ws_send(
+                        conv_id, {"type": "state_update", "updates": ooda["updates"]}
+                    )
+            final_prose = extract_post_ooda_prose(cleaned_pass2) if ooda else ""
+            if not final_prose:
+                final_prose = cleaned_pass2
+                final_prose = _re.sub(r"<ooda>[\s\S]*?</ooda>\s*", "", final_prose).strip()
+                final_prose = _re.sub(r"<ooda>[\s\S]*$", "", final_prose).strip()
 
         # Stream prose to client
         for i in range(0, len(final_prose), 8):
