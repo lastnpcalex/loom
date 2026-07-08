@@ -483,6 +483,7 @@ def _prepare_hermes_prompt(
     model: str | None = None,
     *,
     is_first_turn: bool = True,
+    cwd: str | None = None,
 ) -> str:
     """Inject the Loom contract and positionality for Hermes.
 
@@ -497,6 +498,12 @@ def _prepare_hermes_prompt(
     ``<loom_branch_info>`` would feed the model every prior message twice.
     Fresh sessions (no ``resume_session_id``, or the resume-failed fallback
     that opens ``session/new``) get the full orientation block.
+
+    ``cwd`` is injected as a ``<loom_env>`` block so the model knows its
+    working directory + the fact that the terminal is Git Bash (POSIX paths on
+    Windows). Without this the model routinely emits `C:\\Users\\...` paths
+    which Git Bash mangles (`C:Usersexast...`) — costing 2-3 wasted tool calls
+    per task while it learns to use `/c/Users/...`.
     """
     if not is_first_turn:
         return prompt
@@ -523,6 +530,29 @@ def _prepare_hermes_prompt(
     # prompt (model emitted bare tool calls with no prose, tools didn't execute)
     # and is reverted. Do NOT re-add a nudge without verifying against a live
     # dream turn's agent.log — see project_hermes_toolcall_hallucination_nudge.
+
+    env_info = ""
+    if cwd:
+        # The terminal tool runs Git Bash, so POSIX-style paths are required
+        # even on Windows. Translate the cwd to its /c/... POSIX form so the
+        # model doesn't have to guess and waste calls on `cd C:\Users\...`
+        # (which bash mangles to `C:Usersexast...`).
+        posix_cwd = str(Path(cwd)).replace("\\", "/")
+        # C:\Users\... -> /c/Users/...  (drive letter -> /<lower>/)
+        if len(posix_cwd) >= 2 and posix_cwd[1] == ":":
+            posix_cwd = "/" + posix_cwd[0].lower() + posix_cwd[2:]
+        is_win = sys.platform == "win32"
+        env_info = (
+            f"<loom_env>\n"
+            f"You are on {'Windows' if is_win else sys.platform}. The terminal tool "
+            f"runs Git Bash (POSIX shell), so use POSIX-style paths (e.g. "
+            f"`/c/Users/...` not `C:\\\\Users\\\\...` — bash strips unescaped "
+            f"backslashes, mangling `C:\\\\Users\\\\exast` to `C:Usersexast`). "
+            f"Working directory: `{posix_cwd}`. `cd` there first if you need a "
+            f"specific project root; otherwise commands run from the agent's "
+            f"startup cwd.\n"
+            f"</loom_env>\n\n"
+        )
 
     branch_info = ""
     if branch or model:
@@ -566,6 +596,7 @@ def _prepare_hermes_prompt(
 
     return (
         f"{contract_header}"
+        f"{env_info}"
         f"{branch_info}"
         f"<user_task>\n"
         f"{prompt}\n"
@@ -1056,7 +1087,7 @@ async def _run_hermes_oneshot(
         {type:"error", error}
         {type:"result", session_id, stop_reason, duration_ms, num_turns}
     """
-    prompt = _prepare_hermes_prompt(prompt, branch, model, is_first_turn=is_first_turn)
+    prompt = _prepare_hermes_prompt(prompt, branch, model, is_first_turn=is_first_turn, cwd=cwd)
     exe = hermes_exe or default_hermes_exe(hermes_home)
     home = hermes_home or os.environ.get(
         "HERMES_HOME",
@@ -1284,7 +1315,7 @@ async def run_hermes(
 ):
     """Run one prompt turn through a persistent `hermes acp` runtime."""
     del system  # reserved for parity with other provider clients
-    prompt = _prepare_hermes_prompt(prompt, branch, model, is_first_turn=is_first_turn)
+    prompt = _prepare_hermes_prompt(prompt, branch, model, is_first_turn=is_first_turn, cwd=cwd)
     exe = hermes_exe or default_hermes_exe(hermes_home)
     home = hermes_home or os.environ.get(
         "HERMES_HOME",
