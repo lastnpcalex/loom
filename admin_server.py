@@ -1077,9 +1077,24 @@ def _dream_cmd() -> str:
     if not model:
         model = (r"C:\Users\exast\OneDrive\Documents\Loom-Projects\llama-diffusion"
                  r"\models\diffusiongemma-26b-a4b-it-nvfp4.gguf")
-    # -m <gguf> is the standard llama.cpp model flag (common_params_parse).
+    # Context size: CRITICAL. The C++ server defaults n_ctx to 4096 when -c is
+    # omitted (server.cpp: srv.n_ctx = params.n_ctx > 0 ? params.n_ctx : 4096).
+    # A Weave OODA turn (system prompt + state cards + 12-msg verbatim window)
+    # blows past 4096 and the server 500s with "prompt too long for context
+    # (n_ctx=4096)". Pass -c so the model's full capacity is usable.
+    # dream_context_size default is 131072; the model trains to 262144.
+    ctx = int(getattr(_loom_config, "dream_context_size", 0) or 0) if _loom_config else 0
+    if ctx <= 0:
+        ctx = 131072
+    # Flash attention + quantized KV cache keep the large context inside 32GB VRAM.
+    fa = (getattr(_loom_config, "dream_flash_attn", "on") or "on") if _loom_config else "on"
+    ctk = (getattr(_loom_config, "dream_cache_type_k", "q8_0") or "q8_0") if _loom_config else "q8_0"
+    ctv = (getattr(_loom_config, "dream_cache_type_v", "q8_0") or "q8_0") if _loom_config else "q8_0"
+    # -m <gguf> + -c <ctx> are standard llama.cpp flags (common_params_parse).
     # --host/--port are server-only flags pulled out of argv before common_params_parse.
-    return f'cd /d "{cwd}" && "{exe}" -m "{model}" --host 127.0.0.1 --port {port}'
+    # -fa/-ctk/-ctv make a 131k context fit in 32GB (q8_0 KV ~= 1/2 the VRAM of f16).
+    return (f'cd /d "{cwd}" && "{exe}" -m "{model}" -c {ctx} '
+            f'-fa {fa} -ctk {ctk} -ctv {ctv} --host 127.0.0.1 --port {port}')
 
 
 async def _dream_probe(timeout: float = 2.0) -> dict | None:
