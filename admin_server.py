@@ -1188,6 +1188,31 @@ async def tool_dream_start():
         return JSONResponse({"status": "error", "output": f"Failed to launch Dream sidecar: {e}\nCmd: {cmd}"})
 
 
+@app.post("/tools/dream-restart")
+async def tool_dream_restart():
+    """Stop the running dream sidecar (C++ exe or legacy Python adapter), wait for
+    the port to free, then start a fresh instance with the current config.
+
+    Mirrors tool_llama_restart. The dashboard's Dream "Restart" button calls this
+    endpoint — without it, the button 404s. Stop releases VRAM + process RAM; the
+    port-free wait matters because the C++ exe binds :8787 at startup and will
+    fail to launch if a prior process (e.g. the tool-blind Python adapter) still
+    holds it. Start then launches the tool-aware C++ exe per _dream_cmd."""
+    await tool_dream_stop()
+    await asyncio.sleep(2)  # Give Windows time to release the port socket
+    port = _dream_port()
+    for _ in range(8):
+        await asyncio.sleep(1)
+        try:
+            async with httpx.AsyncClient(timeout=1.0) as client:
+                r = await client.get(f"http://127.0.0.1:{port}/health")
+                if r.status_code != 200:
+                    break
+        except Exception:
+            break  # port free (no listener) — proceed to start
+    return await tool_dream_start()
+
+
 @app.post("/tools/dream-stop")
 async def tool_dream_stop():
     """Terminate the dream sidecar process. Releases VRAM AND the process working
