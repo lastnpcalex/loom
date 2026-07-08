@@ -30,6 +30,32 @@ _mock_mode = False
 # Serializes vision calls so parallel describe_image tasks don't collide.
 _llama_lock = asyncio.Lock()
 
+# Persistent httpx client, reused across sync_chat / stream_chat calls.
+# Creating a fresh AsyncClient per request costs ~265ms of TCP+TLS setup on
+# every call (measured 2026-07-07: fresh=510ms vs reused=245ms per dream
+# request). Weave does an OODA pass + a repair pass per turn, so the per-call
+# overhead compounded to ~530ms/turn — roughly the "1s slower" the user felt
+# after the dream server swap. A shared client pools connections and skips that
+# setup. Lazily created on first use (no event loop yet at import time); the
+# per-request `timeout=` passed to .post()/.stream() still overrides per-call.
+_shared_client: httpx.AsyncClient | None = None
+
+
+def _client() -> httpx.AsyncClient:
+    """Return the shared AsyncClient, creating it on first use.
+
+    Kept open for the process lifetime — httpx pools connections internally and
+    handles server-side keep-alive close gracefully. The connect timeout is set
+    on the client (10s); read/write timeouts are set per-request at the call
+    site, since they vary (dream cold-loads need 600s, normal turns <30s)."""
+    global _shared_client
+    if _shared_client is None or _shared_client.is_closed:
+        _shared_client = httpx.AsyncClient(
+            limits=httpx.Limits(max_keepalive_connections=8, keepalive_expiry=120.0),
+            timeout=httpx.Timeout(None, connect=10.0),
+        )
+    return _shared_client
+
 # Mapping from disk .gguf filename → server-registered model ID.
 # Populated by health_check() when the server is reachable.
 _model_name_map: dict[str, str] = {}
@@ -373,78 +399,79 @@ async def stream_chat(
     # default 300s timeout. Mirror dream_client.REQUEST_TIMEOUT (600s) for dream.
     _stream_timeout = 600.0 if _is_dream_model(raw_model) else 300.0
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(_stream_timeout, connect=10.0)) as client:
-            async with client.stream(
-                "POST",
-                f"{chat_host}/v1/chat/completions",
-                json=payload,
-                headers={"Accept": "text/event-stream"},
-            ) as response:
-                if response.status_code != 200:
-                    body = await response.aread()
-                    try:
-                        err = json.loads(body).get("error", body.decode())
-                    except Exception:
-                        err = f"HTTP {response.status_code}"
-                    raise RuntimeError(f"Llama Server error: {err}")
+        client = _client()
+        async with client.stream(
+            "POST",
+            f"{chat_host}/v1/chat/completions",
+            json=payload,
+            headers={"Accept": "text/event-stream"},
+            timeout=httpx.Timeout(_stream_timeout, connect=10.0),
+        ) as response:
+            if response.status_code != 200:
+                body = await response.aread()
+                try:
+                    err = json.loads(body).get("error", body.decode())
+                except Exception:
+                    err = f"HTTP {response.status_code}"
+                raise RuntimeError(f"Llama Server error: {err}")
 
-                _was_thinking = False
-                _content_tokens = 0
-                _input_tokens = 0
-                _output_tokens = 0
+            _was_thinking = False
+            _content_tokens = 0
+            _input_tokens = 0
+            _output_tokens = 0
 
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith(":"):
-                        continue  # SSE comment
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]":
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
+                if line.startswith(":"):
+                    continue  # SSE comment
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("error"):
+                    raise RuntimeError(f"Llama Server error: {chunk['error']}")
+
+                usage = chunk.get("usage")
+                if usage:
+                    _input_tokens = usage.get("prompt_tokens", _input_tokens)
+                    _output_tokens = usage.get("completion_tokens", _output_tokens)
+
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+
+                # llama-server emits reasoning under "reasoning_content" delta key
+                reasoning = (delta.get("reasoning_content") or delta.get("reasoning") or "")
+                token = delta.get("content") or ""
+
+                if reasoning:
+                    if not _was_thinking:
+                        _was_thinking = True
+                        yield {"type": "thinking_start"}
+                    yield reasoning
+
+                if token:
+                    if _was_thinking:
+                        _was_thinking = False
+                        yield {"type": "thinking_end"}
+                    _content_tokens += 1
+                    yield token
+                    if _content_tokens >= effective_max:
                         break
-                    try:
-                        chunk = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    if chunk.get("error"):
-                        raise RuntimeError(f"Llama Server error: {chunk['error']}")
 
-                    usage = chunk.get("usage")
-                    if usage:
-                        _input_tokens = usage.get("prompt_tokens", _input_tokens)
-                        _output_tokens = usage.get("completion_tokens", _output_tokens)
-
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
-
-                    # llama-server emits reasoning under "reasoning_content" delta key
-                    reasoning = (delta.get("reasoning_content") or delta.get("reasoning") or "")
-                    token = delta.get("content") or ""
-
-                    if reasoning:
-                        if not _was_thinking:
-                            _was_thinking = True
-                            yield {"type": "thinking_start"}
-                        yield reasoning
-
-                    if token:
-                        if _was_thinking:
-                            _was_thinking = False
-                            yield {"type": "thinking_end"}
-                        _content_tokens += 1
-                        yield token
-                        if _content_tokens >= effective_max:
-                            break
-
-                yield {
-                    "type": "usage",
-                    "input_tokens": _input_tokens,
-                    "output_tokens": _output_tokens or _content_tokens,
-                }
-                return
+            yield {
+                "type": "usage",
+                "input_tokens": _input_tokens,
+                "output_tokens": _output_tokens or _content_tokens,
+            }
+            return
     except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as e:
         raise RuntimeError(f"Cannot reach local chat backend at {chat_host}: {e}")
 
@@ -479,15 +506,19 @@ async def sync_chat(
     # dream_client.REQUEST_TIMEOUT (600s) for dream models (OODA sync passes).
     _sync_timeout = 600.0 if _is_dream_model(raw_model) else 300.0
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(_sync_timeout, connect=10.0)) as client:
-            resp = await client.post(f"{chat_host}/v1/chat/completions", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            choices = data.get("choices") or []
-            if not choices:
-                return ""
-            msg = choices[0].get("message") or {}
-            return msg.get("content") or msg.get("reasoning_content") or ""
+        client = _client()
+        resp = await client.post(
+            f"{chat_host}/v1/chat/completions",
+            json=payload,
+            timeout=httpx.Timeout(_sync_timeout, connect=10.0),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+        msg = choices[0].get("message") or {}
+        return msg.get("content") or msg.get("reasoning_content") or ""
     except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as _e:
         if _is_dream_model(raw_model):
             raise RuntimeError(
