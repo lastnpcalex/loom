@@ -5343,6 +5343,28 @@ pre.tool-output {
     #state-panel {
         max-height: 50vh;
     }
+
+    /* New Conversation mode picker: 6 modes (incl. "Dream Space", "NROL-AO")
+       don't fit one row on mobile — .toggle-group has overflow: hidden, so
+       the long-label buttons get clipped off the right edge and become
+       untappable. Wrap 3-per-row, mirroring the .settings-toggle pattern. */
+    #mode-toggle { flex-wrap: wrap; }
+    #mode-toggle .toggle-btn {
+        min-width: 0;
+        overflow-wrap: anywhere;
+        text-align: center;
+        line-height: 1.2;
+        flex: 1 1 33%;
+        padding: 8px 10px;
+        font-size: 12px;
+    }
+    /* Drop the right-border on the last button of each wrapped row so we
+       don't get a stray vertical line floating in the gap. */
+    #mode-toggle .toggle-btn:nth-child(3n) { border-right: none; }
+
+    /* Home filter bar: same shape — 7 pill buttons in a non-wrapping row.
+       Wrap so "Dream Space {Agent}" stays on-screen instead of overflowing. */
+    #conv-filter-bar { flex-wrap: wrap; }
 }
 
 /* ── Compact Marker (system message after /compact or handoff) ── */
