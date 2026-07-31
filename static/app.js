@@ -39,6 +39,17 @@ function truthySetting(value) {
     return !!value;
 }
 
+function resetNewConversationMinimalFields({ resetModel = false } = {}) {
+    const minimalToggle = document.getElementById('weave-system-only');
+    if (minimalToggle) minimalToggle.checked = false;
+    const systemPromptInput = document.getElementById('weave-system-prompt');
+    if (systemPromptInput) systemPromptInput.value = '';
+    if (resetModel) {
+        const localModel = document.getElementById('local-model');
+        if (localModel) localModel.value = '';
+    }
+}
+
 const API = {
     async get(url) {
         const res = await fetch(url);
@@ -1255,6 +1266,7 @@ async function createConversation() {
     const customScene = document.getElementById('custom-scene').value.trim();
     const personaId = document.getElementById('persona-select').value || null;
     const styleNudge = 'Natural';
+    const localModel = document.getElementById('local-model')?.value || '';
     const systemOnly = !!document.getElementById('weave-system-only')?.checked;
     const systemPrompt = document.getElementById('weave-system-prompt')?.value.trim() || '';
 
@@ -1276,16 +1288,14 @@ async function createConversation() {
         custom_scene: systemOnly ? null : (customScene || null),
         system_only: systemOnly,
         system_prompt: systemOnly ? systemPrompt : null,
+        local_model: localModel || undefined,
     });
 
     State.conversations.unshift(conv);
     closeModal('modal-new-conv');
     document.getElementById('new-conv-title').value = '';
     document.getElementById('custom-scene').value = '';
-    const minimalToggle = document.getElementById('weave-system-only');
-    if (minimalToggle) minimalToggle.checked = false;
-    const systemPromptInput = document.getElementById('weave-system-prompt');
-    if (systemPromptInput) systemPromptInput.value = '';
+    resetNewConversationMinimalFields({ resetModel: true });
     State.selectedCharacterId = null;
 
     await loadConversation(conv.id);
@@ -1332,10 +1342,7 @@ async function openNewConvModal() {
     document.querySelectorAll('#first-turn-toggle .toggle-btn').forEach(b => b.classList.remove('active'));
     document.querySelector('#first-turn-toggle .toggle-btn[data-value="character"]').classList.add('active');
     document.getElementById('custom-scene').value = '';
-    const minimalToggle = document.getElementById('weave-system-only');
-    if (minimalToggle) minimalToggle.checked = false;
-    const systemPromptInput = document.getElementById('weave-system-prompt');
-    if (systemPromptInput) systemPromptInput.value = '';
+    resetNewConversationMinimalFields({ resetModel: true });
     // Reset mode toggle to Loom
     document.querySelectorAll('#mode-toggle .toggle-btn').forEach(b => b.classList.remove('active'));
     document.querySelector('#mode-toggle .toggle-btn[data-value="claude"]').classList.add('active');
@@ -2541,7 +2548,9 @@ function setupEventListeners() {
                 showWeaveFields(false);
                 fetchLocalModels();
             } else {
+                document.getElementById('local-model-group').classList.remove('hidden');
                 showWeaveFields(true);
+                fetchLocalModels();
             }
         });
     });
@@ -3193,6 +3202,9 @@ function setupEventListeners() {
     document.querySelectorAll('.modal-backdrop').forEach(bd => {
         bd.addEventListener('click', () => {
             const m = bd.closest('.modal');
+            if (m && m.id === 'modal-new-conv') {
+                resetNewConversationMinimalFields({ resetModel: true });
+            }
             m.classList.add('hidden');
             if (m.id === 'modal-settings') _stopServerLightPolling();
         });

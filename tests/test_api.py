@@ -81,6 +81,7 @@ async def test_create_system_only_weave_conversation(client, mock_llama):
         "first_turn": "character",
         "system_only": True,
         "system_prompt": "Use only branch history and this instruction.",
+        "local_model": "diffusiongemma-26b-a4b-it-nvfp4",
     })
     assert resp.status_code == 200
     data = resp.json()
@@ -91,6 +92,7 @@ async def test_create_system_only_weave_conversation(client, mock_llama):
     assert data["system_only"] == 1
     assert data["system_prompt"] == "Use only branch history and this instruction."
     assert data["ooda_enabled"] == 0
+    assert data["local_model"] == "diffusiongemma-26b-a4b-it-nvfp4"
 
 
 def test_minimal_weave_helpers_do_not_reintroduce_defaults():
