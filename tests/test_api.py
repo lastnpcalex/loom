@@ -66,6 +66,29 @@ async def test_create_weave_conversation(client, mock_llama):
     assert data["mode"] == "weave"
 
 
+async def test_create_system_only_weave_conversation(client, mock_llama):
+    """POST /api/conversations can create a minimal system-message-only Weave space."""
+    resp = await client.post("/api/conversations", json={
+        "title": "Minimal Weave Test",
+        "mode": "weave",
+        "character_id": "should-be-ignored",
+        "persona_id": "also-ignored",
+        "lore_ids": ["ignored"],
+        "first_turn": "character",
+        "system_only": True,
+        "system_prompt": "Use only branch history and this instruction.",
+    })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["mode"] == "weave"
+    assert data["character_id"] is None
+    assert data["persona_id"] is None
+    assert data["lore_ids"] == "[]"
+    assert data["system_only"] == 1
+    assert data["system_prompt"] == "Use only branch history and this instruction."
+    assert data["ooda_enabled"] == 0
+
+
 async def test_create_local_conversation(client, mock_llama):
     """POST /api/conversations with mode=local and local_model set."""
     resp = await client.post("/api/conversations", json={

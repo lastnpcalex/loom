@@ -32,6 +32,11 @@ def pytest_configure(config):
             base = Path(tempfile.gettempdir()) / f"loom-pytest-{username}"
         config.option.basetemp = base
 
+    # Register the live-Dream marker used by the Phase 0.5 tool-call probe.
+    config.addinivalue_line(
+        "markers", "live_dream: requires the live Dream sidecar at :8787"
+    )
+
 
 @pytest.fixture(autouse=True)
 async def tmp_database(tmp_path):

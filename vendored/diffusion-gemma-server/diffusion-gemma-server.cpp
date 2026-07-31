@@ -16,6 +16,7 @@
 #include "arg.h"
 #include "chat.h"
 #include "common.h"
+#include "fit.h"
 #include "llama.h"
 #include "log.h"
 #ifdef GGML_USE_CUDA
@@ -29,6 +30,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -111,6 +113,29 @@ static void diffusion_configure_cuda_mmq_env(const common_params_diffusion & par
     SRV_INF("GGML_CUDA_MMQ_MAX_X=%d\n", params.cuda_mmq_max_x);
 }
 
+static bool diffusion_bool_from_string(std::string s, bool fallback) {
+    std::string lower;
+    lower.reserve(s.size());
+    for (char c : s) {
+        lower.push_back((char) std::tolower((unsigned char) c));
+    }
+    if (lower == "1" || lower == "true" || lower == "yes" || lower == "on") return true;
+    if (lower == "0" || lower == "false" || lower == "no" || lower == "off") return false;
+    return fallback;
+}
+
+static bool diffusion_json_bool(const json & value, bool fallback) {
+    if (value.is_boolean()) return value.get<bool>();
+    if (value.is_number_integer()) return value.get<int>() != 0;
+    if (value.is_string()) return diffusion_bool_from_string(value.get<std::string>(), fallback);
+    return fallback;
+}
+
+static bool diffusion_env_bool(const char * name, bool fallback) {
+    const char * value = std::getenv(name);
+    return value ? diffusion_bool_from_string(value, fallback) : fallback;
+}
+
 // ------------------------------------------------------------------------------------------------
 // per-request generation parameters and result
 // ------------------------------------------------------------------------------------------------
@@ -137,6 +162,8 @@ struct diffusion_result {
     int    n_decode        = 0;    // total llama_decode() calls (prefill + denoise + commit)
     double prefill_ms      = 0.0;  // encoder-phase prompt prefill wall time
     double gen_ms          = 0.0;  // denoising block-loop wall time
+    bool   hit_eog         = false;
+    bool   hit_length      = false;
     bool   ok              = false;
     std::string error;
 };
@@ -235,9 +262,18 @@ struct diffusion_server {
         auto caps = common_chat_templates_get_caps(templates.get());
         inputs.parallel_tool_calls = body.value("parallel_tool_calls", caps["supports_parallel_tool_calls"]);
         inputs.add_generation_prompt = true;
-        // match the reference template default: emit the trailing thought-channel preamble
-        // and skip the system turn (the inputs default of true renders the opposite)
-        inputs.enable_thinking = false;
+        // Default remains reference-compatible, but callers can request the full
+        // Gemma4 thought channel with chat_template_kwargs.enable_thinking=true.
+        inputs.enable_thinking = diffusion_env_bool("DREAM_ENABLE_THINKING", false);
+        if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object()) {
+            const json & kwargs = body["chat_template_kwargs"];
+            if (kwargs.contains("enable_thinking")) {
+                inputs.enable_thinking = diffusion_json_bool(kwargs["enable_thinking"], inputs.enable_thinking);
+            }
+        }
+        if (body.contains("enable_thinking")) {
+            inputs.enable_thinking = diffusion_json_bool(body["enable_thinking"], inputs.enable_thinking);
+        }
         return common_chat_templates_apply(templates.get(), inputs);
     }
 
@@ -617,6 +653,8 @@ struct diffusion_server {
         out.n_steps_total = n_steps_total;
         out.canvas_tokens = n_blocks_run * canvas_length;
         out.n_decode      = n_decode;
+        out.hit_eog       = done;
+        out.hit_length    = !done && n_blocks_run >= max_canvases;
         out.ok            = true;
         return out;
     }
@@ -867,6 +905,11 @@ static json usage_json(const diffusion_result & r) {
     };
 }
 
+static std::string finish_reason_for(const diffusion_result & r, const common_chat_msg * msg = nullptr) {
+    if (msg && !msg->tool_calls.empty()) return "tool_calls";
+    return r.hit_length ? "length" : "stop";
+}
+
 // per-request timing log, llama_perf-style but with the denoise phase substituted for AR eval
 static void log_timings(const diffusion_result & r) {
     const double ppt = r.prompt_tokens > 0 ? r.prefill_ms / r.prompt_tokens : 0.0;
@@ -969,29 +1012,7 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    SRV_INF("%s\n", "loading model");
-
-    llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = params.n_gpu_layers >= 0 ? params.n_gpu_layers : 999;
-    model_params.devices      = params.devices.data();
-    model_params.use_mmap     = params.use_mmap;
-    model_params.use_extra_bufts = !params.no_extra_bufts;
-    model_params.no_host         = params.no_host;
-
     diffusion_server srv;
-    srv.model = llama_model_load_from_file(params.model.path.c_str(), model_params);
-    if (!srv.model) {
-        SRV_ERR("failed to load model '%s'\n", params.model.path.c_str());
-        return 1;
-    }
-    if (!llama_model_is_diffusion(srv.model)) {
-        SRV_ERR("'%s' is not a diffusion model\n", params.model.path.c_str());
-        llama_model_free(srv.model);
-        return 1;
-    }
-
-    srv.vocab         = llama_model_get_vocab(srv.model);
-    srv.n_vocab       = llama_vocab_n_tokens(srv.vocab);
     srv.canvas_length = DEF_CANVAS_LENGTH;
     srv.n_steps       = std::max(params.diffusion.steps, 1);
     srv.diffusion     = params.diffusion;
@@ -1007,6 +1028,41 @@ int main(int argc, char ** argv) {
     srv.model_path    = params.model.path;
     srv.metrics.t_start = (int64_t) std::time(nullptr);
 
+    params.n_ctx    = srv.n_ctx;
+    params.n_batch  = srv.n_ub;
+    params.n_ubatch = srv.n_ub;
+
+    SRV_INF("%s\n", "loading model");
+
+    llama_model_params   model_params = common_model_params_to_llama(params);
+    llama_context_params ctx_params   = common_context_params_to_llama(params);
+
+    if (params.fit_params) {
+        SRV_INF("%s\n", "fitting params to device memory");
+        common_fit_params(params.model.path.c_str(), &model_params, &ctx_params,
+            params.tensor_split,
+            params.tensor_buft_overrides.data(),
+            params.fit_params_target.data(),
+            params.fit_params_min_ctx,
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    }
+
+    srv.n_ctx = (int) ctx_params.n_ctx;
+
+    srv.model = llama_model_load_from_file(params.model.path.c_str(), model_params);
+    if (!srv.model) {
+        SRV_ERR("failed to load model '%s'\n", params.model.path.c_str());
+        return 1;
+    }
+    if (!llama_model_is_diffusion(srv.model)) {
+        SRV_ERR("'%s' is not a diffusion model\n", params.model.path.c_str());
+        llama_model_free(srv.model);
+        return 1;
+    }
+
+    srv.vocab         = llama_model_get_vocab(srv.model);
+    srv.n_vocab       = llama_vocab_n_tokens(srv.vocab);
+
     {
         std::string p = params.model.path;
         size_t slash = p.find_last_of("/\\");
@@ -1015,25 +1071,6 @@ int main(int argc, char ** argv) {
         if (dot != std::string::npos) srv.model_id = srv.model_id.substr(0, dot);
         if (srv.model_id.empty()) srv.model_id = "diffusion-gemma";
     }
-
-    llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx    = srv.n_ctx;
-    ctx_params.n_batch  = srv.n_ub;
-    ctx_params.n_ubatch = srv.n_ub;
-    ctx_params.no_perf  = params.no_perf;
-    ctx_params.n_seq_max       = params.n_parallel;
-    ctx_params.flash_attn_type = params.flash_attn_type;
-    ctx_params.offload_kqv     = !params.no_kv_offload;
-    ctx_params.op_offload      = !params.no_op_offload;
-    ctx_params.swa_full        = params.swa_full;
-    ctx_params.kv_unified      = params.kv_unified;
-    ctx_params.type_k          = params.cache_type_k;
-    ctx_params.type_v          = params.cache_type_v;
-    ctx_params.diffusion_self_cond_top_k = srv.diffusion.self_cond_top_k;
-    ctx_params.diffusion_input_gpu_groups = srv.diffusion.input_gpu_groups;
-    ctx_params.diffusion_fused_self_cond_embd = srv.diffusion.fused_self_cond_embd;
-    ctx_params.diffusion_fuse_final_logit_softcap = srv.diffusion.fuse_final_logit_softcap;
-    ctx_params.diffusion_separate_encoder_decoder = srv.diffusion.separate_encoder_decoder;
 
     srv.ctx = llama_init_from_model(srv.model, ctx_params);
     if (!srv.ctx) {
@@ -1372,7 +1409,7 @@ int main(int argc, char ** argv) {
         const diffusion_result r = run_for_body(body, prompt_tokens);
         if (!r.ok) { res.status = 500; res.set_content(error_json(r.error, "server_error", 500).dump(), "application/json"); return; }
         const common_chat_msg msg = parse_chat_answer_oaicompat(chat_params, r.answer);
-        const std::string finish_reason = msg.tool_calls.empty() ? "stop" : "tool_calls";
+        const std::string finish_reason = finish_reason_for(r, &msg);
 
         if (!stream) {
             json out{
@@ -1443,7 +1480,7 @@ int main(int argc, char ** argv) {
         if (!r.ok) { res.status = 500; res.set_content(error_json(r.error, "server_error", 500).dump(), "application/json"); return; }
         json out{
             {"id", gen_id("cmpl")}, {"object", "text_completion"}, {"created", (int64_t) std::time(nullptr)}, {"model", srv.model_id},
-            {"choices", json::array({ json{{"index", 0}, {"text", r.answer}, {"finish_reason", "stop"}} })},
+            {"choices", json::array({ json{{"index", 0}, {"text", r.answer}, {"finish_reason", finish_reason_for(r)}} })},
             {"usage", usage_json(r)},
             {"timings", timings_json(r)},
         };

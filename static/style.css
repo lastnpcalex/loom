@@ -3718,6 +3718,37 @@ body::after {
 .settings-section { min-height: 80px; }
 .hint { font-size: 0.8em; color: var(--text-muted); font-weight: normal; }
 
+.settings-loading-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: -4px 0 12px;
+    padding: 8px 10px;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 0.86em;
+}
+.settings-loading-status::before {
+    content: '';
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid rgba(0, 255, 255, 0.25);
+    border-top-color: var(--cyan);
+    animation: spin 0.8s linear infinite;
+    flex: 0 0 auto;
+}
+
+#weave-minimal-group label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+}
+#weave-minimal-group input[type="checkbox"] { accent-color: var(--cyan); }
+
 /* Settings — restructured panel */
 .settings-divider {
     display: flex;

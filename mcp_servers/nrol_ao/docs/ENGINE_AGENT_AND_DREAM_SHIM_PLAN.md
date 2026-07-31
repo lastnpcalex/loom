@@ -159,7 +159,7 @@ Dream sidecar (:8787, DiffusionGemma, llama-diffusion-gemma-server.exe)
 - `messages` with content blocks (`text`, `image`, `tool_use`, `tool_result`) → OpenAI messages (content string / `tool_calls` / tool-role messages).
 - Top-level `system` param → OpenAI system message (prepend).
 - `tools` (Anthropic: `{name, description, input_schema}`) → OpenAI `tools` (`{type:"function", function:{name, description, parameters}}`).
-- `max_tokens` (required in Anthropic) → `max_tokens` + `dream_thought_budget()` (default 4096, reuse `mcp_servers/nrol_ao/llama.py:120-132` logic) so the thought channel doesn't starve content into `finish_reason=length`. Dream ignores `enable_thinking`/`chat_template_kwargs`, so don't send it (keeps payload clean, mirroring `llama.py:259`).
+- `max_tokens` (required in Anthropic) -> `max_tokens` unchanged. Dream's sidecar computes the needed canvases and clamps to context; do not add a hidden thought budget. Dream accepts `chat_template_kwargs.enable_thinking`, so callers can explicitly choose the Gemma4 thought-channel path or the no-thinking reference prompt.
 - `temperature`, `top_p`, `stream` → passthrough.
 - Model name: shim ignores incoming `model` and uses Dream's loaded model (`diffusiongemma-26b-a4b-it-nvfp4`), OR passes through. Simplest: always target Dream's model (only one is loaded).
 
@@ -232,7 +232,7 @@ Bottom line: the Gemini spec is mostly already-done, duplicated by Track B, scop
 ---
 
 # Files inspected (read-only, for grounding)
-- `mcp_servers/nrol_ao/llama.py` — `chat()` (212), `resolve_backend()` (135), `_split_channel_scaffold()` (27-55, the strip that becomes irrelevant on the tool path and gets fixed-at-shim on the text path), `dream_thought_budget()` (120-132), `dream_host()`/`llama_host()` (76-106)
+- `mcp_servers/nrol_ao/llama.py` — `chat()` (212), `resolve_backend()` (135), `_split_channel_scaffold()` (27-55, the strip that becomes irrelevant on the tool path and gets fixed-at-shim on the text path), `dream_host()`/`llama_host()` (76-106)
 - `mcp_servers/nrol_ao/server.py` — `_run_debate()` (1035-1160), `run_news_scan` (3709+), model forwarding to `_run_debate` (3948)
 - `framework/news_observation_pipeline.py` — `build_advocate_prompt`/`build_rebut_prompt`/`build_jury_prompt` (294-520), the line parsers, `<one sentence>` constraints at 354/423/511
 - `dream_client.py` — async Dream sidecar client (`dream_chat` 185, `dream_chat_sync` 255, `_split_channel_scaffold` 44-72 canonical copy)

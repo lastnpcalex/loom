@@ -627,6 +627,7 @@ def _loom_append_system_prompt(
     nrol_operator: bool = False,
     use_llama: bool = False,
     use_umans: bool = False,
+    use_dream: bool = False,
     cc_model: str | None = None,
 ) -> str | None:
     """Add the shared Loom contract only for ordinary Claude sessions.
@@ -640,7 +641,11 @@ def _loom_append_system_prompt(
     if cc_model:
         provider = (
             "a local llama-server" if use_llama
-            else ("Umans AI" if use_umans else "the Anthropic API")
+            else (
+                "the local Dream DiffusionGemma sidecar"
+                if use_dream
+                else ("Umans AI" if use_umans else "the Anthropic API")
+            )
         )
         contract = contract + (
             "\n\n## Operating model\n"
@@ -657,6 +662,13 @@ def _loom_append_system_prompt(
             "For attached user uploads, look at the system-provided image descriptions in your context, or ask the user."
         )
         contract = contract + image_warning
+    if use_dream:
+        dream_warning = (
+            "\n\nYou are running through the local Dream DiffusionGemma text endpoint. "
+            "It is not a native vision transport. Never read binary image files as text. "
+            "If you need to inspect an image inside the workspace, use the `describe_image` tool from the `loom-workspace` MCP server."
+        )
+        contract = contract + dream_warning
     return merge_system_prompts(contract, append_system_prompt) or None
 
 
@@ -666,6 +678,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                      resume_session_id: str = None, fork_session: bool = False,
                      use_llama: bool = False,
                      use_umans: bool = False,
+                     use_dream: bool = False,
                      backstage_parent_id: int | None = None,
                      nrol_operator: bool = False,
                      extra_mcp_servers: dict | None = None,
@@ -683,6 +696,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     as all three DEFAULT_*_MODEL env vars so CC routes to it regardless of preset.
     When use_umans is True, routes through Umans AI's Anthropic-compatible endpoint
     (api.code.umans.ai) for remote model access.
+    When use_dream is True, routes through Loom's local Anthropic-to-Dream shim,
+    which forwards to the DiffusionGemma OpenAI sidecar.
     Permission hooks route tool approvals through Loom's HTTP API.
     """
     # Configure the permission hook in the project directory (idempotent, skips if already set)
@@ -710,10 +725,10 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             "Write", "Edit", "NotebookEdit", "Bash",
             "Agent", "Task", "KillShell", "SlashCommand",
         ]
-    # Llama/local/umans models: block built-in WebSearch/WebFetch (require Anthropic API).
+    # Llama/local/umans/dream models: block built-in WebSearch/WebFetch (require Anthropic API).
     # The MCP web-tools server (registered below) provides keyless web_search/web_fetch
     # via DuckDuckGo + trafilatura as the replacement.
-    if use_llama or use_umans:
+    if use_llama or use_umans or use_dream:
         disallowed_list += ["WebSearch", "WebFetch"]
     if extra_disallowed_tools:
         disallowed_list += [tool for tool in extra_disallowed_tools if tool not in disallowed_list]
@@ -751,9 +766,9 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         if backstage_md.exists():
             cc_args.extend(["--append-system-prompt", backstage_md.read_text(encoding="utf-8")])
 
-    # Llama/local/umans models: register MCP web-tools so they get web_search/web_fetch
+    # Llama/local/umans/dream models: register MCP web-tools so they get web_search/web_fetch
     # via DuckDuckGo + trafilatura (keyless, no Anthropic API needed).
-    if use_llama or use_umans:
+    if use_llama or use_umans or use_dream:
         web_tools_script = Path(__file__).parent / "mcp_web_tools.py"
         if web_tools_script.is_file():
             mcp_servers["web-tools"] = {
@@ -833,6 +848,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         nrol_operator=nrol_operator,
         use_llama=use_llama,
         use_umans=use_umans,
+        use_dream=use_dream,
         cc_model=model,
     )
     if append_system_prompt:
@@ -885,6 +901,22 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         # Suppress the per-request attribution hash that defeats KV-cache prefix.
         env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
         env["LOOM_USE_LLAMA"] = "1"
+    # Dream DiffusionGemma as CC backend: Claude Code still speaks Anthropic
+    # Messages. The local shim serves /v1/messages and forwards to Dream's
+    # OpenAI-compatible /v1/chat/completions sidecar.
+    elif use_dream:
+        alias = model
+        port = os.environ.get("DREAM_SHIM_PORT", "8788")
+        base = os.environ.get("DREAM_SHIM_BASE_URL", f"http://127.0.0.1:{port}")
+        env["ANTHROPIC_BASE_URL"] = base.rstrip("/")
+        env["ANTHROPIC_API_KEY"] = "dummy"
+        env["ANTHROPIC_AUTH_TOKEN"] = "dummy"
+        env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = alias
+        env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = alias
+        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = alias
+        env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
+        env["LOOM_USE_LLAMA"] = "0"
+        env["LOOM_USE_DREAM"] = "1"
     # Umans AI as CC backend: point the Anthropic SDK at Umans' Anthropic-compatible
     # /v1/messages endpoint. Session resumption works across providers because the
     # conversation history lives in Loom's DB, not the provider.

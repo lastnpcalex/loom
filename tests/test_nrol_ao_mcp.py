@@ -693,6 +693,199 @@ def test_propose_match_validates_without_mutation(nrol, topic_path):
     assert topic_path.read_bytes() == before_bytes  # proposals never mutate
 
 
+def _engine_packet(final_action: dict | None = None, *, article_id: str = "A1") -> tuple[list[dict], dict]:
+    articles = [{
+        "article_id": article_id,
+        "headline": "Synthetic engine deliberation article",
+        "url": f"https://example.test/engine/{uuid.uuid4().hex[:8]}",
+        "source": "engine-test",
+        "date": "2026-06-09",
+        "text": "Test-rig reports the observable metric reached 55 percent.",
+    }]
+    action = final_action or {
+        "kind": "OBSERVE",
+        "indicator_id": "ind_observable_metric",
+        "value": 55.0,
+    }
+    packet = {
+        "slug": SLUG,
+        "advocate_proposals": [{
+            "proposal_id": "adv_test",
+            "article_id": article_id,
+            "verdict": "COMMIT",
+            "proposed_action": action,
+            "analysis": "Advocate cites ind_observable_metric and explains the directional case.",
+        }],
+        "rebuttals": [{
+            "rebuttal_id": "reb_test",
+            "article_id": article_id,
+            "advocate_proposal_id": "adv_test",
+            "verdict": "COMMIT",
+            "objection_raised": False,
+            "rebuttal_analysis": "Rebuttal accepts the advocate proposal adv_test.",
+        }],
+        "jury_verdicts": [{
+            "verdict_id": "jur_test",
+            "article_id": article_id,
+            "advocate_proposal_id": "adv_test",
+            "rebuttal_id": "reb_test",
+            "final_action": action,
+            "jury_rationale": (
+                "Jury weighs advocate proposal adv_test and rebuttal reb_test, "
+                "then accepts OBSERVE ind_observable_metric at 55."
+            ),
+        }],
+    }
+    return articles, packet
+
+
+def _write_manifest_for_test(nrol, *, slug: str = SLUG) -> dict:
+    return nrol._write_engine_scan_manifest(
+        slug=slug,
+        job_id=f"job-test-{uuid.uuid4().hex[:8]}",
+        time_window={"label": "fixture", "hours": 24, "ddg_timelimit": "d"},
+        queries={"wildcard": "fixture query"},
+        search_errors={},
+        raw_article_count=1,
+        freshness_filter={"kept": 1, "dropped": 0},
+        articles=[{
+            "article": {
+                "headline": "Fixture manifest article",
+                "url": f"https://example.test/manifest/{uuid.uuid4().hex[:8]}",
+                "source": "test-wire",
+                "date": "2026-07-15",
+                "relevance": "fixture manifest article",
+            },
+            "idx": 1,
+        }],
+        surfaced={"wildcard": [1]},
+        excerpts=None,
+        engine_articles=[{
+            "article_id": "A1",
+            "headline": "Fixture manifest article",
+            "url": f"https://example.test/manifest/{uuid.uuid4().hex[:8]}",
+            "source": "test-wire",
+            "date": "2026-07-15",
+            "text": "fixture manifest article",
+        }],
+    )
+
+
+def test_file_engine_deliberation_proposals_dry_run_previews_without_writes(nrol, topic_path):
+    articles, packet = _engine_packet()
+    before_topic = topic_path.read_bytes()
+    before_queue = json.loads(nrol.list_proposals(slug=SLUG, status="pending"))
+    before_ids = {p["id"] for p in before_queue["proposals"]}
+
+    out = json.loads(nrol.file_engine_deliberation_proposals(
+        slug=SLUG,
+        articles=articles,
+        deliberation_packet=packet,
+        dry_run=True,
+    ))
+
+    assert out["dry_run"] is True
+    assert out["proposals_filed"] == []
+    assert len(out["proposals"]) == 1
+    preview = out["proposals"][0]
+    assert preview["action"] == "OBSERVE"
+    assert preview["indicator_id"] == "ind_observable_metric"
+    assert preview["deliberation"]["source"] == "nrol_ao_engine"
+    assert preview["deliberation"]["advocate"]["proposal_id"] == "adv_test"
+    assert topic_path.read_bytes() == before_topic
+    after_queue = json.loads(nrol.list_proposals(slug=SLUG, status="pending"))
+    assert {p["id"] for p in after_queue["proposals"]} == before_ids
+
+
+def test_file_engine_deliberation_proposals_files_pending_review_only(nrol, topic_path):
+    articles, packet = _engine_packet()
+    before_topic = topic_path.read_bytes()
+
+    out = json.loads(nrol.file_engine_deliberation_proposals(
+        slug=SLUG,
+        articles=articles,
+        deliberation_packet=packet,
+        dry_run=False,
+        submitted_by="engine-test",
+    ))
+
+    assert out["dry_run"] is False
+    assert len(out["proposals_filed"]) == 1
+    assert topic_path.read_bytes() == before_topic  # proposal filing never mutates topic JSON
+    queue = json.loads(nrol.list_proposals(slug=SLUG, status="pending"))
+    prop = next(p for p in queue["proposals"] if p["id"] == out["proposals_filed"][0])
+    assert prop["action"] == "OBSERVE"
+    assert prop["indicator_id"] == "ind_observable_metric"
+    assert prop["observed_value"] == 55.0
+    stamped = json.loads(prop["deliberation"])
+    assert stamped["deliberation"]["source"] == "nrol_ao_engine"
+    assert stamped["deliberation"]["jury_verdict_id"] == "jur_test"
+
+
+def test_file_engine_deliberation_proposals_skips_duplicate_pending_proposal(nrol, topic_path):
+    articles, packet = _engine_packet()
+
+    first = json.loads(nrol.file_engine_deliberation_proposals(
+        slug=SLUG,
+        articles=articles,
+        deliberation_packet=packet,
+        dry_run=False,
+        submitted_by="engine-test",
+    ))
+    assert len(first["proposals_filed"]) == 1
+
+    second = json.loads(nrol.file_engine_deliberation_proposals(
+        slug=SLUG,
+        articles=articles,
+        deliberation_packet=packet,
+        dry_run=False,
+        submitted_by="engine-test",
+    ))
+
+    assert second["proposals_filed"] == []
+    assert second["proposal_count"] == 0
+    assert second["skipped"][0]["reason"] == "pending_duplicate_proposal"
+    assert second["skipped"][0]["existing_proposal_id"] == first["proposals_filed"][0]
+
+
+def test_file_engine_deliberation_proposals_skips_non_proposable_actions(nrol, topic_path):
+    articles, packet = _engine_packet({"kind": "DUPLICATE_OF", "parent_idx": "A0"})
+    before_queue = json.loads(nrol.list_proposals(slug=SLUG, status="pending"))
+    before_ids = {p["id"] for p in before_queue["proposals"]}
+
+    out = json.loads(nrol.file_engine_deliberation_proposals(
+        slug=SLUG,
+        articles=articles,
+        deliberation_packet=packet,
+        dry_run=False,
+    ))
+
+    assert out["proposals_filed"] == []
+    assert out["skipped"][0]["action"] == "DUPLICATE_OF"
+    after_queue = json.loads(nrol.list_proposals(slug=SLUG, status="pending"))
+    assert {p["id"] for p in after_queue["proposals"]} == before_ids
+
+
+def test_engine_articles_for_deliberation_sanitizes_bad_text(nrol):
+    articles = [{
+        "headline": "Bad extractor payload",
+        "url": "https://example.test/bad-payload",
+        "source": "test-wire",
+        "date": "2026-07-15",
+        "relevance": "prefix\x00\x01 middle\udcff \ufffd\n\t suffix",
+    }]
+
+    projected = nrol._engine_articles_for_deliberation(articles)
+
+    text = projected[0]["text"]
+    assert "prefix" in text
+    assert "suffix" in text
+    assert "\x00" not in text
+    assert "\x01" not in text
+    assert "\udcff" not in text
+    assert "\ufffd" not in text
+
+
 def test_commit_match_applies_fire_through_gates(nrol, topic_path):
     art = json.loads(nrol.submit_article(_article()))
     prop = json.loads(nrol.propose_match(
@@ -776,13 +969,13 @@ def test_safe_policy_scan_parks_and_files_proposals(nrol, topic_path, monkeypatc
         {
             "headline": f"Background development {suffix}",
             "url": f"https://example.test/scan/{suffix}-a",
-            "source": "test-wire", "date": "2026-06-09",
+            "source": "test-wire", "date": "2026-07-15",
             "relevance": "relevant but matches no indicator",
         },
         {
             "headline": f"Official threshold print {suffix}",
             "url": f"https://example.test/scan/{suffix}-b",
-            "source": "test-wire", "date": "2026-06-09",
+            "source": "test-wire", "date": "2026-07-15",
             "relevance": "synthetic event A confirmed",
         },
     ]
@@ -806,6 +999,9 @@ def test_safe_policy_scan_parks_and_files_proposals(nrol, topic_path, monkeypatc
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
         fetch_full_articles=False, brief=False,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
     ))
     assert "error" not in out, out
     assert _disk_posteriors(topic_path) == before  # nothing moved beliefs
@@ -828,6 +1024,555 @@ def test_safe_policy_scan_parks_and_files_proposals(nrol, topic_path, monkeypatc
     assert "proposals filed for review: 1" in digest
 
 
+def test_run_news_scan_engine_deliberation_files_review_proposals(nrol, topic_path, monkeypatch):
+    suffix = uuid.uuid4().hex[:6]
+    articles = [{
+        "headline": f"Engine threshold print {suffix}",
+        "url": f"https://example.test/engine-scan/{suffix}",
+        "source": "test-wire",
+        "date": "2026-07-15",
+        "relevance": "test metric reached 55 percent",
+    }]
+    monkeypatch.setattr(
+        nrol,
+        "_search_web_articles",
+        lambda query, channel, max_results, **kw: list(articles),
+    )
+    def legacy_chat_should_not_run(*args, **kwargs):
+        raise AssertionError("legacy matcher should be opt-in")
+
+    monkeypatch.setattr(nrol.llama_client, "chat", legacy_chat_should_not_run)
+    fw = nrol._import_from_repo("framework.news_observation_pipeline")
+    monkeypatch.setattr(fw, "parse_matcher_output", lambda text: [
+        {"idx": 1, "action": {"kind": "PARK"}, "tag": "EVENT",
+         "claim": "relevant engine scan article", "reason": "legacy path parks"}
+    ])
+
+    from mcp_servers.nrol_ao_engine import deliberation_agent
+
+    def fake_deliberation(slug, engine_articles, **kwargs):
+        assert slug == SLUG
+        assert engine_articles[0]["article_id"] == "A1"
+        assert kwargs["temperature"] == 0.07
+        assert kwargs["max_tokens"] == 777
+        _articles, packet = _engine_packet(article_id="A1")
+        return packet
+
+    monkeypatch.setattr(deliberation_agent, "run_deliberation", fake_deliberation)
+    before = _disk_posteriors(topic_path)
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG],
+        commit=False,
+        dry_run=False,
+        commit_policy="safe",
+        fetch_full_articles=False,
+        deliberate=False,
+        temperature=0.07,
+        max_tokens=777,
+        brief=False,
+    ))
+
+    assert "error" not in out, out
+    assert _disk_posteriors(topic_path) == before
+    packet = out["topics"][0]
+    assert packet["engine_deliberation"] is not None, packet["search_errors"]
+    assert packet["engine_deliberation"]["jury_verdicts"][0]["verdict_id"] == "jur_test"
+    assert len(packet["engine_review"]["proposals_filed"]) == 1
+    queue = json.loads(nrol.list_proposals(slug=SLUG, status="pending"))
+    prop = next(p for p in queue["proposals"] if p["id"] == packet["engine_review"]["proposals_filed"][0])
+    assert prop["action"] == "OBSERVE"
+    assert prop["indicator_id"] == "ind_observable_metric"
+    stamped = json.loads(prop["deliberation"])
+    assert stamped["deliberation"]["source"] == "nrol_ao_engine"
+
+
+def test_run_news_scan_engine_deliberation_processes_internal_chunks(nrol, topic_path, monkeypatch):
+    suffix = uuid.uuid4().hex[:6]
+    articles = [
+        {
+            "headline": f"Engine batch item {suffix}-{idx}",
+            "url": f"https://example.test/engine-batch/{suffix}-{idx}",
+            "source": "test-wire",
+            "date": "2026-07-15",
+            "relevance": f"test metric reached {50 + idx} percent",
+        }
+        for idx in range(1, 4)
+    ]
+    monkeypatch.setattr(
+        nrol,
+        "_search_web_articles",
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [],
+    )
+
+    def legacy_chat_should_not_run(*args, **kwargs):
+        raise AssertionError("legacy matcher should be opt-in")
+
+    monkeypatch.setattr(nrol.llama_client, "chat", legacy_chat_should_not_run)
+
+    from mcp_servers.nrol_ao_engine import deliberation_agent
+
+    seen_chunks = []
+
+    def fake_deliberation(slug, engine_articles, **kwargs):
+        assert slug == SLUG
+        seen_chunks.append([a["article_id"] for a in engine_articles])
+        _articles, packet = _engine_packet(article_id=engine_articles[0]["article_id"])
+        return packet
+
+    monkeypatch.setattr(deliberation_agent, "run_deliberation", fake_deliberation)
+    before_topic = _disk_topic(topic_path)
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG],
+        commit=False,
+        dry_run=False,
+        commit_policy="safe",
+        fetch_full_articles=False,
+        brief=False,
+        engine_max_articles=2,
+    ))
+
+    assert "error" not in out, out
+    packet = out["topics"][0]
+    assert seen_chunks == [["A1", "A2"], ["A3"]]
+    coverage = packet["engine_coverage"]
+    assert coverage["total_articles"] == 3
+    assert coverage["processed_articles"] == 3
+    assert coverage["attempted_articles"] == 3
+    assert coverage["deferred_after"] == 0
+    assert coverage["next_offset"] is None
+    assert coverage["chunk_size"] == 2
+    assert coverage["chunks_completed"] == 2
+    assert coverage["chunks_failed"] == 0
+    assert [c["status"] for c in coverage["chunks"]] == ["completed", "completed"]
+    assert len(packet["engine_review"]["proposals_filed"]) == 2
+    assert packet["scan_record"]["recorded"] is True
+    assert _disk_topic(topic_path).get("meta", {}).get("lastScanned") != before_topic.get("meta", {}).get("lastScanned")
+
+
+def test_run_news_scan_engine_deliberation_offset_runs_next_chunk(nrol, topic_path, monkeypatch):
+    suffix = uuid.uuid4().hex[:6]
+    articles = [
+        {
+            "headline": f"Engine chunk item {suffix}-{idx}",
+            "url": f"https://example.test/engine-chunk/{suffix}-{idx}",
+            "source": "test-wire",
+            "date": "2026-07-15",
+            "relevance": f"test metric reached {50 + idx} percent",
+        }
+        for idx in range(1, 5)
+    ]
+    monkeypatch.setattr(
+        nrol,
+        "_search_web_articles",
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [],
+    )
+    monkeypatch.setattr(
+        nrol.llama_client,
+        "chat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy matcher should be opt-in")),
+    )
+
+    from mcp_servers.nrol_ao_engine import deliberation_agent
+
+    def fake_deliberation(slug, engine_articles, **kwargs):
+        assert [a["article_id"] for a in engine_articles] == ["A3", "A4"]
+        _articles, packet = _engine_packet(article_id="A3")
+        return packet
+
+    monkeypatch.setattr(deliberation_agent, "run_deliberation", fake_deliberation)
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG],
+        commit=False,
+        dry_run=False,
+        commit_policy="safe",
+        fetch_full_articles=False,
+        brief=False,
+        engine_max_articles=2,
+        engine_article_offset=2,
+    ))
+
+    packet = out["topics"][0]
+    coverage = packet["engine_coverage"]
+    assert coverage["total_articles"] == 4
+    assert coverage["selected_articles"] == 2
+    assert coverage["processed_articles"] == 2
+    assert coverage["attempted_articles"] == 2
+    assert coverage["article_offset"] == 2
+    assert coverage["deferred_before"] == 2
+    assert coverage["deferred_after"] == 0
+    assert coverage["next_offset"] is None
+    assert coverage["chunk_size"] == 2
+    assert coverage["chunks_completed"] == 1
+    assert coverage["chunks_failed"] == 0
+    assert [c["status"] for c in coverage["chunks"]] == ["completed"]
+    assert packet["scan_record"]["recorded"] is True
+
+
+def test_run_news_scan_engine_manifest_resume_uses_frozen_articles(nrol, topic_path, monkeypatch):
+    suffix = uuid.uuid4().hex[:6]
+    articles = [
+        {
+            "headline": f"Engine manifest item {suffix}-{idx}",
+            "url": f"https://example.test/engine-manifest/{suffix}-{idx}",
+            "source": "test-wire",
+            "date": "2026-07-15",
+            "relevance": f"test metric reached {50 + idx} percent",
+        }
+        for idx in range(1, 4)
+    ]
+    monkeypatch.setattr(
+        nrol,
+        "_search_web_articles",
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [],
+    )
+    monkeypatch.setattr(
+        nrol.llama_client,
+        "chat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy matcher should be opt-in")),
+    )
+
+    from mcp_servers.nrol_ao_engine import deliberation_agent
+
+    first_chunks = []
+
+    def fake_first_deliberation(slug, engine_articles, **kwargs):
+        first_chunks.append([a["article_id"] for a in engine_articles])
+        _articles, packet = _engine_packet(article_id=engine_articles[0]["article_id"])
+        return packet
+
+    monkeypatch.setattr(deliberation_agent, "run_deliberation", fake_first_deliberation)
+
+    first = json.loads(nrol.run_news_scan(
+        slugs=[SLUG],
+        commit=False,
+        dry_run=True,
+        commit_policy="safe",
+        fetch_full_articles=False,
+        brief=False,
+        engine_file_proposals=False,
+        engine_max_articles=2,
+    ))
+
+    assert "error" not in first, first
+    first_packet = first["topics"][0]
+    manifest = first_packet["engine_manifest"]
+    manifest_id = manifest["manifest_id"]
+    assert manifest["article_count"] == 3
+    assert manifest["engine_article_count"] == 3
+    assert first["engine_manifests"][0]["manifest_id"] == manifest_id
+    assert first_packet["engine_coverage"]["manifest_id"] == manifest_id
+    assert first_chunks == [["A1", "A2"], ["A3"]]
+
+    monkeypatch.setattr(
+        nrol,
+        "_search_web_articles",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("manifest resume should not search")
+        ),
+    )
+    monkeypatch.setattr(
+        nrol,
+        "_fetch_article_payload",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("manifest resume should not fetch")
+        ),
+    )
+    resumed_chunks = []
+
+    def fake_resume_deliberation(slug, engine_articles, **kwargs):
+        resumed_chunks.append([a["article_id"] for a in engine_articles])
+        _articles, packet = _engine_packet(article_id=engine_articles[0]["article_id"])
+        return packet
+
+    monkeypatch.setattr(deliberation_agent, "run_deliberation", fake_resume_deliberation)
+
+    resumed = json.loads(nrol.run_news_scan(
+        slugs=[SLUG],
+        commit=False,
+        dry_run=True,
+        commit_policy="safe",
+        fetch_full_articles=True,
+        brief=True,
+        engine_file_proposals=False,
+        engine_manifest_id=manifest_id,
+        engine_article_offset=1,
+        engine_max_articles=1,
+    ))
+
+    assert "error" not in resumed, resumed
+    assert resumed["engine_manifests"][0]["manifest_id"] == manifest_id
+    resumed_topic = resumed["topics"][0]
+    progress = resumed_topic["engine_progress"]
+    assert resumed_topic["engine_manifest"]["manifest_id"] == manifest_id
+    assert progress["manifest_id"] == manifest_id
+    assert progress["total_articles"] == 3
+    assert progress["processed_articles"] == 2
+    assert resumed_topic["engine_coverage"]["article_offset"] == 1
+    assert resumed_topic["engine_coverage"]["deferred_before"] == 1
+    assert resumed_chunks == [["A2"], ["A3"]]
+
+
+def test_run_news_scan_engine_manifest_rejects_slug_mismatch(nrol, topic_path, monkeypatch):
+    manifest = _write_manifest_for_test(nrol, slug=SLUG)
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=["different-topic"],
+        dry_run=True,
+        engine_manifest_id=manifest["manifest_id"],
+    ))
+
+    assert "error" in out
+    assert "not requested slugs" in out["error"]
+
+
+def test_run_news_scan_engine_deliberation_keeps_completed_chunks_on_failure(nrol, topic_path, monkeypatch):
+    suffix = uuid.uuid4().hex[:6]
+    articles = [
+        {
+            "headline": f"Engine partial item {suffix}-{idx}",
+            "url": f"https://example.test/engine-partial/{suffix}-{idx}",
+            "source": "test-wire",
+            "date": "2026-07-15",
+            "relevance": f"test metric reached {50 + idx} percent",
+        }
+        for idx in range(1, 5)
+    ]
+    monkeypatch.setattr(
+        nrol,
+        "_search_web_articles",
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [],
+    )
+    monkeypatch.setattr(
+        nrol.llama_client,
+        "chat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy matcher should be opt-in")),
+    )
+
+    from mcp_servers.nrol_ao_engine import deliberation_agent
+
+    seen_chunks = []
+
+    def fake_deliberation(slug, engine_articles, **kwargs):
+        seen_chunks.append([a["article_id"] for a in engine_articles])
+        if len(seen_chunks) == 2:
+            raise RuntimeError("formatting failed in chunk two")
+        _articles, packet = _engine_packet(article_id=engine_articles[0]["article_id"])
+        return packet
+
+    monkeypatch.setattr(deliberation_agent, "run_deliberation", fake_deliberation)
+    before_topic = _disk_topic(topic_path)
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG],
+        commit=False,
+        dry_run=False,
+        commit_policy="safe",
+        fetch_full_articles=False,
+        brief=False,
+        engine_max_articles=2,
+    ))
+
+    assert seen_chunks == [["A1", "A2"], ["A3", "A4"], ["A3"], ["A4"]]
+    packet = out["topics"][0]
+    assert "engine_deliberation" not in packet["search_errors"]
+    coverage = packet["engine_coverage"]
+    assert coverage["total_articles"] == 4
+    assert coverage["processed_articles"] == 4
+    assert coverage["attempted_articles"] == 4
+    assert coverage["failed_articles"] == 0
+    assert coverage["deferred_after"] == 0
+    assert coverage["next_offset"] is None
+    assert coverage["chunks_completed"] == 3
+    assert coverage["chunks_failed"] == 1
+    assert [c["status"] for c in coverage["chunks"]] == ["completed", "failed", "completed", "completed"]
+    assert coverage["chunks"][1]["recovery"] == "split_and_retry"
+    assert len(packet["engine_review"]["proposals_filed"]) == 3
+    assert packet["scan_record"]["recorded"] is True
+    assert _disk_topic(topic_path).get("meta", {}).get("lastScanned") != before_topic.get("meta", {}).get("lastScanned")
+
+
+def test_run_news_scan_engine_deliberation_continues_after_single_article_failure(nrol, topic_path, monkeypatch):
+    suffix = uuid.uuid4().hex[:6]
+    articles = [
+        {
+            "headline": f"Engine single-fail item {suffix}-{idx}",
+            "url": f"https://example.test/engine-single-fail/{suffix}-{idx}",
+            "source": "test-wire",
+            "date": "2026-07-15",
+            "relevance": f"test metric reached {50 + idx} percent",
+        }
+        for idx in range(1, 5)
+    ]
+    monkeypatch.setattr(
+        nrol,
+        "_search_web_articles",
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [],
+    )
+    monkeypatch.setattr(
+        nrol.llama_client,
+        "chat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy matcher should be opt-in")),
+    )
+
+    from mcp_servers.nrol_ao_engine import deliberation_agent
+
+    seen_chunks = []
+
+    def fake_deliberation(slug, engine_articles, **kwargs):
+        ids = [a["article_id"] for a in engine_articles]
+        seen_chunks.append(ids)
+        if ids == ["A3", "A4"] or ids == ["A3"]:
+            raise RuntimeError("formatting failed for A3")
+        _articles, packet = _engine_packet(article_id=engine_articles[0]["article_id"])
+        return packet
+
+    monkeypatch.setattr(deliberation_agent, "run_deliberation", fake_deliberation)
+    before_topic = _disk_topic(topic_path)
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG],
+        commit=False,
+        dry_run=False,
+        commit_policy="safe",
+        fetch_full_articles=False,
+        brief=False,
+        engine_max_articles=2,
+    ))
+
+    assert seen_chunks == [["A1", "A2"], ["A3", "A4"], ["A3"], ["A4"]]
+    packet = out["topics"][0]
+    assert "formatting failed for A3" in packet["search_errors"]["engine_deliberation"]
+    coverage = packet["engine_coverage"]
+    assert coverage["total_articles"] == 4
+    assert coverage["processed_articles"] == 3
+    assert coverage["attempted_articles"] == 4
+    assert coverage["failed_articles"] == 1
+    assert coverage["failed_offsets"] == [2]
+    assert coverage["deferred_after"] == 1
+    assert coverage["next_offset"] == 2
+    assert coverage["chunks_completed"] == 2
+    assert coverage["chunks_failed"] == 2
+    assert [c["status"] for c in coverage["chunks"]] == ["completed", "failed", "failed", "completed"]
+    assert len(packet["engine_review"]["proposals_filed"]) == 2
+    assert packet["scan_record"]["recorded"] is False
+    assert "processing 3 of 4 articles" in packet["scan_record"]["skipped_reason"]
+    assert "engine_article_offset=2" in packet["scan_record"]["skipped_reason"]
+    assert _disk_topic(topic_path).get("meta", {}).get("lastScanned") == before_topic.get("meta", {}).get("lastScanned")
+
+
+def test_engine_deliberation_chunks_return_on_time_budget(nrol, monkeypatch):
+    class FakeStore:
+        def __init__(self):
+            self.records = []
+
+        def record(self, *args, **kwargs):
+            self.records.append({"args": args, "kwargs": kwargs})
+
+    from mcp_servers.nrol_ao_engine import deliberation_agent
+
+    def fake_deliberation(slug, engine_articles, **kwargs):
+        return {
+            "slug": slug,
+            "advocate_proposals": [],
+            "rebuttals": [],
+            "jury_verdicts": [{
+                "verdict_id": f"jur_{engine_articles[0]['article_id']}",
+                "article_id": engine_articles[0]["article_id"],
+                "final_action": {"kind": "PARK"},
+            }],
+            "traces": {},
+        }
+
+    monkeypatch.setattr(deliberation_agent, "run_deliberation", fake_deliberation)
+    times = iter([0, 20, 20])
+    monkeypatch.setattr(nrol.time, "time", lambda: next(times, 20))
+
+    packet, review, coverage, error = nrol._run_engine_deliberation_chunks(
+        SLUG,
+        [
+            {"article_id": "A1", "text": "one"},
+            {"article_id": "A2", "text": "two"},
+            {"article_id": "A3", "text": "three"},
+        ],
+        store=FakeStore(),
+        job_id="job-test",
+        model="dream",
+        temperature=0.1,
+        max_tokens=256,
+        timeout_sec=60,
+        dry_run=True,
+        engine_file_proposals=False,
+        engine_max_articles=1,
+        engine_article_offset=0,
+        engine_time_budget_sec=10,
+    )
+
+    assert review is None
+    assert len(packet["jury_verdicts"]) == 1
+    assert coverage["processed_articles"] == 1
+    assert coverage["pending_offsets"] == [1, 2]
+    assert coverage["next_offset"] == 1
+    assert coverage["time_budget_exhausted"] is True
+    assert "time budget exhausted" in error
+
+
+def test_run_news_scan_brief_includes_engine_chunk_progress(nrol, topic_path, monkeypatch):
+    suffix = uuid.uuid4().hex[:6]
+    articles = [
+        {
+            "headline": f"Engine brief item {suffix}-{idx}",
+            "url": f"https://example.test/engine-brief/{suffix}-{idx}",
+            "source": "test-wire",
+            "date": "2026-07-15",
+            "relevance": f"test metric reached {50 + idx} percent",
+        }
+        for idx in range(1, 4)
+    ]
+    monkeypatch.setattr(
+        nrol,
+        "_search_web_articles",
+        lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [],
+    )
+    monkeypatch.setattr(
+        nrol.llama_client,
+        "chat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy matcher should be opt-in")),
+    )
+
+    from mcp_servers.nrol_ao_engine import deliberation_agent
+
+    def fake_deliberation(slug, engine_articles, **kwargs):
+        _articles, packet = _engine_packet(article_id=engine_articles[0]["article_id"])
+        return packet
+
+    monkeypatch.setattr(deliberation_agent, "run_deliberation", fake_deliberation)
+
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG],
+        commit=False,
+        dry_run=False,
+        commit_policy="safe",
+        fetch_full_articles=False,
+        brief=True,
+        engine_max_articles=2,
+    ))
+
+    assert out["brief"] is True
+    tp = out["topics"][0]
+    progress = tp["engine_progress"]
+    assert progress["processed_articles"] == 3
+    assert progress["total_articles"] == 3
+    assert progress["chunk_size"] == 2
+    assert progress["chunks_completed"] == 2
+    assert progress["chunks_failed"] == 0
+    assert [c["status"] for c in progress["chunks"]] == ["completed", "completed"]
+    assert tp["engine_review"]["proposal_count"] == 2
+    assert len(tp["engine_review"]["proposals_filed"]) == 2
+
+
 def test_run_news_scan_brief_default_is_compact(nrol, topic_path, monkeypatch):
     """brief=true (default) returns a compact summary, NOT the full packet.
     No articles/excerpts/matcher_output/digest_path in the brief — those are
@@ -836,7 +1581,7 @@ def test_run_news_scan_brief_default_is_compact(nrol, topic_path, monkeypatch):
     suffix = uuid.uuid4().hex[:6]
     articles = [
         {"headline": f"threshold print {suffix}", "url": f"https://example.test/brief/{suffix}",
-         "source": "test-wire", "date": "2026-06-09", "relevance": "event A confirmed"},
+         "source": "test-wire", "date": "2026-07-15", "relevance": "event A confirmed"},
     ]
     monkeypatch.setattr(nrol, "_search_web_articles",
         lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [])
@@ -851,6 +1596,9 @@ def test_run_news_scan_brief_default_is_compact(nrol, topic_path, monkeypatch):
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
         fetch_full_articles=False, brief=True,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
     ))
     assert "error" not in out, out
     assert out.get("brief") is True
@@ -986,7 +1734,7 @@ def test_run_news_scan_brief_tallies_anti_fire(nrol, topic_path, monkeypatch):
     suffix = uuid.uuid4().hex[:6]
     articles = [
         {"headline": f"blockade decree {suffix}", "url": f"https://example.test/anti/{suffix}",
-         "source": "test-wire", "date": "2026-06-09", "relevance": "formal blockade"},
+         "source": "test-wire", "date": "2026-07-15", "relevance": "formal blockade"},
     ]
     monkeypatch.setattr(nrol, "_search_web_articles",
         lambda query, channel, max_results, **kw: list(articles) if channel == "wildcard" else [])
@@ -1000,6 +1748,9 @@ def test_run_news_scan_brief_tallies_anti_fire(nrol, topic_path, monkeypatch):
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
         fetch_full_articles=False, brief=True,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
     ))
     tp = out["topics"][0]
     assert tp["decisions_by_kind"].get("ANTI_FIRE") == 1
@@ -1013,7 +1764,7 @@ def test_safe_policy_commit_true_still_files_posterior_movers(nrol, topic_path, 
         "headline": f"Official threshold print {suffix}",
         "url": f"https://example.test/scan/{suffix}-b",
         "source": "test-wire",
-        "date": "2026-06-09",
+        "date": "2026-07-15",
         "relevance": "synthetic event A confirmed",
     }]
     monkeypatch.setattr(
@@ -1034,6 +1785,9 @@ def test_safe_policy_commit_true_still_files_posterior_movers(nrol, topic_path, 
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=True, dry_run=False, commit_policy="safe",
         fetch_full_articles=False, deliberate=False,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
     ))
     assert "error" not in out, out
     assert _disk_posteriors(topic_path) == before
@@ -1054,7 +1808,7 @@ def test_empty_matcher_output_is_an_error_not_a_quiet_window(nrol, topic_path, m
     articles = [{
         "headline": f"Relevant development {suffix}",
         "url": f"https://example.test/empty-matcher/{suffix}",
-        "source": "test-wire", "date": "2026-06-10",
+        "source": "test-wire", "date": "2026-07-15",
         "relevance": "clearly relevant",
     }]
     monkeypatch.setattr(
@@ -1070,6 +1824,9 @@ def test_empty_matcher_output_is_an_error_not_a_quiet_window(nrol, topic_path, m
     before_scanned = _disk_topic(topic_path)["meta"].get("lastScanned")
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=False, fetch_full_articles=False,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
     ))
     assert "error" not in out, out
 
@@ -1094,7 +1851,7 @@ def test_scan_feeds_matcher_full_article_excerpts(nrol, topic_path, monkeypatch)
     articles = [{
         "headline": f"Transit data print {suffix}",
         "url": f"https://example.test/full/{suffix}",
-        "source": "test-wire", "date": "2026-06-10",
+        "source": "test-wire", "date": "2026-07-15",
         "relevance": "short snippet only",
     }]
     monkeypatch.setattr(
@@ -1116,7 +1873,14 @@ def test_scan_feeds_matcher_full_article_excerpts(nrol, topic_path, monkeypatch)
 
     monkeypatch.setattr(nrol.llama_client, "chat", fake_chat)
 
-    out = json.loads(nrol.run_news_scan(slugs=[SLUG], commit=False, dry_run=True))
+    out = json.loads(nrol.run_news_scan(
+        slugs=[SLUG],
+        commit=False,
+        dry_run=True,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
+    ))
     assert "error" not in out, out
     assert "EXCERPT:" in seen["prompt"]
     assert f"FULL BODY {suffix}" in seen["prompt"]
@@ -1142,7 +1906,7 @@ def test_run_news_scan_uses_precommitted_search_queries(nrol, topic_path, monkey
         "headline": "US and Iran reach framework agreement",
         "url": "https://example.test/upstream-deal",
         "source": "test-wire",
-        "date": "2026-06-10",
+        "date": "2026-07-15",
         "relevance": "sanctions relief framework",
     }
     calls = []
@@ -1167,6 +1931,9 @@ def test_run_news_scan_uses_precommitted_search_queries(nrol, topic_path, monkey
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=True,
         fetch_full_articles=False, deliberate=False,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
     ))
     assert "error" not in out, out
     packet = out["topics"][0]
@@ -1256,6 +2023,9 @@ def test_run_news_scan_filters_old_and_seen_articles(nrol, topic_path, monkeypat
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=True,
         fetch_full_articles=False, deliberate=False,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
     ))
     packet = out["topics"][0]
     assert packet["raw_article_count"] == 3
@@ -1316,6 +2086,9 @@ def test_run_news_scan_filters_relative_search_dates(nrol, topic_path, monkeypat
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=True,
         fetch_full_articles=False, deliberate=False,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
     ))
     packet = out["topics"][0]
     assert packet["freshness_filter"]["old_dated_dropped"] == 1
@@ -1519,6 +2292,9 @@ def test_safe_scan_downgrades_undated_posterior_movers(nrol, topic_path, monkeyp
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
         fetch_full_articles=False, deliberate=False,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
     ))
     assert "error" not in out, out
     assert _disk_posteriors(topic_path) == before
@@ -1574,6 +2350,9 @@ def test_safe_scan_downgrades_undated_posterior_movers(nrol, topic_path, monkeyp
     brief = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
         fetch_full_articles=False, deliberate=False, brief=True,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
     ))
     samples = brief["topics"][0]["freshness_downgrade_samples"]
     assert samples, "expected at least one freshness-downgrade sample in the brief"
@@ -1596,7 +2375,7 @@ def test_scan_deliberation_rescues_park_into_proposal(nrol, topic_path, monkeypa
     articles = [{
         "headline": f"Metric print {suffix}",
         "url": f"https://example.test/debate/{suffix}",
-        "source": "test-wire", "date": "2026-06-10",
+        "source": "test-wire", "date": "2026-07-15",
         "relevance": "metric reported at 55 percent",
     }]
     monkeypatch.setattr(
@@ -1626,6 +2405,9 @@ def test_scan_deliberation_rescues_park_into_proposal(nrol, topic_path, monkeypa
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
         fetch_full_articles=False,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
     ))
     assert "error" not in out, out
     assert calls["n"] == 4  # matcher + advocate + rebut + jury
@@ -1654,7 +2436,7 @@ def test_matcher_prompt_preserves_indirect_relevance(nrol, topic_path):
         "headline": "Ceasefire talks affect shipping corridor",
         "url": "https://example.test/indirect-relevance",
         "source": "test-wire",
-        "date": "2026-06-10",
+        "date": "2026-07-15",
         "relevance": "regional ceasefire compliance affects the modeled pathway",
     }])
 
@@ -1669,7 +2451,7 @@ def test_scan_deliberation_can_rescue_schema_gap_into_proposal(nrol, topic_path,
         "headline": f"Unmodeled metric print {suffix}",
         "url": f"https://example.test/schema-gap/{suffix}",
         "source": "test-wire",
-        "date": "2026-06-10",
+        "date": "2026-07-15",
         "relevance": "directionally relevant metric reported at 58 percent",
     }]
     monkeypatch.setattr(
@@ -1701,6 +2483,9 @@ def test_scan_deliberation_can_rescue_schema_gap_into_proposal(nrol, topic_path,
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
         fetch_full_articles=False,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
     ))
     assert "error" not in out, out
     assert _disk_posteriors(topic_path) == before
@@ -3051,7 +3836,7 @@ def test_scan_debate_failure_leaves_window_open(nrol, topic_path, monkeypatch):
     articles = [{
         "headline": f"Metric print {suffix}",
         "url": f"https://example.test/debate/{suffix}",
-        "source": "test-wire", "date": "2026-06-10",
+        "source": "test-wire", "date": "2026-07-15",
         "relevance": "metric reported at 55 percent",
     }]
     monkeypatch.setattr(
@@ -3076,6 +3861,9 @@ def test_scan_debate_failure_leaves_window_open(nrol, topic_path, monkeypatch):
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
         fetch_full_articles=False,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
     ))
 
     assert out["topics"][0]["scan_record"]["recorded"] is False
@@ -3769,9 +4557,9 @@ def test_safe_policy_never_applies_posterior_moving_duplicates(nrol, topic_path,
     suffix = uuid.uuid4().hex[:6]
     articles = [
         {"headline": f"Park canonical {suffix}", "url": f"https://example.test/safe-dup/{suffix}-a",
-         "source": "test-wire", "date": "2026-06-09", "relevance": "background"},
+         "source": "test-wire", "date": "2026-07-15", "relevance": "background"},
         {"headline": f"Metric duplicate {suffix}", "url": f"https://example.test/safe-dup/{suffix}-b",
-         "source": "test-wire", "date": "2026-06-09", "relevance": "metric at 60 percent"},
+         "source": "test-wire", "date": "2026-07-15", "relevance": "metric at 60 percent"},
     ]
     monkeypatch.setattr(
         nrol, "_search_web_articles",
@@ -3793,6 +4581,9 @@ def test_safe_policy_never_applies_posterior_moving_duplicates(nrol, topic_path,
     out = json.loads(nrol.run_news_scan(
         slugs=[SLUG], commit=False, dry_run=False, commit_policy="safe",
         fetch_full_articles=False, deliberate=False,
+        engine_deliberation=False,
+        engine_file_proposals=False,
+        legacy_matcher=True,
     ))
     assert "error" not in out, out
     assert _disk_posteriors(topic_path) == before
@@ -4136,11 +4927,8 @@ def test_chat_strips_dream_channel_tags_from_content(monkeypatch):
     assert "consider the article carefully" not in out["text"]
 
 
-def test_chat_dream_always_budgets_for_thought_channel(monkeypatch):
-    """On the dream backend, disable_thinking can't suppress reasoning
-    (DiffusionGemma ignores chat_template_kwargs). chat() must instead bump
-    max_tokens so the thought channel doesn't starve content into
-    finish_reason=length, and must NOT send the Qwen-specific kwarg."""
+def test_chat_dream_passes_requested_max_tokens(monkeypatch):
+    """Dream receives the caller's token budget unchanged."""
     from mcp_servers.nrol_ao import llama as lc
 
     seen = {}
@@ -4171,19 +4959,14 @@ def test_chat_dream_always_budgets_for_thought_channel(monkeypatch):
 
     lc.chat("hi", model="dream", disable_thinking=True, max_tokens=2048)
     payload = seen["payload"]
-    # Thought budget applied — max_tokens must exceed the caller's 2048.
-    assert payload["max_tokens"] > 2048, payload
-    # Qwen-specific kwarg must NOT be sent to DiffusionGemma.
-    assert "chat_template_kwargs" not in payload, payload
+    assert payload["max_tokens"] == 2048, payload
+    assert payload.get("chat_template_kwargs") == {"enable_thinking": False}, payload
 
-    # Deliberation calls use disable_thinking=False; Dream still needs the
-    # thought-channel budget in that mode. The budget is operator-tunable.
     seen.clear()
-    monkeypatch.setenv("NROL_AO_DREAM_THOUGHT_BUDGET", "512")
     lc.chat("hi", model="dream", disable_thinking=False, max_tokens=2048)
     payload = seen["payload"]
-    assert payload["max_tokens"] == 2560, payload
-    assert "chat_template_kwargs" not in payload, payload
+    assert payload["max_tokens"] == 2048, payload
+    assert payload.get("chat_template_kwargs") == {"enable_thinking": True}, payload
 
     # Sanity check: on the llama backend, disable_thinking still sends the
     # kwarg and does NOT bump max_tokens.
@@ -4192,6 +4975,42 @@ def test_chat_dream_always_budgets_for_thought_channel(monkeypatch):
     payload = seen["payload"]
     assert payload["max_tokens"] == 2048, payload
     assert payload.get("chat_template_kwargs") == {"enable_thinking": False}, payload
+
+
+def test_chat_strips_empty_dream_channel_tags_from_content(monkeypatch):
+    """The stripper must fire even when Dream emits an empty thought block."""
+    from mcp_servers.nrol_ao import llama as lc
+
+    leaked_content = "<|channel>thought\n<channel|>\nDECISION\nARTICLE: A1"
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": leaked_content},
+                                 "finish_reason": "stop"}]}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, url, json=None):
+            return _FakeResponse()
+
+    monkeypatch.setattr(lc.httpx, "Client", _FakeClient)
+
+    out = lc.chat("hi", model="dream")
+
+    assert "<|channel>" not in out["text"], out["text"]
+    assert "<channel|>" not in out["text"], out["text"]
+    assert out["text"].lstrip().startswith("DECISION"), out["text"]
 
 
 def test_matcher_parses_cleanly_when_dream_leaks_thoughts(nrol, topic_path, monkeypatch):

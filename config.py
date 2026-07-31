@@ -29,7 +29,7 @@ _PERSISTED_KEYS = (
     # by default; manual unload is safer than killing long cold-start jobs.
     "dream_host", "dream_model", "dream_cwd", "dream_server_exe",
     "dream_model_path", "dream_context_size", "dream_diffusion_steps",
-    "dream_cuda_mmq_max_x", "dream_flash_attn", "dream_cache_type_k",
+    "dream_cuda_mmq_max_x", "dream_gpu_layers", "dream_fit_target_mb", "dream_no_mmap", "dream_flash_attn", "dream_cache_type_k",
     "dream_cache_type_v", "dream_swa_full", "dream_idle_timeout_min",
 )
 _HOST_KEYS = ("llama_host", "dream_host")
@@ -113,7 +113,7 @@ class Config:
     # Generation defaults
     temperature: float = 0.8
     top_p: float = 0.9
-    max_tokens: int = 1024
+    max_tokens: int = 16384
     repeat_penalty: float = 1.08
 
     # --- Hermes Agent (ACP mode) — native Windows install ---
@@ -158,10 +158,15 @@ class Config:
     dream_context_size: int = int(os.getenv("DREAM_CONTEXT_SIZE", "131072"))
     dream_diffusion_steps: int = int(os.getenv("DREAM_DIFFUSION_STEPS", "48"))
     dream_cuda_mmq_max_x: int = int(os.getenv("DREAM_CUDA_MMQ_MAX_X", "64"))
+    dream_gpu_layers: int = int(os.getenv("DREAM_GPU_LAYERS", "-1"))
+    dream_fit_target_mb: int = int(os.getenv("DREAM_FIT_TARGET_MB", "0"))
+    dream_no_mmap: bool = _envbool("DREAM_NO_MMAP", False)
     dream_flash_attn: str = os.getenv("DREAM_FLASH_ATTN", "on")
     dream_cache_type_k: str = os.getenv("DREAM_CACHE_TYPE_K", "q8_0")
     dream_cache_type_v: str = os.getenv("DREAM_CACHE_TYPE_V", "q8_0")
     dream_swa_full: bool = _envbool("DREAM_SWA_FULL", False)
+    dream_enable_thinking: bool = _envbool("DREAM_ENABLE_THINKING", True)
+    dream_thinking_min_tokens: int = int(os.getenv("DREAM_THINKING_MIN_TOKENS", "4096"))
     dream_idle_timeout_min: int = int(os.getenv("DREAM_IDLE_TIMEOUT_MIN", "0"))
     enable_dream: bool = _envbool("LOOM_ENABLE_DREAM", False)
 

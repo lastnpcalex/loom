@@ -831,6 +831,7 @@ function buildConvItem(conv) {
     const isLocal = conv.mode === 'local';
     const isHermes = conv.mode === 'hermes';
     const isDream = conv.mode === 'dream';
+    const isMinimalWeave = conv.mode === 'weave' && !!conv.system_only;
     const isDreamWeaver = conv.mode === 'weave' && _isDreamEngineModel(conv.local_model);
     const charName = isNrol ? (conv.cc_model || 'NROL-AO')
         : isGemini ? (conv.cc_model || 'Gemini')
@@ -840,6 +841,7 @@ function buildConvItem(conv) {
         : isLocal ? (conv.local_model || State.loadedModel || 'Llama')
         : isHermes ? (conv.local_model || State.loadedModel || 'Hermes')
         : isDream ? (conv.local_model || 'Dream Space')
+        : isMinimalWeave ? 'System prompt'
         : conv.character_id
         ? (State.characters.find(c => c.id === conv.character_id)?.name || conv.character_id)
         : 'Freeform';
@@ -851,6 +853,7 @@ function buildConvItem(conv) {
         : isLocal ? '<span class="mode-badge" title="Claude Code powered by a local Llama model">Braid {Local}</span>'
         : isHermes ? '<span class="mode-badge" title="Hermes Agent (ACP) powered by a local Llama model">Hermes {Agent}</span>'
         : isDream ? '<span class="mode-badge" title="Hermes Agent space powered by the Dream DiffusionGemma engine">Dream Space {Agent}</span>'
+        : isMinimalWeave ? '<span class="mode-badge" title="Minimal Weave: system message plus branch history">Weave {Minimal}</span>'
         : isDreamWeaver ? '<span class="mode-badge" title="Weave chat using the Dream DiffusionGemma engine directly">Dream Weaver</span>'
         : '<span class="mode-badge" title="Structured roleplay with local models">Weave</span>';
     const starred = conv.starred ? 1 : 0;
@@ -1245,26 +1248,37 @@ async function createConversation() {
     const customScene = document.getElementById('custom-scene').value.trim();
     const personaId = document.getElementById('persona-select').value || null;
     const styleNudge = 'Natural';
+    const systemOnly = !!document.getElementById('weave-system-only')?.checked;
+    const systemPrompt = document.getElementById('weave-system-prompt')?.value.trim() || '';
 
     const loreIds = [];
-    document.querySelectorAll('#lore-checklist input[type="checkbox"]:checked').forEach(cb => {
-        loreIds.push(cb.value);
-    });
+    if (!systemOnly) {
+        document.querySelectorAll('#lore-checklist input[type="checkbox"]:checked').forEach(cb => {
+            loreIds.push(cb.value);
+        });
+    }
 
     const conv = await API.post('/api/conversations', {
         title,
-        character_id: charId,
-        persona_id: personaId,
+        mode: 'weave',
+        character_id: systemOnly ? null : charId,
+        persona_id: systemOnly ? null : personaId,
         lore_ids: loreIds,
         style_nudge: styleNudge,
-        first_turn: firstTurn,
-        custom_scene: customScene || null,
+        first_turn: systemOnly ? 'user' : firstTurn,
+        custom_scene: systemOnly ? null : (customScene || null),
+        system_only: systemOnly,
+        system_prompt: systemOnly ? systemPrompt : null,
     });
 
     State.conversations.unshift(conv);
     closeModal('modal-new-conv');
     document.getElementById('new-conv-title').value = '';
     document.getElementById('custom-scene').value = '';
+    const minimalToggle = document.getElementById('weave-system-only');
+    if (minimalToggle) minimalToggle.checked = false;
+    const systemPromptInput = document.getElementById('weave-system-prompt');
+    if (systemPromptInput) systemPromptInput.value = '';
     State.selectedCharacterId = null;
 
     await loadConversation(conv.id);
@@ -1272,7 +1286,7 @@ async function createConversation() {
     switchView('chat');
 
     // Trigger generation if character goes first and no static greeting was used
-    if (firstTurn === 'character' && charId) {
+    if (!systemOnly && firstTurn === 'character' && charId) {
         const lastMsg = State.messages[State.messages.length - 1];
         if (!lastMsg || lastMsg.role !== 'assistant') {
             // WebSocket may still be connecting — wait for it
@@ -1311,6 +1325,10 @@ async function openNewConvModal() {
     document.querySelectorAll('#first-turn-toggle .toggle-btn').forEach(b => b.classList.remove('active'));
     document.querySelector('#first-turn-toggle .toggle-btn[data-value="character"]').classList.add('active');
     document.getElementById('custom-scene').value = '';
+    const minimalToggle = document.getElementById('weave-system-only');
+    if (minimalToggle) minimalToggle.checked = false;
+    const systemPromptInput = document.getElementById('weave-system-prompt');
+    if (systemPromptInput) systemPromptInput.value = '';
     // Reset mode toggle to Loom
     document.querySelectorAll('#mode-toggle .toggle-btn').forEach(b => b.classList.remove('active'));
     document.querySelector('#mode-toggle .toggle-btn[data-value="claude"]').classList.add('active');
@@ -1468,12 +1486,13 @@ async function updateInlineCCControls(conv) {
         const incogD = document.getElementById('incognito-toggle-dream');
         if (incogD) incogD.checked = !!conv.incognito;
     } else if (conv && conv.mode === 'weave') {
+        const isMinimalWeave = !!conv.system_only;
         controls.classList.add('hidden');
         weaveControls?.classList.remove('hidden');
-        _setWeaveOnlyBits(true);
+        _setWeaveOnlyBits(!isMinimalWeave);
         const oodaToggle = document.getElementById('ooda-toggle-inline');
-        if (oodaToggle) oodaToggle.checked = !!conv.ooda_enabled;
-        if (conv.ooda_enabled) {
+        if (oodaToggle) oodaToggle.checked = !!conv.ooda_enabled && !isMinimalWeave;
+        if (conv.ooda_enabled && !isMinimalWeave) {
             statePanelChat?.classList.remove('hidden');
         } else {
             statePanelChat?.classList.add('hidden');
@@ -1566,9 +1585,21 @@ function _appendModelGroup(select, label, models, labelPrefix = '') {
     select.appendChild(group);
 }
 
+// Per-render memo for /api/local/all-models. The settings Promise.all fires
+// this 5x in the same tick (4 Weave dropdowns + populateCCModelDropdowns);
+// without the memo each fires its own request, all racing the same backend
+// refresh. _allModelsFetch is null'd by _invalidateModelCaches on every open.
+let _allModelsFetch = null;
+function _fetchAllModelsOnce() {
+    if (!_allModelsFetch) {
+        _allModelsFetch = API.get('/api/local/all-models').catch(() => ({models: []}));
+    }
+    return _allModelsFetch;
+}
+
 async function _fetchSelectableLocalModels(includeDream = true) {
     try {
-        const data = await API.get('/api/local/all-models');
+        const data = await _fetchAllModelsOnce();
         const models = data.models || [];
         return {
             llama: models.filter(m => (m.backend || 'llama') === 'llama' && m.loaded),
@@ -2204,9 +2235,23 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 });
 
+function _syncMinimalWeaveFields() {
+    const minimal = !!document.getElementById('weave-system-only')?.checked;
+    const systemGroup = document.getElementById('weave-system-prompt-group');
+    const fullOnly = ['character-grid', 'persona-select', 'lore-checklist',
+                      'first-turn-toggle', 'custom-scene-group'];
+    if (systemGroup) systemGroup.classList.toggle('hidden', !minimal);
+    for (const id of fullOnly) {
+        const el = document.getElementById(id);
+        const fg = el ? (el.closest('.form-group') || el) : null;
+        if (fg) fg.classList.toggle('hidden', minimal);
+    }
+}
+
 function showWeaveFields(show) {
     const weaveFields = ['character-grid', 'persona-select', 'lore-checklist',
-                         'first-turn-toggle', 'custom-scene-group'];
+                         'first-turn-toggle', 'custom-scene-group',
+                         'weave-minimal-group', 'weave-system-prompt-group'];
     for (const id of weaveFields) {
         const el = document.getElementById(id);
         if (el) {
@@ -2215,6 +2260,7 @@ function showWeaveFields(show) {
             else fg.classList.add('hidden');
         }
     }
+    if (show) _syncMinimalWeaveFields();
 }
 
 async function fetchLocalModels() {
@@ -2237,13 +2283,13 @@ async function populateCCModelDropdowns(selectedValue) {
     if (!_ccModelsCache) {
         try { _ccModelsCache = await API.get('/api/cc-models'); } catch { return; }
     }
-    // Fetch the loaded Llama Server model for local CC/Braid. Dream Engine
-    // models are OpenAI-compatible, not Anthropic /v1/messages targets for
-    // Claude Code, so never append them to this selector.
+    // Fetch the loaded Llama Server model for local CC/Braid. Dream-Claude
+    // options come from /api/cc-models as explicit shim-backed entries, not
+    // from the generic local-model list.
     let llamaModels = [];
     let loadedModel = null;
     try {
-        const data = await API.get('/api/local/all-models');
+        const data = await _fetchAllModelsOnce();
         const found = (data.models || []).find(m => (m.backend || 'llama') === 'llama' && m.loaded);
         if (found) {
             loadedModel = found.name;
@@ -2536,6 +2582,7 @@ function setupEventListeners() {
             btn.classList.add('active');
         });
     });
+    document.getElementById('weave-system-only')?.addEventListener('change', _syncMinimalWeaveFields);
 
     // Global bookmarks button (header)
     const globalBmBtn = document.getElementById('btn-bookmarks-global');
@@ -2566,8 +2613,10 @@ function setupEventListeners() {
     // hits the network once instead of three times.
     let _modelsFetch = null;
     let _visionFetch = null;
+    let _diskModelsFetch = null;
+    let _settingsLoadSeq = 0;
     function _invalidateModelCaches() {
-        _modelsFetch = null; _visionFetch = null;
+        _modelsFetch = null; _visionFetch = null; _diskModelsFetch = null; _allModelsFetch = null;
     }
     function _fetchModels() {
         if (!_modelsFetch) _modelsFetch = API.get('/api/local/models').catch(() => ({models: []}));
@@ -2576,6 +2625,47 @@ function setupEventListeners() {
     function _fetchVisionModels() {
         if (!_visionFetch) _visionFetch = API.get('/api/local/vision-models').catch(() => ({models: []}));
         return _visionFetch;
+    }
+    function _fetchDiskModels() {
+        if (!_diskModelsFetch) _diskModelsFetch = API.get('/api/disk-models').catch(() => ({models: []}));
+        return _diskModelsFetch;
+    }
+    function _setSettingsLoading(loading, text = 'Loading settings...') {
+        const modal = document.getElementById('modal-settings');
+        const status = document.getElementById('settings-loading-status');
+        const saveBtn = document.getElementById('btn-save-settings');
+        if (modal) modal.dataset.loading = loading ? '1' : '0';
+        if (status) {
+            status.textContent = text;
+            status.classList.toggle('hidden', !loading);
+        }
+        if (saveBtn) saveBtn.disabled = !!loading;
+    }
+    function _setSelectLoading(selectId, label = 'Loading...') {
+        const sel = document.getElementById(selectId);
+        if (!sel) return;
+        sel.disabled = true;
+        sel.innerHTML = `<option value="">${label}</option>`;
+    }
+    function _primeSettingsLoadingState() {
+        ['cfg-braid-model', 'cfg-hermes-model', 'cfg-weave-model', 'cfg-dream-model',
+         'cfg-cc-model', 'cfg-llama-model-select', 'cfg-mc-kv-quant', 'cfg-mc-mmproj'].forEach(id => {
+            _setSelectLoading(id);
+        });
+        document.querySelectorAll('#modal-settings input, #modal-settings textarea').forEach(el => {
+            el.disabled = true;
+        });
+        document.querySelectorAll('#modal-settings .btn-mini').forEach(el => {
+            el.disabled = true;
+        });
+        document.querySelectorAll('#cfg-server-grid .server-light').forEach(dot => {
+            dot.dataset.state = 'unknown';
+        });
+        const systemPromptGroup = document.getElementById('cfg-weave-system-prompt-group');
+        const systemPrompt = document.getElementById('cfg-weave-system-prompt');
+        if (systemPromptGroup) systemPromptGroup.classList.add('hidden');
+        if (systemPrompt) systemPrompt.value = '';
+        _setSettingsLoading(true);
     }
 
     function _renderLocalSelect(sel, models, selectedModel, backendLabel) {
@@ -2654,24 +2744,45 @@ function setupEventListeners() {
     }
 
     document.getElementById('btn-settings').addEventListener('click', async () => {
+        const settingsSeq = ++_settingsLoadSeq;
         _invalidateModelCaches();
-        const cfg = await API.get('/api/config');
+        _switchSettingsTab('model');
+        _primeSettingsLoadingState();
+        openModal('modal-settings');
+        _startServerLightPolling();
+        const cfg = await API.get('/api/config').catch(e => {
+            _setSettingsLoading(false);
+            document.querySelectorAll('#modal-settings input, #modal-settings select, #modal-settings textarea').forEach(el => {
+                el.disabled = false;
+            });
+            document.querySelectorAll('#modal-settings .btn-mini').forEach(el => {
+                el.disabled = false;
+            });
+            showToast('Failed to load settings: ' + (e.message || e), 'error');
+            return null;
+        });
+        if (!cfg || settingsSeq !== _settingsLoadSeq) return;
         State.config = cfg;
         const conv = State.currentConv;
 
         // Non-async values
         document.getElementById('cfg-temp').value = cfg.temperature ?? 0.85;
         document.getElementById('cfg-top-p').value = cfg.top_p ?? 0.92;
-        document.getElementById('cfg-max-tokens').value = cfg.max_tokens ?? 1024;
+        document.getElementById('cfg-max-tokens').value = cfg.max_tokens ?? 16384;
         document.getElementById('cfg-repeat-penalty').value = cfg.repeat_penalty ?? 1.12;
         document.getElementById('cfg-cc-effort').value = (conv && conv.cc_effort) || 'high';
         document.getElementById('cfg-cc-permission').value = (conv && conv.mode !== 'codex' && conv.cc_permission_mode) || 'default';
 
         const localModel = (conv && conv.local_model) || '';
-        await Promise.all([
+        const weaveSystemPromptGroup = document.getElementById('cfg-weave-system-prompt-group');
+        const weaveSystemPrompt = document.getElementById('cfg-weave-system-prompt');
+        if (weaveSystemPromptGroup) weaveSystemPromptGroup.classList.toggle('hidden', !(conv && conv.mode === 'weave' && conv.system_only));
+        if (weaveSystemPrompt) weaveSystemPrompt.value = (conv && conv.system_prompt) || '';
+        _setSettingsLoading(true, 'Loading model controls...');
+        const settingsJobs = await Promise.allSettled([
             _loadModelConfigs(),
             _populateModelDropdown(),
-            _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), localModel, false),
+            _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), localModel, true),
             _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), localModel),
             _populateWeaveModelDropdown(document.getElementById('cfg-weave-model'), localModel),
             _populateWeaveModelDropdown(document.getElementById('cfg-dream-model'), localModel),
@@ -2679,6 +2790,17 @@ function setupEventListeners() {
             _populateKvQuantDropdown(),
             _populateMmprojDropdown(),
         ]);
+        if (settingsSeq !== _settingsLoadSeq) return;
+        const settingsFailures = settingsJobs.filter(r => r.status === 'rejected').length;
+        if (settingsFailures) {
+            showToast(`${settingsFailures} settings control${settingsFailures === 1 ? '' : 's'} could not load`, 'warning');
+        }
+        document.querySelectorAll('#modal-settings input, #modal-settings select, #modal-settings textarea').forEach(el => {
+            el.disabled = false;
+        });
+        document.querySelectorAll('#modal-settings .btn-mini').forEach(el => {
+            el.disabled = false;
+        });
 
         // Show tuning for the selected model
         const llamaModelSelect = document.getElementById('cfg-llama-model-select');
@@ -2710,7 +2832,7 @@ function setupEventListeners() {
             if (!group) continue;
             group.classList.remove('hidden');
             group.classList.toggle('overrides-inactive', !active);
-            group.querySelectorAll('select, input').forEach(c => { c.disabled = !active; });
+            group.querySelectorAll('select, input, textarea').forEach(c => { c.disabled = !active; });
         }
         const ccPermissionGroup = document.getElementById('cfg-cc-permission')?.closest('.form-group');
         if (ccPermissionGroup) ccPermissionGroup.classList.toggle('hidden', isActuallyCodex || isActuallyGemini);
@@ -2730,9 +2852,7 @@ function setupEventListeners() {
         document.getElementById('cfg-stream-debug').checked =
             localStorage.getItem('loom-stream-debug') === '1';
 
-        _switchSettingsTab('model');
-        openModal('modal-settings');
-        _startServerLightPolling();
+        _setSettingsLoading(false);
     });
 
     // Apply settings + restart Llama Server. Saves whatever's in the panel right now
@@ -2780,7 +2900,7 @@ function setupEventListeners() {
             _invalidateModelCaches();
             await checkHealth();
             await Promise.all([
-                _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), document.getElementById('cfg-braid-model') ? document.getElementById('cfg-braid-model').value : '', false),
+                _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), document.getElementById('cfg-braid-model') ? document.getElementById('cfg-braid-model').value : '', true),
                 _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), document.getElementById('cfg-hermes-model') ? document.getElementById('cfg-hermes-model').value : ''),
                 _populateWeaveModelDropdown(document.getElementById('cfg-weave-model'), document.getElementById('cfg-weave-model') ? document.getElementById('cfg-weave-model').value : ''),
                 _populateWeaveModelDropdown(document.getElementById('cfg-dream-model'), document.getElementById('cfg-dream-model') ? document.getElementById('cfg-dream-model').value : ''),
@@ -2846,6 +2966,11 @@ function setupEventListeners() {
     });
 
     async function _saveSettingsFromPanel() {
+        const settingsModal = document.getElementById('modal-settings');
+        if (settingsModal && settingsModal.dataset.loading === '1') {
+            showToast('Settings are still loading', 'warning');
+            return false;
+        }
         const conv = State.currentConv;
         const valueOf = (id, fallback = '') => {
             const el = document.getElementById(id);
@@ -2866,7 +2991,7 @@ function setupEventListeners() {
             llama_server_exe: valueOf('cfg-llama-server-exe', State.config.llama_server_exe || ''),
             temperature: parseFloat(valueOf('cfg-temp', State.config.temperature ?? 0.85)),
             top_p: parseFloat(valueOf('cfg-top-p', State.config.top_p ?? 0.92)),
-            max_tokens: parseInt(valueOf('cfg-max-tokens', State.config.max_tokens ?? 1024)),
+            max_tokens: parseInt(valueOf('cfg-max-tokens', State.config.max_tokens ?? 16384)),
             repeat_penalty: parseFloat(valueOf('cfg-repeat-penalty', State.config.repeat_penalty ?? 1.12)),
             max_context_tokens: parseInt(valueOf('cfg-context', State.config.max_context_tokens ?? 28000)),
             verbatim_window: parseInt(valueOf('cfg-verbatim', State.config.verbatim_window ?? 8)),
@@ -2893,6 +3018,7 @@ function setupEventListeners() {
                 updates.local_model = valueOf('cfg-hermes-model', conv.local_model || '');
             } else if (conv.mode === 'weave') {
                 updates.local_model = valueOf('cfg-weave-model', conv.local_model || '');
+                if (conv.system_only) updates.system_prompt = valueOf('cfg-weave-system-prompt', conv.system_prompt || '');
             } else if (conv.mode === 'dream') {
                 updates.local_model = valueOf('cfg-dream-model', conv.local_model || '');
             }
@@ -2939,7 +3065,7 @@ function setupEventListeners() {
         const sel = document.getElementById('cfg-llama-model-select');
         if (!sel) return;
         try {
-            const data = await API.get('/api/disk-models');
+            const data = await _fetchDiskModels();
             const models = data.models || [];
             sel.innerHTML = '';
             for (const m of models) {
@@ -2979,7 +3105,7 @@ function setupEventListeners() {
         noneOpt.textContent = 'none';
         sel.appendChild(noneOpt);
         try {
-            const data = await API.get('/api/disk-models');
+            const data = await _fetchDiskModels();
             const models = data.models || [];
             for (const m of models) {
                 const ml = m.toLowerCase();

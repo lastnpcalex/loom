@@ -63,6 +63,7 @@ from ooda_harness import (
     execute_ooda_updates,
 )
 from prompt_engine import (
+    BASE_SYSTEM_PROMPT,
     build_system_prompt,
     assemble_prompt,
     get_style_nudge,
@@ -107,6 +108,7 @@ CRON_DENY_PATTERNS = (
 _cron_scheduler_task: asyncio.Task | None = None
 _hermes_state_task: asyncio.Task | None = None
 _cron_running: set[int] = set()
+_dream_shim_proc: subprocess.Popen | None = None
 
 # ── Canvas CLAUDE.md template ──
 CANVAS_CLAUDE_MD = """\
@@ -1660,14 +1662,48 @@ async def api_local_refresh_models():
 
 _ALL_ENGINES_CACHE: dict | None = None
 _ALL_ENGINES_CACHE_TTL_SEC = 10
+# Single-flight guard: concurrent callers of api_local_all_models (the settings
+# panel fires several in the same tick) must share one refresh rather than each
+# re-probing llama-server (5s timeout) and the dream sidecar (2s timeout).
+# Held only for the duration of _refresh_all_engines_cache.
+_ALL_ENGINES_REFRESH_LOCK: asyncio.Lock = asyncio.Lock()
+
+
+def _all_engines_cache_fresh() -> bool:
+    """True if the all-engines cache exists and is within its TTL."""
+    if not _ALL_ENGINES_CACHE:
+        return False
+    return time.time() - float(_ALL_ENGINES_CACHE.get("fetched_at", 0)) <= _ALL_ENGINES_CACHE_TTL_SEC
 
 
 async def _refresh_all_engines_cache() -> dict:
-    """Scan disk for .gguf files and probe llama-server for loaded models."""
+    """Scan disk for .gguf files and probe llama-server for loaded models.
+
+    The llama-server and dream sidecar health probes run concurrently: they
+    were previously sequential (await health_check() then await
+    dream_client.health()), which stacked a 5s llama timeout on top of a 2s
+    dream timeout. With gather they overlap, so worst case is max() not sum().
+    """
     global _ALL_ENGINES_CACHE
     import llama_client as _lc
     disk_models = _lc.list_local_models()
-    status = await _lc.health_check()
+
+    # Probe both backends concurrently. Each returns its own result/exception
+    # so one slow/down service can't block or abort the other.
+    status_task = _lc.health_check()
+    async def _dream_probe():
+        try:
+            import dream_client as _dc
+            return await _dc.health(config.dream_host, timeout=2.0)
+        except Exception:
+            return None
+    status, dh = await asyncio.gather(status_task, _dream_probe(), return_exceptions=True)
+
+    # health_check already returns a dict on failure (mock mode), but guard
+    # anyway in case gather surfaced it as an exception object.
+    if isinstance(status, Exception):
+        status = {"models": [], "model_name_map": {}}
+
     live_models = status.get("models", [])
     model_name_map = status.get("model_name_map", {})
     out: list[dict] = []
@@ -1688,23 +1724,18 @@ async def _refresh_all_engines_cache() -> dict:
         out.append({"name": dream_model, "backend": "dream", "loaded": False})
         dream_seen.add(dream_model)
 
-    try:
-        import dream_client as _dc
-        dh = await _dc.health(config.dream_host, timeout=2.0)
-        if dh is not None:
-            avail = dh.get("available") or []
-            loaded = bool(dh.get("loaded_model"))
-            for mid in avail:
-                name = str(mid)
-                if name in dream_seen:
-                    for model in out:
-                        if model.get("backend") == "dream" and model.get("name") == name:
-                            model["loaded"] = loaded
-                    continue
-                out.append({"name": name, "backend": "dream", "loaded": loaded})
-                dream_seen.add(name)
-    except Exception:
-        pass  # dream sidecar down or not configured — skip silently
+    if isinstance(dh, dict) and dh is not None:
+        avail = dh.get("available") or []
+        loaded = bool(dh.get("loaded_model"))
+        for mid in avail:
+            name = str(mid)
+            if name in dream_seen:
+                for model in out:
+                    if model.get("backend") == "dream" and model.get("name") == name:
+                        model["loaded"] = loaded
+                continue
+            out.append({"name": name, "backend": "dream", "loaded": loaded})
+            dream_seen.add(name)
 
     _ALL_ENGINES_CACHE = {
         "models": out,
@@ -1718,10 +1749,14 @@ async def _refresh_all_engines_cache() -> dict:
 async def api_local_all_models():
     """Returns all local .gguf models plus live llama-server models.
     Used by the inline dropdown for model selection."""
-    if (
-        _ALL_ENGINES_CACHE is None
-        or time.time() - float(_ALL_ENGINES_CACHE.get("fetched_at", 0)) > _ALL_ENGINES_CACHE_TTL_SEC
-    ):
+    if _all_engines_cache_fresh():
+        return _ALL_ENGINES_CACHE
+    # Single-flight: hold the lock so concurrent callers serialize on one
+    # refresh, then re-check freshness once inside — another caller may have
+    # just refreshed the cache while we waited for the lock.
+    async with _ALL_ENGINES_REFRESH_LOCK:
+        if _all_engines_cache_fresh():
+            return _ALL_ENGINES_CACHE
         await _refresh_all_engines_cache()
     return _ALL_ENGINES_CACHE
 
@@ -2144,6 +2179,14 @@ async def api_create_conversation(data: dict = None):
     cc_model = data.get("cc_model", "sonnet")
     cc_effort = data.get("cc_effort", "high")
     local_model = data.get("local_model")
+    system_only = bool(data.get("system_only")) and mode == "weave"
+    system_prompt = data.get("system_prompt")
+    if system_only:
+        character_id = None
+        persona_id = None
+        lore_ids = []
+        custom_scene = None
+        first_turn = "user"
 
     if nrol_operator:
         blocked = _nrol_operator_block_reason(cc_model)
@@ -2170,7 +2213,9 @@ async def api_create_conversation(data: dict = None):
         custom_scene=custom_scene,
         cc_model=cc_model,
         cc_effort=cc_effort,
-        ooda_enabled=1 if mode == "weave" else 0,
+        ooda_enabled=0 if system_only else (1 if mode == "weave" else 0),
+        system_only=1 if system_only else 0,
+        system_prompt=(system_prompt.strip() if isinstance(system_prompt, str) and system_prompt.strip() else None),
     )
     if nrol_operator:
         fields["nrol_operator"] = 1
@@ -2338,7 +2383,15 @@ async def api_update_conversation(conv_id: int, data: dict):
     if "local_model" in data:
         fields["local_model"] = data["local_model"]
     if "ooda_enabled" in data:
-        fields["ooda_enabled"] = int(data["ooda_enabled"])
+        conv = await db.get_conversation(conv_id)
+        fields["ooda_enabled"] = 0 if conv and conv.get("system_only") else int(data["ooda_enabled"])
+    if "system_only" in data:
+        fields["system_only"] = int(bool(data["system_only"]))
+        if fields["system_only"]:
+            fields["ooda_enabled"] = 0
+    if "system_prompt" in data:
+        value = data["system_prompt"]
+        fields["system_prompt"] = value.strip() if isinstance(value, str) and value.strip() else None
     if "folder" in data:
         fields["folder"] = data["folder"]
     if fields:
@@ -2931,8 +2984,8 @@ async def api_import_conversation(file: UploadFile = File(...)):
     )
     # Update optional fields
     fields = {}
-    for key in ("persona_id", "lore_ids", "style_nudge", "custom_scene"):
-        if conv_data.get(key):
+    for key in ("persona_id", "lore_ids", "style_nudge", "custom_scene", "system_only", "system_prompt"):
+        if key in conv_data:
             fields[key] = conv_data[key]
     if fields:
         await db.update_conversation_fields(new_conv["id"], **fields)
@@ -3196,6 +3249,12 @@ CC_MODELS = [
         {"value": "umans-kimi-k2.7", "label": "Umans Kimi K2.7 (always thinks)"},
         {"value": "umans-glm-5.2", "label": "Umans GLM 5.2 (largest context)"},
         {"value": "umans-flash", "label": "Umans Flash (light, high-interactivity)"},
+    ]},
+    {"group": "Dream via Claude Code", "models": [
+        {
+            "value": f"dream:{config.dream_model}",
+            "label": f"Dream Claude ({config.dream_model})",
+        },
     ]},
 ]
 
@@ -4333,6 +4392,11 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                         )
                         old_task = _active_generations[old_key]
                         if websocket is getattr(old_task, "_origin_ws", None):
+                            if action == "generate" and (
+                                parent_id is None or parent_id == old_key[1]
+                            ):
+                                await _send_active_gen_state(websocket, conv_id)
+                                continue
                             old_task.cancel()
                             _active_generations.pop(old_key, None)
                         else:
@@ -4474,6 +4538,87 @@ def _format_synthetic_error_note(syn: dict) -> str:
         f"\n\n[Loom note: CC-synthesized error — type={err}"
         f"{f', status={status}' if status else ''}{suffix}]"
     )
+
+
+def _cc_result_error_detail(result_info: dict) -> str:
+    """Return the best human-readable CC error detail without treating it as output."""
+    if not isinstance(result_info, dict):
+        return ""
+    for key in ("error", "result_text"):
+        value = result_info.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _cc_has_streamed_output(full_text: str, content_blocks: list[dict]) -> bool:
+    """True if CC streamed anything user-visible before a terminal event."""
+    if (full_text or "").strip():
+        return True
+    for block in content_blocks or []:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            if (block.get("text") or "").strip():
+                return True
+        elif btype == "thinking":
+            if (block.get("text") or "").strip():
+                return True
+        elif btype == "tool_use":
+            # Even an unfinished tool block is useful partial work.
+            return True
+        elif btype:
+            return True
+    return False
+
+
+def _cc_should_adopt_result_text(evt: dict) -> bool:
+    """Use CC result text only as a non-error fallback when no deltas arrived."""
+    return bool(evt.get("result_text")) and not evt.get("is_error")
+
+
+def _append_cc_text_block(content_blocks: list[dict], text: str) -> None:
+    if not text:
+        return
+    if content_blocks and content_blocks[-1].get("type") == "text":
+        content_blocks[-1]["text"] = (content_blocks[-1].get("text") or "").rstrip() + text
+    else:
+        content_blocks.append({"type": "text", "text": text})
+
+
+def _append_cc_interrupt_note(
+    full_text: str,
+    content_blocks: list[dict],
+    result_info: dict,
+) -> str:
+    """Append an interruption note while preserving streamed tool/thinking blocks."""
+    detail = _cc_result_error_detail(result_info) or "agent exited unexpectedly"
+    if full_text:
+        note = f"\n\n---\n[Turn interrupted: {detail}]"
+        updated = full_text.rstrip() + note
+    else:
+        n_tools = sum(
+            1
+            for block in content_blocks or []
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        )
+        if n_tools:
+            note = (
+                f"\n\n---\n[Turn interrupted: agent exited after {n_tools} tool call(s) "
+                f"without producing a final response - {detail}]"
+            )
+        else:
+            note = (
+                "\n\n---\n[Turn interrupted before producing a final response - "
+                f"{detail}]"
+            )
+        updated = note.strip()
+    if full_text and not content_blocks:
+        content_blocks.append({"type": "text", "text": updated})
+    else:
+        _append_cc_text_block(content_blocks, note)
+    return updated
 
 
 async def _patch_marker_with_summary(conv_id: int, marker_id: int, new_session: str):
@@ -4840,6 +4985,83 @@ def is_umans_model(model: str) -> bool:
     return ml.startswith("umans-")
 
 
+def is_dream_claude_model(model: str) -> bool:
+    """True for the explicit Claude Code -> Dream shim selector value."""
+    if not model:
+        return False
+    ml = model.lower()
+    if ml.startswith("dream:"):
+        return True
+    dream_model = (getattr(config, "dream_model", "") or "").lower()
+    return bool(dream_model and ml == dream_model and "diffusiongemma" in ml)
+
+
+def _dream_claude_model_id(model: str) -> str:
+    if model and model.lower().startswith("dream:"):
+        return model.split(":", 1)[1] or (getattr(config, "dream_model", "") or "diffusiongemma")
+    return model or (getattr(config, "dream_model", "") or "diffusiongemma")
+
+
+def _dream_shim_url() -> str:
+    port = os.getenv("DREAM_SHIM_PORT", "8788")
+    base = os.getenv("DREAM_SHIM_BASE_URL", f"http://127.0.0.1:{port}")
+    if not base.startswith(("http://", "https://")):
+        base = f"http://{base}"
+    return base.replace("//localhost", "//127.0.0.1").rstrip("/")
+
+
+async def _ensure_dream_shim_running() -> tuple[bool, str]:
+    """Start the Anthropic->Dream shim on demand.
+
+    This is intentionally scoped to Dream-Claude launches. It does not affect
+    Dream Space, Weave, Hermes, or the normal llama-server backend.
+    """
+    global _dream_shim_proc
+    url = _dream_shim_url()
+    try:
+        async with httpx.AsyncClient(timeout=0.75) as client:
+            r = await client.get(f"{url}/health")
+            if r.status_code == 200:
+                return True, url
+    except Exception:
+        pass
+
+    script = Path(__file__).parent / "anthropic_dream_router.py"
+    if not script.is_file():
+        return False, f"Dream shim script not found: {script}"
+
+    if _dream_shim_proc and _dream_shim_proc.poll() is None:
+        return True, url
+
+    try:
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        log_path = Path(__file__).parent / "dream_shim.log"
+        log = open(log_path, "a", encoding="utf-8")
+        _dream_shim_proc = subprocess.Popen(
+            [sys.executable, str(script)],
+            cwd=str(Path(__file__).parent),
+            stdout=log,
+            stderr=log,
+            stdin=subprocess.DEVNULL,
+            **kwargs,
+        )
+    except Exception as e:
+        return False, f"Failed to start Dream shim: {e}"
+
+    for _ in range(30):
+        await asyncio.sleep(0.2)
+        try:
+            async with httpx.AsyncClient(timeout=0.5) as client:
+                r = await client.get(f"{url}/health")
+                if r.status_code == 200:
+                    return True, url
+        except Exception:
+            pass
+    return False, f"Dream shim started but did not answer at {url}/health"
+
+
 # Providers with a verified NROL operator lockdown port. Extended as each
 # port lands — see mcp_servers/nrol_ao/ROADMAP.md "Multi-provider operator
 # parity". "claude" covers the whole claude_client launch family (incl.
@@ -4860,6 +5082,7 @@ def _nrol_operator_block_reason(cc_model: str) -> str | None:
     provider = (
         "gemini" if is_gemini_model(cc_model)
         else "codex" if is_codex_model(cc_model)
+        else "dream" if is_dream_claude_model(cc_model)
         else "umans" if is_umans_model(cc_model)
         else "claude"
     )
@@ -4980,7 +5203,7 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
         # Also persist so the dropdown re-selects on next load
         await db.update_conversation_fields(conv_id, local_model=data["cc_model"])
 
-    if conv.get("ooda_enabled"):
+    if conv.get("ooda_enabled") and not conv.get("system_only"):
         await _handle_ooda_generation(websocket, conv_id, conv, data)
     else:
         await _handle_weave_generation(websocket, conv_id, conv, data)
@@ -5034,6 +5257,7 @@ async def _handle_claude_generation(
         is_anthropic = model_context.is_anthropic(cc_model)
         is_gemini = is_gemini_model(cc_model)
         is_codex = is_codex_model(cc_model)
+        is_dream = is_dream_claude_model(cc_model)
         # .gguf models go through Claude Code with ANTHROPIC_BASE_URL pointed
         # at the local llama-server (which speaks /v1/messages natively on :11434).
         is_llama = cc_model.endswith(".gguf")
@@ -5044,14 +5268,21 @@ async def _handle_claude_generation(
         use_llama = conv.get("_use_llama", False) or is_llama
         # Use umans when explicitly flagged or when model is umans-*.
         use_umans = conv.get("_use_umans", False) or is_umans
+        # Use Dream when explicitly selected from the Claude Code model picker.
+        use_dream = is_dream
         # Belt-and-suspenders: NEVER route Anthropic/Gemini/Codex through llama/umans
         if is_anthropic or is_gemini or is_codex:
             use_llama = False
             use_umans = False
+            use_dream = False
         # Mutually exclusive: don't route through both at once
-        if use_umans:
+        if use_umans or use_dream:
             use_llama = False
-        print(f"[CC] Model routing: cc_model={cc_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} is_codex={is_codex} is_llama={is_llama} use_llama={use_llama} is_umans={is_umans} use_umans={use_umans} conv._use_llama={conv.get('_use_llama')} conv.mode={conv.get('mode')}")
+        if use_dream:
+            use_umans = False
+        provider_model = _dream_claude_model_id(cc_model) if use_dream else cc_model
+        cc_session_mode = "dream-claude" if use_dream else "claude"
+        print(f"[CC] Model routing: cc_model={cc_model!r} provider_model={provider_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} is_codex={is_codex} is_dream={is_dream} is_llama={is_llama} use_llama={use_llama} is_umans={is_umans} use_umans={use_umans} use_dream={use_dream} conv._use_llama={conv.get('_use_llama')} conv.mode={conv.get('mode')}")
 
         target_mode = "gemini" if is_gemini else ("codex" if is_codex else ("umans" if use_umans else ("local" if use_llama else "claude")))
 
@@ -5078,6 +5309,7 @@ async def _handle_claude_generation(
         if (
             action == "generate"
             and parent_id
+            and not use_dream
             and not model_context.is_1m_anthropic(cc_model)
         ):
             branch_tokens = await db.sum_branch_tokens(parent_id)
@@ -5150,8 +5382,15 @@ async def _handle_claude_generation(
                     print(f"[CC] Skipping empty session on msg {msg['id']}")
                     continue
                 # Check if the session was created by a different provider system.
-                # All Claude Code wrappers (Anthropic, Umans, Llama) generate compatible 
-                # sessions and can resume from each other. Gemini and Codex cannot.
+                # Dream-Claude runs through the same CLI but a different local
+                # provider shim; keep its sessions isolated until proven safe.
+                prev_session_mode = msg.get("cc_session_mode")
+                if (prev_session_mode == "dream-claude") != use_dream:
+                    print(
+                        f"[CC] Cross-provider turn at msg {msg['id']} ({prev_session_mode}), will rebuild full history"
+                    )
+                    crossed_provider = True
+                    break
                 prev_model = msg.get("cc_model_used") or ""
                 prev_is_gemini = is_gemini_model(prev_model)
                 prev_is_codex = is_codex_model(prev_model)
@@ -5399,7 +5638,7 @@ async def _handle_claude_generation(
                 draft_msg_id=draft_msg_id,
                 parent_id=parent_id,
                 cc_model=cc_model,
-                mode="gemini" if is_gemini else ("codex" if is_codex else ("umans" if use_umans else ("local" if use_llama else "claude"))),
+                mode="gemini" if is_gemini else ("codex" if is_codex else ("umans" if use_umans else ("local" if use_llama else ("dream-claude" if use_dream else "claude")))),
             )
 
         # Let the client know we're launching
@@ -5409,6 +5648,8 @@ async def _handle_claude_generation(
             launch_label = f"Launching Codex ({cc_model})..."
         elif use_umans:
             launch_label = f"Launching {cc_model} via Umans..."
+        elif use_dream:
+            launch_label = f"Launching {provider_model} via Dream shim..."
         elif use_llama:
             launch_label = f"Launching {cc_model} via Llama Server..."
         else:
@@ -5441,6 +5682,14 @@ async def _handle_claude_generation(
 
         # Launch CC — with resume if available, with fallback on failure
         try:
+            if use_dream:
+                ok, info = await _ensure_dream_shim_running()
+                if not ok:
+                    raise RuntimeError(info)
+                await _ws_send(
+                    conv_id,
+                    {"type": "status", "text": f"Dream shim ready at {info}", "parent_id": parent_id},
+                )
             if is_gemini:
                 proc, event_stream = await gemini_client.run_gemini(
                     prompt,
@@ -5476,13 +5725,14 @@ async def _handle_claude_generation(
                     project_dir,
                     conv_id=conv_id,
                     server_port=config.port,
-                    model=cc_model,
+                    model=provider_model,
                     effort=cc_effort,
                     permission_mode=cc_permission_mode,
                     resume_session_id=resume_session_id if use_resume else None,
                     fork_session=fork_session,
                     use_llama=use_llama,
                     use_umans=use_umans,
+                    use_dream=use_dream,
                     backstage_parent_id=conv.get("backstage_parent_id"),
                     nrol_operator=bool(conv.get("nrol_operator")),
                 )
@@ -5522,11 +5772,12 @@ async def _handle_claude_generation(
                         project_dir,
                         conv_id=conv_id,
                         server_port=config.port,
-                        model=cc_model,
+                        model=provider_model,
                         effort=cc_effort,
                         permission_mode=cc_permission_mode,
                         use_llama=use_llama,
                         use_umans=use_umans,
+                        use_dream=use_dream,
                         backstage_parent_id=conv.get("backstage_parent_id"),
                         nrol_operator=bool(conv.get("nrol_operator")),
                     )
@@ -5544,7 +5795,7 @@ async def _handle_claude_generation(
                 conv_id=conv_id,
                 pid=proc.pid,
                 project_dir=project_dir,
-                mode="umans" if use_umans else ("local" if use_llama else ("gemini" if is_gemini else ("codex" if is_codex else "claude"))),
+                mode="umans" if use_umans else ("local" if use_llama else ("dream-claude" if use_dream else ("gemini" if is_gemini else ("codex" if is_codex else "claude")))),
             )
         except Exception as e:
             print(f"[GEN] Failed to register active generation: {e}")
@@ -5855,7 +6106,7 @@ async def _handle_claude_generation(
                 got_error = evt.get("is_error", False)
                 # Use result text as fallback if no text came from assistant events
                 # Don't adopt error text as full_text — it would block the retry fallback
-                if not full_text and evt.get("result_text") and not got_error:
+                if not full_text and _cc_should_adopt_result_text(evt):
                     full_text = evt["result_text"]
                     content_blocks.append({"type": "text", "text": full_text})
 
@@ -5871,13 +6122,26 @@ async def _handle_claude_generation(
 
         _active_claude_procs.pop(conv_id, None)
 
-        # If --resume failed (is_error), retry with full history fallback.
-        # CC may emit the error as assistant text before the result event,
-        # so don't gate on `not full_text` — always retry on resume errors.
-        if got_error and use_resume:
+        # If --resume failed, retry with full history fallback. Some local
+        # backends can also accept a resumed session and exit 0 while producing
+        # an empty content block; treat that as a poisoned/stale resume too.
+        # CC may emit error text before the result event, so don't gate explicit
+        # errors on `not full_text`.
+        empty_resume = (
+            use_resume
+            and not got_error
+            and not full_text.strip()
+            and not content_blocks
+        )
+        if use_resume and (got_error or empty_resume):
             error_detail = result_info.get("result_text", "") or result_info.get("error", "")
-            print(f"[CC] Resume returned error, retrying with full history: {error_detail[:200]}")
-            await _ws_send(conv_id, {"type": "status", "text": f"Session error — retrying with full history..."})
+            if empty_resume:
+                print("[CC] Resume returned empty response, retrying with full history")
+                status_text = "Session returned no response — retrying with full history..."
+            else:
+                print(f"[CC] Resume returned error, retrying with full history: {error_detail[:200]}")
+                status_text = "Session error — retrying with full history..."
+            await _ws_send(conv_id, {"type": "status", "text": status_text})
             branch = await db.get_branch_to_root(parent_id) if parent_id else []
             fallback_prompt = _build_claude_history_prompt(branch, project_dir) or "(continue)"
             # Re-attach images
@@ -6021,10 +6285,12 @@ async def _handle_claude_generation(
                     project_dir,
                     conv_id=conv_id,
                     server_port=config.port,
-                    model=cc_model,
+                    model=provider_model,
                     effort=cc_effort,
                     permission_mode=cc_permission_mode,
                     use_llama=use_llama,
+                    use_umans=use_umans,
+                    use_dream=use_dream,
                     backstage_parent_id=conv.get("backstage_parent_id"),
                     nrol_operator=bool(conv.get("nrol_operator")),
                 )
@@ -6216,7 +6482,7 @@ async def _handle_claude_generation(
                     )
                 elif etype == "result":
                     result_info = evt
-                    if not full_text and evt.get("result_text"):
+                    if not full_text and _cc_should_adopt_result_text(evt):
                         full_text = evt["result_text"]
                         content_blocks.append({"type": "text", "text": full_text})
 
@@ -6233,13 +6499,13 @@ async def _handle_claude_generation(
             _active_claude_procs.pop(conv_id, None)
 
         # If CC produced no output at all, mark draft as error (don't delete)
-        if not full_text and not any(b["type"] == "tool_use" for b in content_blocks):
+        if not _cc_has_streamed_output(full_text, content_blocks):
             provider_name = (
                 "Antigravity (agy)"
                 if is_gemini
                 else ("ChatGPT Codex" if is_codex else ("Umans" if use_umans else ("Llama Server" if use_llama else "Claude Code")))
             )
-            error_msg = result_info.get("error")
+            error_msg = _cc_result_error_detail(result_info)
             if not error_msg:
                 if rate_limit_data:
                     info = rate_limit_data.get("rate_limit_info", {})
@@ -6275,29 +6541,8 @@ async def _handle_claude_generation(
         # Partial output: agent died mid-turn (hook timeout, crash, etc.)
         # Save whatever text/tools streamed before death so the user isn't
         # left with a blank message — they can read what happened and retry.
-        if result_info.get("is_error") and full_text:
-            error_note = f"\n\n---\n[Turn interrupted: {result_info.get('error') or 'agent exited unexpectedly'}]"
-            full_text = full_text.rstrip() + error_note
-            if content_blocks and content_blocks[-1].get("type") == "text":
-                content_blocks[-1]["text"] = content_blocks[-1]["text"].rstrip() + error_note
-            else:
-                content_blocks.append({"type": "text", "text": error_note})
-        elif result_info.get("is_error") and not full_text and content_blocks:
-            # Agent died after tool calls but produced no final text (e.g. agy
-            # planner-loop shutdown — the agent did real work via tool_use
-            # blocks, then died before emitting any text/content event).
-            # Without this branch the draft commits content='' with the tool
-            # blocks invisible in chat, because the empty-response gate above
-            # (line 6024) only fires when there are NO tool_use blocks. Save
-            # the tool work as the visible content so the user can read what
-            # happened instead of staring at a blank message.
-            n_tools = sum(1 for b in content_blocks if b.get("type") == "tool_use")
-            error_note = (
-                f"\n\n---\n[Turn interrupted: agent exited after {n_tools} tool call(s) "
-                f"without producing a final response — {result_info.get('error') or 'agent exited unexpectedly'}]"
-            )
-            full_text = error_note.strip()
-            content_blocks.append({"type": "text", "text": error_note})
+        if result_info.get("is_error") and _cc_has_streamed_output(full_text, content_blocks):
+            full_text = _append_cc_interrupt_note(full_text, content_blocks, result_info)
 
         # CC streamed an error response (e.g. "You've hit your org's monthly
         # usage limit") as assistant text. Augment the saved draft so the user
@@ -6336,6 +6581,8 @@ async def _handle_claude_generation(
         resolved_model = actual_model or cc_model
         if use_llama:
             model_used_field = f"{cc_model}@llama-server"
+        elif use_dream:
+            model_used_field = f"{provider_model}@dream-shim"
         else:
             model_used_field = resolved_model
 
@@ -6361,11 +6608,36 @@ async def _handle_claude_generation(
             turn_input_tokens=input_tokens,
             turn_output_tokens=output_tokens,
             cc_session_id=new_session_id or None,
-            cc_session_mode="claude",
+            cc_session_mode=cc_session_mode,
             cc_model_used=model_used_field,
             generation_ms=_gen_ms,
         )
         msg = await db.get_message(draft_msg_id)
+        if not msg:
+            print(
+                f"[GEN] Draft {draft_msg_id} missing at finalize; "
+                "creating recovery assistant message"
+            )
+            recovered = await db.add_message(
+                conv_id,
+                "assistant",
+                full_text,
+                parent_id=_describe_msg_id or parent_id,
+                content_blocks=json.dumps(content_blocks),
+                turn_cost_usd=cost_usd,
+                turn_input_tokens=input_tokens,
+                turn_output_tokens=output_tokens,
+                cc_session_id=new_session_id or None,
+            )
+            draft_msg_id = recovered["id"]
+            await db.update_message_content(
+                draft_msg_id,
+                cc_session_mode=cc_session_mode,
+                cc_model_used=model_used_field,
+                generation_ms=_gen_ms,
+            )
+            await db.set_active_branch(conv_id, draft_msg_id)
+            msg = await db.get_message(draft_msg_id)
 
         # Update conversation with session_id and cumulative cost
         old_cost = conv.get("total_cost_usd") or 0
@@ -6387,11 +6659,21 @@ async def _handle_claude_generation(
 
         detected_images = []
         seen_paths = set()
+        def _block_text(value) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                return value
+            try:
+                return json.dumps(value, default=str)
+            except Exception:
+                return str(value)
+
         all_text = (
             full_text
             + " "
             + " ".join(
-                b.get("input", "") + " " + b.get("result", "")
+                _block_text(b.get("input")) + " " + _block_text(b.get("result"))
                 for b in content_blocks
                 if b.get("type") == "tool_use"
             )
@@ -6596,12 +6878,18 @@ async def _handle_local_generation(
 ):
     """Handle Local mode: Claude Code launched against llama-server."""
     print(f"[LOCAL-GEN] Starting: conv_id={conv_id}, local_model={conv.get('local_model')}, action={data.get('action')}, parent_id={data.get('parent_id')}")
-    # Local mode = Claude Code powered by a local llama-server model.
-    # Reuse the full CC handler but with use_llama=True.
+    # Local mode = Claude Code powered by a local model. Standard .gguf models
+    # route through llama-server; the explicit Dream model routes through the
+    # isolated Anthropic->Dream shim.
     conv = dict(conv)  # mutable copy
     # Map local_model into cc_model so _handle_claude_generation uses it
-    conv["cc_model"] = conv.get("local_model") or config.llama_model
-    conv["_use_llama"] = True
+    local_model = conv.get("local_model") or config.llama_model
+    if is_dream_claude_model(local_model):
+        conv["cc_model"] = f"dream:{_dream_claude_model_id(local_model)}"
+        conv["_use_llama"] = False
+    else:
+        conv["cc_model"] = local_model
+        conv["_use_llama"] = True
     await _handle_claude_generation(websocket, conv_id, conv, data)
 
 
@@ -6664,7 +6952,7 @@ async def _handle_dream_completion(
             [{"role": "user", "content": prompt}],
             model=model,
             host=config.dream_host,
-            max_tokens=data.get("max_tokens") or 2048,
+            max_tokens=data.get("max_tokens") or config.max_tokens,
         )
         reasoning = res.get("reasoning_content") or ""
         if reasoning:
@@ -7196,6 +7484,7 @@ async def _handle_prometheus_generation(
     import time as _time
     draft_msg_id = None
     full_text = ""
+    content_blocks: list[dict] = []
     proc = None
     start_t = _time.time()
     try:
@@ -7227,6 +7516,18 @@ async def _handle_prometheus_generation(
                                  "draft_msg_id": draft_msg_id,
                                  "local_model": backend["model"],
                                  "prometheus_backend": backend_tag})
+        _gen_key_local = getattr(asyncio.current_task(), "_gen_key", None)
+        if _gen_key_local:
+            _update_gen_snapshot(
+                _gen_key_local,
+                full_text="",
+                content_blocks=content_blocks,
+                started_at=start_t,
+                draft_msg_id=draft_msg_id,
+                parent_id=parent_id,
+                cc_model=backend.get("model") or "",
+                mode="prometheus",
+            )
         await _ws_send(conv_id, {"type": "status",
                                  "text": f"Prometheus generating ({backend_tag})…"})
 
@@ -7270,7 +7571,13 @@ async def _handle_prometheus_generation(
         async for event in event_stream:
             etype = event.get("type", "")
             if etype == "text_delta":
-                full_text += event.get("text", "")
+                delta = event.get("text", "")
+                full_text += delta
+                if content_blocks and content_blocks[-1].get("type") == "text":
+                    content_blocks[-1]["text"] += delta
+                else:
+                    content_blocks.append({"type": "text", "text": delta})
+                await _ws_send(conv_id, {"type": "stream_chunk", "content": delta})
             elif etype == "error":
                 await _ws_send(conv_id, event)
             elif etype == "result":
@@ -7280,6 +7587,12 @@ async def _handle_prometheus_generation(
                 await _ws_send(conv_id, event)
             else:
                 await _ws_send(conv_id, event)
+            if _gen_key_local:
+                _update_gen_snapshot(
+                    _gen_key_local,
+                    full_text=full_text,
+                    content_blocks=content_blocks,
+                )
 
         if draft_msg_id and not full_text.strip():
             try:
@@ -7467,6 +7780,18 @@ async def _handle_dream_generation(
         total_input_tokens = 0
         total_output_tokens = 0
         result_info: dict = {}
+        _gen_key_local = getattr(asyncio.current_task(), "_gen_key", None)
+        if _gen_key_local:
+            _update_gen_snapshot(
+                _gen_key_local,
+                full_text="",
+                content_blocks=content_blocks,
+                started_at=start_t,
+                draft_msg_id=draft_msg_id,
+                parent_id=parent_id,
+                cc_model=config.dream_model or "",
+                mode="dream",
+            )
 
         async for evt in event_stream:
             etype = evt.get("type")
@@ -7556,6 +7881,14 @@ async def _handle_dream_generation(
             elif etype == "result":
                 result_info = evt
                 new_session_id = evt.get("session_id", "") or new_session_id
+            if _gen_key_local:
+                _update_gen_snapshot(
+                    _gen_key_local,
+                    full_text=full_text,
+                    content_blocks=content_blocks,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                )
 
         _active_hermes_procs.pop(conv_id, None)
 
@@ -7762,6 +8095,18 @@ async def _handle_hermes_generation(
         total_input_tokens = 0
         total_output_tokens = 0
         result_info: dict = {}
+        _gen_key_local = getattr(asyncio.current_task(), "_gen_key", None)
+        if _gen_key_local:
+            _update_gen_snapshot(
+                _gen_key_local,
+                full_text="",
+                content_blocks=content_blocks,
+                started_at=start_t,
+                draft_msg_id=draft_msg_id,
+                parent_id=parent_id,
+                cc_model=model or "",
+                mode="hermes",
+            )
 
         async for evt in event_stream:
             etype = evt.get("type")
@@ -7869,6 +8214,14 @@ async def _handle_hermes_generation(
                 result_info = evt
                 new_session_id = evt.get("session_id", "") or new_session_id
             # hermes_commands / hermes_raw_update: ignored in v1.
+            if _gen_key_local:
+                _update_gen_snapshot(
+                    _gen_key_local,
+                    full_text=full_text,
+                    content_blocks=content_blocks,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                )
 
         _active_hermes_procs.pop(conv_id, None)
 
@@ -8090,8 +8443,9 @@ async def _handle_ooda_generation(
             },
         )
         weave_model = conv.get("local_model") or None
+        ooda_max_tokens = int(getattr(config, "max_tokens", 2048) or 2048)
         raw_pass1 = await sync_chat(
-            messages, max_tokens=2048, think=False, model=weave_model
+            messages, max_tokens=ooda_max_tokens, think=False, model=weave_model
         )
         # Check if cancelled during the sync call
         if asyncio.current_task().cancelled():
@@ -8224,7 +8578,7 @@ async def _handle_ooda_generation(
                 ),
             }]
             raw_pass2 = await sync_chat(
-                repair_messages, max_tokens=2048, think=False, model=weave_model
+                repair_messages, max_tokens=ooda_max_tokens, think=False, model=weave_model
             )
             if asyncio.current_task().cancelled():
                 raise asyncio.CancelledError()
@@ -8349,8 +8703,9 @@ async def _handle_weave_generation(
         if action == "generate" and parent_id is None:
             leaf = await db.get_active_leaf(conv_id)
             parent_id = leaf["id"] if leaf else None
+        system_only = bool(conv and conv.get("system_only"))
         character = None
-        if conv and conv.get("character_id"):
+        if (not system_only) and conv and conv.get("character_id"):
             char_path = os.path.join(
                 config.characters_dir, f"{conv['character_id']}.md"
             )
@@ -8363,11 +8718,11 @@ async def _handle_weave_generation(
             )
         else:
             print(
-                f"[GEN] No character_id on conv! character_id={conv.get('character_id') if conv else 'NO CONV'}"
+                f"[GEN] No character_id on conv! character_id={conv.get('character_id') if conv else 'NO CONV'} system_only={system_only}"
             )
 
         # Get style nudge from conversation settings (user-selected, not rotating)
-        style_nudge_name = conv.get("style_nudge", "Natural") if conv else "Natural"
+        style_nudge_name = "Natural" if system_only else (conv.get("style_nudge", "Natural") if conv else "Natural")
         nudge_index = 0
         for i, nudge in enumerate(STYLE_NUDGES):
             if nudge["name"] == style_nudge_name:
@@ -8376,7 +8731,7 @@ async def _handle_weave_generation(
 
         # Load persona if set
         persona = None
-        if conv and conv.get("persona_id"):
+        if (not system_only) and conv and conv.get("persona_id"):
             persona_path = os.path.join("personas", f"{conv['persona_id']}.md")
             persona = load_persona(persona_path)
             print(
@@ -8387,7 +8742,7 @@ async def _handle_weave_generation(
 
         # Load lore entries if set
         lore_entries = []
-        if conv and conv.get("lore_ids"):
+        if (not system_only) and conv and conv.get("lore_ids"):
             import json as _json
 
             try:
@@ -8414,15 +8769,18 @@ async def _handle_weave_generation(
 
         # Run repetition analysis on recent assistant messages
         # Build system prompt (use custom scene if set)
-        custom_scene = conv.get("custom_scene") if conv else None
-        system_prompt = build_system_prompt(
-            character=character,
-            style_nudge_index=nudge_index,
-            scenario_override=custom_scene,
-        )
+        custom_scene = None if system_only else (conv.get("custom_scene") if conv else None)
+        if system_only:
+            system_prompt = (conv.get("system_prompt") or "").strip() or BASE_SYSTEM_PROMPT
+        else:
+            system_prompt = build_system_prompt(
+                character=character,
+                style_nudge_index=nudge_index,
+                scenario_override=custom_scene,
+            )
 
         # Assemble full prompt (persona + lore injected as user turn)
-        example_msgs = character.get("example_messages", []) if character else []
+        example_msgs = [] if system_only else (character.get("example_messages", []) if character else [])
         messages = assemble_prompt(
             system_prompt=system_prompt,
             example_messages=example_msgs,

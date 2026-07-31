@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     lore_ids TEXT NOT NULL DEFAULT '[]',
     style_nudge TEXT NOT NULL DEFAULT 'Natural',
     custom_scene TEXT,
+    system_only INTEGER DEFAULT 0,
+    system_prompt TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -348,6 +350,10 @@ async def _run_migrations(db):
         "ALTER TABLE conversations ADD COLUMN bookmark_msg_id INTEGER",
         # OODA harness toggle
         "ALTER TABLE conversations ADD COLUMN ooda_enabled INTEGER DEFAULT 0",
+        # Minimal Weave: skip character/state scaffolding and use only this
+        # conversation-level system message plus branch history.
+        "ALTER TABLE conversations ADD COLUMN system_only INTEGER DEFAULT 0",
+        "ALTER TABLE conversations ADD COLUMN system_prompt TEXT",
         # Tier 3: branch-level state deltas stored per assistant message
         "ALTER TABLE messages ADD COLUMN state_deltas TEXT",
         # Track which model generated each message (for provider switch detection)
@@ -740,6 +746,8 @@ async def update_conversation_fields(conv_id: int, **fields):
         "cc_permission_mode",
         "incognito",
         "ooda_enabled",
+        "system_only",
+        "system_prompt",
         "canvas_enabled",
         "canvas_slug",
         "project_dir",
@@ -1125,8 +1133,9 @@ async def fork_conversation(
     cursor = await db.execute(
         """INSERT INTO conversations (title, character_id, persona_id, lore_ids,
            style_nudge, custom_scene, mode, project_dir, cc_model, cc_effort,
-           local_model, nrol_operator, incognito, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           local_model, nrol_operator, incognito, system_only, system_prompt,
+           created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             title,
             orig.get("character_id"),
@@ -1147,6 +1156,8 @@ async def fork_conversation(
             # conversation stays incognito — silently de-souling on fork would be
             # the exact contamination the incognito flag exists to control.
             int(orig.get("incognito", 0) or 0),
+            int(orig.get("system_only", 0) or 0),
+            orig.get("system_prompt"),
             now,
             now,
         ),

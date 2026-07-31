@@ -198,6 +198,32 @@ class ProposalStore:
             )
         return self.get_proposal(pid)
 
+    def find_pending_proposal(
+        self,
+        *,
+        article_id: str,
+        slug: str,
+        action: str,
+        indicator_id: str = "",
+        observed_value: float | None = None,
+    ) -> dict | None:
+        """Return an existing equivalent pending proposal, if one exists."""
+        query = (
+            "SELECT * FROM proposals WHERE status = 'pending' "
+            "AND article_id = ? AND slug = ? AND action = ? "
+            "AND COALESCE(indicator_id, '') = ? "
+        )
+        params: list = [article_id, slug, action, indicator_id or ""]
+        if observed_value is None:
+            query += "AND observed_value IS NULL "
+        else:
+            query += "AND observed_value = ? "
+            params.append(observed_value)
+        query += "ORDER BY created_at DESC LIMIT 1"
+        with contextlib.closing(self._conn()) as conn, conn:
+            row = conn.execute(query, params).fetchone()
+        return dict(row) if row else None
+
     def get_proposal(self, proposal_id: str) -> dict | None:
         with contextlib.closing(self._conn()) as conn, conn:
             row = conn.execute(

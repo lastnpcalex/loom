@@ -20,6 +20,7 @@ function parseImagePaths(imagePath) {
 
 let _wsReconnectDelay = 2000;
 let _wsReconnectTimer = null;
+let _lastResumeProbeAt = 0;
 
 function connectWebSocket(convId, _attempt) {
     if (!_attempt) {
@@ -193,9 +194,32 @@ function _resetStreamState() {
     State._streamIsOurBranch = undefined;
     State._followingGenId = null;
     State._parallelCount = 0;
+    _queuedStreamEventsDuringReconstruct = [];
     if (streamingDiv && !streamingDiv.isConnected) {
         streamingDiv = null;  // detached; drop the stale ref
     }
+}
+
+function _clearTerminalStreamState({ clearParallel = false } = {}) {
+    if (typeof _streamFlushTimer !== 'undefined' && _streamFlushTimer) {
+        clearTimeout(_streamFlushTimer);
+        _streamFlushTimer = null;
+    }
+    if (State._reconstructWatchdog) {
+        clearTimeout(State._reconstructWatchdog);
+        State._reconstructWatchdog = null;
+    }
+    _streamBuffer = '';
+    State.isStreaming = false;
+    State._reconstructing = false;
+    State._streamIsOurBranch = undefined;
+    State._followingGenId = null;
+    State._compactedThisGen = false;
+    State._compactData = null;
+    if (clearParallel) State._parallelCount = 0;
+    _queuedStreamEventsDuringReconstruct = [];
+    const sendBtn = document.getElementById('btn-send');
+    if (sendBtn) sendBtn.disabled = false;
 }
 
 // Probe the WS when the tab returns to foreground. readyState alone is not
@@ -204,6 +228,9 @@ function _resetStreamState() {
 // normal reconnect path can replace it.
 function _probeWSOnResume(source) {
     if (!State.currentConvId) return;
+    const now = Date.now();
+    if (source !== 'online' && now - _lastResumeProbeAt < 300) return;
+    _lastResumeProbeAt = now;
     const ws = State.ws;
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
         console.log(`[WS] ${source} — no live socket, reconnecting`);
@@ -218,6 +245,15 @@ function _probeWSOnResume(source) {
         // socket's generation_active / generation_idle will handle sync.
         return;
     }
+    // Socket looks fresh, but mobile browsers can suspend JS delivery while
+    // leaving readyState OPEN. Ask for authoritative state so a hidden-tab
+    // stream catches up without requiring a manual refresh.
+    if (State.isStreaming || State._reconstructing || (streamingDiv && !streamingDiv.isConnected)) {
+        console.log(`[WS] ${source} — requesting stream snapshot`);
+        ws._needsSync = true;
+        _requestSnapshotIfStreaming(true);
+        return;
+    }
     // Socket looks fresh. A light resync covers anything we missed while blurred.
     if (!State.isStreaming && !document.querySelector('.edit-message-input')) {
         loadMessages(State.currentConvId);
@@ -227,11 +263,35 @@ function _probeWSOnResume(source) {
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') _probeWSOnResume('visibilitychange');
 });
-// iOS Safari back/forward cache restores the page without firing
-// visibilitychange. pageshow with persisted=true is the reliable signal.
+window.addEventListener('focus', () => _probeWSOnResume('focus'));
+window.addEventListener('online', () => _probeWSOnResume('online'));
+// iOS Safari can restore or foreground pages without firing visibilitychange.
 window.addEventListener('pageshow', (e) => {
-    if (e.persisted) _probeWSOnResume('pageshow(bfcache)');
+    _probeWSOnResume(e.persisted ? 'pageshow(bfcache)' : 'pageshow');
 });
+
+async function _fetchActiveBranchMessages(convId) {
+    const treeData = await API.get(`/api/conversations/${convId}/tree`);
+    State.treeData = treeData;  // keep branch indicators in sync
+    if (typeof markTreeDataFresh === 'function') markTreeDataFresh(convId);
+    hideRetryBar();
+    const leaf = findActiveConversationLeaf(treeData);
+    if (leaf) {
+        State.messages = await API.get(`/api/conversations/${convId}/branch/${leaf.id}`);
+    } else if (!State.messages.length) {
+        State.messages = [];
+    }
+}
+
+async function _syncMessagesForStreaming(convId) {
+    await _fetchActiveBranchMessages(convId);
+    if (typeof renderTree === 'function') {
+        if (typeof TREE !== 'undefined') TREE._skipCenter = true;
+        renderTree();
+    } else if (typeof refreshTree === 'function') {
+        refreshTree();
+    }
+}
 
 async function loadMessages(convId) {
     try {
@@ -244,15 +304,7 @@ async function loadMessages(convId) {
         // being skipped by the cheap-diff bail below.
         const _msgSig = m => `${m.id}:${(m.content || '').length > 0 ? 1 : 0}`;
         const prevIdSig = State.messages.map(_msgSig).join(',');
-        const treeData = await API.get(`/api/conversations/${convId}/tree`);
-        State.treeData = treeData;  // keep branch indicators in sync
-        hideRetryBar();
-        const leaf = findActiveConversationLeaf(treeData);
-        if (leaf) {
-            State.messages = await API.get(`/api/conversations/${convId}/branch/${leaf.id}`);
-        } else if (!State.messages.length) {
-            State.messages = [];
-        }
+        await _fetchActiveBranchMessages(convId);
         // Cheap change detection: if the message id list is identical to what
         // we already rendered, skip the container.innerHTML='' + full rebuild.
         // Heartbeat-driven WS reconnects used to call loadMessages on every
@@ -403,7 +455,34 @@ const _ACTIVITY_EVENT_TYPES = new Set([
     'plan_ready', 'plan_landed', 'canvas_updated', 'image_describe',
 ]);
 
+const _RECONSTRUCT_QUEUE_EVENT_TYPES = new Set([
+    'thinking_start', 'thinking_end', 'thinking_chunk',
+    'stream_chunk', 'tool_start', 'tool_input_chunk', 'tool_result',
+    'usage', 'stream_end', 'cancelled', 'error', 'generation_idle',
+]);
+let _queuedStreamEventsDuringReconstruct = [];
+
+function _queueStreamEventDuringReconstruct(data) {
+    if (!State._reconstructing || !_RECONSTRUCT_QUEUE_EVENT_TYPES.has(data.type)) return false;
+    if (data.gen_id != null && State._followingGenId != null && data.gen_id !== State._followingGenId) {
+        return false;
+    }
+    if (State._streamIsOurBranch === false) return false;
+    _queuedStreamEventsDuringReconstruct.push(data);
+    return true;
+}
+
+function _drainQueuedStreamEvents() {
+    if (!_queuedStreamEventsDuringReconstruct.length) return;
+    const queued = _queuedStreamEventsDuringReconstruct;
+    _queuedStreamEventsDuringReconstruct = [];
+    for (const event of queued) {
+        handleWSMessage(event);
+    }
+}
+
 function handleWSMessage(data) {
+    if (_queueStreamEventDuringReconstruct(data)) return;
     if (_ACTIVITY_EVENT_TYPES.has(data.type)) _removeStreamWaiting();
     switch (data.type) {
         case 'context_info':
@@ -920,12 +999,7 @@ function handleWSMessage(data) {
                 break;
             }
             // Our followed stream ended
-            State.isStreaming = false;
-            State._streamIsOurBranch = undefined;
-            State._followingGenId = null;
-            State._compactedThisGen = false;
-            State._compactData = null;
-            document.getElementById('btn-send').disabled = false;
+            _clearTerminalStreamState({ clearParallel: allDone });
             hideGenStatus();
             // Clear ghost node before tree refresh so it doesn't persist
             // Tree refreshes on stream_end/cancel/error to replace draft with final node
@@ -968,12 +1042,8 @@ function handleWSMessage(data) {
         }
 
         case 'cancelled':
-            State._reconstructing = false;
             removeStreamingMessage();
-            State.isStreaming = false;
-            State._streamIsOurBranch = undefined;
-            State._followingGenId = null;
-            document.getElementById('btn-send').disabled = false;
+            _clearTerminalStreamState({ clearParallel: true });
             hideGenStatus();
             showRetryBar('Generation cancelled');
             refreshTree();
@@ -1000,9 +1070,7 @@ function handleWSMessage(data) {
             }
             const preservedPartial = markStreamingMessageInterrupted(data.error || 'Generation error');
             if (!preservedPartial) removeStreamingMessage();
-            State.isStreaming = false;
-            State._streamIsOurBranch = undefined;
-            document.getElementById('btn-send').disabled = false;
+            _clearTerminalStreamState({ clearParallel: true });
             hideGenStatus();
             if (data.error && data.error.includes('another branch')) {
                 showToast(data.error, 'error');
@@ -1044,17 +1112,17 @@ function handleWSMessage(data) {
                         State._reconstructWatchdog = null;
                     }, 15000);
                     const activeWs = State.ws;
-                    // Keep _reconstructing true through loadMessages AND the
-                    // snapshot rebuild. Clearing it in between leaves a window
-                    // where appendStreamChunk sees streamingDiv=null AND
-                    // _reconstructing=false, so it fires _requestSnapshotIfStreaming
-                    // → server returns generation_active → outer handler isn't
-                    // gated → another loadMessages cycle → renderMessages wipes
-                    // streamingDiv → permanent freeze. Hold the flag until the
-                    // reconstruction is actually in the DOM.
-                    loadMessages(State.currentConvId).then(() => {
+                    const hadAttachedStream = !!(streamingDiv && streamingDiv.isConnected);
+                    const syncPromise = hadAttachedStream
+                        ? _syncMessagesForStreaming(State.currentConvId)
+                        : loadMessages(State.currentConvId);
+                    let discardQueuedEvents = false;
+                    // Keep _reconstructing true through message sync and any
+                    // snapshot rebuild. Events received in this window are
+                    // queued until the DOM is stable, then replayed.
+                    syncPromise.then(() => {
                         if (State.ws !== activeWs) {
-                            State._reconstructing = false;
+                            discardQueuedEvents = true;
                             return;
                         }
                         // If the draft message has already landed from the DB
@@ -1064,8 +1132,6 @@ function handleWSMessage(data) {
                             m => m.id === snap.draft_msg_id && (m.content || '').trim()
                         );
                         if (draftLanded) {
-                            State._reconstructing = false;
-                            _drainPendingPermPrompts();
                             return;
                         }
                         // Otherwise reconstruct from snapshot — covers the race
@@ -1077,12 +1143,24 @@ function handleWSMessage(data) {
                         const freshIds = new Set(State.messages.map(m => m.id));
                         const stillOurs = !snap.parent_id || freshIds.has(snap.parent_id);
                         State._streamIsOurBranch = stillOurs;
-                        if (stillOurs) {
+                        if (stillOurs && _snapshotShouldReplaceLiveStream(snap)) {
                             _reconstructFromSnapshot(snap);
                         }
+                    }).catch((err) => {
+                        console.warn('[WS] generation_active sync failed:', err);
+                    }).finally(() => {
+                        if (State._reconstructWatchdog) {
+                            clearTimeout(State._reconstructWatchdog);
+                            State._reconstructWatchdog = null;
+                        }
                         State._reconstructing = false;
+                        if (discardQueuedEvents || State.ws !== activeWs) {
+                            _queuedStreamEventsDuringReconstruct = [];
+                        } else {
+                            _drainQueuedStreamEvents();
+                        }
                         _drainPendingPermPrompts();
-                    }).catch(() => { State._reconstructing = false; _drainPendingPermPrompts(); });
+                    });
                 }
             } else {
                 // No snapshot — just load messages
@@ -1111,15 +1189,12 @@ function handleWSMessage(data) {
                 break;
             }
             if (State.isStreaming || (State.ws && State.ws._needsSync) || wasReconstructing) {
-                State.isStreaming = false;
-                State._streamIsOurBranch = undefined;
-                State._followingGenId = null;
-                document.getElementById('btn-send').disabled = false;
                 removeStreamingMessage();
+                _clearTerminalStreamState({ clearParallel: true });
                 hideGenStatus();
                 // Don't clobber an in-progress edit or typed draft on reconnect.
                 const editing = !!document.querySelector('.edit-message-input');
-                const ta = document.getElementById('message-input');
+                const ta = document.getElementById('user-input');
                 const typing = !!(ta && ta.value && ta.value.trim().length > 0);
                 if (!editing && !typing) {
                     loadMessages(State.currentConvId);
@@ -1246,6 +1321,43 @@ function updateContextInfo(data) {
     } else if (banner) {
         banner.classList.add('hidden');
     }
+}
+
+function _snapshotTextLength(snap) {
+    let len = 0;
+    const blocks = snap?.content_blocks || [];
+    for (const block of blocks) {
+        if (block.type === 'text') len += (block.text || '').length;
+        else if (block.type === 'thinking') len += (block.text || '').length;
+    }
+    return Math.max(len, (snap?.full_text || '').length);
+}
+
+function _snapshotNonTextBlockCount(snap) {
+    const blocks = snap?.content_blocks || [];
+    return blocks.filter(block => block.type && block.type !== 'text').length;
+}
+
+function _currentStreamingContentStats() {
+    if (!streamingDiv || !streamingDiv.isConnected) {
+        return { textLength: 0, blockCount: 0 };
+    }
+    _flushStreamBufferNow();
+    const contentEl = streamingDiv.querySelector('.message-content');
+    if (!contentEl) return { textLength: 0, blockCount: 0 };
+    const clone = contentEl.cloneNode(true);
+    clone.querySelectorAll('.stream-waiting, .typing-cursor').forEach(el => el.remove());
+    return {
+        textLength: clone.textContent.length,
+        blockCount: clone.querySelectorAll('.tool-block, .cc-thinking, .ask-question-block').length,
+    };
+}
+
+function _snapshotShouldReplaceLiveStream(snap) {
+    if (!streamingDiv || !streamingDiv.isConnected) return true;
+    const current = _currentStreamingContentStats();
+    return _snapshotTextLength(snap) > current.textLength
+        || _snapshotNonTextBlockCount(snap) > current.blockCount;
 }
 
 /**
@@ -3513,11 +3625,11 @@ function hideThinkingIndicator() {
 let streamingDiv = null;
 let _lastSnapshotRequestAt = 0;
 
-function _requestSnapshotIfStreaming() {
+function _requestSnapshotIfStreaming(force = false) {
     // Throttle: at most one request every 750ms — server reply ('generation_active')
     // takes one round-trip and triggers _reconstructFromSnapshot which rebuilds the div.
     const now = Date.now();
-    if (now - _lastSnapshotRequestAt < 750) return;
+    if (!force && now - _lastSnapshotRequestAt < 750) return;
     if (!State.ws || State.ws.readyState !== WebSocket.OPEN) return;
     _lastSnapshotRequestAt = now;
     try {
@@ -3796,7 +3908,9 @@ function finalizeStreamingMessage(msg, cost) {
     // Replace the streaming div (which holds append-only raw text) with a
     // fully rendered message element. This is the ONE markdown parse pass per
     // turn — O(N) instead of O(N²) from per-chunk reparsing.
-    State.messages.push(msg);
+    const existingIdx = State.messages.findIndex(m => m.id === msg.id);
+    if (existingIdx >= 0) State.messages[existingIdx] = msg;
+    else State.messages.push(msg);
     const elapsed = _streamStartTime ? Math.round((Date.now() - _streamStartTime) / 1000) : 0;
     const newEl = createMessageElement(msg, cost, elapsed);
     streamingDiv.replaceWith(newEl);

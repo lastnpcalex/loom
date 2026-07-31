@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
 from typing import AsyncGenerator, Optional
@@ -33,6 +34,17 @@ DEFAULT_HOST = "http://127.0.0.1:8787"
 # when the caller doesn't specify max_tokens, matching the adapter's own default.
 DEFAULT_MAX_TOKENS = 2048
 CANVAS = 256
+
+
+def _envbool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _default_enable_thinking() -> bool:
+    return _envbool("DREAM_ENABLE_THINKING", True)
 REQUEST_TIMEOUT = 600.0  # 10 min — cold loads take a while
 
 _DREAM_THOUGHT_BLOCK_RE = re.compile(
@@ -188,6 +200,7 @@ async def dream_chat(
     model: Optional[str] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    enable_thinking: Optional[bool] = None,
     host: Optional[str] = None,
     timeout: float = REQUEST_TIMEOUT,
 ) -> AsyncGenerator[str, None]:
@@ -210,6 +223,9 @@ async def dream_chat(
         payload["temperature"] = temperature
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+    payload["chat_template_kwargs"] = {
+        "enable_thinking": _default_enable_thinking() if enable_thinking is None else bool(enable_thinking)
+    }
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -258,6 +274,7 @@ async def dream_chat_sync(
     model: Optional[str] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    enable_thinking: Optional[bool] = None,
     host: Optional[str] = None,
     timeout: float = REQUEST_TIMEOUT,
 ) -> dict:
@@ -281,6 +298,9 @@ async def dream_chat_sync(
         payload["temperature"] = temperature
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+    payload["chat_template_kwargs"] = {
+        "enable_thinking": _default_enable_thinking() if enable_thinking is None else bool(enable_thinking)
+    }
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(f"{h}/v1/chat/completions", json=payload)

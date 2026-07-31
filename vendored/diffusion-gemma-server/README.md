@@ -54,8 +54,9 @@ The flow (line numbers refer to `diffusion-gemma-server.cpp` in this folder):
    `tool_choice` from the OpenAI body via `common_chat_tools_parse_oaicompat`
    and `common_chat_tool_choice_parse_oaicompat`, then applies the chat template
    (`common_chat_templates_apply`) so the tools are rendered into the prompt the
-   model sees. `inputs.enable_thinking = false` (line ~240) matches the reference
-   template default.
+   model sees. `chat_template_kwargs.enable_thinking` can enable Gemma4's
+   thought channel per request; otherwise the server default follows
+   `DREAM_ENABLE_THINKING` and falls back to the no-thinking reference prompt.
 
 2. **Generation** — `generate` (line ~268) runs the block-diffusion denoising
    loop. `max_tokens` maps to canvas blocks via `_blocks_for` (256 tokens/block,

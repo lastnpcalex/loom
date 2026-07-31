@@ -339,6 +339,17 @@
                 <label>Character</label>
                 <div id="character-grid"></div>
             </div>
+            <div class="form-group hidden" id="weave-minimal-group">
+                <label for="weave-system-only">
+                    <input type="checkbox" id="weave-system-only">
+                    Minimal Weave
+                    <span class="label-hint">(system message only)</span>
+                </label>
+            </div>
+            <div class="form-group hidden" id="weave-system-prompt-group">
+                <label for="weave-system-prompt">System message</label>
+                <textarea id="weave-system-prompt" rows="5" placeholder="Define the roleplay rules, style, viewpoint, boundaries, and continuity expectations..."></textarea>
+            </div>
             <div class="form-group">
                 <label>Your Persona <span class="label-hint">(optional — who are you in this RP?)</span></label>
                 <select id="persona-select" class="form-select">
@@ -378,6 +389,7 @@
                 <button class="toggle-btn" data-settings-tab="display">Display</button>
                 <button class="toggle-btn" data-settings-tab="advanced">Advanced</button>
             </div>
+            <div id="settings-loading-status" class="settings-loading-status hidden">Loading settings...</div>
 
             <!-- Model & Generation -->
             <div id="settings-model" class="settings-section">
@@ -395,7 +407,7 @@
                 <div class="form-row">
                     <div class="form-group">
                         <label for="cfg-max-tokens">Max Tokens</label>
-                        <input type="number" id="cfg-max-tokens" step="64" min="64" max="8192">
+                        <input type="number" id="cfg-max-tokens" step="256" min="64" max="131072">
                     </div>
                     <div class="form-group">
                         <label for="cfg-repeat-penalty">Repeat Penalty</label>
@@ -462,6 +474,10 @@
                     <div class="form-group">
                         <label for="cfg-weave-model">Weave Local Model</label>
                         <select id="cfg-weave-model" class="form-select"></select>
+                    </div>
+                    <div class="form-group hidden" id="cfg-weave-system-prompt-group">
+                        <label for="cfg-weave-system-prompt">System message</label>
+                        <textarea id="cfg-weave-system-prompt" rows="5" placeholder="Minimal Weave system message"></textarea>
                     </div>
                 </div>
                 <!-- Dream Engine (DiffusionGemma) overrides -->
@@ -742,7 +758,7 @@ assistant: *Another example response*"></textarea>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=14"></script>
-    <script src="/static/app.js?v=97"></script>
+    <script src="/static/app.js?v=98"></script>
     <script src="/static/chat.js?v=133"></script>
     <script src="/static/tree.js?v=37"></script>
 </body>

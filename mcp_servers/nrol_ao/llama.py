@@ -117,21 +117,6 @@ def dream_model(explicit: str = "") -> str:
     )
 
 
-def dream_thought_budget() -> int:
-    """Extra output budget reserved for DiffusionGemma's thought channel."""
-    cfg = _load_loom_config()
-    raw = (
-        os.environ.get("NROL_AO_DREAM_THOUGHT_BUDGET")
-        or os.environ.get("DREAM_THOUGHT_BUDGET")
-        or cfg.get("dream_thought_budget")
-        or 4096
-    )
-    try:
-        return max(0, int(raw))
-    except (TypeError, ValueError):
-        return 4096
-
-
 def resolve_backend(model: str = "") -> tuple[str, str, str]:
     """Map a requested model to (backend, host, resolved_model).
 
@@ -226,10 +211,8 @@ def chat(
     (finish_reason=length, 0 content tokens). Templates without the
     variable ignore the kwarg.
 
-    On the dream backend (DiffusionGemma), the Qwen chat_template_kwargs is
-    ignored — DiffusionGemma always emits a thought channel. So instead of
-    suppressing reasoning, we bump max_tokens by a thought budget so the
-    channel doesn't starve content into finish_reason=length.
+    On the dream backend (DiffusionGemma), the Loom sidecar accepts the same
+    enable_thinking kwarg and maps it onto Gemma4's thought-channel template.
 
     model="dream" or "dream:<id>" routes to the Dream Engine (DiffusionGemma
     sidecar) instead of llama-server; see resolve_backend()."""
@@ -239,24 +222,17 @@ def chat(
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
-    # DiffusionGemma can't suppress its thought channel, even when callers set
-    # disable_thinking=False for deliberation. Always reserve extra budget for
-    # Dream only; llama-server/Qwen payloads keep the caller's max_tokens.
-    effective_max_tokens = max_tokens
-    if backend == "dream":
-        effective_max_tokens = max_tokens + dream_thought_budget()
-
     payload: dict[str, Any] = {
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": effective_max_tokens,
+        "max_tokens": max_tokens,
         "stream": False,
     }
     if resolved_model:
         payload["model"] = resolved_model
-    # chat_template_kwargs is Qwen-specific; DiffusionGemma ignores it. Only
-    # send it on the llama backend to keep the dream payload clean.
-    if disable_thinking and backend != "dream":
+    if backend == "dream":
+        payload["chat_template_kwargs"] = {"enable_thinking": not disable_thinking}
+    elif disable_thinking:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
 
     with httpx.Client(timeout=timeout_sec) as client:
@@ -283,12 +259,12 @@ def chat(
     # text verbatim when no channel tags are present.
     if backend == "dream":
         extracted_reasoning, stripped_content = _split_channel_scaffold(text)
+        text = stripped_content
         if extracted_reasoning:
             reasoning = (
                 (reasoning.rstrip() + "\n\n" + extracted_reasoning).strip()
                 if reasoning else extracted_reasoning
             )
-            text = stripped_content
 
     return {
         "backend": backend,

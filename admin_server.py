@@ -1090,11 +1090,22 @@ def _dream_cmd() -> str:
     fa = (getattr(_loom_config, "dream_flash_attn", "on") or "on") if _loom_config else "on"
     ctk = (getattr(_loom_config, "dream_cache_type_k", "q8_0") or "q8_0") if _loom_config else "q8_0"
     ctv = (getattr(_loom_config, "dream_cache_type_v", "q8_0") or "q8_0") if _loom_config else "q8_0"
+    mmq = int(getattr(_loom_config, "dream_cuda_mmq_max_x", -1) or -1) if _loom_config else -1
+    gpu_layers = int(getattr(_loom_config, "dream_gpu_layers", -1) or -1) if _loom_config else -1
+    fit_target = int(getattr(_loom_config, "dream_fit_target_mb", 0) or 0) if _loom_config else 0
+    no_mmap = bool(getattr(_loom_config, "dream_no_mmap", False)) if _loom_config else False
+    thinking = "1" if bool(getattr(_loom_config, "dream_enable_thinking", True)) else "0"
     # -m <gguf> + -c <ctx> are standard llama.cpp flags (common_params_parse).
     # --host/--port are server-only flags pulled out of argv before common_params_parse.
     # -fa/-ctk/-ctv make a 131k context fit in 32GB (q8_0 KV ~= 1/2 the VRAM of f16).
-    return (f'cd /d "{cwd}" && "{exe}" -m "{model}" -c {ctx} '
-            f'-fa {fa} -ctk {ctk} -ctv {ctv} --host 127.0.0.1 --port {port}')
+    mmq_arg = f" --diffusion-cuda-mmq-max-x {mmq}" if mmq >= 0 else ""
+    gpu_layers_arg = f" -ngl {gpu_layers}" if gpu_layers >= 0 else ""
+    fit_mode_arg = " -fit off" if gpu_layers >= 0 else ""
+    fit_arg = f" -fitt {fit_target}" if gpu_layers < 0 and fit_target > 0 else ""
+    mmap_arg = " --no-mmap" if no_mmap else ""
+    return (f'set "DREAM_ENABLE_THINKING={thinking}" && cd /d "{cwd}" && '
+            f'"{exe}" -m "{model}"{gpu_layers_arg}{fit_mode_arg}{fit_arg} -c {ctx} '
+            f'-fa {fa} -ctk {ctk} -ctv {ctv}{mmq_arg}{mmap_arg} --host 127.0.0.1 --port {port}')
 
 
 async def _dream_probe(timeout: float = 2.0) -> dict | None:
@@ -1375,21 +1386,50 @@ async def api_dream_models():
     models, VRAM used, and the sidecar process's working-set + cached-RAM footprint."""
     global _dream_last_activity
     h = await _dream_probe()
+    port = _dream_port()
     pid = _dream_resolve_pid()
     ws_mb, cached_mb = _dream_proc_mem(pid)
     # VRAM via nvidia-smi (process-specific if we can resolve it, else total).
     vram_used_mb = _gpu_vram_for_pid(pid) if pid else _gpu_total_vram_used_mb()
     loaded = (h or {}).get("loaded_model")
+    available = (h or {}).get("available", [])
+    maxtok = (h or {}).get("maxtok", 0)
+    if h is not None and not loaded:
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                mr = await client.get(f"http://127.0.0.1:{port}/v1/models")
+                if mr.status_code == 200:
+                    data = mr.json().get("data", [])
+                    ids = [str(m.get("id") or "") for m in data if isinstance(m, dict)]
+                    ids = [i for i in ids if i]
+                    if ids:
+                        loaded = ids[0] if len(ids) == 1 else None
+                        available = available or ids
+        except Exception:
+            pass
+    if not maxtok:
+        maxtok = (_loom_config.dream_context_size if _loom_config else 0) or 0
+    memory = await _dream_memory_breakdown(port) if h is not None else None
+    memory_summary = _dream_memory_summary(memory)
+    if memory_summary.get("device_used_mb"):
+        vram_used_mb = memory_summary["device_used_mb"]
     if h is not None:
         _dream_last_activity = time.time()  # sidecar is up and responsive
     idle_secs = int(time.time() - _dream_last_activity) if _dream_last_activity else 0
     return {
         "running": h is not None,
         "loaded_model": loaded,
-        "available": (h or {}).get("available", []),
-        "maxtok": (h or {}).get("maxtok", 0),
+        "available": available,
+        "maxtok": maxtok,
         "pid": pid,
         "vram_used_mb": vram_used_mb,
+        "vram_self_mb": memory_summary.get("cuda_self_mb", 0),
+        "vram_model_mb": memory_summary.get("cuda_model_mb", 0),
+        "vram_context_mb": memory_summary.get("cuda_context_mb", 0),
+        "vram_compute_mb": memory_summary.get("cuda_compute_mb", 0),
+        "vram_unattributed_mb": memory_summary.get("device_unattributed_mb", 0),
+        "cuda_host_mb": memory_summary.get("host_self_mb", 0),
+        "memory_breakdown": memory,
         "ram_working_set_mb": ws_mb,
         "ram_cached_mb": cached_mb,
         "idle_secs": idle_secs,
@@ -1429,6 +1469,184 @@ def _gpu_vram_for_pid(pid: int) -> int:
     except Exception:
         pass
     return _gpu_total_vram_used_mb()
+
+
+async def _dream_memory_breakdown(port: int | None = None) -> dict | None:
+    """Read Dream's llama.cpp allocator breakdown when the sidecar supports it."""
+    try:
+        p = port or _dream_port()
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(f"http://127.0.0.1:{p}/memory")
+        if r.status_code == 200:
+            data = r.json()
+            return data if isinstance(data, dict) else None
+    except Exception:
+        pass
+    return None
+
+
+def _dream_memory_summary(memory: dict | None) -> dict:
+    """Flatten /memory into the fields the admin dashboard can display safely."""
+    if not isinstance(memory, dict):
+        return {}
+    rows = memory.get("rows") if isinstance(memory.get("rows"), list) else []
+    devices = memory.get("devices") if isinstance(memory.get("devices"), list) else []
+
+    def mb(row: dict, key: str) -> float:
+        try:
+            return float(row.get(key) or 0.0)
+        except Exception:
+            return 0.0
+
+    cuda_rows = [r for r in rows if isinstance(r, dict) and not r.get("host")]
+    host_rows = [r for r in rows if isinstance(r, dict) and r.get("host")]
+    cuda_self = sum(mb(r, "self_mb") for r in cuda_rows)
+    device_used = 0.0
+    if devices and isinstance(devices[0], dict):
+        device_used = mb(devices[0], "used_mb")
+    return {
+        "cuda_self_mb": int(round(cuda_self)),
+        "cuda_model_mb": int(round(sum(mb(r, "model_mb") for r in cuda_rows))),
+        "cuda_context_mb": int(round(sum(mb(r, "context_mb") for r in cuda_rows))),
+        "cuda_compute_mb": int(round(sum(mb(r, "compute_mb") for r in cuda_rows))),
+        "host_self_mb": int(round(sum(mb(r, "self_mb") for r in host_rows))),
+        "device_used_mb": int(round(device_used)),
+        "device_unattributed_mb": int(round(max(0.0, device_used - cuda_self))) if device_used else 0,
+    }
+
+
+def _pids_by_signature(*needles: str) -> list[int]:
+    try:
+        import psutil
+        found: list[int] = []
+        lowered = [n.lower() for n in needles if n]
+        for p in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                name = str(p.info.get("name") or "").lower()
+                cmd = " ".join(p.info.get("cmdline") or []).lower()
+                haystack = f"{name} {cmd}"
+                if any(n in haystack for n in lowered):
+                    found.append(int(p.info["pid"]))
+            except Exception:
+                pass
+        return sorted(set(found))
+    except Exception:
+        return []
+
+
+def _working_set_for_pids(pids: list[int]) -> int:
+    try:
+        import psutil
+        total = 0
+        for pid in pids:
+            try:
+                total += psutil.Process(pid).memory_info().rss
+            except Exception:
+                pass
+        return int(total / 1048576)
+    except Exception:
+        return 0
+
+
+@app.get("/api/memory-services")
+async def api_memory_services():
+    """Dashboard memory cards for services that intentionally park model memory."""
+    services = []
+
+    llama_models: list[str] = []
+    llama_up = False
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(f"http://127.0.0.1:{_get_llama_port()}/v1/models")
+        if r.status_code == 200:
+            llama_up = True
+            llama_models = [str(m.get("id") or "") for m in r.json().get("data", []) if isinstance(m, dict)]
+            llama_models = [m for m in llama_models if m]
+    except Exception:
+        pass
+    llama_pid = None
+    llama_proc = _child_procs.get("llama")
+    if llama_proc and llama_proc.poll() is None:
+        llama_pid = llama_proc.pid
+    llama_pids = [llama_pid] if llama_pid else _pids_by_signature("llama-server.exe")
+    services.append({
+        "key": "llama",
+        "state": "warm" if llama_up and llama_models else ("ready" if llama_up else "off"),
+        "loaded": llama_models,
+        "pids": llama_pids,
+        "gpu_mb": _gpu_vram_for_pid(llama_pids[0]) if llama_pids else 0,
+        "active_ram_mb": _working_set_for_pids(llama_pids),
+        "reserved_ram_mb": 0,
+        "cache_mb": 0,
+        "release_action": "Unload stops llama-server.",
+    })
+
+    dream_h = await _dream_probe()
+    dream_pid = _dream_resolve_pid()
+    dream_ws_mb, dream_cache_mb = _dream_proc_mem(dream_pid)
+    dream_memory = await _dream_memory_breakdown(_dream_port()) if dream_h is not None else None
+    dream_summary = _dream_memory_summary(dream_memory)
+    dream_loaded = []
+    if dream_h is not None:
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                mr = await client.get(f"http://127.0.0.1:{_dream_port()}/v1/models")
+            if mr.status_code == 200:
+                dream_loaded = [
+                    str(m.get("id") or "") for m in mr.json().get("data", [])
+                    if isinstance(m, dict) and m.get("id")
+                ]
+        except Exception:
+            pass
+    services.append({
+        "key": "dream",
+        "state": "warm" if dream_h is not None and dream_loaded else ("ready" if dream_h is not None else "off"),
+        "loaded": dream_loaded,
+        "pids": [dream_pid] if dream_pid else [],
+        "gpu_mb": dream_summary.get("cuda_self_mb") or (
+            _gpu_vram_for_pid(dream_pid) if dream_pid else _gpu_total_vram_used_mb()
+        ),
+        "active_ram_mb": dream_ws_mb,
+        "reserved_ram_mb": dream_summary.get("host_self_mb", 0),
+        "cache_mb": dream_cache_mb,
+        "idle_secs": int(time.time() - _dream_last_activity) if _dream_last_activity else 0,
+        "idle_timeout_min": (_loom_config.dream_idle_timeout_min if _loom_config else 10),
+        "release_action": "Unload stops Dream sidecar.",
+        "memory_breakdown": dream_memory,
+        "gpu_device_mb": dream_summary.get("device_used_mb", 0),
+        "gpu_context_mb": dream_summary.get("cuda_context_mb", 0),
+        "gpu_compute_mb": dream_summary.get("cuda_compute_mb", 0),
+        "gpu_model_mb": dream_summary.get("cuda_model_mb", 0),
+        "gpu_unattributed_mb": dream_summary.get("device_unattributed_mb", 0),
+    })
+
+    comfy_up = False
+    comfy_gpu_mb = 0
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(f"{COMFYUI_URL}/system_stats")
+        if r.status_code == 200:
+            comfy_up = True
+            for dev in r.json().get("devices", []):
+                if isinstance(dev, dict):
+                    comfy_gpu_mb += max(0, int(dev.get("vram_total", 0)) - int(dev.get("vram_free", 0)))
+            comfy_gpu_mb = int(comfy_gpu_mb / 1048576)
+    except Exception:
+        pass
+    comfy_pids = _pids_by_signature("comfyui", "main.py")
+    services.append({
+        "key": "comfy",
+        "state": "ready" if comfy_up else "off",
+        "loaded": [],
+        "pids": comfy_pids,
+        "gpu_mb": comfy_gpu_mb,
+        "active_ram_mb": _working_set_for_pids(comfy_pids),
+        "reserved_ram_mb": 0,
+        "cache_mb": 0,
+        "release_action": "Unload stops ComfyUI.",
+    })
+
+    return JSONResponse({"services": services})
 
 
 def _ensure_dream_idle_watcher():
@@ -1500,17 +1718,33 @@ async def tool_dream_status():
     pid = _dream_resolve_pid()
     ws_mb, cached_mb = _dream_proc_mem(pid)
     vram_mb = _gpu_vram_for_pid(pid) if pid else _gpu_total_vram_used_mb()
+    memory = await _dream_memory_breakdown(port)
+    memory_summary = _dream_memory_summary(memory)
+    if memory_summary.get("device_used_mb"):
+        vram_mb = memory_summary["device_used_mb"]
     idle_secs = int(time.time() - _dream_last_activity) if _dream_last_activity else 0
     lines = [
         f"Dream sidecar running on :{port} (PID {pid or 'unknown'}).",
         f"Loaded model: {loaded_model or 'none'}",
         f"Available: {', '.join(available) or 'none'}",
         f"maxtok (ctx): {maxtok}",
-        f"VRAM used: {vram_mb} MB",
+        f"VRAM used (device total): {vram_mb} MB",
+    ]
+    if memory_summary.get("cuda_self_mb"):
+        lines.append(
+            "Dream CUDA self: "
+            f"{memory_summary['cuda_self_mb']} MB "
+            f"(model {memory_summary['cuda_model_mb']} / "
+            f"context {memory_summary['cuda_context_mb']} / "
+            f"compute {memory_summary['cuda_compute_mb']})"
+        )
+        lines.append(f"CUDA host buffers: {memory_summary.get('host_self_mb', 0)} MB")
+        lines.append(f"Driver/other/unattributed: {memory_summary.get('device_unattributed_mb', 0)} MB")
+    lines.extend([
         f"RAM working set: {ws_mb} MB",
         f"RAM cached (GGUF mmap): {cached_mb} MB",
         f"Idle: {idle_secs}s (auto-unload after {(_loom_config.dream_idle_timeout_min if _loom_config else 10)} min)",
-    ]
+    ])
     return JSONResponse({"status": "ok", "output": "\n".join(lines)})
 
 

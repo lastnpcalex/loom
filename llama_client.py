@@ -16,6 +16,7 @@ import json
 import mimetypes
 import os
 import random
+import re
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
@@ -39,6 +40,38 @@ _llama_lock = asyncio.Lock()
 # setup. Lazily created on first use (no event loop yet at import time); the
 # per-request `timeout=` passed to .post()/.stream() still overrides per-call.
 _shared_client: httpx.AsyncClient | None = None
+
+_DREAM_THOUGHT_BLOCK_RE = re.compile(
+    r"<\|channel>thought\s*(.*?)<channel\|>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_channel_scaffold(text: str) -> tuple[str, str]:
+    if "<|channel>" not in (text or "") and "<channel|>" not in (text or ""):
+        return "", text or ""
+    normalized = (text or "").replace("\r\n", "\n")
+    thoughts: list[str] = []
+    content_parts: list[str] = []
+    cursor = 0
+    matched = False
+    for match in _DREAM_THOUGHT_BLOCK_RE.finditer(normalized):
+        matched = True
+        before = normalized[cursor:match.start()]
+        if before.strip():
+            content_parts.append(before)
+        thought = match.group(1).strip()
+        if thought:
+            thoughts.append(thought)
+        cursor = match.end()
+    if matched:
+        after = normalized[cursor:]
+        if after.strip():
+            content_parts.append(after)
+        return "\n\n".join(thoughts), "".join(content_parts)
+    if normalized.strip() in {"<|channel>", "<channel|>", "thought"}:
+        return "", ""
+    return "", normalized
 
 
 def _client() -> httpx.AsyncClient:
@@ -362,6 +395,7 @@ async def stream_chat(
     repeat_penalty: float = None,
     model: str = None,
     verbatim_window: int = None,
+    think: bool = None,
 ) -> AsyncGenerator:
     """Stream chat completion tokens from Llama Server (or mock).
 
@@ -391,9 +425,15 @@ async def stream_chat(
         "stream_options": {"include_usage": True},
         "temperature": temperature if temperature is not None else config.temperature,
         "top_p": top_p if top_p is not None else config.top_p,
-        "max_tokens": effective_max + 8192,
+        "max_tokens": effective_max,
         "repeat_penalty": repeat_penalty if repeat_penalty is not None else config.repeat_penalty,
     }
+    if think is not None:
+        payload["chat_template_kwargs"] = {"enable_thinking": bool(think)}
+    elif _is_dream_model(raw_model):
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": bool(getattr(config, "dream_enable_thinking", True))
+        }
 
     # Dream sidecar cold-loads (JIT load of the 17GB NVFP4 GGUF) can exceed the
     # default 300s timeout. Mirror dream_client.REQUEST_TIMEOUT (600s) for dream.
@@ -450,6 +490,13 @@ async def stream_chat(
                 # llama-server emits reasoning under "reasoning_content" delta key
                 reasoning = (delta.get("reasoning_content") or delta.get("reasoning") or "")
                 token = delta.get("content") or ""
+                if _is_dream_model(raw_model) and token:
+                    extracted_reasoning, token = _split_channel_scaffold(token)
+                    if extracted_reasoning:
+                        if not _was_thinking:
+                            _was_thinking = True
+                            yield {"type": "thinking_start"}
+                        yield extracted_reasoning
 
                 if reasoning:
                     if not _was_thinking:
@@ -463,7 +510,7 @@ async def stream_chat(
                         yield {"type": "thinking_end"}
                     _content_tokens += 1
                     yield token
-                    if _content_tokens >= effective_max:
+                    if not _is_dream_model(raw_model) and _content_tokens >= effective_max:
                         break
 
             yield {
@@ -501,6 +548,10 @@ async def sync_chat(
     }
     if think is not None:
         payload["chat_template_kwargs"] = {"enable_thinking": bool(think)}
+    elif _is_dream_model(raw_model):
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": bool(getattr(config, "dream_enable_thinking", True))
+        }
 
     # Dream sidecar cold-loads can exceed the default 300s timeout; mirror
     # dream_client.REQUEST_TIMEOUT (600s) for dream models (OODA sync passes).
@@ -518,7 +569,16 @@ async def sync_chat(
         if not choices:
             return ""
         msg = choices[0].get("message") or {}
-        return msg.get("content") or msg.get("reasoning_content") or ""
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or ""
+        if _is_dream_model(raw_model):
+            extracted_reasoning, content = _split_channel_scaffold(content)
+            if extracted_reasoning:
+                reasoning = (
+                    (reasoning.rstrip() + "\n\n" + extracted_reasoning).strip()
+                    if reasoning else extracted_reasoning
+                )
+        return content or reasoning or ""
     except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as _e:
         if _is_dream_model(raw_model):
             raise RuntimeError(

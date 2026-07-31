@@ -1,6 +1,6 @@
 # NROL-AO Architecture Update
 
-**Status:** planned, not implemented. Canonical reference for the architecture update. Written 2026-07-06. Supersedes `ENGINE_AGENT_AND_DREAM_SHIM_PLAN.md` (folded in below) and the diagnostic report in `~/.claude/plans/i-need-a-report-indexed-sprout.md`.
+**Status:** partially implemented. Track B's Anthropic-to-Dream shim exists in the current working tree; Track A's engine-agent deliberation path is still planned. Written 2026-07-06, updated after red-team review. Supersedes `ENGINE_AGENT_AND_DREAM_SHIM_PLAN.md` (folded in below) and the diagnostic report in `~/.claude/plans/i-need-a-report-indexed-sprout.md`.
 
 This document is the single source of truth for: (1) what's broken in the current NROL-AO server, (2) the architectural decision and the probes that validate it, (3) the two implementation tracks and how they converge, (4) the alternatives that were evaluated and rejected, and (5) the end-to-end verification plan.
 
@@ -28,11 +28,11 @@ The NROL-AO system spans **two repos**. This is the single biggest implementatio
 | `build_*_prompt` string builders to delete | **Engine repo** (`framework/news_observation_pipeline.py`) | Where the builders live; deleted in Track A phase 5 |
 | `_split_channel_scaffold` strip code to delete (Track A) / fix-at-shim (Track B) | **MCP server repo** (`mcp_servers/nrol_ao/llama.py:27-55`) | Where the strip lives |
 | Operator MCP tool flips (`run_news_scan` → "launch engine agent") | **MCP server repo** (`mcp_servers/nrol_ao/server.py`) | Where the MCP tools live |
-| Anthropic shim (Track B) | **MCP server repo** (new file, e.g. `mcp_servers/nrol_ao/anthropic_shim.py`) | Sits between Claude Code and Dream; started by `admin_server.py` |
-| Engine agent harness (custom Python loop or SDK subagent launcher) | **MCP server repo** (in the new `mcp_servers/nrol_ao_engine/` folder) | Launches and drives the agent; lives where the MCP server can spawn it |
+| Anthropic shim (Track B) | **MCP server repo** (`anthropic_dream_router.py`) | Sits between Claude Code and Dream; already wired through main `server.py` / `claude_client.py`, not `admin_server.py` |
+| Engine agent harness (custom Python loop first; SDK subagent later if useful) | **MCP server repo** (in the new `mcp_servers/nrol_ao_engine/` package) | Launches and drives the agent; lives where the operator MCP can import it in-process |
 | Tool-call-trace audit ledger format | **MCP server repo** (`mcp_servers/nrol_ao_engine/`) — persisted alongside (not into) the existing activity ledger | See A.5 |
 
-**Consequence for sequencing:** Track A work no longer requires editing the engine repo for the new tools — they live in `mcp_servers/nrol_ao_engine/` and call the engine repo's `framework/pipeline.py` via `_import_from_repo` (read/write). The engine repo is touched only for *deletions* (parsers, prompt builders) in Track A phase 5, once the new path is trusted. The MCP server repo's `_import_from_repo` means a changed engine module is picked up on next server restart — no rebuild, but the engine repo must be on `sys.path`.
+**Consequence for sequencing:** Track A work no longer requires editing the engine repo for the new tools — they live in `mcp_servers/nrol_ao_engine/` and call the engine repo's `framework/pipeline.py` via `_import_from_repo` (read/write). Separately, the code-consolidation track (§0.7) does require touching/moving engine code, but that is a path-normalization migration, not a prerequisite for proving the tool-call deliberation architecture. The MCP server repo's `_import_from_repo` means a changed engine module is picked up on next server restart — no rebuild, but the configured engine code root must be on `sys.path`.
 
 ---
 
@@ -49,19 +49,80 @@ The engine-side tools live in a new sibling MCP folder, `mcp_servers/nrol_ao_eng
 ```
 mcp_servers/nrol_ao_engine/
   __init__.py
-  server.py              # the engine MCP server: registers the engine-side tools
+  server.py              # optional later MCP server wrapper; do not make this phase-1
   tools/
     read.py              # read_topic, read_indicator_schema, read_recent_evidence, read_parked_queue
     fetch.py             # fetch_article, run_search
     deliberate.py        # propose_advocate, propose_rebut, submit_jury
     act.py               # fire_indicator, observe_indicator, park_article, flag_schema_gap, flag_duplicate
     ledger.py            # write_evidence
-  engine_agent.py        # the custom Python loop OR SDK subagent launcher (A.7)
+  engine_agent.py        # custom Python loop first; SDK subagent launcher only if needed (A.7)
   audit.py               # tool-call-trace ledger (A.5)
   README.md
 ```
 
 Each tool module imports the engine repo's state layer via `_import_from_repo` (the same shim, factored to a shared location or duplicated from `mcp_servers/nrol_ao/server.py:132`). The tools are thin wrappers: `fire_indicator(slug, indicator_id, evidence)` calls `framework.pipeline`'s update function with the same arguments the current `submit_transition` commit path uses — no new posterior math, no new gates.
+
+---
+
+## 0.7 Engine code consolidation (verified)
+
+Operator question: should the entire engine live inside `a-shadow-loom`, outside the MCP operator folder, instead of relying on `C:\Claude-Code\NROL-AO\temp-repo`?
+
+**Answer:** move the **engine code** into `a-shadow-loom`; do **not** move the hot mutable state into OneDrive.
+
+Verified facts:
+
+- `C:\Claude-Code\NROL-AO\temp-repo` is outside OneDrive; `a-shadow-loom` is inside OneDrive.
+- The temp repo is a separate git repo with active engine history.
+- Runtime state is large and hot: `loom/mcp_activity/activity.jsonl` is ~97 MB, `proposals.db` is ~56 MB, `topics.bak/` is ~358 MB and grows by ~18 MB per topic save, and the active Hormuz topic JSON is ~18 MB.
+- `engine.py` already supports a code/state split through `NROL_AO_STATE_DIR`: canonical `topics/`, `briefs/`, `dashboards/`, and `topics.bak/` can live outside the code repo.
+- The old roadmap already warned that the split is incomplete: several standalone framework scripts still hardcode repo-local paths and must be converted before production flips to an external state root.
+
+Target layout:
+
+```
+C:\Users\exast\OneDrive\Documents\Loom2\a-shadow-loom\
+  engine/                         # MOVED engine code: engine.py, governor.py, framework/, etc.
+  mcp_servers/nrol_ao/            # operator MCP
+  mcp_servers/nrol_ao_engine/     # engine MCP + tool-call agent harness
+
+C:\Claude-Code\NROL-AO\state\     # NOT OneDrive-synced
+  topics/
+  topics.bak/
+  briefs/
+  dashboards/
+  loom/mcp_activity/
+    activity.jsonl
+    snapshot.json
+    proposals.db
+  sources/
+```
+
+Required path work before the move:
+
+- Introduce a small shared path helper in the moved engine code, for example `engine/paths.py`, with `code_root()`, `state_root()`, `topics_dir()`, `sources_dir()`, `activity_dir()`, and `canvas_projection_dir()` accessors.
+- Convert hardcoded framework paths to the helper or `NROL_AO_STATE_DIR`. Verified hardcoded modules include:
+  - `engine.py` itself: `_STATE_ROOT` fallback currently fails open to `Path(__file__).parent`; `CANVAS_TOPICS_DIR` and `LOOM_TOPICS_DIR` are projection writes at `engine.py:54-56`, used around `save_topic()`.
+  - `framework/pipeline.py`: `_SOURCE_DB_PATH` is anchored to `Path(_REPO) / "sources" / "source_db.json"` and `_write_activity()` writes to `Path(_REPO).parent / "canvas" / "activity-log.json"`; after a move this can land under `a-shadow-loom/canvas/` inside OneDrive.
+  - `framework/source_db.py` (`sources/source_db.json`)
+  - `framework/topic_search.py` (`topics/`, `sources/source-trust.json`, cold storage)
+  - `framework/extrapolation.py`, `framework/lens_calibration.py`, `framework/meta_health.py`
+  - `framework/migrate_to_lr.py`, `framework/replay_indicators.py`, `framework/runner.py`
+  - `framework/stamp_deadlines.py`, `framework/stamp_resolution_dates.py`
+  - maintenance hooks / dashboard projections that assume repo-local topic paths
+- Update `mcp_servers/nrol_ao/server.py` defaults so `NROL_AO_REPO` points to `a-shadow-loom/engine` and `NROL_AO_ACTIVITY_DIR` defaults to the external state activity directory.
+- Add a startup guard and a leak test. Keep `NROL_AO_STATE_DIR` and `NROL_AO_ACTIVITY_DIR` explicit in local launch/admin config. Do not rely on fallbacks after the move; `engine.py` currently falls back to `Path(__file__).parent`, and `default_activity_dir(_repo_path())` would put `activity.jsonl` and `proposals.db` under the code root. A missing env var must fail loudly or at least warn if the resolved state/activity root is under OneDrive.
+
+Migration rule:
+
+1. Finish the path helper and convert hardcoded modules while code still lives in `temp-repo`.
+2. Run the existing NROL-AO tests with `NROL_AO_STATE_DIR` and `NROL_AO_ACTIVITY_DIR` pointing to a copied external state directory. Add an invariant test: perform a representative `save_topic` / proposal-store open with env vars set and assert nothing is written under the engine code root.
+3. Move code into `a-shadow-loom/engine`.
+4. Set defaults/env to `NROL_AO_REPO=a-shadow-loom/engine` and `NROL_AO_STATE_DIR=C:\Claude-Code\NROL-AO\state`.
+5. Only after a successful live scan, retire `temp-repo` as a code source.
+
+This gives the desired consolidation (engine code versioned with Shadow Loom) without reintroducing OneDrive corruption/sync-conflict risk for the mutable topic JSON, backups, activity log, or SQLite proposal store.
 
 ---
 
@@ -195,7 +256,8 @@ Typed params enforce what the current regex tries to recover. `analysis`/`ration
 
 **Reading:**
 - `read_topic(slug) → {meta, hypotheses, posteriors}`
-- `read_indicator_schema(slug) → [{id, tier, observable, likelihoods, direction}]`
+- `read_indicator_schema(slug) → [{id, tier, desc, likelihoods, posteriorEffect?, observable?, shape?, target_hypothesis?}]`
+  - This mirrors the real topic indicator JSON. Do not idealize it into top-level `direction` or `midpoint` fields. Direction, when present, lives inside `observable.direction`; `desc` and `posteriorEffect` are the fields the agent cites against.
 - `read_recent_evidence(slug, limit) → [evidence]`
 - `fetch_article(url) → {headline, source, text, published_at}` — replaces line-serialized fetch
 - `run_search(slug, query) → [results]`
@@ -247,18 +309,19 @@ Engine agent: audit unit is the **tool-call trace** — the sequence of tool cal
 
 The state layer and commit gates never change, so a bad engine-agent run cannot corrupt topic state that the current system couldn't also corrupt. Migration is reversible through phase 5.
 
-1. **Build one engine-side tool** (`fetch_article`) + a minimal engine agent that uses it. Validate the tool-call round-trip end-to-end on Dream. (Probe already confirms this works; this step confirms it works through the chosen harness — SDK via Track B shim, or custom loop.)
-2. **Decide harness layer** (Unknown 2): if Track B shim landed → Claude Code Agent SDK subagent pointed at shim; else → minimal custom Python agent loop speaking OpenAI format to `:8787`. Validate multi-turn tool use with a 2-call sequence (the multi-turn probe in §2.2 already verified Dream handles this).
-3. **Add deliberation tools** (`propose_advocate`, `propose_rebut`, `submit_jury`). Run **advocate-only** as a subagent. Compare output quality vs the current one-liner advocate — confirm the `analysis` field carries actual multi-paragraph reasoning (concrete metric: §4.1 phase 3).
-4. **Add rebut + jury subagents.** Wire to the existing commit gates (Loom approval, governance, evidence log) — the commit path is unchanged, the engine agent calls the same gates the current tools do.
+1. **DONE:** Build one engine-side tool (`fetch_article`) + a minimal engine agent that uses it. Validate the tool-call round-trip end-to-end on Dream.
+2. **DONE:** Add read-only topic/schema/evidence tools plus `propose_advocate`. Run advocate-only as a subagent. Confirm `analysis` carries actual multi-paragraph reasoning and cites real indicator ids.
+3. **DONE:** Add rebut + jury tools/subagents (`propose_rebut`, `submit_jury`) as proposal-recording tools only. They read the advocate proposals and produce a full deliberation packet, but still do not commit, mutate topics, or move posteriors. `deliberation_agent.run_deliberation` runs the full advocate → rebut → jury packet; live-verified against the real Hormuz topic (§4.1 phase 3).
+4. **Later:** Wire final jury proposals to the existing commit gates (Loom approval, governance, evidence log) — the commit path is unchanged, the engine agent calls the same gates the current tools do.
 5. **Operator MCP tools flip** from "build prompt + parse" to "launch engine agent + collect trace." Old tools coexist behind a flag until the new path is trusted. Then delete the prompt-build + regex-parse code.
 
 ## A.7 Engine agent launch mechanics
 
 **How the engine agent is spawned from the MCP server:**
 
-- **Custom Python loop path (default if Track B not landed):** the engine MCP server (`mcp_servers/nrol_ao_engine/server.py`) runs the engine agent as a Python function call (in-process). The loop is `mcp_servers/nrol_ao_engine/engine_agent.py` — it builds the OpenAI-format message list, calls a thin Dream-direct client with `tools`, dispatches returned tool calls to the engine-side tool implementations (in `mcp_servers/nrol_ao_engine/tools/`, which call the engine repo's state layer via `_import_from_repo`), appends tool results, loops until `finish_reason=stop` with no tool calls.
-- **SDK subagent path (if Track B shim landed):** the engine MCP server spawns a Claude Code Agent SDK subagent via the SDK's Python API, pointed at the shim's `ANTHROPIC_BASE_URL`. The SDK handles the tool-call loop; the engine-side tools (in `mcp_servers/nrol_ao_engine/tools/`) are registered as MCP tools the subagent can call. Subagents (advocate/rebut/jury) are launched via the SDK's `Agent` tool equivalent.
+- **Custom Python loop path (phase-1 default):** `mcp_servers/nrol_ao_engine/` is an importable package, and the operator MCP calls `engine_agent.py` in-process. The loop builds the OpenAI-format message list, calls a thin Dream-direct client with `tools`, dispatches returned tool calls to plain Python tool functions in `mcp_servers/nrol_ao_engine/tools/`, appends tool results, and loops until `finish_reason=stop` with no tool calls. Do not start a second MCP server process for this path.
+- **Stage-scoped tool surfaces (implemented 2026-07-12):** `run_engine_agent(..., tool_names=...)` now sends only the allowed tool specs for that stage and dispatches only through that allow-list. Advocate exposes `read_indicator_schema`, `read_recent_evidence`, and `propose_advocate`; rebut exposes `read_indicator_schema` and `propose_rebut`; jury exposes `read_indicator_schema` and `submit_jury`. This is the in-process mirror-MCP behavior: Dream receives real OpenAI `tools` payloads, but each role sees a constrained tool set.
+- **SDK subagent path (optional later):** if the SDK route becomes worthwhile, register `mcp_servers/nrol_ao_engine/` as an MCP server so Claude Code can discover/call its tools, then spawn a Claude Code Agent SDK subagent pointed at the shim's `ANTHROPIC_BASE_URL`. This is not the phase-1 path.
 - **Concurrent scans:** the engine agent is launched per-scan by the operator MCP `run_news_scan` tool. Concurrency is bounded by the existing scan-serialization in the MCP server (today, scans run one at a time per worker). The engine agent does not introduce new concurrency — it runs within the scan's existing lifetime. The Dream sidecar is single-model; concurrent LLM calls queue at the sidecar.
 - **Failure modes:** a tool-call loop that exceeds N turns (e.g. 20) without `finish_reason=stop` is aborted and recorded as a failed scan. Malformed tool arguments (schema violation) are retried once, then fail-closed. The commit gates (Loom approval, governance) are unchanged — a bad engine-agent run cannot commit evidence the current tools couldn't.
 
@@ -267,10 +330,12 @@ The state layer and commit gates never change, so a bad engine-agent run cannot 
 Kimi's review correctly noted a sequencing bias: recommending Track B first only makes sense if the QoL win is the priority. If the goal is NROL deliberation quality, **Track A phase 1 with the custom Python loop is lower risk and gives signal faster** — it validates the tool-call deliberation idea end-to-end without building the shim.
 
 **Revised default sequencing (lower-risk first):**
-1. **Track A phase 1** — `fetch_article` tool + custom Python loop, validated against Dream. Cheapest possible validation of the core idea. No shim, no SDK, no C++ work.
-2. **Track A phase 2** — multi-turn tool use (already probe-verified), advocate-only subagent. Concrete signal on deliberation quality (§4.1 phase 3 metric).
-3. **Track A phase 3-5** — rebut/jury, commit gates, operator MCP flip.
-4. **Track B** — pursued separately/asynchronously for the QoL win, OR if Track A phase 2 shows the custom loop is painful enough to justify the shim + SDK path.
+0. **Phase 0.5 probe** — before building the full A.2 tool surface, run a Dream tool-call stress probe with one required long-string parameter (multi-paragraph `analysis`), one enum, and one optional numeric/id field, repeated N=20. Gate on valid JSON arguments, correct enum values, and no channel contamination. The existing Paris/weather probe is not enough for the real deliberation payload shape.
+1. **Track A phase 1** — `fetch_article` tool + custom Python loop, validated against Dream. Cheapest possible validation of the core idea. No SDK, no C++ work, and no second MCP process.
+2. **Track A phase 2** — DONE: multi-turn tool use, read tools, advocate-only subagent. Concrete signal on deliberation quality (§4.1 phase 2 live result).
+3. **Track A phase 3** — DONE: rebut/jury proposal-recording tools and subagents (`propose_rebut`, `submit_jury`, `deliberation_agent.run_deliberation`), still no commit path. Live-verified full advocate → rebut → jury packet (§4.1 phase 3).
+4. **Track A phase 4-5** — commit gates, operator MCP flip.
+5. **Track B verification** — the shim already exists in the working tree; remaining work is verification/QA, not initial implementation.
 
 Track B is not a prerequisite for Track A. The custom Python loop is the default harness; Track B is an optional upgrade that, if it lands, lets Track A migrate to the SDK path. This removes the sequencing bias.
 
@@ -306,7 +371,7 @@ Dream sidecar (:8787, DiffusionGemma, llama-diffusion-gemma-server.exe)
 - `messages` with content blocks (`text`, `image`, `tool_use`, `tool_result`) → OpenAI messages (content string / `tool_calls` / tool-role messages).
 - Top-level `system` param → OpenAI system message (prepend).
 - `tools` (Anthropic: `{name, description, input_schema}`) → OpenAI `tools` (`{type:"function", function:{name, description, parameters}}`).
-- `max_tokens` (required in Anthropic) → `max_tokens` + `dream_thought_budget()` (default 4096, reuse `mcp_servers/nrol_ao/llama.py:120-132` logic) so the thought channel doesn't starve content into `finish_reason=length`. Dream ignores `enable_thinking`/`chat_template_kwargs`, so don't send it (keeps payload clean, mirroring `llama.py:259`).
+- `max_tokens` (required in Anthropic) -> `max_tokens` unchanged. Dream's sidecar computes the needed canvases and clamps to context; do not add a hidden thought budget. Dream accepts `chat_template_kwargs.enable_thinking`, so callers can explicitly choose the Gemma4 thought-channel path or the no-thinking reference prompt.
 - `temperature`, `top_p`, `stream` → passthrough.
 - Model name: shim ignores incoming `model` and uses Dream's loaded model (`diffusiongemma-26b-a4b-it-nvfp4`), OR passes through. Simplest: always target Dream's model (only one is loaded).
 
@@ -332,7 +397,15 @@ OpenAI delta stream → map each `delta.content` chunk to a `content_block_delta
 - `POST /v1/messages/count_tokens` — Anthropic token counting; stub with a rough estimate (len-based) or best-effort. Claude Code uses this for context budgeting; a rough estimate is acceptable.
 
 ## B.5 Claude Code launch wiring
-When a "dream model" is selected in Loom (model selector), Loom launches `claude` with `ANTHROPIC_BASE_URL=http://127.0.0.1:SHIM_PORT` and `ANTHROPIC_API_KEY=dummy` (shim does not auth against a real key). Existing dream-model detection (`llama_client.py:_is_dream_model` / `_chat_host_for_model`, `llama_client.py:125-135`) already routes dream models — extend the claude-session spawn path to set the env vars when a dream model is detected. The shim sidecar is started by `admin_server.py` alongside the dream sidecar (extend the dream-start/dream-stop lifecycle at `admin_server.py:1192/1227` to also start/stop the shim).
+Implemented in the current working tree, with different wiring than the original plan:
+
+- Shim server: `anthropic_dream_router.py`
+- Default shim port: `DREAM_SHIM_PORT` / `:8788`
+- Main Loom server lifecycle: `_ensure_dream_shim_running()` in root `server.py`
+- Claude launch env: `claude_client.py` sets `ANTHROPIC_BASE_URL` to the local shim for dream-routed Claude Code sessions
+- Model-selector route: root `server.py` starts the shim when a dream model is selected
+
+`admin_server.py` is not the current lifecycle owner for the shim; do not implement a duplicate admin lifecycle without first reconciling it with the main-server path.
 
 ## B.6 Relationship to Track A
 - If Track B lands before Track A phase 2: the engine agent uses the Claude Code Agent SDK pointed at the shim. No custom Python loop needed. The shim is the single integration point for both operator Claude Code sessions and the NROL-AO engine agent.
@@ -340,9 +413,9 @@ When a "dream model" is selected in Loom (model selector), Loom launches `claude
 - The two tracks are decoupled and can proceed independently. Convergence is optional.
 
 ## B.7 Shim complexity & risk
-- Bounded. The translation is well-defined with reference implementations (LiteLLM, claude-code-proxy projects do exactly this). A custom shim (~300-500 lines) lets us bake in the Dream thought-channel strip, which off-the-shelf proxies won't handle.
-- Main risk: streaming SSE tool-use (`input_json_delta` piecewise assembly). Fiddly but well-specified. Mitigate with a non-streaming fallback path first (get correctness on non-streaming tool calls, then add streaming).
-- The probe already proved Dream emits clean tool_calls on the OpenAI path, so the shim's downstream is verified.
+- Mostly implemented. `anthropic_dream_router.py` contains the request translation, response translation, SSE stream shape, `/v1/models`, `/v1/messages/count_tokens`, and unconditional Dream channel-strip on returned text.
+- Remaining risk is QA, not first implementation: verify the streaming contract against Claude Code, tool-use round trip, error mapping, timeout behavior, and sidecar contention under concurrent shim + engine-agent usage.
+- The probe already proved Dream emits clean tool_calls on the OpenAI path, so the shim's downstream is verified for simple and multi-turn tool use. The long-argument phase-0.5 probe is still required for deliberation-shaped payloads.
 
 ---
 
@@ -380,13 +453,19 @@ Even in the SDK path, a shim is cheaper than C++ server mods. And if we go custo
 ## 4. Verification (end-to-end)
 
 ### 4.1 Track A
-- **Phase 1:** `fetch_article` tool call round-trips through the engine agent on Dream, returns a structured article object (not a line of text).
-- **Phase 3 (concrete, not "compare output quality"):** Advocate subagent's `propose_advocate` calls carry `analysis` strings with **char length > 400** (the current `REASON` field averages ~80–120 chars) AND containing **at least one cited prior evidence id or indicator id** (verifies the agent actually read context, not restated the matcher). `verdict`/`kind` enums are schema-valid (tool-use protocol enforces this — a malformed value is a tool-call error, not a silent PARK).
-- **Phase 4:** A full scan through the engine agent produces jury verdicts that move posteriors via the existing commit gates — same posterior delta math, no regression vs current scan output. Run a known article through both paths and compare the evidence logged (evidence_id, posterior delta, indicator_id must match within float tolerance).
-- **Phase 5:** Operator MCP `run_news_scan` launches the engine agent, returns a tool-call trace as the audit record. Old `run_matcher_with_llama` / `deliberate_candidates` still work behind the flag for parity checks.
+- **Phase 0.5: PASS (implemented 2026-07-11).** `tests/test_dream_long_argument_probe.py` runs N=20 Dream tool-call requests against `:8787` with a required multi-paragraph `analysis` string (>400 chars), `verdict` enum, and optional `indicator_id`/`value` fields. Live run: all 20 returned `finish_reason=tool_calls`, valid JSON arguments, legal enum values, no `<|channel>`/`<channel|>` contamination, mean `analysis_len`=1134 chars. Skipped (module-level) when the sidecar is down so the normal suite never depends on the GPU; force with `LOOM_RUN_LIVE_DREAM_PROBE=1`. This gates the full deliberation tool surface.
+- **Phase 1: PASS (implemented 2026-07-11).** `mcp_servers/nrol_ao_engine/` is an importable in-process package with a thin OpenAI tool-call client (`dream_client.py`), the `fetch_article` tool (`tools/fetch.py`, reuses the proven trafilatura+httpx fetch pattern from `server.py:_fetch_article_payload`), and a minimal tool-call loop (`engine_agent.py`, max 10 turns, retry-once-then-fail-closed on malformed JSON, no commits/mutation). Live end-to-end test (`test_engine_agent_live_round_trip_fetch_article`) round-trips fetch_article through Dream and stops. 21 mocked unit tests + 1 live test, all green.
+  - **Prompt-engineering finding:** DiffusionGemma is a diffusion text model, not an instruction-tuned chat model. A verbose system prompt describing tool *availability* ("you have tools…") causes it to narrate intent or refuse ("I do not have access to a tool") instead of emitting the structured `tool_calls` object — even with `tool_choice="required"`. A terse imperative prompt ("Call fetch_article with the URL, then answer.") is reliable (4/4). `engine_agent.run_engine_agent` also accepts `force_first_tool_call=True` to send `tool_choice="required"` on turn 1 only. This is a Phase 2 prompt-engineering requirement (see §6) made concrete early.
+- **Phase 2 (advocate-only): PASS (implemented 2026-07-11).** Added the reading tools (`tools/read.py`: `read_topic`, `read_indicator_schema`, `read_recent_evidence` — all read-only, project to slim dicts via `import_from_repo` + `walk_indicators`/`iter_indicators_for_topic`) and the advocate tool (`tools/advocate.py`: `propose_advocate` RECORDS a proposal in an in-memory list — never commits, no posterior movement, no topic mutation). `advocate_agent.run_advocate(slug, articles)` is a thin wrapper over `run_engine_agent` with a terse imperative system prompt and `force_first_tool_call=True`; it harvests recorded proposals keyed to the asked-for article ids and returns `{slug, proposals, trace}`. 40 mocked unit tests + 1 live test across the two test files, all green (`tests/test_nrol_ao_engine_agent.py` + `tests/test_nrol_ao_engine_agent_advocate.py`).
+  - **Live result against `calibration-hormuz-reopen-2027` (real Dream :8787):** 4 turns — `read_indicator_schema` (forced turn 1) → `propose_advocate` (turn 2) → stop. Verdict `COMMIT` / `proposed_action` `OBSERVE` on `t2_transit_recovery_70pct` @ value 60. `analysis_len` = **905 chars** (gate: >400 ✓), citing indicator id `t2_transit_recovery_70pct` and all four hypothesis ids (`H1`/`H2`/`H3`/`H4`). The §4.1 phase-3 metric (analysis > 400 chars AND ≥1 cited indicator/evidence id) is met by this run. The multi-paragraph `analysis` demand lives in the `propose_advocate` tool description, NOT the system prompt — confirming the Phase-1 terse-prompt finding carries to the deliberation stage.
+- **Phase 3 (rebut + jury, no commits): PASS (implemented 2026-07-11).** Added `propose_rebut` (`tools/rebut.py`) and `submit_jury` (`tools/jury.py`) as proposal-recording tools — both RECORD verdicts in in-process lists, never commit, never mutate topic state, never move posteriors. The jury's `final_action.kind` enum includes `DUPLICATE_OF` (§2.1 — the discriminator-on-`parent_idx` form the prior JSON-mode spec contradicted itself over). `deliberation_agent.run_deliberation(slug, articles)` drives the full packet: it runs `advocate_agent.run_advocate` first, then a rebut subagent with the advocate's structured proposals (full `analysis` text) injected as context, then a jury subagent with both advocate + rebut records injected. Each stage is its own `run_engine_agent` loop with a terse imperative system prompt and `force_first_tool_call=True`; the multi-paragraph / cross-reference / citation demands live in the tool descriptions, not the system prompts (Phase-1 finding carried forward). Returns `{slug, advocate_proposals, rebuttals, jury_verdicts, traces}`. 70 mocked unit tests across the three test files, all green (`test_nrol_ao_engine_agent.py` + `test_nrol_ao_engine_agent_advocate.py` + `test_nrol_ao_engine_agent_deliberation.py`, `-k "not live"`); 1 live test, green. The no-mutation safety is enforced by an AST-level test (`test_phase3_modules_do_not_import_or_call_forbidden_commit_symbols`) that parses each phase-3 module and asserts it neither imports nor calls `process_evidence` / `save_topic` / `commit_match` / `propose_match` / `submit_transition` / `fire_indicator` / `observe_indicator` / `write_evidence` — a raw-substring grep was rejected because the module docstrings legitimately mention those names as safety documentation.
+  - **Live result against `calibration-hormuz-reopen-2027` (real Dream :8787):** full advocate → rebut → jury packet in ~16-29s. Advocate: 3 turns, `analysis_len`=**1148 chars** (gate >400 ✓), verdict `COMMIT` / `OBSERVE` on `t2_transit_recovery_70pct` @ value 60, citing `t2_transit_recovery_70pct`, `t1_transit_below_25pct_3mo`, `H1`, `H2`. Rebut: 4 turns, `rebuttal_analysis_len`=**479 chars** (gate >300 ✓), verdict `COMMIT`, objection_raised=False, referencing advocate proposal `adv_96778700` and citing `t2_transit_recovery_70pct`. Jury: 3 turns, `jury_rationale_len`=**616 chars** (gate >300 ✓), `final_action` `OBSERVE` on `t2_transit_recovery_70pct` @ value 60, referencing BOTH `adv_96778700` and `reb_641317e6`. All three records chain: the jury verdict's `advocate_proposal_id`/`rebuttal_id` match the harvested ids. **No topic JSON mtime/size change, no proposal DB writes** (verified before/after).
+  - **Phase-3 robustness fix:** the harvest filters in `run_advocate` / `_run_rebut` / `_run_jury` now accept a proposal whose `article_id` is the asked article's URL, not just the `article_id` — DiffusionGemma (non-deterministic even at temp 0.2) sometimes uses the URL as the `article_id` in its tool call because the prompt shows both `[A1]` and a `url:` line. Without this, a legitimate proposal was silently filtered out (the live test hit this on the first runs). Locked in by `test_run_advocate_accepts_url_as_article_id`; a genuinely unknown id is still dropped.
+- **Phase 4 (review bridge, no commits): PASS (implemented 2026-07-15).** Added `file_engine_deliberation_proposals(slug, articles, deliberation_packet, dry_run=true)` on the operator MCP. It maps engine-agent jury `final_action` records into the existing pending proposal lifecycle (`submit_article` / proposal store / later `commit_match`) without moving posteriors or mutating topic JSON. Default is dry-run preview. `dry_run=false` files pending proposals only; `IGNORE` and `DUPLICATE_OF` jury actions are reported as skipped because they are not commit proposals. Focused verification: 3 new bridge tests plus an existing commit-gate regression, all green.
+- **Phase 5 (default scan integration): PASS (implemented 2026-07-15, flipped 2026-07-15, chunked 2026-07-15).** `run_news_scan(...)` launches the engine-agent deliberation path over the scan's deduped articles by default and stores the packet under `engine_deliberation` in each topic packet. `engine_file_proposals=true` is also default; it routes each completed chunk through the Phase 4 review bridge and files pending proposals only when `dry_run=false` and `commit_policy="safe"`, otherwise it returns a dry-run preview. `engine_max_articles` is the internal Dream deliberation chunk size (default 2), not a manual operator cap; one scan call drains the window chunk-by-chunk. Completed chunks file proposals immediately and progress is reported under `engine_coverage` / `engine_progress`. If a multi-article chunk fails, the server splits and retries smaller chunks so one bad batch does not block the tail. If an individual article still fails, `engine_coverage.failed_offsets` records it, `next_offset` points at the first failed/pending article, and `lastScanned` is not stamped. The filing bridge suppresses identical pending duplicate proposals. A cooperative `engine_time_budget_sec` returns partial progress before an outer harness timeout kills the tool call. The legacy matcher/debate path is now opt-in via `legacy_matcher=true` for parity checks or rollback.
 
 ### 4.2 Track B
-- Shim serves `POST /v1/messages` (non-streaming) and returns a valid Anthropic response for a text prompt → Claude Code can complete against Dream.
+- Shim serves `POST /v1/messages` (non-streaming) and returns a valid Anthropic response for a text prompt → Claude Code can complete against Dream. Existing tests in `tests/test_anthropic_dream_router.py` and `tests/test_dream_claude_routing.py` should be mapped against this checklist before adding new test coverage.
 - Tool-use round-trip: a `tools`-bearing Anthropic request returns a `tool_use` content block with valid `input` JSON, assembled from Dream's `tool_calls`.
 - Streaming: SSE event sequence matches Anthropic's 6-event contract (`message_start` → `content_block_start` → `content_block_delta` → `content_block_stop` → `message_delta` → `message_stop`); a reference Claude Code client consumes it without error.
 - Thought-channel strip: a text response from Dream arrives at Claude Code with no `<|channel>thought<channel|>` scaffold (the empty-thought edge case is handled — strip fires on regex match, unconditionally).
@@ -420,7 +499,7 @@ Removing the parsing constraint allows multi-paragraph reasoning; it does not pr
 - **Citation of prior rounds.** The rebut's `objection_details` should reference specific claims in the advocate's `analysis`. The jury's `jury_rationale` should reference specific points from both advocate and rebut. The subagent context injection (A.3) makes the full prior-round records available; the prompts must tell the model to use them.
 - **Reading the indicator schema.** The advocate/rebut/jury subagents must call `read_indicator_schema` (and `read_recent_evidence` where relevant) before proposing a verdict, not just pattern-match the article headline.
 
-These are prompt-engineering requirements on the new architecture, not afterthoughts. Phase 3 verification (§4.1) checks for them concretely (analysis > 400 chars, at least one cited indicator/evidence id).
+These are prompt-engineering requirements on the new architecture, not afterthoughts. Track A verification (§4.1) checks for them concretely: advocate analysis >400 chars with real indicator/evidence citations, rebuttal referencing advocate claims, and jury referencing both prior rounds.
 
 ---
 
@@ -442,7 +521,7 @@ response:
 Key finding: the `<|channel>thought` leak that plagues the text-generation path does NOT affect the tool-use path. When the model emits a tool call, the adapter routes it cleanly into the structured `tool_calls` object and `content` stays empty.
 
 ### 7.2 Files inspected (read-only, for grounding)
-- `mcp_servers/nrol_ao/llama.py` — `chat()` (212), `resolve_backend()` (135), `_split_channel_scaffold()` (27-55, the strip that becomes irrelevant on the tool path and gets fixed-at-shim on the text path), `dream_thought_budget()` (120-132), `dream_host()`/`llama_host()` (76-106)
+- `mcp_servers/nrol_ao/llama.py` — `chat()` (212), `resolve_backend()` (135), `_split_channel_scaffold()` (27-55, the strip that becomes irrelevant on the tool path and gets fixed-at-shim on the text path), `dream_host()`/`llama_host()` (76-106)
 - `mcp_servers/nrol_ao/server.py` — `_run_debate()` (1035-1160), `run_news_scan` (3709+), model forwarding to `_run_debate` (3948), `_import_from_repo()` (132), `_DEFAULT_REPO` (34)
 - `framework/news_observation_pipeline.py` — `build_advocate_prompt`/`build_rebut_prompt`/`build_jury_prompt` (294-520), the line parsers, `<one sentence>` constraints at 354/423/511
 - `dream_client.py` — async Dream sidecar client (`dream_chat` 185, `dream_chat_sync` 255, `_split_channel_scaffold` 44-72 canonical copy)
@@ -462,15 +541,25 @@ Key finding: the `<|channel>thought` leak that plagues the text-generation path 
 - Latest scan digest: `digest-20260706T173308Z.json` (17 decisions, all PARK/IGNORE, `commit_policy: safe`)
 
 ### 7.4 Memory notes corrected by this investigation
-- `project_nrol_dream_feature_complete` claimed the `<|channel>thought` strip is "fixed." It is NOT fixed — the `if extracted_reasoning:` guard at `llama.py:289` skips the strip when the thought block is empty (which it always is). The strip becomes irrelevant under the tool-call architecture (Track A) and gets genuinely fixed at the shim layer (Track B).
+- `project_nrol_dream_feature_complete` was stale during the initial investigation: the `<|channel>thought` strip was not fixed then because `text = stripped_content` was guarded by `if extracted_reasoning`. In the current working tree, `mcp_servers/nrol_ao/llama.py` now assigns `text = stripped_content` unconditionally for `backend == "dream"`, so the empty-thought edge case is fixed in the sync nrol client as well as at the shim layer.
 - `project_nrol_dream_feature_complete` claimed "port default :18081→:8787." The llama default is `:8000` (`llama.py:82`); `:18081` lingers only as a stale default in `config.py:126` and `server.py:6513`'s fallback. The dream default is `:8787` (`llama.py:104`), matching the persisted `config.json`.
 
 ---
 
 ## Implementation status
 
-**Nothing implemented.** This document is the plan. Implementation begins on operator direction.
+**Partially implemented.** Track B's shim exists in the working tree (`anthropic_dream_router.py`) with Loom launch wiring and tests. **Track A Phase 0.5 + Phase 1 are implemented (2026-07-11):** the long-argument Dream tool-call probe (`tests/test_dream_long_argument_probe.py`, PASS) and the `mcp_servers/nrol_ao_engine/` package (in-process, `fetch_article` tool + minimal tool-call loop, live end-to-end verified against Dream) are in the working tree. **Track A Phase 2 (advocate-only) is implemented (2026-07-11):** reading tools + `propose_advocate` (records, never commits) + `run_advocate` runner, live-verified against the real Hormuz topic (905-char analysis citing `t2_transit_recovery_70pct` + H1–H4; §4.1 phase-3 gate met). **Track A Phase 3 (rebut + jury, no commits) is implemented (2026-07-11):** `propose_rebut` + `submit_jury` proposal-recording tools and `deliberation_agent.run_deliberation` (full advocate → rebut → jury packet), live-verified against the real Hormuz topic (1148-char advocate analysis, 479-char rebuttal referencing the advocate proposal id, 616-char jury rationale referencing both advocate + rebut ids; §4.1 phase 3). **Track A Phase 4 and Phase 5 scan integration are implemented (2026-07-15), review-first by default.** The engine-agent scan path is now the `run_news_scan` default; the legacy line-format matcher/debate path is opt-in via `legacy_matcher=true`. Engine code/state consolidation (§0.7) is not implemented yet.
 
-**Recommended first concrete step (revised per Kimi review):** Track A phase 1 — create `mcp_servers/nrol_ao_engine/` with `fetch_article` as the first engine-side tool + a minimal custom Python loop in `engine_agent.py`, validated against Dream. This is the lowest-risk, fastest-signal path: it validates the core tool-call-deliberation idea end-to-end without building the shim, without the SDK, without C++ work, and without touching the engine repo (the new folder calls the engine repo's state layer via `_import_from_repo` — read-only from the engine repo's perspective until Track A phase 5 deletions). Track B (the Anthropic shim, QoL win) is pursued separately/asynchronously and is not a prerequisite for Track A.
+**Stage-scoped Dream tool surfaces are implemented (2026-07-12):** the engine loop now accepts `tool_names`, sends only that stage's OpenAI `tools` payload, and dispatches only through that allow-list. Advocate exposes `read_indicator_schema`, `read_recent_evidence`, and `propose_advocate`; rebut exposes `read_indicator_schema` and `propose_rebut`; jury exposes `read_indicator_schema` and `submit_jury`. Targeted non-live verification is 73 passed / 3 live deselected across the engine-agent, advocate, and deliberation suites.
+
+**Phase 4 review bridge is implemented (2026-07-15):** `file_engine_deliberation_proposals` previews or files engine-agent jury outputs into the existing pending proposal queue. It does not commit, does not move posteriors, and does not mutate topic JSON; `commit_match` remains the only path from a filed proposal to evidence/posterior movement.
+
+**Phase 5 scan integration is implemented (2026-07-15):** `run_news_scan` accepts `engine_deliberation`, `engine_file_proposals`, `engine_max_articles`, `engine_article_offset`, and `legacy_matcher`. The engine path is default with bounded internal chunks (`engine_max_articles=2` by default), legacy matcher/debate is opt-in for parity, and engine jury outputs can file only as pending review proposals. One scan call processes chunks serially and files proposals after each completed chunk. If a chunk fails, `engine_coverage.deferred_after` is nonzero, `engine_coverage.next_offset` tells the operator what offset to resume from, and `lastScanned` is not stamped.
+
+**Recommended next concrete step:** run parity scans on a known corpus with default engine scans versus `legacy_matcher=true` scans, then compare proposed actions and rationale quality. Keep legacy matcher/debate available as an explicit rollback/parity mode until engine outputs and pending proposals match operational expectations.
+
+**Before any full engine-code move:** finish the path-normalization work in §0.7. The safe end state is engine code in `a-shadow-loom/engine` and hot state outside OneDrive via `NROL_AO_STATE_DIR`, not topic JSON and logs inside the Shadow Loom repo. Track B (the Anthropic shim, QoL win) is pursued separately/asynchronously and is not a prerequisite for Track A.
+
+**Operational risks carried forward from red-team review:** keep `mcp_servers/nrol_ao_engine/` in-process as a package for phase 1 to avoid a second writer process; add audit trace format/rotation/read caps before storing multi-paragraph tool traces; treat Dream sidecar contention as real because shim sessions and engine-agent scans share the same model server; keep `fire_indicator` / `observe_indicator` proposal-producing or approval-gated until parity is proven.
 
 **Kimi review addressed (2026-07-06):** repo map added (§0.5); multi-turn tool-use probe added to §2.2 (retires the single-probe concern — Dream handles multi-turn tool use cleanly, and text generation after a tool turn is also free of channel contamination); known limitations / out-of-scope problems table added (§5); system-prompt + tool-description requirements added (§6); engine agent launch mechanics added (§A.7); sequencing bias corrected — Track A phase 1 with custom Python loop is now the default first step (§A.8); line-number drift flagged in §7.2; verification metric made concrete (§4.1 phase 3: analysis > 400 chars + at least one cited indicator/evidence id).

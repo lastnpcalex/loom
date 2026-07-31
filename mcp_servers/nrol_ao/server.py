@@ -1077,7 +1077,8 @@ def _run_debate(
                 max_tokens=max_tokens,
                 timeout_sec=timeout_sec,
                 # Deliberation requires reasoning mode enabled. Dream/DiffusionGemma
-                # still gets its thought-channel budget inside llama_client.chat().
+                # receives the caller's max_tokens unchanged; the sidecar owns
+                # canvas budgeting.
                 disable_thinking=False,
             )
             text = response.get("text", "")
@@ -3706,6 +3707,89 @@ def apply_news_scan_results(
         return _json({"job_id": job_id, "error": str(exc), "slug": slug})
 
 
+def _engine_manifest_root() -> Path:
+    return _activity_store().snapshot_path.parent / "scan_manifests"
+
+
+def _new_engine_manifest_id(slug: str) -> str:
+    safe_slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", slug or "topic").strip("-") or "topic"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"esm-{stamp}-{safe_slug[:64]}-{uuid.uuid4().hex[:8]}"
+
+
+def _engine_manifest_path(manifest_id: str) -> Path:
+    mid = str(manifest_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", mid):
+        raise ValueError("engine_manifest_id must be an id, not a path")
+    root = _engine_manifest_root().resolve()
+    path = (root / f"{mid}.json").resolve()
+    if root not in path.parents:
+        raise ValueError(f"engine manifest path must stay under {root}")
+    return path
+
+
+def _engine_manifest_summary(payload: dict) -> dict:
+    return {
+        "manifest_id": payload.get("manifest_id"),
+        "created_at": payload.get("created_at"),
+        "job_id": payload.get("job_id"),
+        "slug": payload.get("slug"),
+        "article_count": len(payload.get("articles") or []),
+        "engine_article_count": len(payload.get("engine_articles") or []),
+    }
+
+
+def _write_engine_scan_manifest(
+    *,
+    slug: str,
+    job_id: str,
+    time_window: dict,
+    queries: dict,
+    search_errors: dict,
+    raw_article_count: int,
+    freshness_filter: dict,
+    articles: list[dict],
+    surfaced: dict,
+    excerpts: dict | None,
+    engine_articles: list[dict],
+) -> dict:
+    """Persist the exact article list used by Dream engine deliberation."""
+    root = _engine_manifest_root()
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_id = _new_engine_manifest_id(slug)
+    payload = {
+        "version": 1,
+        "manifest_id": manifest_id,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "job_id": job_id,
+        "slug": slug,
+        "time_window": time_window,
+        "queries": queries,
+        "search_errors": search_errors,
+        "raw_article_count": raw_article_count,
+        "freshness_filter": freshness_filter,
+        "articles": articles,
+        "surfaced": surfaced,
+        "excerpts": excerpts,
+        "engine_articles": engine_articles,
+    }
+    path = _engine_manifest_path(manifest_id)
+    path.write_text(_json(payload), encoding="utf-8")
+    return _engine_manifest_summary(payload)
+
+
+def _read_engine_scan_manifest(manifest_id: str) -> dict:
+    path = _engine_manifest_path(manifest_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"engine manifest {manifest_id!r} is not a JSON object")
+    if payload.get("version") != 1:
+        raise ValueError(f"unsupported engine manifest version: {payload.get('version')!r}")
+    if payload.get("manifest_id") != manifest_id:
+        raise ValueError("engine manifest id mismatch")
+    return payload
+
+
 @mcp.tool()
 def run_news_scan(
     slugs: list[str] | None = None,
@@ -3721,6 +3805,13 @@ def run_news_scan(
     fetch_full_articles: bool = True,
     excerpt_chars: int = 2800,
     deliberate: bool = True,
+    engine_deliberation: bool = True,
+    engine_file_proposals: bool = True,
+    engine_max_articles: int = 2,
+    engine_article_offset: int = 0,
+    engine_time_budget_sec: int = 1080,
+    engine_manifest_id: str = "",
+    legacy_matcher: bool = False,
     brief: bool = False,
 ) -> str:
     """Run the full NROL-AO news scan on the MCP/server side.
@@ -3730,10 +3821,30 @@ def run_news_scan(
     snippet — snippets alone rarely contain the numeric values OBSERVE
     decisions require.
 
-    deliberate=true (default) runs the 3-stage advocate/rebut/jury debate
-    over the strict matcher's PARKs. Jury MOVE_TO verdicts supersede the
-    PARK and flow into the same proposal/commit gates as direct matcher
-    decisions — the debate widens recall, never authority.
+    engine_deliberation=true (default) runs the Dream tool-call
+    advocate/rebut/jury packet over deduped articles. engine_file_proposals
+    routes that packet through file_engine_deliberation_proposals; it files
+    pending proposals only when dry_run=false and commit_policy="safe",
+    otherwise it returns a dry-run preview.
+    engine_max_articles is the internal Dream deliberation chunk size. The
+    operator still makes one run_news_scan call; the server processes chunks
+    serially, files review proposals after each completed chunk, and records
+    progress to the activity ledger. Set <=0 only for explicit full-batch
+    experiments.
+    engine_article_offset selects the starting article for failure recovery.
+    If a chunk fails, completed chunks stay filed and engine_coverage.next_offset
+    points at the failed chunk for a later resume.
+    engine_time_budget_sec is a cooperative budget for the Dream deliberation
+    loop. It is checked between chunks so the MCP tool can return partial
+    progress before an outer harness timeout kills the call.
+    engine_manifest_id resumes from a frozen scan manifest created by an
+    earlier run. When supplied, search/fetch/dedupe are skipped and
+    engine_article_offset indexes into the original manifest order.
+
+    legacy_matcher=false (default) skips the old line-format matcher/debate.
+    Set legacy_matcher=true for parity checks or rollback. With
+    legacy_matcher=true, deliberate=true runs the old 3-stage debate over the
+    strict matcher's PARKs.
 
     brief=true returns a COMPACT summary (counts, decisions by kind,
     proposals filed, freshness downgrades, scan coverage) — enough for the
@@ -3745,9 +3856,9 @@ def run_news_scan(
     plus a digest_path is a common trigger for attempted sandbox break-outs.
 
     This is the one-call operational path: select stale topics, perform
-    server-side web search, dedupe articles, deliberate with the local
-    llama-server matcher, parse FIRE/OBSERVE/PARK/SCHEMA_GAP decisions, and
-    optionally apply through NROL engine gates after Loom approval.
+    server-side web search, dedupe articles, deliberate through the Dream
+    tool-call engine by default, and file review proposals through NROL gates.
+    The old llama-server matcher remains available with legacy_matcher=true.
 
     dry_run=true never mutates state and does not stamp lastScanned.
     dry_run=false records successful scan coverage by stamping lastScanned.
@@ -3761,11 +3872,25 @@ def run_news_scan(
     commit=true is supplied. No posterior ever moves without a human approving
     a proposal or direct non-safe commit. A digest is written beside the
     activity ledger.
+
+    The legacy path is opt-in. It is not run by default.
     """
     store = _activity_store()
     job_id = new_job_id("news-scan-worker")
     start = time.time()
     try:
+        engine_manifest = _read_engine_scan_manifest(engine_manifest_id) if engine_manifest_id else None
+        if engine_manifest:
+            manifest_slug = str(engine_manifest.get("slug") or "").strip()
+            if not manifest_slug:
+                raise ValueError(f"engine manifest {engine_manifest_id!r} has no slug")
+            requested_slugs = [slugs] if isinstance(slugs, str) else list(slugs or [])
+            if requested_slugs and manifest_slug not in requested_slugs:
+                raise ValueError(
+                    f"engine_manifest_id {engine_manifest_id!r} is for {manifest_slug!r}, "
+                    f"not requested slugs {requested_slugs!r}"
+                )
+            slugs = [manifest_slug]
         engine = _import_from_repo("engine")
         mutation = _import_from_repo("framework.news_mutation")
         news = _import_from_repo("framework.news_observation_pipeline")
@@ -3782,6 +3907,13 @@ def run_news_scan(
                 "topics": [t.get("meta", {}).get("slug") for t in topics],
                 "commit": commit,
                 "dry_run": dry_run,
+                "engine_deliberation": engine_deliberation,
+                "engine_file_proposals": engine_file_proposals,
+                "engine_max_articles": engine_max_articles,
+                "engine_article_offset": engine_article_offset,
+                "engine_time_budget_sec": engine_time_budget_sec,
+                "engine_manifest_id": engine_manifest_id or None,
+                "legacy_matcher": legacy_matcher,
             },
         )
 
@@ -3791,6 +3923,9 @@ def run_news_scan(
         for topic in topics:
             meta = topic.get("meta", {}) or {}
             slug = meta.get("slug")
+            topic_manifest = engine_manifest if engine_manifest and engine_manifest.get("slug") == slug else None
+            scan_manifest = _engine_manifest_summary(topic_manifest) if topic_manifest else None
+            frozen_engine_articles = None
             classification = (meta.get("classification") or "ROUTINE").upper()
             floor = 12 if classification == "ALERT" else (7 * 24 if classification == "CALIBRATION" else 72)
             window = _scan_search_window(topic, tempo_floor_hours=floor)
@@ -3799,52 +3934,81 @@ def run_news_scan(
             query_specs = _search_query_specs(topic, window.get("label", "recent period"))
             channels = [spec["channel"] for spec in query_specs]
 
-            store.record(
-                job_id,
-                "running",
-                task="run_news_scan",
-                slug=slug,
-                model=model or llama_client.llama_model(),
-                summary={
-                    "phase": "searching",
-                    "channels": channels,
-                    "window": window.get("label"),
-                    "ddg_timelimit": timelimit_code,
-                },
-            )
             parsed_by_channel = {}
             queries = {}
             search_errors = {}
-            for spec in query_specs:
-                channel = spec["channel"]
-                query = spec["query"]
-                queries[channel] = query
-                try:
-                    parsed_by_channel[channel] = _search_web_articles(
-                        query,
-                        channel,
-                        max_results_per_channel,
-                        timelimit=timelimit_code,
-                    )
-                except Exception as exc:
-                    search_errors[channel] = str(exc)
-                    parsed_by_channel[channel] = []
+            excerpt_stats = None
+            if topic_manifest:
+                window = topic_manifest.get("time_window") or window
+                queries = topic_manifest.get("queries") or {}
+                search_errors = dict(topic_manifest.get("search_errors") or {})
+                surfaced = topic_manifest.get("surfaced") or {}
+                freshness_stats = topic_manifest.get("freshness_filter") or {}
+                deduped = list(topic_manifest.get("articles") or [])
+                raw_article_count = int(topic_manifest.get("raw_article_count") or len(deduped))
+                excerpt_stats = topic_manifest.get("excerpts")
+                frozen_engine_articles = list(topic_manifest.get("engine_articles") or [])
+                store.record(
+                    job_id,
+                    "running",
+                    task="run_news_scan",
+                    slug=slug,
+                    model=model or llama_client.llama_model(),
+                    summary={
+                        "phase": "engine_manifest_resume",
+                        "engine_manifest_id": scan_manifest.get("manifest_id"),
+                        "article_count": len(deduped),
+                        "engine_article_count": len(frozen_engine_articles),
+                        "engine_article_offset": engine_article_offset,
+                    },
+                )
+            else:
+                store.record(
+                    job_id,
+                    "running",
+                    task="run_news_scan",
+                    slug=slug,
+                    model=model or llama_client.llama_model(),
+                    summary={
+                        "phase": "searching",
+                        "channels": channels,
+                        "window": window.get("label"),
+                        "ddg_timelimit": timelimit_code,
+                    },
+                )
+                for spec in query_specs:
+                    channel = spec["channel"]
+                    query = spec["query"]
+                    queries[channel] = query
+                    try:
+                        parsed_by_channel[channel] = _search_web_articles(
+                            query,
+                            channel,
+                            max_results_per_channel,
+                            timelimit=timelimit_code,
+                        )
+                    except Exception as exc:
+                        search_errors[channel] = str(exc)
+                        parsed_by_channel[channel] = []
 
-            deduped_raw, surfaced = mutation.dedupe_articles(parsed_by_channel)
-            deduped, freshness_stats = _filter_scan_articles(
-                topic,
-                deduped_raw,
-                window,
-                drop_old_dated=not fetch_full_articles,
-            )
+                deduped_raw, surfaced = mutation.dedupe_articles(parsed_by_channel)
+                raw_article_count = len(deduped_raw)
+                deduped, freshness_stats = _filter_scan_articles(
+                    topic,
+                    deduped_raw,
+                    window,
+                    drop_old_dated=not fetch_full_articles,
+                )
             matcher_output = ""
             decisions = []
             applied = None
             packet_policy = None
-            excerpt_stats = None
             debate_packet = None
+            engine_packet = None
+            engine_review = None
+            engine_coverage = None
             jury_overrides = {}
-            if deduped and fetch_full_articles:
+            if deduped and fetch_full_articles and not topic_manifest:
                 store.record(
                     job_id,
                     "running",
@@ -3907,53 +4071,115 @@ def run_news_scan(
                 }
             total_articles += len(deduped)
             if deduped:
-                matcher_prompt = _build_matcher_prompt(news, topic, deduped)
-                store.record(
-                    job_id,
-                    "running",
-                    task="run_news_scan",
-                    slug=slug,
-                    model=model or llama_client.llama_model(),
-                    prompt=matcher_prompt,
-                    summary={"phase": "matching", "article_count": len(deduped)},
-                )
-                response = llama_client.chat(
-                    matcher_prompt,
-                    system_prompt=(
-                        "You are the NROL-AO evidence matcher. Return only DECISION blocks "
-                        "in the requested format. Do not invent indicators, likelihoods, or posteriors."
-                    ),
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    timeout_sec=timeout_sec,
-                    disable_thinking=True,
-                )
-                matcher_output = response.get("text", "")
-                if not matcher_output.strip():
-                    # An empty matcher is a failure, not a quiet news window —
-                    # reasoning models can spend the whole token budget in the
-                    # think channel and return no content at all.
-                    search_errors["matcher"] = (
-                        "matcher returned no content "
-                        f"(finish_reason={response.get('finish_reason') or '?'}, "
-                        f"reasoning_chars={response.get('reasoning_chars', 0)}, "
-                        f"model={response.get('model') or 'default'}) — "
-                        "articles NOT marked scanned; raise max_tokens or check the chat template"
+                if engine_deliberation:
+                    all_engine_articles = (
+                        frozen_engine_articles
+                        if frozen_engine_articles is not None
+                        else _engine_articles_for_deliberation(deduped)
                     )
-                decisions = news.parse_matcher_output(matcher_output)
-                total_decisions += len(decisions)
+                    if not topic_manifest:
+                        scan_manifest = _write_engine_scan_manifest(
+                            slug=slug,
+                            job_id=job_id,
+                            time_window=window,
+                            queries=queries,
+                            search_errors=search_errors,
+                            raw_article_count=raw_article_count,
+                            freshness_filter=freshness_stats,
+                            articles=deduped,
+                            surfaced=surfaced,
+                            excerpts=excerpt_stats,
+                            engine_articles=all_engine_articles,
+                        )
+                        store.record(
+                            job_id,
+                            "running",
+                            task="run_news_scan",
+                            slug=slug,
+                            model=model or llama_client.llama_model(),
+                            summary={
+                                "phase": "engine_manifest_written",
+                                "engine_manifest_id": scan_manifest.get("manifest_id"),
+                                "article_count": scan_manifest.get("article_count"),
+                                "engine_article_count": scan_manifest.get("engine_article_count"),
+                            },
+                        )
+                    try:
+                        engine_packet, engine_review, engine_coverage, engine_error = (
+                            _run_engine_deliberation_chunks(
+                                slug,
+                                all_engine_articles,
+                                store=store,
+                                job_id=job_id,
+                                model=model or None,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                timeout_sec=timeout_sec,
+                                dry_run=bool(dry_run or commit_policy != "safe"),
+                                engine_file_proposals=engine_file_proposals,
+                                engine_max_articles=engine_max_articles,
+                                engine_article_offset=engine_article_offset,
+                                engine_time_budget_sec=engine_time_budget_sec,
+                            )
+                        )
+                        if scan_manifest and engine_coverage is not None:
+                            engine_coverage["manifest_id"] = scan_manifest.get("manifest_id")
+                        if engine_error:
+                            search_errors["engine_deliberation"] = engine_error
+                    except Exception as exc:
+                        search_errors["engine_deliberation"] = str(exc)
 
-                if deliberate and decisions and "matcher" not in search_errors:
-                    jury_overrides, debate_packet = _run_debate(
-                        topic, deduped, decisions, news,
-                        model=model, temperature=temperature,
-                        max_tokens=max_tokens, timeout_sec=timeout_sec,
-                        store=store, job_id=job_id, slug=slug,
+                response = {}
+                if legacy_matcher:
+                    matcher_prompt = _build_matcher_prompt(news, topic, deduped)
+                    store.record(
+                        job_id,
+                        "running",
+                        task="run_news_scan",
+                        slug=slug,
+                        model=model or llama_client.llama_model(),
+                        prompt=matcher_prompt,
+                        summary={"phase": "legacy_matching", "article_count": len(deduped)},
                     )
-                    if debate_packet and "error" in debate_packet:
-                        search_errors["debate"] = debate_packet["error"]
-                    decisions = _apply_jury_overrides(decisions, jury_overrides)
+                    response = llama_client.chat(
+                        matcher_prompt,
+                        system_prompt=(
+                            "You are the NROL-AO evidence matcher. Return only DECISION blocks "
+                            "in the requested format. Do not invent indicators, likelihoods, or posteriors."
+                        ),
+                        model=model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        timeout_sec=timeout_sec,
+                        disable_thinking=True,
+                    )
+                    matcher_output = response.get("text", "")
+                    if not matcher_output.strip():
+                        # An empty matcher is a failure, not a quiet news window —
+                        # reasoning models can spend the whole token budget in the
+                        # think channel and return no content at all.
+                        search_errors["matcher"] = (
+                            "matcher returned no content "
+                            f"(finish_reason={response.get('finish_reason') or '?'}, "
+                            f"reasoning_chars={response.get('reasoning_chars', 0)}, "
+                            f"model={response.get('model') or 'default'}) — "
+                            "articles NOT marked scanned; raise max_tokens or check the chat template"
+                        )
+                    decisions = news.parse_matcher_output(matcher_output)
+                    total_decisions += len(decisions)
+
+                    if deliberate and decisions and "matcher" not in search_errors:
+                        jury_overrides, debate_packet = _run_debate(
+                            topic, deduped, decisions, news,
+                            model=model, temperature=temperature,
+                            max_tokens=max_tokens, timeout_sec=timeout_sec,
+                            store=store, job_id=job_id, slug=slug,
+                        )
+                        if debate_packet and "error" in debate_packet:
+                            search_errors["debate"] = debate_packet["error"]
+                        decisions = _apply_jury_overrides(decisions, jury_overrides)
+                elif engine_packet:
+                    total_decisions += len(engine_packet.get("jury_verdicts") or [])
 
                 if "debate" not in search_errors:
                     if commit_policy == "safe" and not dry_run and decisions:
@@ -4036,7 +4262,7 @@ def run_news_scan(
                                 "slug": slug,
                                 "article_count": len(deduped),
                                 "decision_count": len(decisions),
-                                "model": response.get("model"),
+                                "model": response.get("model") or (model or "dream"),
                             },
                         )
                         if denied:
@@ -4045,7 +4271,7 @@ def run_news_scan(
                                 "denied",
                                 task="run_news_scan",
                                 slug=slug,
-                                model=response.get("model"),
+                                model=response.get("model") or (model or "dream"),
                                 summary={"denied": denied},
                             )
                             applied = {"denied": denied, "committed": False}
@@ -4055,6 +4281,20 @@ def run_news_scan(
             search_failed_all = bool(channels) and all(c in search_errors for c in channels)
             matcher_failed = "matcher" in search_errors
             debate_failed = "debate" in search_errors
+            engine_failed = engine_deliberation and "engine_deliberation" in search_errors
+            engine_deferred = bool(
+                engine_deliberation
+                and not legacy_matcher
+                and engine_coverage
+                and engine_coverage.get("deferred_after", 0) > 0
+            )
+            engine_no_verdicts = bool(
+                engine_deliberation
+                and not legacy_matcher
+                and deduped
+                and not engine_failed
+                and (not engine_packet or not (engine_packet.get("jury_verdicts") or []))
+            )
             scan_record = {
                 "recorded": False,
                 "dry_run": dry_run,
@@ -4070,6 +4310,29 @@ def run_news_scan(
                 scan_record["skipped_reason"] = "matcher returned no content — window left open"
             elif debate_failed:
                 scan_record["skipped_reason"] = f"deliberation failed: {search_errors['debate']} — window left open"
+            elif engine_failed:
+                if engine_coverage:
+                    scan_record["skipped_reason"] = (
+                        f"engine deliberation failed after processing "
+                        f"{engine_coverage.get('processed_articles', 0)} "
+                        f"of {engine_coverage.get('total_articles', 0)} articles; "
+                        f"resume with engine_manifest_id={engine_coverage.get('manifest_id')!r} "
+                        f"and engine_article_offset={engine_coverage.get('next_offset')}; "
+                        f"{search_errors['engine_deliberation']} — window left open"
+                    )
+                else:
+                    scan_record["skipped_reason"] = f"engine deliberation failed: {search_errors['engine_deliberation']} — window left open"
+            elif engine_deferred:
+                scan_record["skipped_reason"] = (
+                    f"engine deliberation processed {engine_coverage.get('selected_articles', 0)} "
+                    f"of {engine_coverage.get('total_articles', 0)} articles "
+                    f"from offset {engine_coverage.get('article_offset', 0)}; "
+                    f"{engine_coverage.get('deferred_after', 0)} deferred after this chunk — "
+                    f"rerun with engine_manifest_id={engine_coverage.get('manifest_id')!r} "
+                    f"and engine_article_offset={engine_coverage.get('next_offset')} — window left open"
+                )
+            elif engine_no_verdicts:
+                scan_record["skipped_reason"] = "engine deliberation produced no jury verdicts — window left open"
             else:
                 try:
                     stamped = mutation.stamp_last_scanned(slug)
@@ -4085,13 +4348,17 @@ def run_news_scan(
                 "time_window": window,
                 "queries": queries,
                 "search_errors": search_errors,
-                "raw_article_count": len(deduped_raw),
+                "raw_article_count": raw_article_count,
                 "freshness_filter": freshness_stats,
                 "articles": deduped,
                 "surfaced": surfaced,
                 "excerpts": excerpt_stats,
+                "engine_manifest": scan_manifest,
                 "decisions": decisions,
                 "deliberation": debate_packet,
+                "engine_deliberation": engine_packet,
+                "engine_review": engine_review,
+                "engine_coverage": engine_coverage,
                 "matcher_output": matcher_output,
                 "committed": bool(commit and applied and not applied.get("denied")),
                 "dry_run": dry_run,
@@ -4109,6 +4376,9 @@ def run_news_scan(
             "topics_scanned": len(topic_packets),
             "article_count": total_articles,
             "decision_count": total_decisions,
+            "engine_manifests": [
+                p.get("engine_manifest") for p in topic_packets if p.get("engine_manifest")
+            ],
             "topics": topic_packets,
         }
         if not dry_run:
@@ -4215,17 +4485,60 @@ def _brief_scan_packet(packet: dict, job_id: str) -> dict:
             for res in applied_results:
                 if isinstance(res, dict) and res.get("article") and res.get("evidence_id"):
                     ev_id_by_article[res["article"]] = res["evidence_id"]
+        engine_cov = tp.get("engine_coverage") or {}
+        engine_chunks = engine_cov.get("chunks") if isinstance(engine_cov, dict) else []
+        engine_manifest = tp.get("engine_manifest") or {}
+        engine_progress = None
+        if isinstance(engine_cov, dict) and engine_cov:
+            engine_progress = {
+                "manifest_id": engine_cov.get("manifest_id") or engine_manifest.get("manifest_id"),
+                "processed_articles": engine_cov.get("processed_articles", engine_cov.get("selected_articles", 0)),
+                "attempted_articles": engine_cov.get("attempted_articles"),
+                "failed_articles": engine_cov.get("failed_articles", 0),
+                "total_articles": engine_cov.get("total_articles", 0),
+                "chunk_size": engine_cov.get("chunk_size") or engine_cov.get("max_articles"),
+                "chunks_completed": engine_cov.get("chunks_completed", 0),
+                "chunks_failed": engine_cov.get("chunks_failed", 0),
+                "chunks_total": engine_cov.get("chunks_total", 0),
+                "next_offset": engine_cov.get("next_offset"),
+                "failed_offsets": engine_cov.get("failed_offsets") or [],
+                "pending_offsets": engine_cov.get("pending_offsets") or [],
+                "time_budget_exhausted": bool(engine_cov.get("time_budget_exhausted")),
+                "time_budget_sec": engine_cov.get("time_budget_sec"),
+                "chunks": [
+                    {
+                        "chunk_index": c.get("chunk_index"),
+                        "article_offset": c.get("article_offset"),
+                        "article_count": c.get("article_count"),
+                        "status": c.get("status"),
+                        "verdict_count": c.get("verdict_count", 0),
+                        "proposals_filed": c.get("proposals_filed", []),
+                        "error": c.get("error"),
+                    }
+                    for c in (engine_chunks or [])
+                    if isinstance(c, dict)
+                ],
+            }
         topics_brief.append({
             "slug": tp.get("slug"),
             "title": tp.get("title"),
             "scan_status": tp.get("scan_status"),
             "time_window": tp.get("time_window"),
             "raw_article_count": tp.get("raw_article_count"),
+            "engine_manifest": engine_manifest or None,
             "decision_count": len(decisions),
             "decisions_by_kind": by_kind,
             "deliberation": (tp.get("deliberation") or {}).get("candidates")
                 and {k: (tp["deliberation"].get(k)) for k in ("candidates", "parks", "argue_moves", "rescued")}
                 or None,
+            "engine_coverage": tp.get("engine_coverage"),
+            "engine_progress": engine_progress,
+            "engine_review": {
+                "proposals_filed": (tp.get("engine_review") or {}).get("proposals_filed") or [],
+                "proposal_count": (tp.get("engine_review") or {}).get("proposal_count", 0),
+                "skipped": (tp.get("engine_review") or {}).get("skipped") or [],
+                "errors": (tp.get("engine_review") or {}).get("errors") or [],
+            } if tp.get("engine_review") else None,
             "freshness_downgrades": len(downgrades),
             "freshness_downgrade_samples": [
                 {"idx": r.get("idx"),
@@ -4249,6 +4562,7 @@ def _brief_scan_packet(packet: dict, job_id: str) -> dict:
         "topics_scanned": packet.get("topics_scanned"),
         "article_count": packet.get("article_count"),
         "decision_count": packet.get("decision_count"),
+        "engine_manifests": packet.get("engine_manifests") or [],
         "topics": topics_brief,
         "digest_available": ("digest_path" in packet) or ("digest_error" not in packet and not packet.get("dry_run")),
         "digest_error": packet.get("digest_error"),
@@ -4307,6 +4621,55 @@ def _write_digest(packet: dict) -> str:
                     f"{db.get('argue_moves', 0)} argued, "
                     f"{db.get('rescued', 0)} rescued by jury"
                 )
+        if tp.get("engine_coverage"):
+            cov = tp["engine_coverage"]
+            manifest_id = cov.get("manifest_id") or (tp.get("engine_manifest") or {}).get("manifest_id")
+            if manifest_id:
+                lines.append(f"- engine manifest: {manifest_id}")
+            lines.append(
+                f"- engine deliberation coverage: {cov.get('selected_articles', 0)}/"
+                f"{cov.get('total_articles', 0)} articles from offset "
+                f"{cov.get('article_offset', 0)}"
+            )
+            lines.append(
+                f"- engine progress: processed={cov.get('processed_articles', cov.get('selected_articles', 0))} "
+                f"attempted={cov.get('attempted_articles', cov.get('selected_articles', 0))} "
+                f"failed={cov.get('failed_articles', 0)}; "
+                f"chunks={cov.get('chunks_completed', 0)}/{cov.get('chunks_total', 0)} "
+                f"completed, {cov.get('chunks_failed', 0)} failed"
+            )
+            for ch in (cov.get("chunks") or [])[:10]:
+                if not isinstance(ch, dict):
+                    continue
+                lines.append(
+                    f"  - chunk {ch.get('chunk_index')} @ offset {ch.get('article_offset')}: "
+                    f"{ch.get('status')} ({ch.get('article_count', 0)} articles, "
+                    f"{ch.get('verdict_count', 0)} verdicts)"
+                )
+            if len(cov.get("chunks") or []) > 10:
+                lines.append(f"  - ... {len(cov.get('chunks') or []) - 10} more chunk(s)")
+            if cov.get("deferred_after"):
+                lines.append(
+                    f"- engine deferred after this chunk: {cov.get('deferred_after')} "
+                    f"(resume with engine_manifest_id={manifest_id!r}, "
+                    f"engine_article_offset={cov.get('next_offset')})"
+                )
+            if cov.get("time_budget_exhausted"):
+                lines.append(
+                    f"- engine stopped at cooperative time budget "
+                    f"({cov.get('time_budget_sec')}s); resume with "
+                    f"engine_manifest_id={manifest_id!r}, "
+                    f"engine_article_offset={cov.get('next_offset')}"
+                )
+            if cov.get("failed_offsets"):
+                lines.append(f"- engine failed article offsets: {cov.get('failed_offsets')}")
+        if tp.get("engine_review"):
+            er = tp["engine_review"]
+            filed = er.get("proposals_filed") or []
+            lines.append(
+                f"- engine proposals filed for review: {len(filed)}"
+                + (f" ({', '.join(filed)})" if filed else "")
+            )
         policy = tp.get("commit_policy") or {}
         if policy:
             auto = policy.get("auto_committed") or {}
@@ -6615,6 +6978,9 @@ def submit_transition(
 
 
 _PROPOSAL_ACTIONS = {"PARK", "FIRE", "OBSERVE", "SCHEMA_GAP"}
+_ENGINE_TEXT_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_ENGINE_TEXT_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+_ENGINE_TEXT_MAX_CHARS = 8000
 
 
 def _validate_proposal_shape(
@@ -6713,6 +7079,620 @@ def propose_match(
         return _json(record)
     except Exception as exc:
         return _json({"error": str(exc), "article_id": article_id, "slug": slug})
+
+
+def _engine_article_index(articles: list[dict]) -> dict[str, dict]:
+    """Index caller-provided articles by article_id and URL for jury verdicts."""
+    out: dict[str, dict] = {}
+    for raw in articles or []:
+        if not isinstance(raw, dict):
+            continue
+        art = _article_for_proposal(raw)
+        for key in (
+            raw.get("article_id"),
+            raw.get("id"),
+            raw.get("url"),
+            art.get("article_id"),
+            art.get("id"),
+            art.get("url"),
+        ):
+            key = str(key or "").strip()
+            if key:
+                out[key] = art
+    return out
+
+
+def _sanitize_engine_article_text(value: Any, max_chars: int = _ENGINE_TEXT_MAX_CHARS) -> str:
+    """Normalize fetched article text before it enters Dream chat templates."""
+    text = str(value or "")
+    if not text:
+        return ""
+    text = _ENGINE_TEXT_SURROGATE_RE.sub(" ", text)
+    text = _ENGINE_TEXT_CONTROL_RE.sub(" ", text)
+    text = text.replace("\ufffd", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max(0, int(max_chars))]
+
+
+def _engine_articles_for_deliberation(articles: list[dict]) -> list[dict]:
+    """Project scan articles into the engine-agent article shape."""
+    out: list[dict] = []
+    for idx, raw in enumerate(articles or [], start=1):
+        if not isinstance(raw, dict):
+            continue
+        art = _article_for_proposal(raw)
+        text = (
+            art.get("excerpt")
+            or art.get("body")
+            or art.get("text")
+            or art.get("relevance")
+            or art.get("snippet")
+            or ""
+        )
+        text = _sanitize_engine_article_text(text)
+        out.append({
+            "article_id": str(raw.get("article_id") or art.get("article_id") or f"A{idx}"),
+            "headline": art.get("headline") or art.get("title") or "",
+            "url": art.get("url") or "",
+            "source": art.get("source") or art.get("metadata_source") or "",
+            "published_at": art.get("published") or art.get("published_at") or art.get("date") or "",
+            "date": art.get("date") or art.get("published") or "",
+            "text": text,
+        })
+    return out
+
+
+def _empty_engine_deliberation_packet(slug: str) -> dict:
+    return {
+        "slug": slug,
+        "advocate_proposals": [],
+        "rebuttals": [],
+        "jury_verdicts": [],
+        "traces": {"chunks": []},
+        "chunks": [],
+    }
+
+
+def _empty_engine_review(slug: str, *, dry_run: bool) -> dict:
+    return {
+        "slug": slug,
+        "dry_run": dry_run,
+        "proposal_count": 0,
+        "proposals_filed": [],
+        "proposals": [],
+        "skipped": [],
+        "errors": [],
+        "chunks": [],
+        "next_step": (
+            "Review list_proposals(slug, status='pending') then commit_match(proposal_id)."
+            if not dry_run else
+            "Re-run with dry_run=false to file pending proposals after review."
+        ),
+    }
+
+
+def _append_engine_packet_chunk(aggregate: dict, chunk_packet: dict, chunk_key: str) -> None:
+    """Append a one-chunk deliberation packet into the topic aggregate."""
+    for key in ("advocate_proposals", "rebuttals", "jury_verdicts"):
+        rows = chunk_packet.get(key) or []
+        if isinstance(rows, list):
+            aggregate[key].extend(rows)
+    traces = chunk_packet.get("traces") or {}
+    if isinstance(traces, dict):
+        aggregate.setdefault("traces", {}).setdefault("chunks", []).append({
+            "chunk": chunk_key,
+            "traces": traces,
+        })
+
+
+def _append_engine_review_chunk(aggregate: dict, chunk_review: dict, chunk_key: str) -> None:
+    """Append one chunk's proposal-filing result into the review aggregate."""
+    proposals = chunk_review.get("proposals") or []
+    filed = chunk_review.get("proposals_filed") or []
+    skipped = chunk_review.get("skipped") or []
+    errors = chunk_review.get("errors") or []
+    if isinstance(proposals, list):
+        aggregate["proposals"].extend(proposals)
+    if isinstance(filed, list):
+        aggregate["proposals_filed"].extend(filed)
+    if isinstance(skipped, list):
+        aggregate["skipped"].extend(skipped)
+    if isinstance(errors, list):
+        aggregate["errors"].extend(errors)
+    aggregate["proposal_count"] = len(aggregate["proposals"])
+    aggregate["chunks"].append({
+        "chunk": chunk_key,
+        "proposal_count": len(proposals) if isinstance(proposals, list) else 0,
+        "proposals_filed": filed if isinstance(filed, list) else [],
+        "skipped_count": len(skipped) if isinstance(skipped, list) else 0,
+        "error_count": len(errors) if isinstance(errors, list) else 0,
+    })
+    if aggregate["proposals_filed"]:
+        aggregate["next_step"] = "Review list_proposals(slug, status='pending') then commit_match(proposal_id)."
+
+
+def _run_engine_deliberation_chunks(
+    slug: str,
+    all_engine_articles: list[dict],
+    *,
+    store: ActivityStore,
+    job_id: str,
+    model: str | None,
+    temperature: float,
+    max_tokens: int,
+    timeout_sec: int,
+    dry_run: bool,
+    engine_file_proposals: bool,
+    engine_max_articles: int,
+    engine_article_offset: int,
+    engine_time_budget_sec: int,
+) -> tuple[dict, dict | None, dict, str | None]:
+    """Run Dream deliberation in bounded chunks and file each chunk immediately.
+
+    ``engine_max_articles`` is the per-Dream-call chunk size. It is not a total
+    cap. If a later chunk fails, earlier chunk proposals remain filed and
+    ``coverage.next_offset`` points at the failed chunk so the operator can
+    resume without redoing completed chunks.
+    """
+    total = len(all_engine_articles or [])
+    start_offset = max(0, int(engine_article_offset or 0))
+    start_offset = min(start_offset, total)
+    configured_chunk = int(engine_max_articles or 0)
+    remaining = max(0, total - start_offset)
+    chunk_size = configured_chunk if configured_chunk > 0 else (remaining or 1)
+
+    engine_packet = _empty_engine_deliberation_packet(slug)
+    engine_review = _empty_engine_review(slug, dry_run=dry_run) if engine_file_proposals else None
+    chunks: list[dict] = []
+    completed_articles = 0
+    attempted_articles = 0
+    failed_articles = 0
+    error: str | None = None
+
+    if remaining <= 0:
+        coverage = {
+            "total_articles": total,
+            "selected_articles": 0,
+            "processed_articles": 0,
+            "attempted_articles": 0,
+            "failed_articles": 0,
+            "article_offset": start_offset,
+            "deferred_before": start_offset,
+            "deferred_after": 0,
+            "deferred_articles": 0,
+            "next_offset": None,
+            "max_articles": configured_chunk,
+            "chunk_size": chunk_size,
+            "chunks_completed": 0,
+            "chunks_failed": 0,
+            "chunks_total": 0,
+            "chunks": chunks,
+        }
+        return engine_packet, engine_review, coverage, None
+
+    from mcp_servers.nrol_ao_engine import deliberation_agent
+
+    initial_total_chunks = (remaining + chunk_size - 1) // chunk_size
+    segments: list[tuple[int, int]] = []
+    cursor = start_offset
+    while cursor < total:
+        seg_len = min(chunk_size, total - cursor)
+        segments.append((cursor, seg_len))
+        cursor += seg_len
+
+    attempted_offsets: set[int] = set()
+    completed_offsets: set[int] = set()
+    failed_offsets: set[int] = set()
+    failures: list[str] = []
+    budget_exhausted = False
+    budget_message = ""
+    budget_started = time.time()
+    chunk_index = 0
+    while segments:
+        if (
+            engine_time_budget_sec
+            and engine_time_budget_sec > 0
+            and chunks
+            and (time.time() - budget_started) >= engine_time_budget_sec
+        ):
+            budget_exhausted = True
+            next_pending = segments[0][0]
+            budget_message = (
+                f"engine deliberation time budget exhausted after "
+                f"{int(time.time() - budget_started)}s; resume with "
+                f"engine_article_offset={next_pending}"
+            )
+            store.record(
+                job_id,
+                "running",
+                task="run_news_scan",
+                slug=slug,
+                model=model or "dream",
+                summary={
+                    "phase": "engine_deliberation_time_budget_exhausted",
+                    "processed_articles": len(completed_offsets),
+                    "attempted_articles": len(attempted_offsets),
+                    "total_articles": total,
+                    "next_offset": next_pending,
+                    "time_budget_sec": engine_time_budget_sec,
+                },
+            )
+            break
+        current, seg_len = segments.pop(0)
+        chunk_index += 1
+        chunk_articles = all_engine_articles[current:current + seg_len]
+        if not chunk_articles:
+            continue
+        chunk_key = f"{current}-{current + len(chunk_articles) - 1}"
+        article_ids = [str(a.get("article_id") or a.get("url") or "") for a in chunk_articles]
+        attempted_offsets.update(range(current, current + len(chunk_articles)))
+        chunk_summary: dict[str, Any] = {
+            "chunk_index": chunk_index,
+            "chunk": chunk_key,
+            "article_offset": current,
+            "article_count": len(chunk_articles),
+            "article_ids": article_ids,
+            "status": "running",
+        }
+        chunks.append(chunk_summary)
+        store.record(
+            job_id,
+            "running",
+            task="run_news_scan",
+            slug=slug,
+            model=model or "dream",
+            summary={
+                "phase": "engine_deliberation_chunk",
+                "chunk_index": chunk_index,
+                "chunks_total": initial_total_chunks,
+                "article_offset": current,
+                "article_count": len(chunk_articles),
+                "processed_articles": len(completed_offsets),
+                "total_articles": total,
+                "chunk_size": chunk_size,
+            },
+        )
+
+        try:
+            chunk_packet = deliberation_agent.run_deliberation(
+                slug,
+                chunk_articles,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=float(timeout_sec),
+            )
+            verdicts = chunk_packet.get("jury_verdicts") or []
+            if not verdicts:
+                raise RuntimeError(
+                    "engine deliberation produced no jury verdicts "
+                    f"for chunk starting at offset {current}"
+                )
+
+            chunk_review = None
+            if engine_file_proposals:
+                chunk_review = _file_engine_deliberation_proposals(
+                    slug,
+                    chunk_articles,
+                    chunk_packet,
+                    dry_run=dry_run,
+                    submitted_by="engine-news-scan",
+                )
+                _append_engine_review_chunk(engine_review, chunk_review, chunk_key)
+
+            _append_engine_packet_chunk(engine_packet, chunk_packet, chunk_key)
+            completed_offsets.update(range(current, current + len(chunk_articles)))
+            chunk_summary.update({
+                "status": "completed",
+                "verdict_count": len(verdicts),
+                "advocate_count": len(chunk_packet.get("advocate_proposals") or []),
+                "rebuttal_count": len(chunk_packet.get("rebuttals") or []),
+                "proposal_count": (chunk_review or {}).get("proposal_count", 0) if chunk_review else 0,
+                "proposals_filed": (chunk_review or {}).get("proposals_filed", []) if chunk_review else [],
+                "review_error_count": len((chunk_review or {}).get("errors") or []) if chunk_review else 0,
+            })
+            store.record(
+                job_id,
+                "running",
+                task="run_news_scan",
+                slug=slug,
+                model=model or "dream",
+                summary={
+                    "phase": "engine_deliberation_chunk_completed",
+                    "chunk_index": chunk_index,
+                    "chunks_total": initial_total_chunks,
+                    "article_offset": current,
+                    "article_count": len(chunk_articles),
+                    "processed_articles": len(completed_offsets),
+                    "total_articles": total,
+                    "verdict_count": len(verdicts),
+                    "proposals_filed": len(chunk_summary["proposals_filed"]),
+                },
+            )
+        except Exception as exc:
+            chunk_error = str(exc)
+            chunk_summary.update({
+                "status": "failed",
+                "error": chunk_error,
+            })
+            if len(chunk_articles) > 1:
+                left_len = max(1, len(chunk_articles) // 2)
+                right_len = len(chunk_articles) - left_len
+                retry_segments = [(current, left_len)]
+                if right_len > 0:
+                    retry_segments.append((current + left_len, right_len))
+                segments = retry_segments + segments
+                chunk_summary["recovery"] = "split_and_retry"
+                chunk_summary["retry_chunks"] = [
+                    f"{offset}-{offset + length - 1}" for offset, length in retry_segments
+                ]
+            else:
+                failed_offsets.add(current)
+                failures.append(f"offset {current} ({article_ids[0] if article_ids else 'unknown'}): {chunk_error}")
+            store.record(
+                job_id,
+                "running",
+                task="run_news_scan",
+                slug=slug,
+                model=model or "dream",
+                summary={
+                    "phase": "engine_deliberation_chunk_failed",
+                    "chunk_index": chunk_index,
+                    "chunks_total": initial_total_chunks,
+                    "article_offset": current,
+                    "article_count": len(chunk_articles),
+                    "processed_articles": len(completed_offsets),
+                    "total_articles": total,
+                    "next_offset": current,
+                    "error": chunk_error,
+                    "recovery": chunk_summary.get("recovery"),
+                },
+            )
+
+    if failures:
+        error = (
+            "engine deliberation failed for "
+            f"{len(failed_offsets)} article(s): " + "; ".join(failures[:5])
+        )
+        if len(failures) > 5:
+            error += f"; ... {len(failures) - 5} more"
+    elif budget_exhausted:
+        error = budget_message
+    first_failed_offset = min(failed_offsets) if failed_offsets else None
+    pending_offsets: set[int] = set()
+    for offset, length in segments:
+        pending_offsets.update(range(offset, offset + length))
+    deferred_after = len(failed_offsets | pending_offsets)
+    next_offset = first_failed_offset
+    if next_offset is None and pending_offsets:
+        next_offset = min(pending_offsets)
+    coverage = {
+        "total_articles": total,
+        "selected_articles": len(completed_offsets),
+        "processed_articles": len(completed_offsets),
+        "attempted_articles": len(attempted_offsets),
+        "failed_articles": len(failed_offsets),
+        "article_offset": start_offset,
+        "deferred_before": start_offset,
+        "deferred_after": deferred_after,
+        "deferred_articles": deferred_after,
+        "next_offset": next_offset,
+        "failed_offsets": sorted(failed_offsets),
+        "pending_offsets": sorted(pending_offsets),
+        "time_budget_sec": engine_time_budget_sec,
+        "time_budget_exhausted": budget_exhausted,
+        "max_articles": configured_chunk,
+        "chunk_size": chunk_size,
+        "chunks_completed": sum(1 for c in chunks if c.get("status") == "completed"),
+        "chunks_failed": sum(1 for c in chunks if c.get("status") == "failed"),
+        "chunks_total": len(chunks),
+        "initial_chunks_total": initial_total_chunks,
+        "chunks": chunks,
+    }
+    engine_packet["chunks"] = chunks
+    return engine_packet, engine_review, coverage, error
+
+
+def _engine_deliberation_by_id(rows: list[dict], id_key: str) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for row in rows or []:
+        if isinstance(row, dict):
+            key = str(row.get(id_key) or "").strip()
+            if key:
+                out[key] = row
+    return out
+
+
+def _engine_deliberation_stamp(
+    verdict: dict,
+    advocate_by_id: dict[str, dict],
+    rebut_by_id: dict[str, dict],
+) -> dict:
+    """Build the gate-passing deliberation record stored on a proposal."""
+    adv_id = str(verdict.get("advocate_proposal_id") or "").strip()
+    reb_id = str(verdict.get("rebuttal_id") or "").strip()
+    return {
+        "source": "nrol_ao_engine",
+        "jury_verdict_id": verdict.get("verdict_id") or "",
+        "jury_rationale": verdict.get("jury_rationale") or "",
+        "final_action": verdict.get("final_action") or {},
+        "advocate_proposal_id": adv_id,
+        "rebuttal_id": reb_id,
+        "advocate": advocate_by_id.get(adv_id, {}),
+        "rebuttal": rebut_by_id.get(reb_id, {}),
+    }
+
+
+def _file_engine_deliberation_proposals(
+    slug: str,
+    articles: list[dict],
+    deliberation_packet: dict,
+    *,
+    dry_run: bool,
+    submitted_by: str,
+) -> dict:
+    """File engine-agent jury outputs as pending proposals; never commit."""
+    if not isinstance(deliberation_packet, dict):
+        raise ValueError("deliberation_packet must be a JSON object")
+    if not isinstance(articles, list):
+        raise ValueError("articles must be a JSON array")
+
+    engine = _import_from_repo("engine")
+    topic = engine.load_topic(slug)
+    if topic.get("meta", {}).get("status") != "ACTIVE":
+        raise ValueError(f"topic {slug!r} is not ACTIVE")
+
+    article_by_key = _engine_article_index(articles)
+    advocate_rows = deliberation_packet.get("advocate_proposals") or []
+    rebut_rows = deliberation_packet.get("rebuttals") or []
+    verdicts = deliberation_packet.get("jury_verdicts") or []
+    advocate_by_id = _engine_deliberation_by_id(advocate_rows, "proposal_id")
+    rebut_by_id = _engine_deliberation_by_id(rebut_rows, "rebuttal_id")
+
+    pstore = _proposal_store()
+    filed: list[str] = []
+    previews: list[dict] = []
+    skipped: list[dict] = []
+    errors: list[dict] = []
+
+    for verdict in verdicts:
+        if not isinstance(verdict, dict):
+            skipped.append({"reason": "verdict is not an object", "verdict": verdict})
+            continue
+        action = verdict.get("final_action") or {}
+        if not isinstance(action, dict):
+            errors.append({"verdict_id": verdict.get("verdict_id"), "error": "final_action is not an object"})
+            continue
+
+        kind = str(action.get("kind") or "").strip().upper()
+        article_key = str(verdict.get("article_id") or "").strip()
+        if kind in {"IGNORE", "DUPLICATE_OF"}:
+            skipped.append({
+                "article_id": article_key,
+                "verdict_id": verdict.get("verdict_id"),
+                "action": kind,
+                "reason": f"{kind} is not a pending proposal action",
+            })
+            continue
+
+        article = article_by_key.get(article_key)
+        if not article:
+            errors.append({
+                "article_id": article_key,
+                "verdict_id": verdict.get("verdict_id"),
+                "error": "article not found in supplied articles",
+            })
+            continue
+
+        indicator_id = str(action.get("indicator_id") or "").strip()
+        observed_value = action.get("value")
+        missing_direction = str(action.get("description") or "").strip()
+        try:
+            _validate_proposal_shape(topic, kind, indicator_id, observed_value)
+        except Exception as exc:
+            errors.append({
+                "article_id": article_key,
+                "verdict_id": verdict.get("verdict_id"),
+                "action": kind,
+                "error": str(exc),
+            })
+            continue
+
+        stamp = _engine_deliberation_stamp(verdict, advocate_by_id, rebut_by_id)
+        rationale = (
+            verdict.get("jury_rationale")
+            or (advocate_by_id.get(stamp.get("advocate_proposal_id", "")) or {}).get("analysis")
+            or "engine-agent jury proposal"
+        )
+        preview = {
+            "article_id": article_key,
+            "slug": slug,
+            "action": kind,
+            "indicator_id": indicator_id,
+            "observed_value": observed_value,
+            "rationale": str(rationale)[:500],
+            "missing_direction": missing_direction,
+            "deliberation": stamp,
+        }
+        if dry_run:
+            previews.append(preview)
+            continue
+
+        art_rec = pstore.submit_article(article, submitted_by=submitted_by)
+        existing = pstore.find_pending_proposal(
+            article_id=art_rec["id"],
+            slug=slug,
+            action=kind,
+            indicator_id=indicator_id,
+            observed_value=observed_value,
+        )
+        if existing:
+            skipped.append({
+                "article_id": article_key,
+                "verdict_id": verdict.get("verdict_id"),
+                "action": kind,
+                "indicator_id": indicator_id,
+                "observed_value": observed_value,
+                "reason": "pending_duplicate_proposal",
+                "existing_proposal_id": existing.get("id"),
+            })
+            continue
+        prop = pstore.add_proposal(
+            article_id=art_rec["id"],
+            slug=slug,
+            action=kind,
+            indicator_id=indicator_id,
+            observed_value=observed_value,
+            rationale=preview["rationale"],
+            missing_direction=missing_direction,
+            deliberation=json.dumps({"deliberation": stamp}, ensure_ascii=True, default=str),
+        )
+        filed.append(prop["id"])
+        previews.append({**preview, "proposal_id": prop["id"], "stored_article_id": art_rec["id"]})
+
+    return {
+        "slug": slug,
+        "dry_run": dry_run,
+        "proposal_count": len(previews),
+        "proposals_filed": filed,
+        "proposals": previews,
+        "skipped": skipped,
+        "errors": errors,
+        "next_step": (
+            "Review list_proposals(slug, status='pending') then commit_match(proposal_id)."
+            if filed else
+            "Re-run with dry_run=false to file pending proposals after review."
+        ),
+    }
+
+
+@mcp.tool()
+def file_engine_deliberation_proposals(
+    slug: str,
+    articles: list[dict],
+    deliberation_packet: dict,
+    dry_run: bool = True,
+    submitted_by: str = "engine-agent",
+) -> str:
+    """Bridge engine-agent jury outputs into the pending proposal queue.
+
+    This is Track A phase 4's review bridge. It does not commit, does not move
+    posteriors, and does not mutate topic JSON. It converts reviewable jury
+    final actions (PARK/FIRE/OBSERVE/SCHEMA_GAP) into pending proposals using
+    the existing proposal lifecycle. IGNORE and DUPLICATE_OF are reported as
+    skipped because they are not commit proposals.
+    """
+    try:
+        result = _file_engine_deliberation_proposals(
+            slug,
+            articles,
+            deliberation_packet,
+            dry_run=bool(dry_run),
+            submitted_by=submitted_by or "engine-agent",
+        )
+        return _json(result)
+    except Exception as exc:
+        return _json({"error": str(exc), "slug": slug, "dry_run": dry_run})
 
 
 @mcp.tool()

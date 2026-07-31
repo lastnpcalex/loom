@@ -46,6 +46,21 @@ async def test_update_conversation_local_model():
     assert updated["local_model"] == "qwen3:4b"
 
 
+async def test_update_conversation_system_only_weave_fields():
+    """Minimal Weave fields persist on conversations."""
+    conv = await db.create_conversation("Minimal Weave", mode="weave")
+    await db.update_conversation_fields(
+        conv["id"],
+        system_only=1,
+        system_prompt="Stay in close third person.",
+        ooda_enabled=0,
+    )
+    updated = await db.get_conversation(conv["id"])
+    assert updated["system_only"] == 1
+    assert updated["system_prompt"] == "Stay in close third person."
+    assert updated["ooda_enabled"] == 0
+
+
 async def test_add_message_and_branch():
     """Add messages in a chain and verify branch walk returns root->leaf order."""
     conv = await db.create_conversation("Branch Test")
