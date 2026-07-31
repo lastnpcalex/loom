@@ -63,7 +63,6 @@ from ooda_harness import (
     execute_ooda_updates,
 )
 from prompt_engine import (
-    BASE_SYSTEM_PROMPT,
     build_system_prompt,
     assemble_prompt,
     get_style_nudge,
@@ -109,6 +108,21 @@ _cron_scheduler_task: asyncio.Task | None = None
 _hermes_state_task: asyncio.Task | None = None
 _cron_running: set[int] = set()
 _dream_shim_proc: subprocess.Popen | None = None
+
+
+def _truthy_setting(value) -> bool:
+    """Normalize SQLite/API boolean-ish values without making "0" truthy."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _minimal_weave_system_prompt(conv: dict | None) -> str:
+    """Minimal Weave must not fall back to the full RP system prompt."""
+    if not conv:
+        return ""
+    value = conv.get("system_prompt")
+    return value.strip() if isinstance(value, str) else ""
 
 # ── Canvas CLAUDE.md template ──
 CANVAS_CLAUDE_MD = """\
@@ -2179,7 +2193,7 @@ async def api_create_conversation(data: dict = None):
     cc_model = data.get("cc_model", "sonnet")
     cc_effort = data.get("cc_effort", "high")
     local_model = data.get("local_model")
-    system_only = bool(data.get("system_only")) and mode == "weave"
+    system_only = _truthy_setting(data.get("system_only")) and mode == "weave"
     system_prompt = data.get("system_prompt")
     if system_only:
         character_id = None
@@ -2379,14 +2393,14 @@ async def api_update_conversation(conv_id: int, data: dict):
     if "incognito" in data:
         # Incognito routes Hermes-class turns to Prometheus (always-warm,
         # cloud-fallback, no soul). 0 = ensouled attendant, 1 = Prometheus.
-        fields["incognito"] = int(bool(data["incognito"]))
+        fields["incognito"] = int(_truthy_setting(data["incognito"]))
     if "local_model" in data:
         fields["local_model"] = data["local_model"]
     if "ooda_enabled" in data:
         conv = await db.get_conversation(conv_id)
-        fields["ooda_enabled"] = 0 if conv and conv.get("system_only") else int(data["ooda_enabled"])
+        fields["ooda_enabled"] = 0 if conv and _truthy_setting(conv.get("system_only")) else int(_truthy_setting(data["ooda_enabled"]))
     if "system_only" in data:
-        fields["system_only"] = int(bool(data["system_only"]))
+        fields["system_only"] = int(_truthy_setting(data["system_only"]))
         if fields["system_only"]:
             fields["ooda_enabled"] = 0
     if "system_prompt" in data:
@@ -5203,7 +5217,7 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
         # Also persist so the dropdown re-selects on next load
         await db.update_conversation_fields(conv_id, local_model=data["cc_model"])
 
-    if conv.get("ooda_enabled") and not conv.get("system_only"):
+    if _truthy_setting(conv.get("ooda_enabled")) and not _truthy_setting(conv.get("system_only")):
         await _handle_ooda_generation(websocket, conv_id, conv, data)
     else:
         await _handle_weave_generation(websocket, conv_id, conv, data)
@@ -8703,7 +8717,7 @@ async def _handle_weave_generation(
         if action == "generate" and parent_id is None:
             leaf = await db.get_active_leaf(conv_id)
             parent_id = leaf["id"] if leaf else None
-        system_only = bool(conv and conv.get("system_only"))
+        system_only = bool(conv) and _truthy_setting(conv.get("system_only"))
         character = None
         if (not system_only) and conv and conv.get("character_id"):
             char_path = os.path.join(
@@ -8771,7 +8785,7 @@ async def _handle_weave_generation(
         # Build system prompt (use custom scene if set)
         custom_scene = None if system_only else (conv.get("custom_scene") if conv else None)
         if system_only:
-            system_prompt = (conv.get("system_prompt") or "").strip() or BASE_SYSTEM_PROMPT
+            system_prompt = _minimal_weave_system_prompt(conv)
         else:
             system_prompt = build_system_prompt(
                 character=character,

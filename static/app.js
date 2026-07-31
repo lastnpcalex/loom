@@ -32,6 +32,13 @@ function isMobileDevice() {
         && !hasMouse;
 }
 
+function truthySetting(value) {
+    if (typeof value === 'string') {
+        return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+    }
+    return !!value;
+}
+
 const API = {
     async get(url) {
         const res = await fetch(url);
@@ -831,7 +838,7 @@ function buildConvItem(conv) {
     const isLocal = conv.mode === 'local';
     const isHermes = conv.mode === 'hermes';
     const isDream = conv.mode === 'dream';
-    const isMinimalWeave = conv.mode === 'weave' && !!conv.system_only;
+    const isMinimalWeave = conv.mode === 'weave' && truthySetting(conv.system_only);
     const isDreamWeaver = conv.mode === 'weave' && _isDreamEngineModel(conv.local_model);
     const charName = isNrol ? (conv.cc_model || 'NROL-AO')
         : isGemini ? (conv.cc_model || 'Gemini')
@@ -1486,7 +1493,7 @@ async function updateInlineCCControls(conv) {
         const incogD = document.getElementById('incognito-toggle-dream');
         if (incogD) incogD.checked = !!conv.incognito;
     } else if (conv && conv.mode === 'weave') {
-        const isMinimalWeave = !!conv.system_only;
+        const isMinimalWeave = truthySetting(conv.system_only);
         controls.classList.add('hidden');
         weaveControls?.classList.remove('hidden');
         _setWeaveOnlyBits(!isMinimalWeave);
@@ -2776,7 +2783,7 @@ function setupEventListeners() {
         const localModel = (conv && conv.local_model) || '';
         const weaveSystemPromptGroup = document.getElementById('cfg-weave-system-prompt-group');
         const weaveSystemPrompt = document.getElementById('cfg-weave-system-prompt');
-        if (weaveSystemPromptGroup) weaveSystemPromptGroup.classList.toggle('hidden', !(conv && conv.mode === 'weave' && conv.system_only));
+        if (weaveSystemPromptGroup) weaveSystemPromptGroup.classList.toggle('hidden', !(conv && conv.mode === 'weave' && truthySetting(conv.system_only)));
         if (weaveSystemPrompt) weaveSystemPrompt.value = (conv && conv.system_prompt) || '';
         _setSettingsLoading(true, 'Loading model controls...');
         const settingsJobs = await Promise.allSettled([
@@ -3018,7 +3025,7 @@ function setupEventListeners() {
                 updates.local_model = valueOf('cfg-hermes-model', conv.local_model || '');
             } else if (conv.mode === 'weave') {
                 updates.local_model = valueOf('cfg-weave-model', conv.local_model || '');
-                if (conv.system_only) updates.system_prompt = valueOf('cfg-weave-system-prompt', conv.system_prompt || '');
+                if (truthySetting(conv.system_only)) updates.system_prompt = valueOf('cfg-weave-system-prompt', conv.system_prompt || '');
             } else if (conv.mode === 'dream') {
                 updates.local_model = valueOf('cfg-dream-model', conv.local_model || '');
             }

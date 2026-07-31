@@ -1,6 +1,10 @@
 """Tests for REST API endpoints."""
 
+import json
+
 import pytest
+
+import database as db
 
 
 class _FakeAnthropicResponse:
@@ -87,6 +91,93 @@ async def test_create_system_only_weave_conversation(client, mock_llama):
     assert data["system_only"] == 1
     assert data["system_prompt"] == "Use only branch history and this instruction."
     assert data["ooda_enabled"] == 0
+
+
+def test_minimal_weave_helpers_do_not_reintroduce_defaults():
+    import server
+
+    assert server._truthy_setting("1") is True
+    assert server._truthy_setting("true") is True
+    assert server._truthy_setting("0") is False
+    assert server._truthy_setting("false") is False
+    assert server._minimal_weave_system_prompt({"system_prompt": ""}) == ""
+
+
+async def test_system_only_weave_generation_uses_only_system_prompt(monkeypatch):
+    """Minimal Weave sends the stored system prompt without RP scaffolding."""
+    import server
+
+    conv = await db.create_conversation(
+        "Dirty Minimal Weave",
+        character_id="leaky-character",
+        mode="weave",
+    )
+    await db.update_conversation_fields(
+        conv["id"],
+        persona_id="leaky-persona",
+        lore_ids=json.dumps(["leaky-lore"]),
+        custom_scene="LEAKY SCENE",
+        system_only=1,
+        system_prompt="ONLY THIS SYSTEM MESSAGE",
+        ooda_enabled=1,
+        local_model="Qwen3.6-27B-NVFP4.gguf",
+    )
+    user_msg = await db.add_message(conv["id"], "user", "Start here.")
+    conv = await db.get_conversation(conv["id"])
+
+    loader_calls = []
+
+    def record_loader(name):
+        def _loader(*args, **kwargs):
+            loader_calls.append(name)
+            return {
+                "name": name,
+                "personality": f"LEAKY {name} PERSONALITY",
+                "scenario": f"LEAKY {name} SCENARIO",
+                "content": f"LEAKY {name} CONTENT",
+                "example_messages": [
+                    {"role": "assistant", "content": f"LEAKY {name} EXAMPLE"},
+                ],
+            }
+        return _loader
+
+    captured = {}
+
+    async def fake_stream_chat(messages, model=None):
+        captured["messages"] = messages
+        captured["model"] = model
+        yield "ok"
+
+    async def fake_update_rolling_summary(conv_id):
+        return None
+
+    monkeypatch.setattr(server, "load_character", record_loader("character"))
+    monkeypatch.setattr(server, "load_persona", record_loader("persona"))
+    monkeypatch.setattr(server, "load_lore_entry", record_loader("lore"))
+    monkeypatch.setattr(server, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr("context_manager.update_rolling_summary", fake_update_rolling_summary)
+
+    await server._handle_weave_generation(
+        None,
+        conv["id"],
+        conv,
+        {"action": "generate", "parent_id": user_msg["id"]},
+    )
+
+    assert loader_calls == []
+    assert captured["model"] == "Qwen3.6-27B-NVFP4.gguf"
+    assert captured["messages"][0] == {
+        "role": "system",
+        "content": "ONLY THIS SYSTEM MESSAGE",
+    }
+    assert captured["messages"][1:] == [
+        {"role": "user", "content": "Start here."},
+    ]
+    prompt_text = "\n".join(m["content"] for m in captured["messages"])
+    assert "collaborative fiction writer" not in prompt_text
+    assert "LEAKY" not in prompt_text
+    assert "My character" not in prompt_text
+    assert "Background" not in prompt_text
 
 
 async def test_create_local_conversation(client, mock_llama):
