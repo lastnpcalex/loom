@@ -46,17 +46,27 @@ async def test_update_conversation_local_model():
     assert updated["local_model"] == "qwen3:4b"
 
 
+async def test_update_conversation_mode():
+    """update_conversation_fields accepts and persists mode changes."""
+    conv = await db.create_conversation("Mode Test", mode="claude")
+    await db.update_conversation_fields(conv["id"], mode="openrouter")
+    updated = await db.get_conversation(conv["id"])
+    assert updated["mode"] == "openrouter"
+
+
 async def test_update_conversation_system_only_weave_fields():
     """Minimal Weave fields persist on conversations."""
     conv = await db.create_conversation("Minimal Weave", mode="weave")
     await db.update_conversation_fields(
         conv["id"],
         system_only=1,
+        minimal_ooda_enabled=0,
         system_prompt="Stay in close third person.",
         ooda_enabled=0,
     )
     updated = await db.get_conversation(conv["id"])
     assert updated["system_only"] == 1
+    assert updated["minimal_ooda_enabled"] == 0
     assert updated["system_prompt"] == "Stay in close third person."
     assert updated["ooda_enabled"] == 0
 
@@ -125,6 +135,27 @@ async def test_cc_session_mode_column_exists():
     await conn.close()
     col_names = [c[1] for c in columns]
     assert "cc_session_mode" in col_names
+
+
+async def test_codex_goal_columns_round_trip():
+    conv = await db.create_conversation("Codex Goal", mode="codex")
+    await db.update_conversation_fields(
+        conv["id"],
+        codex_goal_objective="Finish the migration",
+        codex_goal_status="active",
+        codex_goal_token_budget=40000,
+        codex_goal_tokens_used=123,
+        codex_goal_time_used_seconds=7,
+        codex_goal_updated_at=42.0,
+    )
+
+    updated = await db.get_conversation(conv["id"])
+    assert updated["codex_goal_objective"] == "Finish the migration"
+    assert updated["codex_goal_status"] == "active"
+    assert updated["codex_goal_token_budget"] == 40000
+    assert updated["codex_goal_tokens_used"] == 123
+    assert updated["codex_goal_time_used_seconds"] == 7
+    assert updated["codex_goal_updated_at"] == 42.0
 
 
 async def test_cc_session_mode_round_trip_and_null_compat():

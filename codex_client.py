@@ -21,7 +21,6 @@ _IGNORED_APP_SERVER_EVENTS = {
     "account/rateLimits/updated",
     "remoteControl/status/changed",
     "serverRequest/resolved",
-    "thread/tokenUsage/updated",
     "turn/started",
 }
 
@@ -356,20 +355,44 @@ def _codex_runner_error(item: dict) -> str:
 
 def _codex_usage(raw: dict) -> dict | None:
     """Normalize token usage from turn/item payloads when Codex includes it."""
-    usage = raw.get("usage") or raw.get("token_usage") or raw.get("metrics", {}).get("usage")
-    if not isinstance(usage, dict):
+    params = raw.get("params") or {}
+    candidates = [
+        raw.get("usage"),
+        raw.get("token_usage"),
+        raw.get("tokenUsage"),
+        raw.get("metrics", {}).get("usage") if isinstance(raw.get("metrics"), dict) else None,
+        params.get("usage") if isinstance(params, dict) else None,
+        params.get("token_usage") if isinstance(params, dict) else None,
+        params.get("tokenUsage") if isinstance(params, dict) else None,
+    ]
+    for container_name in ("turn", "thread", "message", "item"):
+        container = params.get(container_name) if isinstance(params, dict) else None
+        if isinstance(container, dict):
+            candidates.extend([
+                container.get("usage"),
+                container.get("token_usage"),
+                container.get("tokenUsage"),
+            ])
+    usage = next((candidate for candidate in candidates if isinstance(candidate, dict)), None)
+    if not usage:
         return None
 
     input_tokens = (
         usage.get("input_tokens")
+        or usage.get("inputTokens")
         or usage.get("prompt_tokens")
+        or usage.get("promptTokens")
         or usage.get("total_input_tokens")
+        or usage.get("totalInputTokens")
         or 0
     )
     output_tokens = (
         usage.get("output_tokens")
+        or usage.get("outputTokens")
         or usage.get("completion_tokens")
+        or usage.get("completionTokens")
         or usage.get("total_output_tokens")
+        or usage.get("totalOutputTokens")
         or 0
     )
     if not input_tokens and not output_tokens:
@@ -597,6 +620,30 @@ def _app_sandbox_policy(cwd: str, nrol_operator: bool = False) -> dict:
     }
 
 
+def _codex_goal_set_params(
+    thread_id: str,
+    objective: str | None = None,
+    status: str | None = None,
+    token_budget: int | None = None,
+) -> dict:
+    params = {"threadId": thread_id}
+    if objective is not None:
+        params["objective"] = objective
+    if status is not None:
+        params["status"] = status
+    if token_budget is not None:
+        params["tokenBudget"] = token_budget
+    return params
+
+
+def _codex_goal_from_response(response: dict) -> dict | None:
+    result = response.get("result") if isinstance(response, dict) else None
+    if not isinstance(result, dict):
+        return None
+    goal = result.get("goal")
+    return goal if isinstance(goal, dict) else None
+
+
 def _app_permission_payload(method: str, params: dict) -> tuple[str, dict]:
     if method == "item/commandExecution/requestApproval":
         command = params.get("command") or params.get("cmd") or params.get("argv") or params.get("execCommand")
@@ -683,13 +730,211 @@ async def _post_loom_permission(
     return await asyncio.to_thread(_post)
 
 
+async def manage_codex_goal(
+    action: str,
+    cwd: str,
+    conv_id: int = 0,
+    server_port: int = 8000,
+    model: str = "Codex (GPT-4o)",
+    permission_mode: str = "default",
+    resume_session_id: str | None = None,
+    objective: str | None = None,
+    status: str | None = None,
+    token_budget: int | None = None,
+    nrol_operator: bool = False,
+) -> dict:
+    """Run a short app-server control session for Codex thread goal commands."""
+    workspace_root = Path(cwd).resolve()
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    cwd = str(workspace_root)
+
+    codex_model = _loom_model_to_codex(model)
+    codex_exe = _find_codex_exe()
+    approval_policy, sandbox_mode = _codex_launch_policies(permission_mode, nrol_operator)
+    mcp_servers_cfg = _thread_mcp_servers(conv_id, server_port, nrol_operator)
+    mcp_args = [
+        arg
+        for name, server_cfg in mcp_servers_cfg.items()
+        for arg in _mcp_server_config_args(name, server_cfg)
+    ]
+    cmd = [codex_exe, "app-server", *mcp_args, "--stdio", "--disable", "hooks"]
+    env = {
+        **os.environ,
+        "LOOM_CONV_ID": str(conv_id),
+        "LOOM_PORT": str(server_port),
+        "LOOM_API_URL": f"http://127.0.0.1:{server_port}",
+        "LOOM_WORKSPACE_ROOT": cwd,
+    }
+    if nrol_operator:
+        env["LOOM_NROL_OPERATOR"] = "1"
+
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x08000000 | 0x00000200
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd,
+        env=env,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=16 * 1024 * 1024,
+        **kwargs,
+    )
+
+    stderr_lines: list[str] = []
+    pending_responses: dict[str | int, asyncio.Future] = {}
+    request_id = 0
+
+    async def _read_stderr():
+        try:
+            async for line in proc.stderr:
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    stderr_lines.append(text)
+                    print(f"[CODEX-stderr] {text}")
+        except Exception as e:
+            log.error(f"[CODEX] Error reading goal stderr: {e}")
+
+    stderr_task = asyncio.create_task(_read_stderr())
+
+    async def _read_stdout():
+        try:
+            async for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    print(f"[CODEX] Non-JSON goal line on stdout: {line[:200]}")
+                    continue
+                if "id" in raw and ("result" in raw or "error" in raw) and "method" not in raw:
+                    fut = pending_responses.pop(raw.get("id"), None)
+                    if fut and not fut.done():
+                        fut.set_result(raw)
+        except Exception as e:
+            for fut in pending_responses.values():
+                if not fut.done():
+                    fut.set_exception(RuntimeError(f"Codex app-server stdout failed: {e}"))
+
+    stdout_task = asyncio.create_task(_read_stdout())
+
+    async def _send(payload: dict):
+        if not proc.stdin or proc.stdin.is_closing():
+            raise RuntimeError("Codex app-server stdin is closed")
+        proc.stdin.write(_json_dumps_line(payload))
+        await proc.stdin.drain()
+
+    async def _request(method: str, params: dict | None = None) -> dict:
+        nonlocal request_id
+        request_id += 1
+        rid = request_id
+        fut = asyncio.get_running_loop().create_future()
+        pending_responses[rid] = fut
+        payload = {"id": rid, "method": method}
+        if params is not None:
+            payload["params"] = params
+        await _send(payload)
+        return await asyncio.wait_for(fut, timeout=120)
+
+    cleaned_up = False
+
+    async def _cleanup():
+        nonlocal cleaned_up
+        if cleaned_up:
+            return
+        cleaned_up = True
+        try:
+            if proc.stdin and not proc.stdin.is_closing():
+                proc.stdin.close()
+        except Exception:
+            pass
+        if proc.returncode is None:
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+        if not stdout_task.done():
+            stdout_task.cancel()
+        try:
+            await stdout_task
+        except asyncio.CancelledError:
+            pass
+        await stderr_task
+
+    try:
+        init = await _request(
+            "initialize",
+            {
+                "clientInfo": {"name": "Loom", "version": "1"},
+                "capabilities": {"experimental": True, "experimentalApi": True},
+            },
+        )
+        if init.get("error"):
+            raise RuntimeError(json.dumps(init["error"]))
+        await _send({"method": "initialized"})
+
+        method, thread_params = _codex_thread_request(
+            cwd,
+            codex_model,
+            approval_policy,
+            sandbox_mode,
+            {"mcp_servers": mcp_servers_cfg} if mcp_servers_cfg else None,
+            resume_session_id,
+            fork_session=False,
+        )
+        thread_start = await _request(method, thread_params)
+        if thread_start.get("error"):
+            raise RuntimeError(json.dumps(thread_start["error"]))
+
+        thread_result = thread_start.get("result") or {}
+        thread = thread_result.get("thread") or {}
+        thread_id = thread.get("id") or thread.get("threadId") or resume_session_id
+        if not thread_id:
+            raise RuntimeError("Codex app-server did not return a thread id")
+
+        normalized = (action or "get").lower()
+        if normalized == "get":
+            goal_response = await _request("thread/goal/get", {"threadId": thread_id})
+        elif normalized == "clear":
+            goal_response = await _request("thread/goal/clear", {"threadId": thread_id})
+        elif normalized == "set":
+            goal_response = await _request(
+                "thread/goal/set",
+                _codex_goal_set_params(
+                    thread_id,
+                    objective=objective,
+                    status=status,
+                    token_budget=token_budget,
+                ),
+            )
+        else:
+            raise ValueError(f"Unsupported Codex goal action: {action}")
+
+        if goal_response.get("error"):
+            raise RuntimeError(json.dumps(goal_response["error"]))
+        return {
+            "action": normalized,
+            "thread_id": thread_id,
+            "goal": _codex_goal_from_response(goal_response),
+            "raw": goal_response.get("result") or {},
+        }
+    finally:
+        await _cleanup()
+
+
 async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
                     model: str = "Codex (GPT-4o)", effort: str = "high",
                     permission_mode: str = "default",
                     resume_session_id: str = None, fork_session: bool = False,
                     backstage_parent_id: int | None = None,
                     nrol_operator: bool = False,
-                    permission_request_handler=None):
+                    permission_request_handler=None,
+                    codex_goal: dict | None = None):
     """Launch Codex app-server and yield Loom-compatible stream events."""
     workspace_root = Path(cwd).resolve()
     workspace_root.mkdir(parents=True, exist_ok=True)
@@ -888,6 +1133,8 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
         turn_inflight = False
         turn_activity_seen = False
         active_turn_id = ""
+        last_usage_input_tokens = 0
+        last_usage_output_tokens = 0
         started_tool_ids: set[str] = set()
         diff_tool_ids: set[str] = set()
         unknown_event_types: set[str] = set()
@@ -941,6 +1188,29 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                         "type": "status",
                         "text": "NROL MCP configured for this Codex thread; waiting for startup status",
                     }
+                if codex_goal and codex_goal.get("objective"):
+                    try:
+                        goal_set = await _request(
+                            "thread/goal/set",
+                            _codex_goal_set_params(
+                                session_id,
+                                objective=codex_goal.get("objective"),
+                                status=codex_goal.get("status") or "active",
+                                token_budget=codex_goal.get("tokenBudget"),
+                            ),
+                        )
+                        if goal_set.get("error"):
+                            yield {
+                                "type": "status",
+                                "text": f"Codex goal sync failed: {json.dumps(goal_set['error'])}",
+                            }
+                        else:
+                            yield {
+                                "type": "codex_goal",
+                                "goal": _codex_goal_from_response(goal_set),
+                            }
+                    except Exception as goal_exc:
+                        yield {"type": "status", "text": f"Codex goal sync failed: {goal_exc}"}
 
                 turn_start = await _request(
                     "turn/start",
@@ -986,6 +1256,15 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                 usage_evt = _codex_usage(raw)
                 if usage_evt:
                     turn_activity_seen = True
+                    current_input = int(usage_evt.get("input_tokens") or 0)
+                    current_output = int(usage_evt.get("output_tokens") or 0)
+                    usage_evt["input_tokens"] = current_input
+                    if current_output >= last_usage_output_tokens:
+                        usage_evt["output_tokens"] = current_output - last_usage_output_tokens
+                    else:
+                        usage_evt["output_tokens"] = current_output
+                    last_usage_input_tokens = current_input or last_usage_input_tokens
+                    last_usage_output_tokens = current_output or last_usage_output_tokens
                     yield usage_evt
 
                 if etype in ("turn.started", "turn/started"):

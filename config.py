@@ -19,7 +19,11 @@ _PERSISTED_KEYS = (
     "llama_host", "llama_model", "llama_server_exe", "llama_models_dir",
     "llama_chat_template_file",
     "vision_model",
-    "umans_model",
+    "umans_model", "enable_umans_models",
+    "goose_model", "goose_mode", "goose_builtins", "enable_goose",
+    "openrouter_base_url", "openrouter_weekly_limit_usd",
+    "openrouter_monthly_limit_usd", "openrouter_max_prompt_price_per_mtok",
+    "openrouter_max_completion_price_per_mtok",
     "max_context_tokens", "verbatim_window",
     "temperature", "top_p", "max_tokens", "repeat_penalty",
     "db_path",
@@ -28,7 +32,7 @@ _PERSISTED_KEYS = (
     # (holds config.json + models/ + .temp/). dream_idle_timeout_min is disabled
     # by default; manual unload is safer than killing long cold-start jobs.
     "dream_host", "dream_model", "dream_cwd", "dream_server_exe",
-    "dream_model_path", "dream_context_size", "dream_diffusion_steps",
+    "dream_model_path", "dream_context_size", "dream_min_output_tokens", "dream_diffusion_steps",
     "dream_cuda_mmq_max_x", "dream_gpu_layers", "dream_fit_target_mb", "dream_no_mmap", "dream_flash_attn", "dream_cache_type_k",
     "dream_cache_type_v", "dream_swa_full", "dream_idle_timeout_min",
 )
@@ -54,8 +58,30 @@ class Config:
     llama_model: str = os.getenv("LLAMA_MODEL", "Qwen3.6-27B-NVFP4.gguf")
     vision_model: str = os.getenv("VISION_MODEL", "")  # for image description; empty = use llama_model
 
-    # Umans AI connection (remote, Anthropic/OpenAI-compatible endpoint)
+    # Deprecated Umans AI connection (remote, Anthropic/OpenAI-compatible endpoint).
+    # Kept for existing conversations; hidden from new model pickers unless this
+    # compatibility switch is enabled.
     umans_model: str = os.getenv("UMANS_MODEL", "umans-coder")
+    enable_umans_models: bool = _envbool("LOOM_ENABLE_UMANS", False)
+
+    # Goose ACP integration. The executable path is install-specific and stays
+    # env-only; these persisted values are the Loom-visible defaults/knobs.
+    goose_exe: str = os.getenv("GOOSE_EXE", "")
+    goose_model: str = os.getenv("GOOSE_MODEL_LOOM", "goose:openrouter:z-ai/glm-5.2")
+    goose_mode: str = os.getenv("LOOM_GOOSE_MODE", "approve")
+    goose_builtins: str = os.getenv("LOOM_GOOSE_BUILTINS", "developer")
+    enable_goose: bool = _envbool("LOOM_ENABLE_GOOSE", True)
+
+    # OpenRouter connection. API keys are deliberately env/.env-only:
+    # OPENROUTER_API_KEY for inference and OPENROUTER_MANAGEMENT_KEY for account
+    # monitoring/provisioning. The values below are non-secret UI/config knobs.
+    openrouter_base_url: str = os.getenv(
+        "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+    )
+    openrouter_weekly_limit_usd: float = float(os.getenv("OPENROUTER_WEEKLY_LIMIT_USD", "12.5"))
+    openrouter_monthly_limit_usd: float = float(os.getenv("OPENROUTER_MONTHLY_LIMIT_USD", "50"))
+    openrouter_max_prompt_price_per_mtok: float = float(os.getenv("OPENROUTER_MAX_PROMPT_PRICE_PER_MTOK", "1"))
+    openrouter_max_completion_price_per_mtok: float = float(os.getenv("OPENROUTER_MAX_COMPLETION_PRICE_PER_MTOK", "4"))
 
     # Prometheus cloud fallback — the always-warm incognito Hermes runtime falls
     # back to the Umans OpenAI-compatible endpoint when no local model is up. These
@@ -156,6 +182,7 @@ class Config:
         r"C:\Users\exast\OneDrive\Documents\Loom-Projects\llama-diffusion\models\diffusiongemma-26b-a4b-it-nvfp4.gguf",
     )
     dream_context_size: int = int(os.getenv("DREAM_CONTEXT_SIZE", "131072"))
+    dream_min_output_tokens: int = int(os.getenv("DREAM_MIN_OUTPUT_TOKENS", "2048"))
     dream_diffusion_steps: int = int(os.getenv("DREAM_DIFFUSION_STEPS", "48"))
     dream_cuda_mmq_max_x: int = int(os.getenv("DREAM_CUDA_MMQ_MAX_X", "64"))
     dream_gpu_layers: int = int(os.getenv("DREAM_GPU_LAYERS", "-1"))

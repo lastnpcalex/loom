@@ -23,6 +23,7 @@ from typing import AsyncGenerator, Optional
 import httpx
 
 from config import config
+import openrouter_client
 
 # ── State ──────────────────────────────────────────────────────────────────
 
@@ -185,7 +186,18 @@ def _is_dream_model(model: str | None) -> bool:
     return bool(model and getattr(config, "dream_model", "") and _model_matches(model, config.dream_model))
 
 
+def _effective_max_tokens(max_tokens: int | None, raw_model: str | None) -> int:
+    effective = int(max_tokens or config.max_tokens)
+    if _is_dream_model(raw_model):
+        floor = int(getattr(config, "dream_min_output_tokens", 0) or 0)
+        if floor > 0:
+            effective = max(effective, floor)
+    return effective
+
+
 def _chat_host_for_model(model: str | None) -> str:
+    if openrouter_client.is_openrouter_model(model):
+        return openrouter_client.base_url()
     if _is_dream_model(model):
         # Default to the real sidecar port (8787). The legacy 18081 port survives
         # only in config.py's env default; if DREAM_HOST is unset, falling back to
@@ -321,6 +333,178 @@ async def _mock_stream(messages: list[dict]) -> AsyncGenerator[str, None]:
         await asyncio.sleep(0.02 + random.random() * 0.03)
 
 
+async def _stream_openrouter_chat(
+    messages: list[dict],
+    temperature: float = None,
+    top_p: float = None,
+    max_tokens: int = None,
+    model: str = None,
+    verbatim_window: int = None,
+) -> AsyncGenerator:
+    raw_model = model or "openrouter:z-ai/glm-5.2"
+    target_model = openrouter_client.model_slug(raw_model)
+    effective_max = _effective_max_tokens(max_tokens, raw_model)
+    win = verbatim_window if verbatim_window is not None else config.verbatim_window
+    built_messages = _build_messages(messages, verbatim_window=win)
+    projected = openrouter_client.estimate_request_cost(built_messages, effective_max)
+    await openrouter_client.ensure_budget_available(projected_cost_usd=projected)
+
+    payload = {
+        "model": target_model,
+        "messages": built_messages,
+        "stream": True,
+        "temperature": temperature if temperature is not None else config.temperature,
+        "top_p": top_p if top_p is not None else config.top_p,
+        "max_tokens": effective_max,
+    }
+    payload.update(openrouter_client.provider_price_guard())
+
+    print(f"[OPENROUTER] Sending {len(messages)} messages to {target_model}")
+    try:
+        client = _client()
+        async with client.stream(
+            "POST",
+            f"{openrouter_client.base_url()}/chat/completions",
+            json=payload,
+            headers={**openrouter_client.request_headers(), "Accept": "text/event-stream"},
+            timeout=httpx.Timeout(300.0, connect=10.0),
+        ) as response:
+            if response.status_code != 200:
+                body = await response.aread()
+                try:
+                    err = json.loads(body).get("error", body.decode())
+                    if isinstance(err, dict):
+                        err = err.get("message") or err.get("code") or err
+                except Exception:
+                    err = f"HTTP {response.status_code}"
+                raise RuntimeError(f"OpenRouter error: {err}")
+
+            _was_thinking = False
+            _content_tokens = 0
+            _usage_info = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": 0.0,
+            }
+            async for line in response.aiter_lines():
+                if not line or line.startswith(":") or not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("error"):
+                    err = chunk["error"]
+                    if isinstance(err, dict):
+                        err = err.get("message") or err.get("code") or err
+                    raise RuntimeError(f"OpenRouter error: {err}")
+
+                usage = chunk.get("usage")
+                if usage:
+                    _usage_info.update(openrouter_client.usage_from_openai_payload(usage))
+
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                reasoning = (delta.get("reasoning_content") or delta.get("reasoning") or "")
+                token = delta.get("content") or ""
+                if reasoning:
+                    if not _was_thinking:
+                        _was_thinking = True
+                        yield {"type": "thinking_start"}
+                    # Reasoning must go out on the thinking channel. A bare string
+                    # here would be concatenated into the visible message body by
+                    # the Weave/OODA handlers, leaking chain-of-thought into chat
+                    # for reasoning models (e.g. deepseek-v4-flash, kimi-k2.7).
+                    yield {"type": "thinking_delta", "text": reasoning}
+                if token:
+                    if _was_thinking:
+                        _was_thinking = False
+                        yield {"type": "thinking_end"}
+                    _content_tokens += 1
+                    yield token
+
+            yield {
+                "type": "usage",
+                "input_tokens": _usage_info.get("input_tokens", 0),
+                "output_tokens": _usage_info.get("output_tokens", 0) or _content_tokens,
+                "cost_usd": _usage_info.get("cost_usd", 0.0),
+                **({
+                    "reasoning_tokens": _usage_info["reasoning_tokens"]
+                } if _usage_info.get("reasoning_tokens") else {}),
+                **({
+                    "cached_tokens": _usage_info["cached_tokens"]
+                } if _usage_info.get("cached_tokens") else {}),
+            }
+            return
+    except openrouter_client.OpenRouterBudgetError:
+        raise
+    except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as e:
+        raise RuntimeError(f"Cannot reach OpenRouter at {openrouter_client.base_url()}: {e}")
+
+
+async def _sync_openrouter_chat(
+    messages: list[dict],
+    temperature: float = None,
+    max_tokens: int = None,
+    model: str = None,
+    think: bool = None,
+    return_usage: bool = False,
+):
+    raw_model = model or "openrouter:z-ai/glm-5.2"
+    target_model = openrouter_client.model_slug(raw_model)
+    effective_max = _effective_max_tokens(max_tokens, raw_model)
+    built_messages = _build_messages(messages, verbatim_window=config.verbatim_window)
+    projected = openrouter_client.estimate_request_cost(built_messages, effective_max)
+    await openrouter_client.ensure_budget_available(projected_cost_usd=projected)
+
+    payload = {
+        "model": target_model,
+        "messages": built_messages,
+        "stream": False,
+        "temperature": temperature if temperature is not None else config.temperature,
+        "max_tokens": effective_max,
+    }
+    payload.update(openrouter_client.provider_price_guard())
+    if think is not None:
+        payload["reasoning"] = {"enabled": bool(think)}
+
+    try:
+        client = _client()
+        resp = await client.post(
+            f"{openrouter_client.base_url()}/chat/completions",
+            json=payload,
+            headers=openrouter_client.request_headers(),
+            timeout=httpx.Timeout(300.0, connect=10.0),
+        )
+        if resp.status_code >= 400:
+            try:
+                err = resp.json().get("error")
+                if isinstance(err, dict):
+                    err = err.get("message") or err.get("code") or err
+            except Exception:
+                err = f"HTTP {resp.status_code}"
+            raise RuntimeError(f"OpenRouter error: {err}")
+        data = resp.json()
+        usage_info = openrouter_client.usage_from_openai_payload(data.get("usage"))
+        choices = data.get("choices") or []
+        if not choices:
+            return ("", usage_info) if return_usage else ""
+        msg = choices[0].get("message") or {}
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+        result = content or reasoning or ""
+        return (result, usage_info) if return_usage else result
+    except openrouter_client.OpenRouterBudgetError:
+        raise
+    except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as e:
+        raise RuntimeError(f"Cannot reach OpenRouter at {openrouter_client.base_url()}: {e}")
+
+
 # ── Public API ─────────────────────────────────────────────────────────────
 
 def list_local_models() -> list[str]:
@@ -335,7 +519,7 @@ async def health_check() -> dict:
     """Check if Llama Server is reachable and return available models."""
     global _mock_mode
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(2.0, connect=0.5)) as client:
             resp = await client.get(f"{_llama_host()}/v1/models")
             resp.raise_for_status()
             data = resp.json()
@@ -406,6 +590,17 @@ async def stream_chat(
     """
     global _mock_mode
     raw_model = model or config.llama_model
+    if openrouter_client.is_openrouter_model(raw_model):
+        async for item in _stream_openrouter_chat(
+            messages,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            model=raw_model,
+            verbatim_window=verbatim_window,
+        ):
+            yield item
+        return
     if _mock_mode and not _is_dream_model(raw_model):
         print("[LLAMA] WARNING: running in MOCK MODE")
         async for tok in _mock_stream(messages):
@@ -415,7 +610,7 @@ async def stream_chat(
     chat_host = _chat_host_for_model(raw_model)
     print(f"[LLAMA] Sending {len(messages)} messages to {target_model} via {chat_host}")
 
-    effective_max = max_tokens or config.max_tokens
+    effective_max = _effective_max_tokens(max_tokens, raw_model)
     win = verbatim_window if verbatim_window is not None else config.verbatim_window
 
     payload = {
@@ -428,6 +623,11 @@ async def stream_chat(
         "max_tokens": effective_max,
         "repeat_penalty": repeat_penalty if repeat_penalty is not None else config.repeat_penalty,
     }
+    if _is_dream_model(raw_model):
+        print(
+            f"[DREAM] stream request max_tokens={effective_max} "
+            f"floor={getattr(config, 'dream_min_output_tokens', None)} requested={max_tokens}"
+        )
     if think is not None:
         payload["chat_template_kwargs"] = {"enable_thinking": bool(think)}
     elif _is_dream_model(raw_model):
@@ -513,11 +713,21 @@ async def stream_chat(
                     if not _is_dream_model(raw_model) and _content_tokens >= effective_max:
                         break
 
-            yield {
-                "type": "usage",
-                "input_tokens": _input_tokens,
-                "output_tokens": _output_tokens or _content_tokens,
-            }
+            if _is_dream_model(raw_model):
+                usage_event = {
+                    "type": "usage",
+                    "input_tokens": _input_tokens,
+                    "output_tokens": _content_tokens,
+                }
+                if _output_tokens:
+                    usage_event["canvas_tokens"] = _output_tokens
+                yield usage_event
+            else:
+                yield {
+                    "type": "usage",
+                    "input_tokens": _input_tokens,
+                    "output_tokens": _output_tokens or _content_tokens,
+                }
             return
     except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as e:
         raise RuntimeError(f"Cannot reach local chat backend at {chat_host}: {e}")
@@ -529,14 +739,30 @@ async def sync_chat(
     max_tokens: int = None,
     model: str = None,
     think: bool = None,
-) -> str:
+    return_usage: bool = False,
+):
     """Non-streaming chat completion (summarization, OODA passes, etc.)."""
     global _mock_mode
     raw_model = model or config.llama_model
+    if openrouter_client.is_openrouter_model(raw_model):
+        return await _sync_openrouter_chat(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            model=raw_model,
+            think=think,
+            return_usage=return_usage,
+        )
     # Dream backend is independent — don't skip it because the local llama server
     # fell into mock mode. Dream failures re-raise rather than setting _mock_mode.
     if _mock_mode and not _is_dream_model(raw_model):
-        return "Summary: The conversation continues with escalating tension and mutual wariness."
+        fallback = "Summary: The conversation continues with escalating tension and mutual wariness."
+        usage = {
+            "input_tokens": sum(len(m.get("content") or "") // 3 for m in messages),
+            "output_tokens": len(fallback) // 3,
+            "cost_usd": 0.0,
+        }
+        return (fallback, usage) if return_usage else fallback
     target_model = config.dream_model if _is_dream_model(raw_model) else _resolve_model(raw_model)
     chat_host = _chat_host_for_model(raw_model)
     payload = {
@@ -544,8 +770,13 @@ async def sync_chat(
         "messages": _build_messages(messages, verbatim_window=config.verbatim_window),
         "stream": False,
         "temperature": temperature if temperature is not None else config.temperature,
-        "max_tokens": max_tokens or config.max_tokens,
+        "max_tokens": _effective_max_tokens(max_tokens, raw_model),
     }
+    if _is_dream_model(raw_model):
+        print(
+            f"[DREAM] sync request max_tokens={payload['max_tokens']} "
+            f"floor={getattr(config, 'dream_min_output_tokens', None)} requested={max_tokens}"
+        )
     if think is not None:
         payload["chat_template_kwargs"] = {"enable_thinking": bool(think)}
     elif _is_dream_model(raw_model):
@@ -565,9 +796,10 @@ async def sync_chat(
         )
         resp.raise_for_status()
         data = resp.json()
+        usage_info = openrouter_client.usage_from_openai_payload(data.get("usage"))
         choices = data.get("choices") or []
         if not choices:
-            return ""
+            return ("", usage_info) if return_usage else ""
         msg = choices[0].get("message") or {}
         content = msg.get("content") or ""
         reasoning = msg.get("reasoning_content") or ""
@@ -578,14 +810,21 @@ async def sync_chat(
                     (reasoning.rstrip() + "\n\n" + extracted_reasoning).strip()
                     if reasoning else extracted_reasoning
                 )
-        return content or reasoning or ""
+        result = content or reasoning or ""
+        return (result, usage_info) if return_usage else result
     except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as _e:
         if _is_dream_model(raw_model):
             raise RuntimeError(
                 f"Dream sidecar unreachable at {chat_host} — is DiffusionGemma running?"
             ) from _e
         _mock_mode = True
-        return "Summary: The conversation continues with escalating tension and mutual wariness."
+        fallback = "Summary: The conversation continues with escalating tension and mutual wariness."
+        usage = {
+            "input_tokens": sum(len(m.get("content") or "") // 3 for m in messages),
+            "output_tokens": len(fallback) // 3,
+            "cost_usd": 0.0,
+        }
+        return (fallback, usage) if return_usage else fallback
 
 
 async def describe_image(image_path: str, model: str = None, context: str = None) -> str:
@@ -596,7 +835,7 @@ async def describe_image(image_path: str, model: str = None, context: str = None
         # Don't let stale _mock_mode from a prior chat failure permanently blind vision.
         import httpx as _httpx
         try:
-            async with _httpx.AsyncClient(timeout=5.0) as _hc:
+            async with _httpx.AsyncClient(timeout=_httpx.Timeout(2.0, connect=0.5)) as _hc:
                 await _hc.get(f"{_llama_host()}/v1/models")
             _mock_mode = False  # Server is back — clear the ratchet
         except Exception:

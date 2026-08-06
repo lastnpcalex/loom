@@ -72,6 +72,55 @@ def test_codex_app_server_sandbox_policy_scopes_workspace(tmp_path):
     assert policy["networkAccess"] is False
 
 
+def test_codex_goal_set_params_use_app_server_shape():
+    import codex_client
+
+    params = codex_client._codex_goal_set_params(
+        "thr_123",
+        objective="Finish the migration",
+        status="active",
+        token_budget=40000,
+    )
+
+    assert params == {
+        "threadId": "thr_123",
+        "objective": "Finish the migration",
+        "status": "active",
+        "tokenBudget": 40000,
+    }
+
+
+def test_codex_slash_commands_include_goal():
+    import skill_scanner
+
+    commands = skill_scanner.get_all_skills(agent="codex")
+    goal = next(cmd for cmd in commands if cmd["name"] == "goal")
+
+    assert goal["command"] == "/goal"
+    assert goal["mode"] == "meta"
+
+
+def test_codex_token_usage_updated_event_is_normalized():
+    import codex_client
+
+    raw = {
+        "method": "thread/tokenUsage/updated",
+        "params": {
+            "threadId": "thr_1",
+            "tokenUsage": {
+                "totalInputTokens": 1234,
+                "totalOutputTokens": 567,
+            },
+        },
+    }
+
+    assert codex_client._codex_usage(raw) == {
+        "type": "usage",
+        "input_tokens": 1234,
+        "output_tokens": 567,
+    }
+
+
 async def test_codex_app_server_permission_uses_direct_handler():
     import codex_client
 
@@ -363,4 +412,3 @@ def test_permission_hook_denies_image_reads(monkeypatch):
     hook_output = json.loads(stdout.getvalue())
     assert hook_output["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "Reading binary image file" in hook_output["hookSpecificOutput"]["permissionDecisionReason"]
-

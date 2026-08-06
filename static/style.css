@@ -2987,6 +2987,107 @@ body::after {
     background: rgba(0, 255, 255, 0.05);
 }
 
+#codex-goal-row {
+    max-width: 800px;
+    margin: 0 auto 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    border: 1px solid rgba(0, 255, 255, 0.22);
+    background: rgba(0, 255, 255, 0.055);
+    border-radius: var(--radius-sm);
+    padding: 6px 8px;
+}
+#codex-goal-row.hidden {
+    display: none;
+}
+.codex-goal-main {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+.codex-goal-label {
+    color: var(--cyan);
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0;
+}
+#codex-goal-status {
+    color: var(--text-muted);
+    font-size: 11px;
+    text-transform: capitalize;
+}
+#codex-goal-objective {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.codex-goal-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+}
+.codex-goal-actions button {
+    background: rgba(10, 10, 25, 0.7);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-size: 11px;
+    line-height: 1;
+    padding: 5px 7px;
+    cursor: pointer;
+    transition: var(--transition);
+}
+.codex-goal-actions button:hover {
+    border-color: var(--cyan);
+    color: var(--cyan);
+}
+.codex-goal-actions button:disabled {
+    opacity: 0.35;
+    cursor: default;
+    border-color: var(--border);
+    color: var(--text-muted);
+}
+
+.codex-goal-modal {
+    max-width: 640px;
+}
+.codex-goal-window-status,
+.codex-goal-progress {
+    color: var(--text-secondary);
+    background: rgba(0, 255, 255, 0.055);
+    border: 1px solid rgba(0, 255, 255, 0.18);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    font-size: 12px;
+}
+.codex-goal-window-status {
+    margin-bottom: 14px;
+}
+.codex-goal-window-status[data-status="active"] {
+    color: var(--cyan);
+}
+.codex-goal-window-status[data-status="paused"] {
+    color: var(--purple);
+}
+.codex-goal-window-status[data-status="none"] {
+    color: var(--text-muted);
+}
+.codex-goal-modal-actions {
+    flex-wrap: wrap;
+}
+.codex-goal-modal-actions button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
 #cc-inline-controls {
     display: flex;
     flex-wrap: wrap;
@@ -3565,7 +3666,8 @@ body::after {
 }
 
 .form-group input[type="text"],
-.form-group input[type="number"] {
+.form-group input[type="number"],
+.form-group input[type="password"] {
     width: 100%;
     background: rgba(10, 10, 25, 0.8);
     border: 1px solid var(--border);
@@ -3574,6 +3676,20 @@ body::after {
     font-family: var(--font-main);
     font-size: 14px;
     padding: 8px 12px;
+}
+
+.form-group input::placeholder,
+.form-group textarea::placeholder {
+    color: var(--text-muted);
+    opacity: 1;
+}
+
+.form-group input:-webkit-autofill,
+.form-group input:-webkit-autofill:hover,
+.form-group input:-webkit-autofill:focus {
+    -webkit-text-fill-color: var(--text-primary);
+    box-shadow: 0 0 0 1000px rgba(10, 10, 25, 0.95) inset;
+    caret-color: var(--text-primary);
 }
 
 .form-group input:focus,
@@ -3741,13 +3857,23 @@ body::after {
     flex: 0 0 auto;
 }
 
-#weave-minimal-group label {
+#weave-minimal-group label,
+.minimal-suboption {
     display: inline-flex;
     align-items: center;
     gap: 8px;
     cursor: pointer;
 }
-#weave-minimal-group input[type="checkbox"] { accent-color: var(--cyan); }
+#weave-minimal-group .minimal-suboption,
+#cfg-weave-system-prompt-group .minimal-suboption {
+    margin-top: 8px;
+    color: var(--text-secondary);
+    font-size: 0.9em;
+}
+#weave-minimal-group input[type="checkbox"],
+.minimal-suboption input[type="checkbox"] {
+    accent-color: var(--cyan);
+}
 
 /* Settings — restructured panel */
 .settings-divider {
@@ -4586,6 +4712,16 @@ pre.tool-output {
 #home-search-input::placeholder {
     color: var(--text-muted);
 }
+#home-search-input:-webkit-autofill,
+#home-search-input:-webkit-autofill:hover,
+#home-search-input:-webkit-autofill:focus,
+#tree-search-input:-webkit-autofill,
+#tree-search-input:-webkit-autofill:hover,
+#tree-search-input:-webkit-autofill:focus {
+    -webkit-text-fill-color: var(--text-primary);
+    box-shadow: 0 0 0 1000px rgba(15, 15, 30, 0.96) inset;
+    caret-color: var(--text-primary);
+}
 #home-search-results {
     position: absolute;
     top: 100%;
@@ -4677,6 +4813,9 @@ pre.tool-output {
     border-color: var(--cyan);
     box-shadow: 0 0 8px rgba(0, 255, 255, 0.2);
     width: 220px;
+}
+#tree-search-input::placeholder {
+    color: var(--text-muted);
 }
 #tree-search-separator {
     width: 1px;
@@ -5207,6 +5346,18 @@ pre.tool-output {
     #cc-inline-controls {
         margin-bottom: 4px;
     }
+    #codex-goal-row {
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-bottom: 6px;
+    }
+    .codex-goal-main {
+        flex: 1 1 100%;
+    }
+    .codex-goal-actions {
+        width: 100%;
+        justify-content: flex-end;
+    }
     #cc-inline-controls select {
         font-size: 11px;
         padding: 3px 6px;
@@ -5688,4 +5839,54 @@ pre.tool-output {
     letter-spacing: 0.5px;
     display: block;
     margin-bottom: 4px;
+}
+
+.settings-subhead {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.openrouter-usage-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.openrouter-usage-grid > div {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 8px 10px;
+    background: rgba(255, 255, 255, 0.03);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    min-width: 0;
+}
+
+.openrouter-usage-grid span {
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.openrouter-usage-grid strong {
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 600;
+    text-align: right;
+    overflow-wrap: anywhere;
+}
+
+.settings-warning {
+    margin-top: 8px;
+    color: var(--danger);
+    font-size: 12px;
+}
+
+@media (max-width: 640px) {
+    .openrouter-usage-grid {
+        grid-template-columns: 1fr;
+    }
 }

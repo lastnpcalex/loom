@@ -42,6 +42,8 @@ function truthySetting(value) {
 function resetNewConversationMinimalFields({ resetModel = false } = {}) {
     const minimalToggle = document.getElementById('weave-system-only');
     if (minimalToggle) minimalToggle.checked = false;
+    const minimalOodaToggle = document.getElementById('weave-minimal-ooda-enabled');
+    if (minimalOodaToggle) minimalOodaToggle.checked = true;
     const systemPromptInput = document.getElementById('weave-system-prompt');
     if (systemPromptInput) systemPromptInput.value = '';
     if (resetModel) {
@@ -310,6 +312,7 @@ function switchView(view) {
         statePanelTree?.classList.add('hidden');
         inputArea?.classList.add('hidden');
     }
+    if (typeof renderCodexGoalRow === 'function') renderCodexGoalRow();
 }
 
 // ── Breadcrumb Navigation ──
@@ -582,7 +585,7 @@ async function checkHealth(retries = 2) {
                 if (State.currentConv.mode === 'dream') {
                     const dreamSel = document.getElementById('dream-model-inline');
                     if (dreamSel) {
-                        _populateWeaveModelDropdown(dreamSel, State.currentConv.local_model || '', true);
+                        _populateWeaveModelDropdown(dreamSel, State.currentConv.local_model || '', true, false);
                     }
                 } else if (State.currentConv.mode === 'hermes' || State.currentConv.mode === 'weave') {
                     const weaveSel = document.getElementById('weave-model-inline');
@@ -590,10 +593,11 @@ async function checkHealth(retries = 2) {
                         _populateWeaveModelDropdown(
                             weaveSel,
                             State.currentConv.local_model || '',
-                            State.currentConv.mode === 'weave' || State.currentConv.mode === 'hermes'
+                            State.currentConv.mode === 'weave' || State.currentConv.mode === 'hermes',
+                            State.currentConv.mode === 'weave'
                         );
                     }
-                } else if (State.currentConv.mode === 'claude' || State.currentConv.mode === 'local' || State.currentConv.mode === 'codex' || State.currentConv.mode === 'gemini' || State.currentConv.mode === 'umans') {
+                } else if (State.currentConv.mode === 'claude' || State.currentConv.mode === 'local' || State.currentConv.mode === 'codex' || State.currentConv.mode === 'gemini' || State.currentConv.mode === 'goose' || State.currentConv.mode === 'umans') {
                     updateInlineCCControls(State.currentConv);
                 }
             }
@@ -626,7 +630,7 @@ function renderConversationList() {
     } else if (State.convFilter === 'nrol') {
         convs = convs.filter(c => !!c.nrol_operator);
     } else if (State.convFilter === 'claude') {
-        convs = convs.filter(c => (c.mode === 'claude' || c.mode === 'codex' || c.mode === 'gemini' || c.mode === 'umans') && !c.nrol_operator);
+        convs = convs.filter(c => (c.mode === 'claude' || c.mode === 'codex' || c.mode === 'gemini' || c.mode === 'goose' || c.mode === 'umans') && !c.nrol_operator);
     }
 
     if (convs.length === 0) {
@@ -839,13 +843,15 @@ function buildConvItem(conv) {
     const div = document.createElement('div');
     div.className = 'conv-item';
 
-    const isCCMode = conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini' || conv.mode === 'umans';
+    const isCCMode = conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini' || conv.mode === 'goose' || conv.mode === 'umans';
     const ccModel = (conv.cc_model || '').toLowerCase();
     const isNrol = isCCMode && !!conv.nrol_operator;
     const isGemini = isCCMode && !isNrol && ccModel.includes('gemini');
     const isCodex = isCCMode && !isNrol && ccModel.startsWith('codex');
+    const isGoose = isCCMode && !isNrol && ccModel.startsWith('goose:');
     const isUmans = isCCMode && !isNrol && ccModel.startsWith('umans-');
-    const isClaude = isCCMode && !isNrol && !isGemini && !isCodex && !isUmans;
+    const isOpenRouter = isCCMode && !isNrol && _isOpenRouterModel(ccModel);
+    const isClaude = isCCMode && !isNrol && !isGemini && !isCodex && !isGoose && !isUmans && !isOpenRouter;
     const isLocal = conv.mode === 'local';
     const isHermes = conv.mode === 'hermes';
     const isDream = conv.mode === 'dream';
@@ -854,7 +860,9 @@ function buildConvItem(conv) {
     const charName = isNrol ? (conv.cc_model || 'NROL-AO')
         : isGemini ? (conv.cc_model || 'Gemini')
         : isCodex ? (conv.cc_model || 'Codex')
+        : isGoose ? (conv.cc_model || 'Goose')
         : isUmans ? (conv.cc_model || 'Umans')
+        : isOpenRouter ? (conv.cc_model || 'OpenRouter')
         : isClaude ? (conv.cc_model || 'Claude')
         : isLocal ? (conv.local_model || State.loadedModel || 'Llama')
         : isHermes ? (conv.local_model || State.loadedModel || 'Hermes')
@@ -866,7 +874,9 @@ function buildConvItem(conv) {
     const modeBadge = isNrol ? '<span class="mode-badge" title="NROL-AO epistemic engine operator — typed transitions only">NROL-AO {Operator}</span>'
         : isGemini ? '<span class="mode-badge" title="Antigravity (agy) in the browser">Loom {agy}</span>'
         : isCodex ? '<span class="mode-badge" title="ChatGPT Codex in the browser">Loom {Codex}</span>'
+        : isGoose ? '<span class="mode-badge" title="Goose ACP in the browser">Loom {Goose}</span>'
         : isUmans ? '<span class="mode-badge" title="Claude Code powered by Umans AI (api.code.umans.ai)">Umans {Remote}</span>'
+        : isOpenRouter ? '<span class="mode-badge" title="Claude Code powered by OpenRouter">Loom {OpenRouter}</span>'
         : isClaude ? '<span class="mode-badge" title="Claude Code in the browser">Loom {Claude}</span>'
         : isLocal ? '<span class="mode-badge" title="Claude Code powered by a local Llama model">Braid {Local}</span>'
         : isHermes ? '<span class="mode-badge" title="Hermes Agent (ACP) powered by a local Llama model">Hermes {Agent}</span>'
@@ -1170,6 +1180,7 @@ async function loadConversation(convId) {
     renderTree();
     renderMessages();
     await updateInlineCCControls(conv);
+    if (typeof renderCodexGoalRow === 'function') renderCodexGoalRow();
 
     // If only a linear conversation (no forks), go straight to chat
     const hasForks = treeData.some(n => {
@@ -1268,6 +1279,7 @@ async function createConversation() {
     const styleNudge = 'Natural';
     const localModel = document.getElementById('local-model')?.value || '';
     const systemOnly = !!document.getElementById('weave-system-only')?.checked;
+    const minimalOodaEnabled = !!document.getElementById('weave-minimal-ooda-enabled')?.checked;
     const systemPrompt = document.getElementById('weave-system-prompt')?.value.trim() || '';
 
     const loreIds = [];
@@ -1287,6 +1299,7 @@ async function createConversation() {
         first_turn: systemOnly ? 'user' : firstTurn,
         custom_scene: systemOnly ? null : (customScene || null),
         system_only: systemOnly,
+        minimal_ooda_enabled: minimalOodaEnabled,
         system_prompt: systemOnly ? systemPrompt : null,
         local_model: localModel || undefined,
     });
@@ -1443,19 +1456,20 @@ async function updateInlineCCControls(conv) {
         _branchCountCtl?.classList.toggle('hidden', !show);
     };
 
-    if (conv && (conv.mode === 'claude' || conv.mode === 'local' || conv.mode === 'codex' || conv.mode === 'gemini' || conv.mode === 'umans')) {
+    if (conv && (conv.mode === 'claude' || conv.mode === 'local' || conv.mode === 'codex' || conv.mode === 'gemini' || conv.mode === 'goose' || conv.mode === 'umans' || conv.mode === 'openrouter')) {
         const isBraid = conv.mode === 'local';
         const modelName = conv.cc_model || '';
         const agentKind = (typeof _agentKindForModel === 'function') ? _agentKindForModel(modelName, conv) : '';
         const isCodex = conv.mode === 'codex' || agentKind === 'codex';
         const isGemini = conv.mode === 'gemini' || agentKind === 'gemini';
+        const isGoose = conv.mode === 'goose' || agentKind === 'goose';
         controls.classList.remove('hidden');
         weaveControls?.classList.add('hidden');
         setBranchCount(1);  // CC / Braid / Codex / Gemini: always single branch
         const modelSel = document.getElementById('cc-model-inline');
         const effortSel = document.getElementById('cc-effort-inline');
         const permSel = document.getElementById('cc-permission-mode-inline');
-        const ccModel = conv.cc_model || (isGemini ? 'Gemini 3.5 Flash (Medium)' : (isCodex ? 'codex-gpt-5.5' : 'sonnet'));
+        const ccModel = conv.cc_model || (isGemini ? 'Gemini 3.5 Flash (Medium)' : (isCodex ? 'codex-gpt-5.5' : (isGoose ? 'goose:openrouter:z-ai/glm-5.2' : 'sonnet')));
         await populateCCModelDropdowns(ccModel);
         
         effortSel.value = conv.cc_effort || 'high';
@@ -1484,7 +1498,7 @@ async function updateInlineCCControls(conv) {
         statePanelChat?.classList.add('hidden');
         setBranchCount(1);
         const weaveSel = document.getElementById('weave-model-inline');
-        if (weaveSel) _populateWeaveModelDropdown(weaveSel, conv.local_model || '');
+        if (weaveSel) _populateWeaveModelDropdown(weaveSel, conv.local_model || '', true, false);
         const incogW = document.getElementById('incognito-toggle-weave');
         if (incogW) incogW.checked = !!conv.incognito;
     } else if (conv && conv.mode === 'dream') {
@@ -1496,7 +1510,7 @@ async function updateInlineCCControls(conv) {
         statePanelChat?.classList.add('hidden');
         setBranchCount(1);
         const dreamSel = document.getElementById('dream-model-inline');
-        if (dreamSel) _populateWeaveModelDropdown(dreamSel, conv.local_model || '');
+        if (dreamSel) _populateWeaveModelDropdown(dreamSel, conv.local_model || '', true, false);
         const incogD = document.getElementById('incognito-toggle-dream');
         if (incogD) incogD.checked = !!conv.incognito;
     } else if (conv && conv.mode === 'weave') {
@@ -1560,10 +1574,19 @@ function _isCodexValue(v) {
     return base.startsWith('codex') || base.startsWith('gpt-5')
         || base === 'gpt-4o' || base.startsWith('o3') || base.startsWith('o4');
 }
+function _isUmansValue(v) {
+    return (v || '').toLowerCase().startsWith('umans-');
+}
+function _isGooseValue(v) {
+    return (v || '').toLowerCase().startsWith('goose:');
+}
+function _isOpenRouterValue(v) {
+    return _isOpenRouterModel(v);
+}
 // Anthropic and Codex models both take the thinking-effort knob
 // (codex_client forwards minimal..xhigh); gemini/local models do not.
 function _supportsEffortValue(v) {
-    return _isAnthropicValue(v) || _isCodexValue(v);
+    return _isAnthropicValue(v) || _isCodexValue(v) || _isOpenRouterValue(v);
 }
 
 function _modelsMatch(a, b) {
@@ -1581,10 +1604,19 @@ function _isDreamEngineModel(model) {
     return m.includes('diffusiongemma') || m.includes('diffusion-gemma');
 }
 
+function _isOpenRouterModel(model) {
+    const m = (model || '').toLowerCase();
+    return m.startsWith('openrouter:')
+        || m === 'z-ai/glm-5.2'
+        || m === 'moonshotai/kimi-k2.7-code'
+        || m === 'openai/gpt-5.6-luna'
+        || m === 'deepseek/deepseek-v4-flash-0731';
+}
+
 function _appendModelOption(select, model, labelPrefix = '') {
     const opt = document.createElement('option');
     opt.value = model.name || model;
-    opt.textContent = `${labelPrefix}${model.name || model}`;
+    opt.textContent = `${labelPrefix}${model.label || model.name || model}`;
     select.appendChild(opt);
     return opt;
 }
@@ -1611,40 +1643,45 @@ function _fetchAllModelsOnce() {
     return _allModelsFetch;
 }
 
-async function _fetchSelectableLocalModels(includeDream = true) {
+async function _fetchSelectableLocalModels(includeDream = true, includeOpenRouter = true) {
     try {
         const data = await _fetchAllModelsOnce();
         const models = data.models || [];
         return {
             llama: models.filter(m => (m.backend || 'llama') === 'llama' && m.loaded),
             dream: includeDream ? models.filter(m => m.backend === 'dream') : [],
+            openrouter: includeOpenRouter ? models.filter(m => m.backend === 'openrouter') : [],
         };
     } catch {
-        return { llama: [], dream: [] };
+        return { llama: [], dream: [], openrouter: [] };
     }
 }
 
 // Inline Weave/Braid model dropdown — populated from Llama Server
-async function _populateWeaveModelDropdown(select, currentModel, includeDream = true) {
+async function _populateWeaveModelDropdown(select, currentModel, includeDream = true, includeOpenRouter = true) {
     if (!select) return;
-    const selectable = await _fetchSelectableLocalModels(includeDream);
-    const allModels = [...selectable.llama, ...selectable.dream];
+    const selectable = await _fetchSelectableLocalModels(includeDream, includeOpenRouter);
+    const allModels = [...selectable.llama, ...selectable.dream, ...selectable.openrouter];
     const prev = select.value;
     select.innerHTML = '<option value="">Local Model</option>';
 
     _appendModelGroup(select, 'Llama Server', selectable.llama);
     _appendModelGroup(select, 'Dream Engine', selectable.dream);
+    _appendModelGroup(select, 'OpenRouter', selectable.openrouter);
 
     let target = currentModel || prev || '';
     if (target) {
-        const match = allModels.find(m => _modelsMatch(target, m.name));
+        const match = allModels.find(m => target === m.name || _modelsMatch(target, m.name));
         target = match ? match.name : '';
     }
     if (!target && allModels.length === 1) {
         target = allModels[0].name;
     }
     select.value = target;
-    select.title = includeDream ? 'Local or Dream Engine model' : 'Local model';
+    const titleParts = ['Local'];
+    if (includeDream) titleParts.push('Dream Engine');
+    if (includeOpenRouter) titleParts.push('OpenRouter');
+    select.title = `${titleParts.join(', ')} model`;
 }
 
 function initBranchCountPill() {
@@ -1743,8 +1780,10 @@ function initInlineCCControls() {
                 await API.put(`/api/conversations/${State.currentConvId}`, { local_model: model });
                 State.currentConv.local_model = model;
                 
-                // If they chose a model, restart the server with it
-                if (model) {
+                // If they chose a local model, restart Llama Server with it.
+                // Remote OpenRouter models are saved as a Weave model pin and
+                // route through the cloud client; there is no local server to restart.
+                if (model && !_isOpenRouterModel(model)) {
                     showLoading(`Restarting Llama Server with ${model}...`);
                     try {
                         // Update global config first so the restart command picks it up
@@ -2251,9 +2290,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
 function _syncMinimalWeaveFields() {
     const minimal = !!document.getElementById('weave-system-only')?.checked;
+    const minimalOodaLabel = document.getElementById('weave-minimal-ooda-enabled')?.closest('label');
     const systemGroup = document.getElementById('weave-system-prompt-group');
     const fullOnly = ['character-grid', 'persona-select', 'lore-checklist',
                       'first-turn-toggle', 'custom-scene-group'];
+    if (minimalOodaLabel) minimalOodaLabel.classList.toggle('hidden', !minimal);
     if (systemGroup) systemGroup.classList.toggle('hidden', !minimal);
     for (const id of fullOnly) {
         const el = document.getElementById(id);
@@ -2282,10 +2323,14 @@ async function fetchLocalModels() {
     if (!select) return;
     select.innerHTML = '<option value="">Local Model</option>';
     const mode = document.querySelector('#mode-toggle .toggle-btn.active')?.dataset.value || '';
-    const selectable = await _fetchSelectableLocalModels(mode === 'weave' || mode === 'hermes' || mode === 'dream');
+    const selectable = await _fetchSelectableLocalModels(
+        mode === 'weave' || mode === 'hermes' || mode === 'dream',
+        mode === 'weave'
+    );
     _appendModelGroup(select, 'Llama Server', selectable.llama);
     _appendModelGroup(select, 'Dream Engine', selectable.dream);
-    const models = [...selectable.llama, ...selectable.dream];
+    _appendModelGroup(select, 'OpenRouter', selectable.openrouter);
+    const models = [...selectable.llama, ...selectable.dream, ...selectable.openrouter];
     if (models.length === 1) {
         select.value = models[0].name;
     }
@@ -2327,6 +2372,16 @@ async function populateCCModelDropdowns(selectedValue) {
             }
             sel.appendChild(og);
         }
+        const isApi = _ccModelsCache.some(group => group.models.some(m => m.value === prev));
+        if (prev && _isUmansValue(prev) && !isApi) {
+            const og = document.createElement('optgroup');
+            og.label = 'Deprecated Umans AI';
+            const opt = document.createElement('option');
+            opt.value = prev;
+            opt.textContent = `${prev} (legacy)`;
+            og.appendChild(opt);
+            sel.appendChild(og);
+        }
         // Append local Llama Server models (only show the active loaded model)
         if (llamaModels.length > 0) {
             const og = document.createElement('optgroup');
@@ -2341,10 +2396,11 @@ async function populateCCModelDropdowns(selectedValue) {
         }
         if (prev) {
             // Check if the previous model value is one of the Anthropic/Gemini/Codex/Umans API models
-            const isApi = _ccModelsCache.some(group => group.models.some(m => m.value === prev));
+            const isApi = _ccModelsCache.some(group => group.models.some(m => m.value === prev))
+                || _isUmansValue(prev);
             if (!isApi) {
                 // Check if it's an umans model (umans-* prefix)
-                const isUmans = prev.startsWith('umans-');
+                const isUmans = _isUmansValue(prev);
                 if (!isUmans) {
                     if (loadedModel && _modelsMatch(prev, loadedModel)) {
                         prev = loadedModel;
@@ -2565,7 +2621,7 @@ function setupEventListeners() {
         } else {
             effortGroup.classList.remove('hidden');
             const isOpus = _isOpusValue(model);
-            const allowXhigh = isOpus || _isCodexValue(model);
+            const allowXhigh = isOpus || _isCodexValue(model) || _isOpenRouterValue(model);
             const maxOpt = document.querySelector('#cc-effort option[value="max"]');
             const xhighOpt = document.querySelector('#cc-effort option[value="xhigh"]');
             if (maxOpt) maxOpt.disabled = !isOpus;
@@ -2616,10 +2672,11 @@ function setupEventListeners() {
     function _switchSettingsTab(tab) {
         document.querySelectorAll('#settings-tabs .toggle-btn').forEach(b => b.classList.remove('active'));
         document.querySelector(`#settings-tabs [data-settings-tab="${tab}"]`).classList.add('active');
-        ['settings-model', 'settings-servers', 'settings-display', 'settings-advanced'].forEach(id => {
+        ['settings-model', 'settings-servers', 'settings-display', 'settings-openrouter', 'settings-advanced'].forEach(id => {
             document.getElementById(id).classList.toggle('hidden', id !== `settings-${tab}`);
         });
         if (tab === 'servers') _refreshServerLights();
+        if (tab === 'openrouter') _refreshOpenRouterUsage();
     }
     document.querySelectorAll('#settings-tabs .toggle-btn').forEach(btn => {
         btn.addEventListener('click', () => _switchSettingsTab(btn.dataset.settingsTab));
@@ -2662,6 +2719,98 @@ function setupEventListeners() {
         if (!sel) return;
         sel.disabled = true;
         sel.innerHTML = `<option value="">${label}</option>`;
+    }
+    function _fmtUsd(value) {
+        const n = Number(value || 0);
+        return `$${n.toFixed(2)}`;
+    }
+    async function _refreshOpenRouterUsage() {
+        const errorEl = document.getElementById('openrouter-usage-error');
+        const setText = (id, text) => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = text;
+        };
+        if (errorEl) {
+            errorEl.classList.add('hidden');
+            errorEl.textContent = '';
+        }
+        try {
+            const data = await API.get('/api/openrouter/usage');
+            const limits = data.limits || {};
+            const key = data.current_key || {};
+            const account = data.account || {};
+            const secrets = data.secrets || {};
+            const apiSecret = secrets.api_key || {};
+            const managementSecret = secrets.management_key || {};
+            const secretLabel = (secret, fallbackConfigured) => {
+                if (!secret.configured && !fallbackConfigured) return 'missing';
+                const fallbackText = fallbackConfigured === true ? 'configured' : fallbackConfigured;
+                const base = secret.preview || fallbackText || 'configured';
+                return `${base}${secret.source ? ` (${secret.source})` : ''}`;
+            };
+            setText('or-api-key-status', secretLabel(apiSecret, key.label));
+            setText('or-management-key-status', secretLabel(managementSecret, data.management_key_configured));
+            const weekly = key.usage_weekly ?? 0;
+            const monthly = key.usage_monthly ?? 0;
+            setText('or-weekly-usage', `${_fmtUsd(weekly)} / ${_fmtUsd(limits.weekly_limit_usd)}`);
+            setText('or-monthly-usage', `${_fmtUsd(monthly)} / ${_fmtUsd(limits.monthly_limit_usd)}`);
+            if (account.total_usage !== undefined) {
+                setText('or-account-used', _fmtUsd(account.total_usage));
+                const left = Number(account.total_credits || 0) - Number(account.total_usage || 0);
+                setText('or-credits-left', _fmtUsd(left));
+            } else {
+                setText('or-account-used', data.management_key_configured ? 'unavailable' : 'management key missing');
+                setText('or-credits-left', data.management_key_configured ? 'unavailable' : 'management key missing');
+            }
+            const sourceWarnings = [];
+            if (apiSecret.env_overrides_dotenv) sourceWarnings.push('OPENROUTER_API_KEY environment variable overrides .env');
+            if (managementSecret.env_overrides_dotenv) sourceWarnings.push('OPENROUTER_MANAGEMENT_KEY environment variable overrides .env');
+            const errs = [data.current_key_error, data.account_error, ...sourceWarnings].filter(Boolean);
+            if (errs.length && errorEl) {
+                errorEl.textContent = errs.join(' | ');
+                errorEl.classList.remove('hidden');
+            }
+        } catch (e) {
+            if (errorEl) {
+                errorEl.textContent = e.message || String(e);
+                errorEl.classList.remove('hidden');
+            }
+        }
+    }
+    async function _saveOpenRouterSecrets() {
+        const errorEl = document.getElementById('openrouter-secrets-error');
+        const apiInput = document.getElementById('cfg-openrouter-api-key');
+        const managementInput = document.getElementById('cfg-openrouter-management-key');
+        const btn = document.getElementById('btn-save-openrouter-secrets');
+        const payload = {};
+        if (apiInput && apiInput.value.trim()) payload.api_key = apiInput.value.trim();
+        if (managementInput && managementInput.value.trim()) payload.management_key = managementInput.value.trim();
+        if (errorEl) {
+            errorEl.classList.add('hidden');
+            errorEl.textContent = '';
+        }
+        if (!payload.api_key && !payload.management_key) {
+            if (errorEl) {
+                errorEl.textContent = 'Paste at least one key to save.';
+                errorEl.classList.remove('hidden');
+            }
+            return;
+        }
+        if (btn) btn.disabled = true;
+        try {
+            await API.post('/api/openrouter/secrets', payload);
+            if (apiInput) apiInput.value = '';
+            if (managementInput) managementInput.value = '';
+            showToast('OpenRouter keys saved');
+            await _refreshOpenRouterUsage();
+        } catch (e) {
+            if (errorEl) {
+                errorEl.textContent = e.message || String(e);
+                errorEl.classList.remove('hidden');
+            }
+        } finally {
+            if (btn) btn.disabled = false;
+        }
     }
     function _primeSettingsLoadingState() {
         ['cfg-braid-model', 'cfg-hermes-model', 'cfg-weave-model', 'cfg-dream-model',
@@ -2788,20 +2937,28 @@ function setupEventListeners() {
         document.getElementById('cfg-repeat-penalty').value = cfg.repeat_penalty ?? 1.12;
         document.getElementById('cfg-cc-effort').value = (conv && conv.cc_effort) || 'high';
         document.getElementById('cfg-cc-permission').value = (conv && conv.mode !== 'codex' && conv.cc_permission_mode) || 'default';
+        const dreamMinOutput = document.getElementById('cfg-dream-min-output-tokens');
+        if (dreamMinOutput) dreamMinOutput.value = cfg.dream_min_output_tokens ?? 2048;
 
         const localModel = (conv && conv.local_model) || '';
         const weaveSystemPromptGroup = document.getElementById('cfg-weave-system-prompt-group');
         const weaveSystemPrompt = document.getElementById('cfg-weave-system-prompt');
+        const weaveMinimalOoda = document.getElementById('cfg-weave-minimal-ooda-enabled');
         if (weaveSystemPromptGroup) weaveSystemPromptGroup.classList.toggle('hidden', !(conv && conv.mode === 'weave' && truthySetting(conv.system_only)));
         if (weaveSystemPrompt) weaveSystemPrompt.value = (conv && conv.system_prompt) || '';
+        if (weaveMinimalOoda) {
+            weaveMinimalOoda.checked = !conv || conv.minimal_ooda_enabled === undefined || conv.minimal_ooda_enabled === null
+                ? true
+                : truthySetting(conv.minimal_ooda_enabled);
+        }
         _setSettingsLoading(true, 'Loading model controls...');
         const settingsJobs = await Promise.allSettled([
             _loadModelConfigs(),
             _populateModelDropdown(),
-            _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), localModel, true),
-            _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), localModel),
+            _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), localModel, true, false),
+            _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), localModel, true, false),
             _populateWeaveModelDropdown(document.getElementById('cfg-weave-model'), localModel),
-            _populateWeaveModelDropdown(document.getElementById('cfg-dream-model'), localModel),
+            _populateWeaveModelDropdown(document.getElementById('cfg-dream-model'), localModel, true, false),
             populateCCModelDropdowns(conv && conv.cc_model || 'sonnet'),
             _populateKvQuantDropdown(),
             _populateMmprojDropdown(),
@@ -2832,7 +2989,7 @@ function setupEventListeners() {
         const mode = conv ? conv.mode : null;
         const ccModelName = conv ? (conv.cc_model || '') : '';
         const agentKind = (conv && typeof _agentKindForModel === 'function') ? _agentKindForModel(ccModelName, conv) : '';
-        const hasLoomOverrides = mode === 'claude' || mode === 'codex' || mode === 'gemini' || mode === 'umans';
+        const hasLoomOverrides = mode === 'claude' || mode === 'codex' || mode === 'gemini' || mode === 'goose' || mode === 'umans';
         const isActuallyCodex = mode === 'codex' || agentKind === 'codex';
         const isActuallyGemini = mode === 'gemini' || agentKind === 'gemini';
 
@@ -2867,6 +3024,18 @@ function setupEventListeners() {
             || (typeof window.LoomBlackhole === 'undefined');
         document.getElementById('cfg-stream-debug').checked =
             localStorage.getItem('loom-stream-debug') === '1';
+        document.getElementById('cfg-enable-umans-models').checked =
+            truthySetting(cfg.enable_umans_models);
+
+        // OpenRouter
+        document.getElementById('cfg-openrouter-base-url').value = cfg.openrouter_base_url || 'https://openrouter.ai/api/v1';
+        document.getElementById('cfg-openrouter-weekly-limit').value = cfg.openrouter_weekly_limit_usd ?? 12.5;
+        document.getElementById('cfg-openrouter-monthly-limit').value = cfg.openrouter_monthly_limit_usd ?? 50;
+        document.getElementById('cfg-openrouter-prompt-price').value = cfg.openrouter_max_prompt_price_per_mtok ?? 1;
+        document.getElementById('cfg-openrouter-completion-price').value = cfg.openrouter_max_completion_price_per_mtok ?? 4;
+        document.getElementById('cfg-openrouter-api-key').value = '';
+        document.getElementById('cfg-openrouter-management-key').value = '';
+        _refreshOpenRouterUsage();
 
         _setSettingsLoading(false);
     });
@@ -2916,10 +3085,10 @@ function setupEventListeners() {
             _invalidateModelCaches();
             await checkHealth();
             await Promise.all([
-                _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), document.getElementById('cfg-braid-model') ? document.getElementById('cfg-braid-model').value : '', true),
-                _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), document.getElementById('cfg-hermes-model') ? document.getElementById('cfg-hermes-model').value : ''),
+                _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), document.getElementById('cfg-braid-model') ? document.getElementById('cfg-braid-model').value : '', true, false),
+                _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), document.getElementById('cfg-hermes-model') ? document.getElementById('cfg-hermes-model').value : '', true, false),
                 _populateWeaveModelDropdown(document.getElementById('cfg-weave-model'), document.getElementById('cfg-weave-model') ? document.getElementById('cfg-weave-model').value : ''),
-                _populateWeaveModelDropdown(document.getElementById('cfg-dream-model'), document.getElementById('cfg-dream-model') ? document.getElementById('cfg-dream-model').value : ''),
+                _populateWeaveModelDropdown(document.getElementById('cfg-dream-model'), document.getElementById('cfg-dream-model') ? document.getElementById('cfg-dream-model').value : '', true, false),
                 populateCCModelDropdowns(document.getElementById('cfg-cc-model') ? document.getElementById('cfg-cc-model').value : ''),
             ]);
             showToast('Models refreshed');
@@ -2934,6 +3103,9 @@ function setupEventListeners() {
     // Manual refresh — queries Anthropic's /v1/models with the local Claude Code
     // subscription token (free, instant, no generation) and rebuilds the
     // Anthropic group's labels with the live version numbers (e.g. "Opus" → "Opus 4.8").
+    document.getElementById('btn-refresh-openrouter-usage')?.addEventListener('click', _refreshOpenRouterUsage);
+    document.getElementById('btn-save-openrouter-secrets')?.addEventListener('click', _saveOpenRouterSecrets);
+
     const btnRefreshCC = document.getElementById('btn-refresh-cc-models');
     if (btnRefreshCC) btnRefreshCC.addEventListener('click', async () => {
         const orig = btnRefreshCC.textContent;
@@ -3011,13 +3183,20 @@ function setupEventListeners() {
             repeat_penalty: parseFloat(valueOf('cfg-repeat-penalty', State.config.repeat_penalty ?? 1.12)),
             max_context_tokens: parseInt(valueOf('cfg-context', State.config.max_context_tokens ?? 28000)),
             verbatim_window: parseInt(valueOf('cfg-verbatim', State.config.verbatim_window ?? 8)),
+            dream_min_output_tokens: parseInt(valueOf('cfg-dream-min-output-tokens', State.config.dream_min_output_tokens ?? 2048)),
+            enable_umans_models: !!document.getElementById('cfg-enable-umans-models')?.checked,
+            openrouter_base_url: valueOf('cfg-openrouter-base-url', State.config.openrouter_base_url || 'https://openrouter.ai/api/v1'),
+            openrouter_weekly_limit_usd: parseFloat(valueOf('cfg-openrouter-weekly-limit', State.config.openrouter_weekly_limit_usd ?? 12.5)),
+            openrouter_monthly_limit_usd: parseFloat(valueOf('cfg-openrouter-monthly-limit', State.config.openrouter_monthly_limit_usd ?? 50)),
+            openrouter_max_prompt_price_per_mtok: parseFloat(valueOf('cfg-openrouter-prompt-price', State.config.openrouter_max_prompt_price_per_mtok ?? 1)),
+            openrouter_max_completion_price_per_mtok: parseFloat(valueOf('cfg-openrouter-completion-price', State.config.openrouter_max_completion_price_per_mtok ?? 4)),
         };
         await API.put('/api/config', globalCfg);
         State.config = globalCfg;
 
         if (conv && State.currentConvId) {
             const updates = {};
-            if (conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini' || conv.mode === 'umans') {
+            if (conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini' || conv.mode === 'goose' || conv.mode === 'umans' || conv.mode === 'openrouter') {
                 const modelName = valueOf('cfg-cc-model', conv.cc_model || (conv.mode === 'gemini' ? 'Gemini 3.5 Flash (Medium)' : 'sonnet'));
                 const agentKind = (typeof _agentKindForModel === 'function') ? _agentKindForModel(modelName, conv) : '';
                 const isActuallyCodex = conv.mode === 'codex' || agentKind === 'codex';
@@ -3034,7 +3213,10 @@ function setupEventListeners() {
                 updates.local_model = valueOf('cfg-hermes-model', conv.local_model || '');
             } else if (conv.mode === 'weave') {
                 updates.local_model = valueOf('cfg-weave-model', conv.local_model || '');
-                if (truthySetting(conv.system_only)) updates.system_prompt = valueOf('cfg-weave-system-prompt', conv.system_prompt || '');
+                if (truthySetting(conv.system_only)) {
+                    updates.system_prompt = valueOf('cfg-weave-system-prompt', conv.system_prompt || '');
+                    updates.minimal_ooda_enabled = !!document.getElementById('cfg-weave-minimal-ooda-enabled')?.checked;
+                }
             } else if (conv.mode === 'dream') {
                 updates.local_model = valueOf('cfg-dream-model', conv.local_model || '');
             }
@@ -3212,6 +3394,7 @@ function setupEventListeners() {
 
     // Send message
     document.getElementById('btn-send').addEventListener('click', sendMessage);
+    if (typeof initCodexGoalControls === 'function') initCodexGoalControls();
     
     // A device is only considered "mobile" if it lacks a precise pointing device (mouse/trackpad)
     const isMobile = isMobileDevice();
@@ -3966,6 +4149,14 @@ function initHomeSearch() {
     const resultsEl = document.getElementById('home-search-results');
     if (!input || !resultsEl) return;
     let timeout = null;
+    const clearRestoredSearch = () => {
+        input.value = '';
+        resultsEl.classList.add('hidden');
+        resultsEl.innerHTML = '';
+    };
+    clearRestoredSearch();
+    window.addEventListener('pageshow', clearRestoredSearch);
+    setTimeout(clearRestoredSearch, 0);
 
     input.addEventListener('input', () => {
         clearTimeout(timeout);
@@ -4018,8 +4209,8 @@ function renderSearchResults(results, query) {
         const item = document.createElement('div');
         item.className = 'search-result-item';
 
-        const modeClass = r.mode === 'gemini' || r.mode === 'umans' ? 'claude' : (r.mode || 'weave');
-        const modeLabel = r.mode === 'claude' || r.mode === 'gemini' || r.mode === 'umans' ? 'Loom' : r.mode === 'local' ? 'Braid' : r.mode === 'hermes' ? 'Hermes' : r.mode === 'dream' ? 'Dream Space' : r.mode === 'codex' ? 'Codex' : 'Weave';
+        const modeClass = r.mode === 'gemini' || r.mode === 'goose' || r.mode === 'umans' ? 'claude' : (r.mode || 'weave');
+        const modeLabel = r.mode === 'claude' || r.mode === 'gemini' || r.mode === 'goose' || r.mode === 'umans' ? 'Loom' : r.mode === 'local' ? 'Braid' : r.mode === 'hermes' ? 'Hermes' : r.mode === 'dream' ? 'Dream Space' : r.mode === 'codex' ? 'Codex' : 'Weave';
         const titleHtml = escapeHtml(r.title || 'Untitled').replace(re, '<mark>$1</mark>');
 
         let snippetHtml = '';

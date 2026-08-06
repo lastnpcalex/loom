@@ -81,8 +81,10 @@ except ModuleNotFoundError as e:
     _HERMES_IMPORT_ERROR = e
     print(f"[STARTUP] Hermes adapter unavailable; Hermes/Dream modes disabled: {e}")
 import codex_client
+import goose_client
 import model_context
 import local_summary
+import openrouter_client
 from skill_scanner import get_all_skills, BUILTIN_COMMANDS
 
 from contextlib import asynccontextmanager
@@ -117,12 +119,43 @@ def _truthy_setting(value) -> bool:
     return bool(value)
 
 
+def _minimal_ooda_enabled(conv: dict | None) -> bool:
+    if not conv or conv.get("minimal_ooda_enabled") is None:
+        return True
+    return _truthy_setting(conv.get("minimal_ooda_enabled"))
+
+
+def _mode_for_cc_model(cc_model: str | None) -> str:
+    cc_model = cc_model or ""
+    is_gemini = is_gemini_model(cc_model)
+    is_codex = is_codex_model(cc_model)
+    is_openrouter = openrouter_client.is_openrouter_model(cc_model)
+    is_goose = goose_client.is_goose_model(cc_model)
+    is_umans = is_umans_model(cc_model)
+    return (
+        "gemini" if is_gemini
+        else "codex" if is_codex
+        else "goose" if is_goose
+        else "openrouter" if is_openrouter
+        else "umans" if is_umans
+        else "claude"
+    )
+
+
 def _minimal_weave_system_prompt(conv: dict | None) -> str:
     """Minimal Weave must not fall back to the full RP system prompt."""
+    ooda_guidance = """Before each response, privately use an OODA loop for roleplay continuity: observe the player's last action and the immediate scene, orient through the viewpoint and motives defined by this system message, decide on one concrete response beat, then act through in-character prose.
+
+Do not print the OODA steps, analysis, XML tags, state-card operations, tool calls, or out-of-character notes. The visible answer should be only the roleplay response."""
     if not conv:
-        return ""
+        return ooda_guidance
     value = conv.get("system_prompt")
-    return value.strip() if isinstance(value, str) else ""
+    base = value.strip() if isinstance(value, str) else ""
+    if not _minimal_ooda_enabled(conv):
+        return base
+    if not base:
+        return ooda_guidance
+    return f"{base}\n\n{ooda_guidance}"
 
 # ── Canvas CLAUDE.md template ──
 CANVAS_CLAUDE_MD = """\
@@ -875,6 +908,13 @@ async def api_debug_state(request: Request):
             "pid": proc.pid,
             "alive": _pid_alive(proc.pid) if proc.pid else False,
         })
+    goose_procs = []
+    for cid, proc in _active_goose_procs.items():
+        goose_procs.append({
+            "conv_id": cid,
+            "pid": proc.pid,
+            "alive": _pid_alive(proc.pid) if proc.pid else False,
+        })
 
     # Llama model name map
     model_map = dict(getattr(llama_client, "_model_name_map", {}))
@@ -889,6 +929,7 @@ async def api_debug_state(request: Request):
         "active_generations_memory": gen_memory,
         "active_generations_db": gen_db,
         "active_hermes_procs": hermes_procs,
+        "active_goose_procs": goose_procs,
         "model_name_map": model_map,
         "llama_config": llama_cfg,
     }
@@ -917,6 +958,7 @@ async def api_debug_stream_state(conv_id: int, request: Request):
     db_gens = [r for r in await db.list_active_generations() if r.get("conv_id") == conv_id]
     cc_proc = _active_claude_procs.get(conv_id)
     hermes_proc = _active_hermes_procs.get(conv_id)
+    goose_proc = _active_goose_procs.get(conv_id)
     clients = _active_websockets.get(conv_id)
 
     return {
@@ -933,6 +975,8 @@ async def api_debug_stream_state(conv_id: int, request: Request):
         "claude_subprocess_pid": cc_proc.pid if cc_proc else None,
         "claude_subprocess_alive": _pid_alive(cc_proc.pid) if cc_proc and cc_proc.pid else False,
         "hermes_subprocess_pid": hermes_proc.pid if hermes_proc else None,
+        "goose_subprocess_pid": goose_proc.pid if goose_proc else None,
+        "goose_subprocess_alive": _pid_alive(goose_proc.pid) if goose_proc and goose_proc.pid else False,
     }
 
 
@@ -1003,6 +1047,8 @@ _gen_seq = 0  # monotonic counter for unique gen keys
 _active_claude_procs: dict[int, asyncio.subprocess.Process] = {}
 # Active Hermes (ACP) subprocesses (for cancellation) — parallel to _active_claude_procs
 _active_hermes_procs: dict[int, asyncio.subprocess.Process] = {}
+# Active Goose ACP subprocesses (for cancellation) — main Loom provider lane
+_active_goose_procs: dict[int, asyncio.subprocess.Process] = {}
 # Active WebSocket connections per conversation — multiple clients can watch the same conv
 _active_websockets: dict[int, set[WebSocket]] = {}
 
@@ -2208,10 +2254,11 @@ async def api_create_conversation(data: dict = None):
             raise HTTPException(status_code=400, detail=blocked)
 
     if mode == "claude":
-        is_gemini = is_gemini_model(cc_model)
-        is_codex = is_codex_model(cc_model)
+        mode = _mode_for_cc_model(cc_model)
         is_umans = is_umans_model(cc_model)
-        mode = "gemini" if is_gemini else ("codex" if is_codex else ("umans" if is_umans else "claude"))
+        is_openrouter = openrouter_client.is_openrouter_model(cc_model)
+        if is_umans or is_openrouter:
+            _reject_disabled_umans_for_new_selection(cc_model)
 
     conv = await db.create_conversation(
         title, character_id, mode=mode, project_dir=project_dir
@@ -2324,6 +2371,76 @@ async def api_create_conversation(data: dict = None):
     return conv
 
 
+@app.post("/api/conversations/{conv_id}/codex-goal")
+async def api_update_codex_goal(conv_id: int, data: dict):
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    if conv.get("mode") != "codex" or not is_codex_model(conv.get("cc_model") or ""):
+        raise HTTPException(
+            400, "Codex goal /goal is only available for Codex conversations"
+        )
+
+    action = (data.get("action") or "get").lower()
+    objective = data.get("objective")
+    status = data.get("status")
+    token_budget = data.get("token_budget")
+
+    if action == "set" and status is None:
+        status = "active"
+
+    if action == "pause":
+        action = "set"
+        status = "paused"
+    elif action == "resume":
+        action = "set"
+        status = "active"
+
+    def _loom_goal():
+        return {
+            "objective": conv.get("codex_goal_objective"),
+            "status": conv.get("codex_goal_status"),
+            "tokenBudget": conv.get("codex_goal_token_budget"),
+            "tokensUsed": conv.get("codex_goal_tokens_used") or 0,
+            "timeUsedSeconds": conv.get("codex_goal_time_used_seconds") or 0,
+        }
+
+    session_id = conv.get("claude_session_id")
+
+    if action == "get" and not session_id:
+        return {"source": "loom", "goal": _loom_goal()}
+
+    cwd = conv.get("project_dir") or str(Path(__file__).parent / "workspaces" / "codex")
+    Path(cwd).mkdir(parents=True, exist_ok=True)
+
+    result = await codex_client.manage_codex_goal(
+        action=action,
+        cwd=cwd,
+        conv_id=conv_id,
+        server_port=config.port,
+        model=conv.get("cc_model") or "Codex (GPT-4o)",
+        permission_mode=conv.get("cc_permission_mode") or "default",
+        resume_session_id=session_id,
+        objective=objective,
+        status=status,
+        token_budget=token_budget,
+    )
+
+    goal = result.get("goal") or {}
+    thread_id = result.get("thread_id")
+    await db.update_conversation_fields(
+        conv_id,
+        claude_session_id=thread_id,
+        codex_goal_objective=goal.get("objective"),
+        codex_goal_status=goal.get("status"),
+        codex_goal_token_budget=goal.get("tokenBudget"),
+        codex_goal_tokens_used=goal.get("tokensUsed"),
+        codex_goal_time_used_seconds=goal.get("timeUsedSeconds"),
+        codex_goal_updated_at=time.time(),
+    )
+    return result
+
+
 @app.get("/api/conversations/{conv_id}")
 async def api_get_conversation(conv_id: int):
     conv = await db.get_conversation(conv_id)
@@ -2341,12 +2458,17 @@ async def api_get_conversation(conv_id: int):
         cc_model = conv["cc_model"]
         is_api = any(
             cc_model.startswith(prefix)
-            for prefix in ("claude-", "fable", "sonnet", "haiku", "opus", "gemini", "Gemini", "gpt", "GPT")
+            for prefix in ("claude-", "fable", "sonnet", "haiku", "opus", "gemini", "Gemini", "gpt", "GPT", "goose:", "openrouter:", "dream:", "umans-", "codex", "o3", "o4")
         )
         if not is_api and models_match(cc_model, config.llama_model):
             if cc_model != config.llama_model:
                 conv["cc_model"] = config.llama_model
                 await db.update_conversation_fields(conv_id, cc_model=config.llama_model)
+    if conv.get("cc_model") and (conv.get("mode") or "").lower() in {"claude", "codex", "gemini", "goose", "umans", "openrouter"}:
+        expected_mode = _mode_for_cc_model(conv.get("cc_model"))
+        if expected_mode != conv.get("mode"):
+            conv["mode"] = expected_mode
+            await db.update_conversation_fields(conv_id, mode=expected_mode)
     # Lazy-mint a slug for conversations that had canvas enabled before
     # the canvas_slug column existed.
     if conv.get("canvas_enabled") and not conv.get("canvas_slug"):
@@ -2381,11 +2503,7 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["nsfw"] = int(data["nsfw"])
     if "cc_model" in data:
         fields["cc_model"] = data["cc_model"]
-        cc_model = data["cc_model"]
-        is_gemini = is_gemini_model(cc_model)
-        is_codex = is_codex_model(cc_model)
-        is_umans = is_umans_model(cc_model)
-        fields["mode"] = "gemini" if is_gemini else ("codex" if is_codex else ("umans" if is_umans else "claude"))
+        fields["mode"] = _mode_for_cc_model(data["cc_model"])
     if "cc_effort" in data:
         fields["cc_effort"] = data["cc_effort"]
     if "cc_permission_mode" in data:
@@ -3165,6 +3283,55 @@ async def api_update_config(data: dict):
     return config.to_dict()
 
 
+# ── OpenRouter ──
+
+
+@app.get("/api/openrouter/secrets")
+async def api_get_openrouter_secrets():
+    return {"ok": True, "status": openrouter_client.secret_status()}
+
+
+@app.post("/api/openrouter/secrets")
+async def api_post_openrouter_secrets(data: dict):
+    updates = {}
+    clear_names = set()
+    for key, env_name in (
+        ("api_key", "OPENROUTER_API_KEY"),
+        ("management_key", "OPENROUTER_MANAGEMENT_KEY"),
+    ):
+        value = data.get(key)
+        if value is None or value == "":
+            clear_names.add(env_name)
+        else:
+            updates[env_name] = value
+    result = openrouter_client.write_dotenv_secrets(
+        updates=updates, clear_names=clear_names
+    )
+    return {
+        "ok": True,
+        "updated": result["updated"],
+        "cleared": result["cleared"],
+        "status": result["status"],
+    }
+
+
+@app.get("/api/openrouter/usage")
+async def api_get_openrouter_usage():
+    return await openrouter_client.usage_snapshot()
+
+
+@app.post("/api/openrouter/provision")
+async def api_post_openrouter_provision(data: dict = None):
+    data = data or {}
+    key = await openrouter_client.create_limited_key(
+        name=data.get("name", "A Shadow Loom"),
+        limit=data.get("limit", 12.5),
+        limit_reset=data.get("limit_reset", "weekly"),
+        include_byok_in_limit=data.get("include_byok_in_limit", True),
+    )
+    return {"ok": True, "key": key}
+
+
 def load_local_codex_models() -> list[dict]:
     """Load Codex models from the local ~/.codex/models_cache.json file if it exists."""
     import os
@@ -3233,9 +3400,14 @@ def get_initial_gemini_models() -> list[dict]:
     if local_models:
         return local_models
     return [
-        {"value": "Gemini 3.5 Flash (Low)", "label": "Gemini 3.5 Flash (Low)"},
+        {"value": "Gemini 3.6 Flash (High)", "label": "Gemini 3.6 Flash (High)"},
+        {"value": "Gemini 3.6 Flash (Medium)", "label": "Gemini 3.6 Flash (Medium)"},
+        {"value": "Gemini 3.6 Flash (Low)", "label": "Gemini 3.6 Flash (Low)"},
+        {"value": "Gemini 3.6 Pro (High)", "label": "Gemini 3.6 Pro (High)"},
+        {"value": "Gemini 3.6 Pro (Low)", "label": "Gemini 3.6 Pro (Low)"},
         {"value": "Gemini 3.5 Flash (High)", "label": "Gemini 3.5 Flash (High)"},
         {"value": "Gemini 3.5 Flash (Medium)", "label": "Gemini 3.5 Flash (Medium)"},
+        {"value": "Gemini 3.5 Flash (Low)", "label": "Gemini 3.5 Flash (Low)"},
         {"value": "Gemini 3.1 Pro (High)", "label": "Gemini 3.1 Pro (High)"},
         {"value": "Gemini 3.1 Pro (Low)", "label": "Gemini 3.1 Pro (Low)"},
         {"value": "Claude Sonnet 4.6 (Thinking)", "label": "Claude Sonnet 4.6 (Thinking)"},
@@ -3258,6 +3430,29 @@ CC_MODELS = [
     ]},
     {"group": "Antigravity (agy)", "models": get_initial_gemini_models()},
     {"group": "ChatGPT Codex (codex)", "models": get_initial_codex_models()},
+    {"group": "Goose ACP", "models": [
+        {"value": "goose:openrouter:z-ai/glm-5.2", "label": "Goose OpenRouter GLM 5.2"},
+        {"value": "goose:openrouter:moonshotai/kimi-k2.7-code", "label": "Goose OpenRouter Kimi K2.7 Code"},
+        {"value": "goose:openrouter:openai/gpt-5.6-luna", "label": "Goose OpenRouter GPT 5.6 Luna"},
+        {"value": "goose:openrouter:deepseek/deepseek-v4-flash-0731", "label": "Goose OpenRouter DeepSeek V4 Flash 0731"},
+        {
+            "value": f"goose:dream:{config.dream_model}",
+            "label": f"Goose Dream ({config.dream_model})",
+        },
+    ]},
+    {"group": "Goose ACP - Auto/Subagents", "models": [
+        {"value": "goose:auto:openrouter:z-ai/glm-5.2", "label": "Goose Auto GLM 5.2"},
+        {
+            "value": f"goose:auto:dream:{config.dream_model}",
+            "label": f"Goose Auto Dream ({config.dream_model})",
+        },
+    ]},
+    {"group": "OpenRouter", "models": [
+        {"value": "openrouter:z-ai/glm-5.2", "label": "OpenRouter GLM 5.2"},
+        {"value": "openrouter:moonshotai/kimi-k2.7-code", "label": "OpenRouter Kimi K2.7 Code"},
+        {"value": "openrouter:openai/gpt-5.6-luna", "label": "OpenRouter GPT 5.6 Luna"},
+        {"value": "openrouter:deepseek/deepseek-v4-flash-0731", "label": "OpenRouter DeepSeek V4 Flash 0731"},
+    ]},
     {"group": "Umans AI", "models": [
         {"value": "umans-coder", "label": "Umans Coder (Kimi K2.7-Code)"},
         {"value": "umans-kimi-k2.7", "label": "Umans Kimi K2.7 (always thinks)"},
@@ -3273,9 +3468,32 @@ CC_MODELS = [
 ]
 
 
+def _visible_cc_models() -> list[dict]:
+    """Return CC model groups, hiding disabled compatibility provider groups."""
+    if config.enable_umans_models and config.enable_goose:
+        return CC_MODELS
+    return [
+        group
+        for group in CC_MODELS
+        if (config.enable_umans_models or "umans" not in group.get("group", "").lower())
+        and (config.enable_goose or "goose" not in group.get("group", "").lower())
+    ]
+
+
 @app.get("/api/cc-models")
 async def api_cc_models():
-    return CC_MODELS
+    return _visible_cc_models()
+
+
+@app.get("/api/goose/diagnostics")
+async def api_goose_diagnostics():
+    return {
+        "enabled": bool(config.enable_goose),
+        "default_model": config.goose_model,
+        "mode": config.goose_mode,
+        "builtins": config.goose_builtins,
+        **goose_client.diagnostics(config.goose_exe or None),
+    }
 
 
 # 1M-context support is per family+version, not per family. Subscription users
@@ -3477,7 +3695,7 @@ async def api_cc_models_refresh():
         print(f"[REFRESH] Failed to update Gemini models: {e}")
 
     CC_MODELS[:] = new_cc_models
-    return {"models": CC_MODELS, "families": sorted(f for f, v in by_family.items() if v)}
+    return {"models": _visible_cc_models(), "families": sorted(f for f, v in by_family.items() if v)}
 
 
 _VISION_MODEL_CACHE: dict[tuple[str, str], bool] = {}
@@ -4313,6 +4531,9 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 hproc = _active_hermes_procs.pop(conv_id, None)
                 if hproc and hermes_client is not None:
                     await hermes_client.cancel_hermes(hproc)
+                gproc = _active_goose_procs.pop(conv_id, None)
+                if gproc:
+                    await goose_client.cancel_goose(gproc)
                 # Clean up pending permissions from memory and DB
                 for rid in list(_pending_hook_permissions):
                     if _pending_hook_permissions[rid].get("conv_id") == conv_id:
@@ -4389,7 +4610,10 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 # different branches would race the same child. (Including "local"
                 # here fixes a latent Braid bug — it was previously treated like
                 # Weave/OODA and allowed to spawn parallel CC subprocesses.)
-                is_subprocess_agent = mode in ("claude", "local", "hermes", "dream")
+                is_subprocess_agent = mode in (
+                    "claude", "local", "hermes", "dream",
+                    "gemini", "codex", "umans", "openrouter",
+                )
 
                 if is_subprocess_agent:
                     # Only one agent generation per conversation
@@ -4999,6 +5223,26 @@ def is_umans_model(model: str) -> bool:
     return ml.startswith("umans-")
 
 
+def is_goose_model(model: str) -> bool:
+    return goose_client.is_goose_model(model)
+
+
+def _umans_disabled_detail() -> str:
+    return (
+        "Umans AI models are deprecated and disabled in Loom. "
+        "Use the OpenRouter GLM/Kimi entries, or enable the legacy Umans "
+        "compatibility switch in Settings."
+    )
+
+
+def _reject_disabled_umans_for_new_selection(model: str | None, *, existing_model: str | None = None):
+    if not model or config.enable_umans_models or not is_umans_model(model):
+        return
+    if existing_model and is_umans_model(existing_model):
+        return
+    raise HTTPException(status_code=400, detail=_umans_disabled_detail())
+
+
 def is_dream_claude_model(model: str) -> bool:
     """True for the explicit Claude Code -> Dream shim selector value."""
     if not model:
@@ -5096,6 +5340,7 @@ def _nrol_operator_block_reason(cc_model: str) -> str | None:
     provider = (
         "gemini" if is_gemini_model(cc_model)
         else "codex" if is_codex_model(cc_model)
+        else "goose" if is_goose_model(cc_model)
         else "dream" if is_dream_claude_model(cc_model)
         else "umans" if is_umans_model(cc_model)
         else "claude"
@@ -5144,7 +5389,7 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
         cc_model = conv["cc_model"]
         is_api = any(
             cc_model.startswith(prefix)
-            for prefix in ("claude-", "fable", "sonnet", "haiku", "opus", "gemini", "Gemini", "gpt", "GPT")
+            for prefix in ("claude-", "fable", "sonnet", "haiku", "opus", "gemini", "Gemini", "gpt", "GPT", "goose:", "openrouter:", "dream:", "umans-", "codex", "o3", "o4")
         )
         if not is_api and models_match(cc_model, config.llama_model):
             if cc_model != config.llama_model:
@@ -5153,6 +5398,17 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
                 conv["cc_model"] = config.llama_model
 
     mode = conv.get("mode", "weave") if conv else "weave"
+    if mode in {"claude", "codex", "gemini", "openrouter", "umans", "goose"}:
+        requested_cc_model = data.get("cc_model") or conv.get("cc_model") or ""
+        target_mode = _mode_for_cc_model(requested_cc_model)
+        if target_mode != mode:
+            conv = dict(conv)
+            conv["mode"] = target_mode
+            conv["cc_model"] = requested_cc_model
+            mode = target_mode
+            await db.update_conversation_fields(
+                conv_id, mode=target_mode, cc_model=requested_cc_model
+            )
 
     # ── Hermes-class routing: Prometheus (incognito) vs attendants (ensouled) ──
     # mode "hermes" → llama attendant; mode "dream" → dream attendant. Both are
@@ -5178,8 +5434,12 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
             await _refuse_ensouled_model_down(websocket, conv_id, "llama", config.llama_model)
             return
 
-    if mode in ("claude", "gemini", "codex"):
+    if mode in ("claude", "gemini", "codex", "openrouter"):
         await _handle_claude_generation(websocket, conv_id, conv, data)
+        return
+
+    if mode == "goose":
+        await _handle_goose_generation(websocket, conv_id, conv, data)
         return
 
     if mode == "local":
@@ -5272,6 +5532,7 @@ async def _handle_claude_generation(
         is_gemini = is_gemini_model(cc_model)
         is_codex = is_codex_model(cc_model)
         is_dream = is_dream_claude_model(cc_model)
+        is_openrouter = openrouter_client.is_openrouter_model(cc_model)
         # .gguf models go through Claude Code with ANTHROPIC_BASE_URL pointed
         # at the local llama-server (which speaks /v1/messages natively on :11434).
         is_llama = cc_model.endswith(".gguf")
@@ -5284,21 +5545,34 @@ async def _handle_claude_generation(
         use_umans = conv.get("_use_umans", False) or is_umans
         # Use Dream when explicitly selected from the Claude Code model picker.
         use_dream = is_dream
-        # Belt-and-suspenders: NEVER route Anthropic/Gemini/Codex through llama/umans
+        use_openrouter = is_openrouter
+        # Belt-and-suspenders: NEVER route Anthropic/Gemini/Codex through llama/umans/openrouter
         if is_anthropic or is_gemini or is_codex:
             use_llama = False
             use_umans = False
             use_dream = False
+            use_openrouter = False
         # Mutually exclusive: don't route through both at once
-        if use_umans or use_dream:
+        if use_umans or use_dream or use_openrouter:
             use_llama = False
         if use_dream:
             use_umans = False
-        provider_model = _dream_claude_model_id(cc_model) if use_dream else cc_model
-        cc_session_mode = "dream-claude" if use_dream else "claude"
-        print(f"[CC] Model routing: cc_model={cc_model!r} provider_model={provider_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} is_codex={is_codex} is_dream={is_dream} is_llama={is_llama} use_llama={use_llama} is_umans={is_umans} use_umans={use_umans} use_dream={use_dream} conv._use_llama={conv.get('_use_llama')} conv.mode={conv.get('mode')}")
+        if use_openrouter:
+            use_umans = False
+            use_dream = False
+        provider_model = (
+            _dream_claude_model_id(cc_model)
+            if use_dream
+            else openrouter_client.model_slug(cc_model) if use_openrouter else cc_model
+        )
+        cc_session_mode = (
+            "dream-claude" if use_dream
+            else "openrouter-claude" if use_openrouter
+            else "claude"
+        )
+        print(f"[CC] Model routing: cc_model={cc_model!r} provider_model={provider_model!r} is_anthropic={is_anthropic} is_gemini={is_gemini} is_codex={is_codex} is_dream={is_dream} is_openrouter={is_openrouter} is_llama={is_llama} use_llama={use_llama} is_umans={is_umans} use_umans={use_umans} use_dream={use_dream} use_openrouter={use_openrouter} conv._use_llama={conv.get('_use_llama')} conv.mode={conv.get('mode')}")
 
-        target_mode = "gemini" if is_gemini else ("codex" if is_codex else ("umans" if use_umans else ("local" if use_llama else "claude")))
+        target_mode = "gemini" if is_gemini else ("codex" if is_codex else ("openrouter" if use_openrouter else ("umans" if use_umans else ("local" if use_llama else ("dream-claude" if use_dream else "claude")))))
 
         # Operator conversations only launch on providers with a ported
         # lockdown — the model picker can otherwise route a locked-down conv
@@ -5399,7 +5673,7 @@ async def _handle_claude_generation(
                 # Dream-Claude runs through the same CLI but a different local
                 # provider shim; keep its sessions isolated until proven safe.
                 prev_session_mode = msg.get("cc_session_mode")
-                if (prev_session_mode == "dream-claude") != use_dream:
+                if prev_session_mode and prev_session_mode != cc_session_mode:
                     print(
                         f"[CC] Cross-provider turn at msg {msg['id']} ({prev_session_mode}), will rebuild full history"
                     )
@@ -5652,7 +5926,7 @@ async def _handle_claude_generation(
                 draft_msg_id=draft_msg_id,
                 parent_id=parent_id,
                 cc_model=cc_model,
-                mode="gemini" if is_gemini else ("codex" if is_codex else ("umans" if use_umans else ("local" if use_llama else ("dream-claude" if use_dream else "claude")))),
+                mode="gemini" if is_gemini else ("codex" if is_codex else ("openrouter" if use_openrouter else ("umans" if use_umans else ("local" if use_llama else ("dream-claude" if use_dream else "claude"))))),
             )
 
         # Let the client know we're launching
@@ -5662,6 +5936,8 @@ async def _handle_claude_generation(
             launch_label = f"Launching Codex ({cc_model})..."
         elif use_umans:
             launch_label = f"Launching {cc_model} via Umans..."
+        elif use_openrouter:
+            launch_label = f"Launching {provider_model} via OpenRouter..."
         elif use_dream:
             launch_label = f"Launching {provider_model} via Dream shim..."
         elif use_llama:
@@ -5747,6 +6023,7 @@ async def _handle_claude_generation(
                     use_llama=use_llama,
                     use_umans=use_umans,
                     use_dream=use_dream,
+                    use_openrouter=use_openrouter,
                     backstage_parent_id=conv.get("backstage_parent_id"),
                     nrol_operator=bool(conv.get("nrol_operator")),
                 )
@@ -5792,6 +6069,7 @@ async def _handle_claude_generation(
                         use_llama=use_llama,
                         use_umans=use_umans,
                         use_dream=use_dream,
+                        use_openrouter=use_openrouter,
                         backstage_parent_id=conv.get("backstage_parent_id"),
                         nrol_operator=bool(conv.get("nrol_operator")),
                     )
@@ -5809,7 +6087,7 @@ async def _handle_claude_generation(
                 conv_id=conv_id,
                 pid=proc.pid,
                 project_dir=project_dir,
-                mode="umans" if use_umans else ("local" if use_llama else ("dream-claude" if use_dream else ("gemini" if is_gemini else ("codex" if is_codex else "claude")))),
+                mode="openrouter" if use_openrouter else ("umans" if use_umans else ("local" if use_llama else ("dream-claude" if use_dream else ("gemini" if is_gemini else ("codex" if is_codex else "claude"))))),
             )
         except Exception as e:
             print(f"[GEN] Failed to register active generation: {e}")
@@ -6305,6 +6583,7 @@ async def _handle_claude_generation(
                     use_llama=use_llama,
                     use_umans=use_umans,
                     use_dream=use_dream,
+                    use_openrouter=use_openrouter,
                     backstage_parent_id=conv.get("backstage_parent_id"),
                     nrol_operator=bool(conv.get("nrol_operator")),
                 )
@@ -6597,6 +6876,8 @@ async def _handle_claude_generation(
             model_used_field = f"{cc_model}@llama-server"
         elif use_dream:
             model_used_field = f"{provider_model}@dream-shim"
+        elif use_openrouter:
+            model_used_field = f"openrouter:{provider_model}"
         else:
             model_used_field = resolved_model
 
@@ -6885,6 +7166,273 @@ def _build_claude_history_prompt(branch: list[dict], project_dir: Path = None) -
         files_str = "\n".join(f"  • {Path(ip).name} (in attached_files/)" for ip in attached_files)
         return f"[Attached files:]\n{files_str}\n\n{base}" if base else f"[Attached files:]\n{files_str}"
     return base
+
+
+async def _handle_goose_generation(
+    websocket: WebSocket, conv_id: int, conv: dict, data: dict
+):
+    """Handle Goose mode through ACP over stdio."""
+    import time as _time
+
+    draft_msg_id = None
+    full_text = ""
+    content_blocks: list[dict] = []
+    current_block: dict | None = None
+    new_session_id = ""
+    input_tokens = 0
+    output_tokens = 0
+    got_error = False
+    start_t = _time.time()
+    proc = None
+    try:
+        action = data.get("action")
+        parent_id = data.get("parent_id")
+        if action == "generate" and parent_id is None:
+            leaf = await db.get_active_leaf(conv_id)
+            parent_id = leaf["id"] if leaf else None
+
+        project_dir = conv.get("project_dir") or "."
+        if project_dir != "." and not os.path.isdir(project_dir):
+            await _ws_send(conv_id, {"type": "error", "error": f"Working directory not found: {project_dir}"})
+            return
+
+        cc_model = data.get("cc_model") or conv.get("cc_model") or config.goose_model
+        if not goose_client.is_goose_model(cc_model):
+            cc_model = config.goose_model if goose_client.is_goose_model(config.goose_model) else f"goose:openrouter:{cc_model}"
+        cc_permission_mode = data.get("cc_permission_mode") or conv.get("cc_permission_mode") or config.goose_mode or "approve"
+        cc_permission_mode = goose_client.permission_mode_for_model(cc_model, cc_permission_mode)
+        if data.get("cc_model") and data["cc_model"] != conv.get("cc_model"):
+            await db.update_conversation_fields(conv_id, cc_model=cc_model)
+
+        if conv.get("nrol_operator"):
+            blocked = _nrol_operator_block_reason(cc_model)
+            if blocked:
+                await _ws_send(conv_id, {"type": "error", "error": blocked})
+                return
+
+        branch = await db.get_branch_to_root(parent_id) if parent_id else []
+        resume_session_id = None
+        use_resume = False
+        for msg in reversed(branch):
+            if msg.get("role") != "assistant" or not msg.get("cc_session_id"):
+                continue
+            mode = msg.get("cc_session_mode")
+            if mode is not None and mode != "goose":
+                continue
+            resume_session_id = msg.get("cc_session_id")
+            use_resume = True
+            break
+
+        if use_resume:
+            latest_user = next((m for m in reversed(branch) if m.get("role") == "user"), None)
+            prompt = (latest_user or {}).get("content") or "(continue)"
+        else:
+            prompt = _build_claude_history_prompt(branch, Path(project_dir)) or "(continue)"
+
+        draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
+        draft_msg_id = draft_msg["id"]
+        await db.update_message_content(draft_msg_id, cc_model_used=cc_model)
+        await db.set_active_branch(conv_id, draft_msg_id)
+
+        await _ws_send(
+            conv_id,
+            {
+                "type": "status",
+                "text": f"Launching Goose ACP ({goose_client.model_label(cc_model)})"
+                        + (" (forking session)" if use_resume else " (building history)"),
+                "parent_id": parent_id,
+            },
+        )
+        await _ws_send(
+            conv_id,
+            {"type": "stream_start", "parent_id": parent_id, "draft_msg_id": draft_msg_id, "cc_model": cc_model},
+        )
+
+        try:
+            proc, event_stream = await goose_client.run_goose(
+                prompt,
+                conv_id=conv_id,
+                model=cc_model,
+                cwd=project_dir,
+                loom_port=config.port,
+                goose_exe=config.goose_exe or None,
+                permission_mode=cc_permission_mode,
+                branch=branch,
+                resume_session_id=resume_session_id if use_resume else None,
+                fork_session=use_resume,
+                nrol_operator=bool(conv.get("nrol_operator")),
+                builtins=config.goose_builtins,
+            )
+        except Exception:
+            if use_resume:
+                await _ws_send(conv_id, {"type": "status", "text": "Goose session fork failed - rebuilding from history..."})
+                prompt = _build_claude_history_prompt(branch, Path(project_dir)) or "(continue)"
+                proc, event_stream = await goose_client.run_goose(
+                    prompt,
+                    conv_id=conv_id,
+                    model=cc_model,
+                    cwd=project_dir,
+                    loom_port=config.port,
+                    goose_exe=config.goose_exe or None,
+                    permission_mode=cc_permission_mode,
+                    branch=branch,
+                    nrol_operator=bool(conv.get("nrol_operator")),
+                    builtins=config.goose_builtins,
+                )
+                use_resume = False
+            else:
+                raise
+
+        _active_goose_procs[conv_id] = proc
+        try:
+            await db.register_active_generation(
+                draft_msg_id=draft_msg_id,
+                conv_id=conv_id,
+                pid=proc.pid,
+                project_dir=project_dir,
+                mode="goose",
+            )
+        except Exception:
+            pass
+
+        async for evt in event_stream:
+            etype = evt.get("type")
+            if etype == "session_info":
+                new_session_id = evt.get("session_id") or new_session_id
+                try:
+                    await db.update_active_generation_session(draft_msg_id, new_session_id)
+                except Exception:
+                    pass
+            elif etype == "status":
+                await _ws_send(conv_id, {"type": "status", "text": evt.get("text", ""), "parent_id": parent_id})
+            elif etype == "text_delta":
+                text = evt.get("text", "")
+                if not text:
+                    continue
+                full_text += text
+                if current_block and current_block.get("type") == "text":
+                    current_block["text"] += text
+                else:
+                    current_block = {"type": "text", "text": text}
+                    content_blocks.append(current_block)
+                await _ws_send(conv_id, {"type": "stream_chunk", "content": text})
+            elif etype == "thinking_delta":
+                text = evt.get("text", "")
+                if text:
+                    content_blocks.append({"type": "thinking", "text": text})
+                    await _ws_send(conv_id, {"type": "thinking_chunk", "content": text})
+            elif etype == "tool_start":
+                current_block = {
+                    "type": "tool_use",
+                    "name": evt.get("name", "goose_tool"),
+                    "tool_id": evt.get("tool_id", ""),
+                    "input": "",
+                    "result": "",
+                }
+                content_blocks.append(current_block)
+                await _ws_send(conv_id, {"type": "tool_start", "name": current_block["name"], "tool_id": current_block["tool_id"]})
+            elif etype == "tool_input_delta":
+                if current_block and current_block.get("type") == "tool_use":
+                    current_block["input"] += evt.get("json", "")
+                await _ws_send(conv_id, {"type": "tool_input_chunk", "content": evt.get("json", ""), "tool_id": evt.get("tool_id", "")})
+            elif etype == "tool_result":
+                tool_id = evt.get("tool_id", "")
+                result = evt.get("content", "")
+                for block in reversed(content_blocks):
+                    if block.get("type") == "tool_use" and block.get("tool_id") == tool_id:
+                        block["result"] = result
+                        break
+                current_block = None
+                await _ws_send(conv_id, {"type": "tool_result", "content": result, "tool_id": tool_id, "is_error": evt.get("is_error", False)})
+            elif etype == "usage":
+                input_tokens += int(evt.get("input_tokens") or 0)
+                output_tokens += int(evt.get("output_tokens") or 0)
+                await _ws_send(conv_id, {"type": "usage", "input_tokens": input_tokens, "output_tokens": output_tokens})
+            elif etype == "permission_request":
+                pass
+            elif etype == "error":
+                got_error = True
+                await _ws_send(conv_id, {"type": "error", "error": evt.get("error", "Goose error")})
+            elif etype == "result" and evt.get("session_id"):
+                new_session_id = evt.get("session_id")
+
+        if not full_text.strip() and not any(b.get("type") != "thinking" for b in content_blocks):
+            if draft_msg_id:
+                await db.delete_branch(draft_msg_id)
+            if not got_error:
+                await _ws_send(conv_id, {"type": "error", "error": "Goose exited with no response"})
+            return
+
+        gen_ms = int((_time.time() - start_t) * 1000)
+        await db.update_message_content(
+            draft_msg_id,
+            content=full_text,
+            content_blocks=json.dumps(content_blocks) if content_blocks else None,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cc_session_id=new_session_id or None,
+            cc_session_mode="goose",
+            cc_model_used=cc_model,
+            generation_ms=gen_ms,
+        )
+        await db.set_active_branch(conv_id, draft_msg_id)
+        msg = await db.get_message(draft_msg_id)
+        await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
+        preview = full_text.replace("#", "").replace("*", "").strip()[:120]
+        await _ws_broadcast_all({
+            "type": "branch_landed",
+            "conv_id": conv_id,
+            "conv_title": conv.get("title", "Conversation"),
+            "message_id": draft_msg_id,
+            "preview": preview,
+        })
+
+    except asyncio.CancelledError:
+        if draft_msg_id:
+            if full_text.strip() or content_blocks:
+                try:
+                    await db.update_message_content(
+                        draft_msg_id,
+                        content=full_text,
+                        content_blocks=json.dumps(content_blocks) if content_blocks else None,
+                        cc_session_id=new_session_id or None,
+                        cc_session_mode="goose",
+                        cc_model_used=cc_model if "cc_model" in locals() else None,
+                    )
+                except Exception:
+                    pass
+            else:
+                await db.delete_branch(draft_msg_id)
+        raise
+    except Exception as exc:
+        print(f"[Goose] Error: {exc}")
+        if draft_msg_id:
+            await db.update_message_content(draft_msg_id, content=f"[Error: {exc}]", cc_model_used=locals().get("cc_model"))
+            msg = await db.get_message(draft_msg_id)
+            await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
+        else:
+            await _ws_send(conv_id, {"type": "error", "error": str(exc)})
+    finally:
+        _active_goose_procs.pop(conv_id, None)
+        if proc is not None:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                try:
+                    await goose_client.cancel_goose(proc)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        if draft_msg_id:
+            try:
+                await db.unregister_active_generation(draft_msg_id)
+            except Exception:
+                pass
+        for rid in list(_pending_hook_permissions):
+            if _pending_hook_permissions[rid].get("conv_id") == conv_id:
+                _pending_hook_permissions.pop(rid, None)
+                await db.delete_pending_permission(rid)
 
 
 async def _handle_local_generation(

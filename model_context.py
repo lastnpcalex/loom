@@ -15,6 +15,10 @@ THRESHOLD_ANTHROPIC_STD = 175_000   # 200k window → 175k gate
 THRESHOLD_GEMINI = 175_000          # Gemini 1M+ but treated as non-1M for CC handoff
 THRESHOLD_LOCAL_LLAMA = 220_000     # local llama-server runs Qwen 262k-context;
                                     # 220k leaves ~16% headroom for token-estimate drift
+THRESHOLD_OPENROUTER_GLM_52 = 880_000
+THRESHOLD_OPENROUTER_KIMI_K27_CODE = 225_000
+THRESHOLD_OPENROUTER_GPT_56_LUNA = 880_000
+THRESHOLD_OPENROUTER_DEEPSEEK_V4_FLASH = 880_000
 
 
 import re as _re
@@ -79,17 +83,48 @@ def is_gemini(model_id: str) -> bool:
     return model_id.lower().startswith("gemini")
 
 
+def is_openrouter(model_id: str) -> bool:
+    if not model_id:
+        return False
+    ml = model_id.lower()
+    return (
+        ml.startswith("openrouter:")
+        or ml in {
+            "z-ai/glm-5.2",
+            "moonshotai/kimi-k2.7-code",
+            "openai/gpt-5.6-luna",
+            "deepseek/deepseek-v4-flash-0731",
+        }
+    )
+
+
+def _openrouter_slug(model_id: str) -> str:
+    m = (model_id or "").lower()
+    return m.split(":", 1)[1] if m.startswith("openrouter:") else m
+
+
 def is_local_llama(model_id: str) -> bool:
     """Local llama models — anything not Anthropic or Gemini."""
     if not model_id:
         return False
-    if is_gemini(model_id) or is_anthropic(model_id):
+    if is_gemini(model_id) or is_anthropic(model_id) or is_openrouter(model_id):
         return False
     return True
 
 
 def handoff_threshold(target_model: str) -> int:
     """Token threshold above which a non-1M target needs a compact-handoff."""
+    if is_openrouter(target_model):
+        slug = _openrouter_slug(target_model)
+        if slug == "z-ai/glm-5.2":
+            return THRESHOLD_OPENROUTER_GLM_52
+        if slug == "moonshotai/kimi-k2.7-code":
+            return THRESHOLD_OPENROUTER_KIMI_K27_CODE
+        if slug == "openai/gpt-5.6-luna":
+            return THRESHOLD_OPENROUTER_GPT_56_LUNA
+        if slug == "deepseek/deepseek-v4-flash-0731":
+            return THRESHOLD_OPENROUTER_DEEPSEEK_V4_FLASH
+        return THRESHOLD_ANTHROPIC_STD
     if is_local_llama(target_model):
         return THRESHOLD_LOCAL_LLAMA
     if is_gemini(target_model):
@@ -111,6 +146,8 @@ def provider_label(target_model: str) -> str:
         return "Anthropic 1M"
     if is_gemini(target_model):
         return "Gemini"
+    if is_openrouter(target_model):
+        return "OpenRouter"
     if is_local_llama(target_model):
         return "Local"
     return "Anthropic"

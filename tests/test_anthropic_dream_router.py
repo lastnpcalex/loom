@@ -47,7 +47,7 @@ def test_anthropic_request_converts_tools_and_tool_results():
 
     assert out["model"] == "dream"
     assert out["stream"] is False
-    assert out["max_tokens"] >= 128
+    assert out["max_tokens"] >= router._dream_min_output_tokens()
     assert out["chat_template_kwargs"] == {"enable_thinking": True}
     assert out["tool_choice"] == "required"
     assert out["tools"][0]["function"]["name"] == "read_file"
@@ -70,7 +70,7 @@ def test_anthropic_request_uses_fallback_max_tokens_when_omitted():
         model="dream",
     )
 
-    assert out["max_tokens"] == router.DEFAULT_MAX_TOKENS
+    assert out["max_tokens"] == max(router.DEFAULT_MAX_TOKENS, router._dream_min_output_tokens())
 
 
 def test_openai_response_converts_text_and_strips_dream_channel_scaffold():

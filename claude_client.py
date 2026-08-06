@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from loom_agent_prompt import load_loom_agent_prompt, merge_system_prompts
+import openrouter_client
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +23,15 @@ _AUTO_CONTINUE_PROMPT = (
     "Do not restate context, apologize, or repeat what you already wrote — "
     "just resume the next token."
 )
+
+
+def _usage_int(value, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def extract_and_save_tool_image(content_block: dict, conv_id: int, project_dir: str) -> str | None:
@@ -334,13 +344,13 @@ def _process_event(raw: dict, state: dict | None = None) -> list[dict]:
                 state["stop_reason"] = sr
             usage = ev.get("usage") or {}
             if usage:
-                input_tok = (usage.get("input_tokens", 0)
-                             + usage.get("cache_read_input_tokens", 0)
-                             + usage.get("cache_creation_input_tokens", 0))
+                input_tok = (_usage_int(usage.get("input_tokens"))
+                             + _usage_int(usage.get("cache_read_input_tokens"))
+                             + _usage_int(usage.get("cache_creation_input_tokens")))
                 events.append({
                     "type": "usage",
                     "input_tokens": input_tok,
-                    "output_tokens": usage.get("output_tokens", 0),
+                    "output_tokens": _usage_int(usage.get("output_tokens")),
                 })
 
         if evt_type == "content_block_start":
@@ -628,6 +638,7 @@ def _loom_append_system_prompt(
     use_llama: bool = False,
     use_umans: bool = False,
     use_dream: bool = False,
+    use_openrouter: bool = False,
     cc_model: str | None = None,
 ) -> str | None:
     """Add the shared Loom contract only for ordinary Claude sessions.
@@ -644,13 +655,17 @@ def _loom_append_system_prompt(
             else (
                 "the local Dream DiffusionGemma sidecar"
                 if use_dream
-                else ("Umans AI" if use_umans else "the Anthropic API")
+                else (
+                    "OpenRouter"
+                    if use_openrouter
+                    else ("Umans AI" if use_umans else "the Anthropic API")
+                )
             )
         )
         contract = contract + (
             "\n\n## Operating model\n"
             f"You are `{cc_model}` via {provider}. Large raw input-token totals are "
-            "normal here: on API/Umans they are mostly cache reads, on the local "
+            "normal here: on API/OpenRouter/Umans they are mostly cache reads, on the local "
             "llama-server they are KV-reused but not reported as cached. Either way, "
             "prefer scoped reads over re-dumping whole files into context."
         )
@@ -679,6 +694,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                      use_llama: bool = False,
                      use_umans: bool = False,
                      use_dream: bool = False,
+                     use_openrouter: bool = False,
                      backstage_parent_id: int | None = None,
                      nrol_operator: bool = False,
                      extra_mcp_servers: dict | None = None,
@@ -696,6 +712,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     as all three DEFAULT_*_MODEL env vars so CC routes to it regardless of preset.
     When use_umans is True, routes through Umans AI's Anthropic-compatible endpoint
     (api.code.umans.ai) for remote model access.
+    When use_openrouter is True, routes through OpenRouter's Anthropic-compatible
+    endpoint using OPENROUTER_API_KEY.
     When use_dream is True, routes through Loom's local Anthropic-to-Dream shim,
     which forwards to the DiffusionGemma OpenAI sidecar.
     Permission hooks route tool approvals through Loom's HTTP API.
@@ -725,10 +743,12 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             "Write", "Edit", "NotebookEdit", "Bash",
             "Agent", "Task", "KillShell", "SlashCommand",
         ]
-    # Llama/local/umans/dream models: block built-in WebSearch/WebFetch (require Anthropic API).
+    # Llama/local/umans/dream/openrouter models: block built-in WebSearch/WebFetch
+    # (require Anthropic API). The MCP web-tools server provides replacement
+    # search/fetch for these routed backends.
     # The MCP web-tools server (registered below) provides keyless web_search/web_fetch
     # via DuckDuckGo + trafilatura as the replacement.
-    if use_llama or use_umans or use_dream:
+    if use_llama or use_umans or use_dream or use_openrouter:
         disallowed_list += ["WebSearch", "WebFetch"]
     if extra_disallowed_tools:
         disallowed_list += [tool for tool in extra_disallowed_tools if tool not in disallowed_list]
@@ -766,9 +786,9 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         if backstage_md.exists():
             cc_args.extend(["--append-system-prompt", backstage_md.read_text(encoding="utf-8")])
 
-    # Llama/local/umans/dream models: register MCP web-tools so they get web_search/web_fetch
+    # Llama/local/umans/dream/openrouter models: register MCP web-tools so they get web_search/web_fetch
     # via DuckDuckGo + trafilatura (keyless, no Anthropic API needed).
-    if use_llama or use_umans or use_dream:
+    if use_llama or use_umans or use_dream or use_openrouter:
         web_tools_script = Path(__file__).parent / "mcp_web_tools.py"
         if web_tools_script.is_file():
             mcp_servers["web-tools"] = {
@@ -849,6 +869,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         use_llama=use_llama,
         use_umans=use_umans,
         use_dream=use_dream,
+        use_openrouter=use_openrouter,
         cc_model=model,
     )
     if append_system_prompt:
@@ -917,6 +938,28 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
         env["LOOM_USE_LLAMA"] = "0"
         env["LOOM_USE_DREAM"] = "1"
+    # OpenRouter as CC backend: Claude Code speaks Anthropic Messages to
+    # https://openrouter.ai/api/v1/messages when ANTHROPIC_BASE_URL is
+    # https://openrouter.ai/api.
+    elif use_openrouter:
+        _or_key = openrouter_client.api_key()
+        if _or_key:
+            alias = openrouter_client.model_slug(model)
+            base = openrouter_client.base_url()
+            if base.endswith("/v1"):
+                base = base[:-3]
+            env["OPENROUTER_API_KEY"] = _or_key
+            env["ANTHROPIC_BASE_URL"] = base.rstrip("/")
+            env["ANTHROPIC_API_KEY"] = _or_key
+            env["ANTHROPIC_AUTH_TOKEN"] = _or_key
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = alias
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = alias
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = alias
+            env["CLAUDE_CODE_SUBAGENT_MODEL"] = alias
+            env["LOOM_USE_LLAMA"] = "0"
+            env["LOOM_USE_OPENROUTER"] = "1"
+        else:
+            print("[CC] WARNING: OPENROUTER_API_KEY not set - OpenRouter routing will fail")
     # Umans AI as CC backend: point the Anthropic SDK at Umans' Anthropic-compatible
     # /v1/messages endpoint. Session resumption works across providers because the
     # conversation history lives in Loom's DB, not the provider.
@@ -1009,7 +1052,7 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
 
     print(f"[CC] Starting subprocess in {cwd}")
     print(f"[CC] CMD: {' '.join(cmd[:8])}{'...' if len(cmd) > 8 else ''}")
-    print(f"[CC] use_llama={use_llama} model={model} effort={effort}")
+    print(f"[CC] use_llama={use_llama} use_openrouter={use_openrouter} model={model} effort={effort}")
     print(f"[CC] Prompt length: {len(prompt)} chars (stdin={use_stdin})")
     print(f"[CC] Hook env: LOOM_CONV_ID={conv_id} LOOM_PORT={server_port}")
 

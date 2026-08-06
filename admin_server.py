@@ -162,6 +162,7 @@ _load_initial_main_db()
 _server_ref: list = []
 # Track child processes we've launched (for restart)
 _child_procs: dict[str, subprocess.Popen] = {}
+_dream_starting: bool = False
 NROL_AO_REPO = Path(os.environ.get("NROL_AO_REPO", r"C:\Claude-Code\NROL-AO\temp-repo"))
 NROL_AO_PORT = int(os.environ.get("ALPHA_OMEGA_PORT", "8098"))
 NROL_SCAN_WORKSPACE = Path(
@@ -1185,17 +1186,25 @@ def _dream_proc_mem(pid: int | None) -> tuple[int, int]:
 async def tool_dream_start():
     """Launch the C++ llama-diffusion-gemma-server (tool-aware HTTP server). Loads the
     GGUF at startup; /health answers once the model is resident (~30-60s cold)."""
-    global _dream_last_activity
+    global _dream_last_activity, _dream_starting
     port = _dream_port()
     # Already up?
     h = await _dream_probe()
     if h is not None:
         _dream_last_activity = time.time()
         return JSONResponse({"status": "ok", "output": f"Dream sidecar already running on :{port} (loaded: {h.get('loaded_model') or 'none'})."})
+    if _dream_starting:
+        _dream_last_activity = time.time()
+        return JSONResponse({"status": "ok", "output": f"Dream sidecar launch already in progress; waiting for :{port} to become healthy."})
+    existing = _child_procs.get("dream")
+    if existing and existing.poll() is None:
+        _dream_last_activity = time.time()
+        return JSONResponse({"status": "ok", "output": f"Dream sidecar launch already in progress (PID {existing.pid}); waiting for :{port} to become healthy."})
     cwd = _dream_cwd()
     if not cwd or not Path(cwd).is_dir():
         return JSONResponse({"status": "error", "output": f"dream_cwd not found: {cwd!r}. Set it in config.json."})
     cmd = _dream_cmd()
+    _dream_starting = True
     try:
         proc = _spawn_detached(cmd, cwd=cwd, log_name="dream_admin.log")
         _child_procs["dream"] = proc
@@ -1212,6 +1221,8 @@ async def tool_dream_start():
         return JSONResponse({"status": "ok", "output": f"Dream sidecar launched (PID {proc.pid}) but server not responding on :{port} after 120s (cold model load can be slow — check dream_admin.log).\nCmd: {cmd}"})
     except Exception as e:
         return JSONResponse({"status": "error", "output": f"Failed to launch Dream sidecar: {e}\nCmd: {cmd}"})
+    finally:
+        _dream_starting = False
 
 
 @app.post("/tools/dream-restart")

@@ -366,6 +366,7 @@ async def test_gemini_client_resume_and_fork_args(monkeypatch, tmp_path):
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", mock_create_subprocess_exec)
     monkeypatch.setattr(gemini_client, "_find_agy_exe", lambda: "agy")
+    monkeypatch.setattr(gemini_client, "_configure_permission_hook", lambda *args, **kwargs: None)
 
     # Override HOME / USERPROFILE env variables to direct brain path to tmp_path
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
@@ -408,6 +409,10 @@ async def test_gemini_client_resume_and_fork_args(monkeypatch, tmp_path):
     assert len(args_captured) == 1
     cmd_args = args_captured[0]
     assert cmd_args[0] == "agy"
+    assert "--output-format" in cmd_args
+    assert cmd_args[cmd_args.index("--output-format") + 1] == "stream-json"
+    assert "--model" in cmd_args
+    assert "--effort" in cmd_args
     idx = cmd_args.index("--conversation")
     dst_session_id = cmd_args[idx + 1]
     assert dst_session_id != "src_session"
@@ -477,6 +482,7 @@ async def test_gemini_operator_turn2_forces_fresh_conv(monkeypatch, tmp_path):
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", mock_create_subprocess_exec)
     monkeypatch.setattr(gemini_client, "_find_agy_exe", lambda: "agy")
+    monkeypatch.setattr(gemini_client, "_configure_permission_hook", lambda *args, **kwargs: None)
 
     # Redirect brain path to tmp_path (operator override relies on no real
     # ~/.gemini state; the new-UUID scan reads brain_path.iterdir()).
@@ -549,6 +555,8 @@ async def test_gemini_operator_turn2_forces_fresh_conv(monkeypatch, tmp_path):
     )
     # --dangerously-skip-permissions stays (hook is the tool-blocking layer).
     assert "--dangerously-skip-permissions" in cmd_args
+    assert "--output-format" in cmd_args
+    assert cmd_args[cmd_args.index("--output-format") + 1] == "stream-json"
 
     # --- Poller-side invariant: did NOT pin to the stale turn-1 transcript ---
     # No forked brain folder was created (fork-copy block was skipped).
@@ -948,6 +956,7 @@ def _patch_agy_subprocess(monkeypatch, mock_proc):
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", mock_create_subprocess_exec)
     monkeypatch.setattr(gemini_client, "_find_agy_exe", lambda: "agy")
+    monkeypatch.setattr(gemini_client, "_configure_permission_hook", lambda *args, **kwargs: None)
     return gemini_client
 
 
@@ -1032,10 +1041,9 @@ async def test_tailer_breaks_on_planner_stall_signature(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_tailer_breaks_on_sustained_dead_log(tmp_path, monkeypatch):
-    """When agy's log goes stale (no mtime change) for 60s+ with no active
-    tool call and proc.returncode still None, the sustained-dead detector
-    breaks the tailer instead of hanging forever."""
+async def test_stdout_producer_breaks_on_sustained_dead_log(tmp_path, monkeypatch):
+    """When agy's log goes stale with proc.returncode still None, the new
+    stdout-driven producer's sustained-dead detector breaks instead of hanging."""
     import asyncio
     import time
     import gemini_client
@@ -1045,29 +1053,17 @@ async def test_tailer_breaks_on_sustained_dead_log(tmp_path, monkeypatch):
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    _write_fake_transcript(tmp_path, conv_id=8, lines=[
-        '{"type":"PLANNER_RESPONSE","step_index":1,"content":"partial"}',
-    ])
-
-    # A benign log (no stall signature) so the planner detector doesn't fire —
-    # only the sustained-dead path should trigger. Set its mtime 70s in the
-    # past so _is_agy_alive returns False immediately.
+    # A benign log with stale mtime so _is_agy_alive returns False immediately.
     log_path = _write_fake_agy_log(tmp_path, "I0706 20:00:00.000000 1 server.go:1322] Starting\n")
     stale = time.time() - 70
     import os
     os.utime(log_path, (stale, stale))
 
-    # Fast-forward time so the 60s sustained-dead window elapses in ~2s of
-    # real test time. The heartbeat checks every 30 polls (~1.5s); two
-    # heartbeats past the threshold is enough. _is_agy_alive and the heartbeat
-    # both call time.time() via a local `import time as _time`, so patching
-    # time.time on the time module itself reaches all call sites.
+    # Fast-forward time so the 60s sustained-dead window elapses quickly.
     real_time = time.time
     t0 = real_time()
 
     def fast_time():
-        # Advance ~35s per real second, so 60s sustained threshold is crossed
-        # in under 2s of wall-clock test time.
         return t0 + (real_time() - t0) * 35.0
 
     monkeypatch.setattr(time, "time", fast_time)
@@ -1092,3 +1088,114 @@ async def test_tailer_breaks_on_sustained_dead_log(tmp_path, monkeypatch):
     result = next(e for e in events if isinstance(e, dict) and e.get("type") == "result")
     assert result["is_error"] is True
     assert "shut down" in (result.get("error") or "").lower() or "no log activity" in (result.get("error") or "").lower()
+
+
+class _ExitingMockProcess:
+    """Mock agy process that exits cleanly and writes stream-json to stdout.
+
+    Simulates the August 2026 agy behavior where --output-format stream-json
+    writes structured events to stdout and exits with code 0.
+    """
+
+    def __init__(self, stdout_data: bytes = b"Hello from stdout\n"):
+        import asyncio
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self.returncode: int | None = None
+        self._stdout_data = stdout_data
+        self._fed = False
+        self._waiters: list[asyncio.Future] = []
+
+    def _resolve_waiters(self):
+        for fut in self._waiters:
+            if not fut.done():
+                fut.set_result(self.returncode)
+        self._waiters.clear()
+
+    async def _feed(self):
+        # Feed stdout and EOF immediately; the producer loop polls every 50ms.
+        self.stdout.feed_data(self._stdout_data)
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+        self._fed = True
+        self.returncode = 0
+        self._resolve_waiters()
+
+    async def wait(self):
+        if self.returncode is not None:
+            return self.returncode
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._waiters.append(fut)
+        return await fut
+
+    def kill(self):
+        self.returncode = -9
+        self._resolve_waiters()
+
+
+@pytest.mark.asyncio
+async def test_agy_stream_json_completes_when_process_exits(tmp_path, monkeypatch):
+    """Regression for stream-json-driven agy.
+
+    run_gemini no longer tails transcript.jsonl; it parses agy's structured
+    stdout and yields Loom-native text/result events.
+    """
+    import asyncio
+    import json
+    import gemini_client
+
+    expected = ("A" * 4096) + ("B" * 16)
+    stdout_data = "\n".join([
+        json.dumps({"event": "init", "init": {"conversation_id": "agy-conv-9", "model": "gemini-3.6-flash-high"}}),
+        json.dumps({"event": "step_update", "step_update": {"delta": expected[:4096]}}),
+        json.dumps({"event": "step_update", "step_update": {"delta": expected[4096:]}}),
+        json.dumps({"event": "result", "result": {
+            "conversation_id": "agy-conv-9",
+            "status": "OK",
+            "response": "",
+            "duration_seconds": 1.25,
+            "num_turns": 1,
+            "usage": {"input_tokens": 2, "output_tokens": 3, "thinking_tokens": 4},
+        }}),
+        "",
+    ]).encode("utf-8")
+    mock_proc = _ExitingMockProcess(stdout_data=stdout_data)
+
+    async def mock_create_subprocess_exec(*args, **kwargs):
+        # Start the feeder so stdout becomes available shortly after launch.
+        asyncio.create_task(mock_proc._feed())
+        return mock_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", mock_create_subprocess_exec)
+    monkeypatch.setattr(gemini_client, "_find_agy_exe", lambda: "agy")
+    monkeypatch.setattr(gemini_client, "_configure_permission_hook", lambda *args, **kwargs: None)
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    proc, event_stream = await asyncio.wait_for(
+        gemini_client.run_gemini(
+            prompt="test",
+            cwd=str(tmp_path),
+            conv_id=9,
+        ),
+        timeout=20,
+    )
+
+    events = []
+    async for evt in event_stream:
+        if evt is None:
+            break
+        events.append(evt)
+        if isinstance(evt, dict) and evt.get("type") == "result":
+            break
+
+    result = next(e for e in events if isinstance(e, dict) and e.get("type") == "result")
+    assert result["is_error"] is False, f"expected success, got error={result.get('error')}"
+    assert result["result_text"] == expected
+    assert result["session_id"] == "agy-conv-9"
+    text_deltas = [e for e in events if isinstance(e, dict) and e.get("type") == "text_delta"]
+    assert "".join(e.get("text", "") for e in text_deltas) == expected
+    usage = next(e for e in events if isinstance(e, dict) and e.get("type") == "usage")
+    assert usage["input_tokens"] == 2
+    assert usage["output_tokens"] == 3

@@ -50,7 +50,7 @@ async def test_braid_dream_model_routes_through_dream_shim(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_dream_stream_passes_requested_max_tokens(monkeypatch):
+async def test_dream_stream_floors_tiny_requested_max_tokens(monkeypatch):
     import llama_client
 
     seen = {}
@@ -82,6 +82,7 @@ async def test_dream_stream_passes_requested_max_tokens(monkeypatch):
             return FakeStreamResponse()
 
     monkeypatch.setattr(llama_client, "_client", lambda: FakeClient())
+    monkeypatch.setattr(llama_client.config, "dream_min_output_tokens", 2048)
     llama_client._mock_mode = False
 
     chunks = []
@@ -92,7 +93,7 @@ async def test_dream_stream_passes_requested_max_tokens(monkeypatch):
     ):
         chunks.append(chunk)
 
-    assert seen["payload"]["max_tokens"] == 128
+    assert seen["payload"]["max_tokens"] == 2048
     assert seen["payload"]["chat_template_kwargs"] == {"enable_thinking": True}
     assert chunks[0] == "ok"
     assert chunks[-1]["type"] == "usage"
@@ -167,3 +168,4 @@ def test_settings_max_tokens_allows_dream_context_scale():
     html = Path("static/index.html").read_text(encoding="utf-8")
 
     assert 'id="cfg-max-tokens" step="256" min="64" max="131072"' in html
+    assert 'id="cfg-dream-min-output-tokens" min="256" step="256"' in html

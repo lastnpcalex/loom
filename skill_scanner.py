@@ -151,6 +151,8 @@ CODEX_COMMANDS = [
      "prompt_template": "Run the relevant tests for this task. If tests fail, diagnose and fix the cause when it is in scope. {args}"},
     {"name": "init", "command": "/init", "description": "Create or update AGENTS.md project guidance", "mode": "headless",
      "prompt_template": "Create or update AGENTS.md with concise project guidance, build/test commands, conventions, and important repo context. {args}"},
+    {"name": "goal", "command": "/goal", "description": "Set, view, pause, resume, or clear a Codex task goal", "mode": "meta",
+     "prompt_template": None},
     {"name": "compact", "command": "/compact", "description": "Context compacts automatically in Loom", "mode": "meta",
      "prompt_template": None},
     {"name": "permissions", "command": "/permissions", "description": "View Loom permission handling", "mode": "meta",

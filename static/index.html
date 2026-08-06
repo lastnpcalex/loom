@@ -221,6 +221,19 @@
 
         <!-- Shared input area (visible on both chat and tree views) -->
         <div id="input-area" class="hidden">
+            <div id="codex-goal-row" class="hidden">
+                <div class="codex-goal-main" title="Current Codex goal">
+                    <span class="codex-goal-label">Goal</span>
+                    <span id="codex-goal-status"></span>
+                    <span id="codex-goal-objective"></span>
+                </div>
+                <div class="codex-goal-actions">
+                    <button id="btn-codex-goal-view" title="View Codex goal">View</button>
+                    <button id="btn-codex-goal-edit" title="Edit Codex goal">Edit</button>
+                    <button id="btn-codex-goal-toggle" title="Pause or resume Codex goal">Pause</button>
+                    <button id="btn-codex-goal-clear" title="Clear Codex goal">&times;</button>
+                </div>
+            </div>
             <div id="image-preview" class="hidden"></div>
             <div id="reply-quote-bar" class="hidden" title="Click to jump to the quoted message">
                 <span class="reply-quote-icon">&#x21A9;</span>
@@ -343,7 +356,11 @@
                 <label for="weave-system-only">
                     <input type="checkbox" id="weave-system-only">
                     Minimal Weave
-                    <span class="label-hint">(system message only)</span>
+                    <span class="label-hint">(system prompt, branch history, no state cards)</span>
+                </label>
+                <label for="weave-minimal-ooda-enabled" class="minimal-suboption">
+                    <input type="checkbox" id="weave-minimal-ooda-enabled" checked>
+                    Private OODA add-in
                 </label>
             </div>
             <div class="form-group hidden" id="weave-system-prompt-group">
@@ -387,6 +404,7 @@
                 <button class="toggle-btn active" data-settings-tab="model">Model &amp; Generation</button>
                 <button class="toggle-btn" data-settings-tab="servers">Servers</button>
                 <button class="toggle-btn" data-settings-tab="display">Display</button>
+                <button class="toggle-btn" data-settings-tab="openrouter">OpenRouter</button>
                 <button class="toggle-btn" data-settings-tab="advanced">Advanced</button>
             </div>
             <div id="settings-loading-status" class="settings-loading-status hidden">Loading settings...</div>
@@ -478,6 +496,10 @@
                     <div class="form-group hidden" id="cfg-weave-system-prompt-group">
                         <label for="cfg-weave-system-prompt">System message</label>
                         <textarea id="cfg-weave-system-prompt" rows="5" placeholder="Minimal Weave system message"></textarea>
+                        <label for="cfg-weave-minimal-ooda-enabled" class="minimal-suboption">
+                            <input type="checkbox" id="cfg-weave-minimal-ooda-enabled">
+                            Private OODA add-in
+                        </label>
                     </div>
                 </div>
                 <!-- Dream Engine (DiffusionGemma) overrides -->
@@ -485,6 +507,10 @@
                     <div class="form-group">
                         <label for="cfg-dream-model">Dream Engine Model</label>
                         <select id="cfg-dream-model" class="form-select"></select>
+                    </div>
+                    <div class="form-group">
+                        <label for="cfg-dream-min-output-tokens">Minimum Output Tokens <span class="hint">(256-token canvas blocks)</span></label>
+                        <input type="number" id="cfg-dream-min-output-tokens" min="256" step="256" placeholder="2048">
                     </div>
                 </div>
             </div>
@@ -532,7 +558,73 @@
                         <span class="hint">(live streaming diagnostics — off by default; the overlay still surfaces a warning automatically when chunks are dropped or the stream is stuck)</span>
                     </label>
                 </div>
+                <div class="form-group toggle-row">
+                    <label for="cfg-enable-umans-models">
+                        <input type="checkbox" id="cfg-enable-umans-models">
+                        Show deprecated Umans models
+                        <span class="hint">(off by default; OpenRouter replaces these)</span>
+                    </label>
+                </div>
                 <div class="hint" style="margin-top:0.5rem">Tree node glow controls will land here next.</div>
+            </div>
+
+            <!-- OpenRouter -->
+            <div id="settings-openrouter" class="settings-section hidden">
+                <div class="settings-divider"><span>Secrets</span></div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="cfg-openrouter-api-key">Inference API Key</label>
+                        <input type="password" id="cfg-openrouter-api-key" autocomplete="off" placeholder="Leave blank to keep current key">
+                    </div>
+                    <div class="form-group">
+                        <label for="cfg-openrouter-management-key">Management Key</label>
+                        <input type="password" id="cfg-openrouter-management-key" autocomplete="off" placeholder="Leave blank to keep current key">
+                    </div>
+                </div>
+                <div class="label-with-action">
+                    <span class="settings-subhead">Saved key status is shown below; raw keys are never displayed again.</span>
+                    <button type="button" class="btn-mini" id="btn-save-openrouter-secrets">Save Keys</button>
+                </div>
+                <div id="openrouter-secrets-error" class="settings-warning hidden"></div>
+
+                <div class="settings-divider"><span>Budget guardrails</span></div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="cfg-openrouter-weekly-limit">Weekly Limit USD</label>
+                        <input type="number" id="cfg-openrouter-weekly-limit" step="0.50" min="0">
+                    </div>
+                    <div class="form-group">
+                        <label for="cfg-openrouter-monthly-limit">Monthly Limit USD</label>
+                        <input type="number" id="cfg-openrouter-monthly-limit" step="1" min="0">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="cfg-openrouter-prompt-price">Max Prompt $/1M</label>
+                        <input type="number" id="cfg-openrouter-prompt-price" step="0.01" min="0">
+                    </div>
+                    <div class="form-group">
+                        <label for="cfg-openrouter-completion-price">Max Output $/1M</label>
+                        <input type="number" id="cfg-openrouter-completion-price" step="0.01" min="0">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="cfg-openrouter-base-url">OpenRouter Base URL</label>
+                    <input type="text" id="cfg-openrouter-base-url" placeholder="https://openrouter.ai/api/v1">
+                </div>
+                <div class="label-with-action">
+                    <span class="settings-subhead">Usage</span>
+                    <button type="button" class="btn-mini" id="btn-refresh-openrouter-usage">Refresh</button>
+                </div>
+                <div class="openrouter-usage-grid" id="openrouter-usage-grid">
+                    <div><span>Inference key</span><strong id="or-api-key-status">unknown</strong></div>
+                    <div><span>Management key</span><strong id="or-management-key-status">unknown</strong></div>
+                    <div><span>Weekly spend</span><strong id="or-weekly-usage">unknown</strong></div>
+                    <div><span>Monthly spend</span><strong id="or-monthly-usage">unknown</strong></div>
+                    <div><span>Account used</span><strong id="or-account-used">unknown</strong></div>
+                    <div><span>Credits left</span><strong id="or-credits-left">unknown</strong></div>
+                </div>
+                <div id="openrouter-usage-error" class="settings-warning hidden"></div>
             </div>
 
  <!-- Advanced -->
@@ -621,6 +713,36 @@
             <div class="modal-actions">
                 <button class="btn-secondary" data-close-modal>Cancel</button>
                 <button class="btn-primary" id="btn-save-settings">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Codex Goal Modal -->
+    <div id="modal-codex-goal" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content codex-goal-modal">
+            <h2>Codex Goal</h2>
+            <div id="codex-goal-window-status" class="codex-goal-window-status">No goal set</div>
+            <div class="form-group">
+                <label for="codex-goal-objective-input">Objective</label>
+                <textarea id="codex-goal-objective-input" rows="7" placeholder="Describe the Codex goal for this conversation..."></textarea>
+            </div>
+            <div class="form-row">
+                <div class="form-group form-half">
+                    <label for="codex-goal-budget-input">Token Budget</label>
+                    <input type="number" id="codex-goal-budget-input" min="1" step="1000" placeholder="Optional">
+                </div>
+                <div class="form-group form-half">
+                    <label>Progress</label>
+                    <div id="codex-goal-progress" class="codex-goal-progress">0 tokens, 0s</div>
+                </div>
+            </div>
+            <div class="modal-actions codex-goal-modal-actions">
+                <button class="btn-secondary" data-close-modal>Close</button>
+                <button class="btn-secondary" id="btn-codex-goal-modal-clear">Clear</button>
+                <button class="btn-secondary" id="btn-codex-goal-modal-toggle">Pause</button>
+                <button class="btn-primary" id="btn-codex-goal-modal-save">Save</button>
+                <button class="btn-primary" id="btn-codex-goal-modal-start">Start Turn</button>
             </div>
         </div>
     </div>

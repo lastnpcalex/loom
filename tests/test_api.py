@@ -90,6 +90,7 @@ async def test_create_system_only_weave_conversation(client, mock_llama):
     assert data["persona_id"] is None
     assert data["lore_ids"] == "[]"
     assert data["system_only"] == 1
+    assert data["minimal_ooda_enabled"] == 1
     assert data["system_prompt"] == "Use only branch history and this instruction."
     assert data["ooda_enabled"] == 0
     assert data["local_model"] == "diffusiongemma-26b-a4b-it-nvfp4"
@@ -102,11 +103,84 @@ def test_minimal_weave_helpers_do_not_reintroduce_defaults():
     assert server._truthy_setting("true") is True
     assert server._truthy_setting("0") is False
     assert server._truthy_setting("false") is False
-    assert server._minimal_weave_system_prompt({"system_prompt": ""}) == ""
+    minimal_prompt = server._minimal_weave_system_prompt({"system_prompt": ""})
+    assert "OODA" in minimal_prompt
+    assert "<ooda>" not in minimal_prompt
+    assert "read_state" not in minimal_prompt
+    plain_prompt = server._minimal_weave_system_prompt({
+        "system_prompt": "ONLY THIS",
+        "minimal_ooda_enabled": 0,
+    })
+    assert plain_prompt == "ONLY THIS"
+
+
+async def test_cc_models_hide_deprecated_umans_by_default(client, monkeypatch):
+    import server
+
+    monkeypatch.setattr(server.config, "enable_umans_models", False)
+    resp = await client.get("/api/cc-models")
+    assert resp.status_code == 200
+    groups = resp.json()
+    assert all("umans" not in group["group"].lower() for group in groups)
+
+
+async def test_cc_models_includes_new_openrouter_models(client):
+    import server
+
+    resp = await client.get("/api/cc-models")
+    assert resp.status_code == 200
+    groups = {g["group"]: g["models"] for g in resp.json()}
+    openrouter = {m["value"] for m in groups.get("OpenRouter", [])}
+    assert "openrouter:openai/gpt-5.6-luna" in openrouter
+    assert "openrouter:deepseek/deepseek-v4-flash-0731" in openrouter
+
+
+async def test_create_umans_conversation_blocked_when_disabled(client, monkeypatch):
+    import server
+
+    monkeypatch.setattr(server.config, "enable_umans_models", False)
+    resp = await client.post("/api/conversations", json={
+        "title": "Deprecated Umans",
+        "mode": "claude",
+        "cc_model": "umans-coder",
+    })
+    assert resp.status_code == 400
+    assert "deprecated" in resp.json()["detail"].lower()
+
+
+async def test_openrouter_secret_endpoint_writes_dotenv_without_echoing_key(client, tmp_path, monkeypatch):
+    import server
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("OTHER_SETTING=kept\nOPENROUTER_API_KEY=old-value\n", encoding="utf-8")
+    monkeypatch.setattr(server.openrouter_client, "_dotenv_path", lambda: env_path)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_MANAGEMENT_KEY", raising=False)
+
+    api_key = "sk-or-v1-test-inference-abcdef1234"
+    management_key = "sk-or-v1-test-management-fedcba9876"
+    resp = await client.post("/api/openrouter/secrets", json={
+        "api_key": api_key,
+        "management_key": management_key,
+    })
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert api_key not in str(data)
+    assert management_key not in str(data)
+    assert data["status"]["api_key"]["preview"] == "sk-or-v...1234"
+    assert data["status"]["api_key"]["source"] == ".env"
+
+    saved = env_path.read_text(encoding="utf-8")
+    assert "OTHER_SETTING=kept" in saved
+    assert f"OPENROUTER_API_KEY={api_key}" in saved
+    assert f"OPENROUTER_MANAGEMENT_KEY={management_key}" in saved
+    assert saved.count("OPENROUTER_API_KEY=") == 1
 
 
 async def test_system_only_weave_generation_uses_only_system_prompt(monkeypatch):
-    """Minimal Weave sends the stored system prompt without RP scaffolding."""
+    """Minimal Weave sends the stored system prompt plus prompt-only OODA."""
     import server
 
     conv = await db.create_conversation(
@@ -120,6 +194,7 @@ async def test_system_only_weave_generation_uses_only_system_prompt(monkeypatch)
         lore_ids=json.dumps(["leaky-lore"]),
         custom_scene="LEAKY SCENE",
         system_only=1,
+        minimal_ooda_enabled=1,
         system_prompt="ONLY THIS SYSTEM MESSAGE",
         ooda_enabled=1,
         local_model="Qwen3.6-27B-NVFP4.gguf",
@@ -168,10 +243,11 @@ async def test_system_only_weave_generation_uses_only_system_prompt(monkeypatch)
 
     assert loader_calls == []
     assert captured["model"] == "Qwen3.6-27B-NVFP4.gguf"
-    assert captured["messages"][0] == {
-        "role": "system",
-        "content": "ONLY THIS SYSTEM MESSAGE",
-    }
+    assert captured["messages"][0]["role"] == "system"
+    assert captured["messages"][0]["content"].startswith("ONLY THIS SYSTEM MESSAGE\n\n")
+    assert "OODA" in captured["messages"][0]["content"]
+    assert "<ooda>" not in captured["messages"][0]["content"]
+    assert "read_state" not in captured["messages"][0]["content"]
     assert captured["messages"][1:] == [
         {"role": "user", "content": "Start here."},
     ]
@@ -180,6 +256,52 @@ async def test_system_only_weave_generation_uses_only_system_prompt(monkeypatch)
     assert "LEAKY" not in prompt_text
     assert "My character" not in prompt_text
     assert "Background" not in prompt_text
+
+
+async def test_system_only_weave_generation_can_disable_minimal_ooda(monkeypatch):
+    """Minimal Weave can send only the stored system prompt with no private OODA add-in."""
+    import server
+
+    conv = await db.create_conversation(
+        "Plain Minimal Weave",
+        character_id="leaky-character",
+        mode="weave",
+    )
+    await db.update_conversation_fields(
+        conv["id"],
+        system_only=1,
+        minimal_ooda_enabled=0,
+        system_prompt="ONLY THIS SYSTEM MESSAGE",
+        local_model="Qwen3.6-27B-NVFP4.gguf",
+    )
+    user_msg = await db.add_message(conv["id"], "user", "Start here.")
+    conv = await db.get_conversation(conv["id"])
+
+    captured = {}
+
+    async def fake_stream_chat(messages, model=None):
+        captured["messages"] = messages
+        captured["model"] = model
+        yield "ok"
+
+    async def fake_update_rolling_summary(conv_id):
+        return None
+
+    monkeypatch.setattr(server, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr("context_manager.update_rolling_summary", fake_update_rolling_summary)
+
+    await server._handle_weave_generation(
+        None,
+        conv["id"],
+        conv,
+        {"action": "generate", "parent_id": user_msg["id"]},
+    )
+
+    assert captured["messages"][0] == {
+        "role": "system",
+        "content": "ONLY THIS SYSTEM MESSAGE",
+    }
+    assert "OODA" not in "\n".join(m["content"] for m in captured["messages"])
 
 
 async def test_create_local_conversation(client, mock_llama):
@@ -207,6 +329,188 @@ async def test_create_claude_conversation(client, mock_llama):
     data = resp.json()
     assert data["mode"] == "claude"
     assert data["cc_model"] == "opus"
+
+
+async def test_update_conversation_openrouter_model_sets_openrouter_mode(client, mock_llama):
+    conv = await db.create_conversation("OpenRouter Mode", mode="claude")
+
+    resp = await client.put(
+        f"/api/conversations/{conv['id']}",
+        json={"cc_model": "openrouter:deepseek/deepseek-v4-flash-0731"},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["mode"] == "openrouter"
+    assert data["cc_model"] == "openrouter:deepseek/deepseek-v4-flash-0731"
+
+
+async def test_get_conversation_repairs_stale_openrouter_mode(client, mock_llama):
+    conv = await db.create_conversation("Stale OpenRouter Mode", mode="codex")
+    await db.update_conversation_fields(
+        conv["id"],
+        cc_model="openrouter:deepseek/deepseek-v4-flash-0731",
+    )
+
+    resp = await client.get(f"/api/conversations/{conv['id']}")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["mode"] == "openrouter"
+
+    updated = await db.get_conversation(conv["id"])
+    assert updated["mode"] == "openrouter"
+
+
+async def test_codex_goal_endpoint_requires_codex(client, mock_llama):
+    conv = await db.create_conversation("Not Codex", mode="weave")
+
+    resp = await client.post(
+        f"/api/conversations/{conv['id']}/codex-goal",
+        json={"action": "set", "objective": "Finish the migration"},
+    )
+
+    assert resp.status_code == 400
+    assert "/goal is only available for Codex" in resp.json()["detail"]
+
+
+async def test_codex_goal_endpoint_rejects_openrouter(client, mock_llama):
+    conv = await db.create_conversation("OpenRouter Goal", mode="openrouter")
+    await db.update_conversation_fields(
+        conv["id"],
+        cc_model="openrouter:deepseek/deepseek-v4-flash-0731",
+    )
+
+    resp = await client.post(
+        f"/api/conversations/{conv['id']}/codex-goal",
+        json={"action": "set", "objective": "This should not start Codex"},
+    )
+
+    assert resp.status_code == 400
+    assert "/goal is only available for Codex" in resp.json()["detail"]
+
+
+async def test_codex_goal_endpoint_rejects_stale_openrouter_mode(client, mock_llama):
+    conv = await db.create_conversation("Stale OpenRouter Goal", mode="codex")
+    await db.update_conversation_fields(
+        conv["id"],
+        cc_model="openrouter:deepseek/deepseek-v4-flash-0731",
+    )
+
+    resp = await client.post(
+        f"/api/conversations/{conv['id']}/codex-goal",
+        json={"action": "set", "objective": "This should not start Codex"},
+    )
+
+    assert resp.status_code == 400
+    assert "/goal is only available for Codex" in resp.json()["detail"]
+
+
+async def test_openrouter_generation_dispatches_to_claude_handler(monkeypatch):
+    import server
+
+    conv = await db.create_conversation("OpenRouter Dispatch", mode="openrouter")
+    await db.update_conversation_fields(
+        conv["id"],
+        cc_model="openrouter:deepseek/deepseek-v4-flash-0731",
+    )
+    calls = []
+
+    async def fake_claude_generation(websocket, conv_id, loaded_conv, data):
+        calls.append(("claude", conv_id, loaded_conv["mode"], loaded_conv["cc_model"]))
+
+    async def fake_weave_generation(*args, **kwargs):
+        raise AssertionError("OpenRouter generation must not route through Weave")
+
+    monkeypatch.setattr(server, "_handle_claude_generation", fake_claude_generation)
+    monkeypatch.setattr(server, "_handle_weave_generation", fake_weave_generation)
+
+    await server._handle_generation(
+        None,
+        conv["id"],
+        {"action": "generate", "cc_model": "openrouter:deepseek/deepseek-v4-flash-0731"},
+    )
+
+    assert calls == [
+        (
+            "claude",
+            conv["id"],
+            "openrouter",
+            "openrouter:deepseek/deepseek-v4-flash-0731",
+        )
+    ]
+
+
+async def test_codex_goal_endpoint_get_without_session_uses_loom_state(client, mock_llama, monkeypatch):
+    import server
+
+    async def fail_manage_goal(*args, **kwargs):
+        raise AssertionError("manage_codex_goal should not be called")
+
+    monkeypatch.setattr(server.codex_client, "manage_codex_goal", fail_manage_goal)
+    conv = await db.create_conversation("Codex Goal Get", mode="codex", project_dir=".")
+    await db.update_conversation_fields(
+        conv["id"],
+        cc_model="codex-gpt-5.5",
+        codex_goal_objective="Keep tests green",
+        codex_goal_status="active",
+    )
+
+    resp = await client.post(f"/api/conversations/{conv['id']}/codex-goal", json={"action": "get"})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["source"] == "loom"
+    assert data["goal"]["objective"] == "Keep tests green"
+
+
+async def test_codex_goal_endpoint_sets_goal_and_persists(client, mock_llama, tmp_path, monkeypatch):
+    import server
+
+    calls = []
+
+    async def fake_manage_goal(action, cwd, **kwargs):
+        calls.append({"action": action, "cwd": cwd, **kwargs})
+        return {
+            "action": action,
+            "thread_id": "thr_goal",
+            "goal": {
+                "threadId": "thr_goal",
+                "objective": kwargs["objective"],
+                "status": kwargs["status"],
+                "tokenBudget": kwargs["token_budget"],
+                "tokensUsed": 5,
+                "timeUsedSeconds": 2,
+            },
+        }
+
+    monkeypatch.setattr(server.codex_client, "manage_codex_goal", fake_manage_goal)
+    conv = await db.create_conversation("Codex Goal Set", mode="codex", project_dir=str(tmp_path))
+    await db.update_conversation_fields(conv["id"], cc_model="codex-gpt-5.5")
+
+    resp = await client.post(
+        f"/api/conversations/{conv['id']}/codex-goal",
+        json={
+            "action": "set",
+            "objective": "Finish the migration",
+            "token_budget": 40000,
+        },
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["thread_id"] == "thr_goal"
+    assert data["goal"]["objective"] == "Finish the migration"
+    assert data["goal"]["tokenBudget"] == 40000
+    assert calls[0]["action"] == "set"
+    assert calls[0]["resume_session_id"] is None
+
+    updated = await db.get_conversation(conv["id"])
+    assert updated["claude_session_id"] == "thr_goal"
+    assert updated["codex_goal_objective"] == "Finish the migration"
+    assert updated["codex_goal_status"] == "active"
+    assert updated["codex_goal_token_budget"] == 40000
+    assert updated["codex_goal_tokens_used"] == 5
 
 
 async def test_create_nrol_operator_conversation(client, mock_llama):
@@ -371,5 +675,3 @@ def test_load_local_gemini_models_and_mapping(tmp_path, monkeypatch):
 
     mapped_mixed = gemini_client._loom_model_to_agy("Gemini:some-other-slug", "medium")
     assert mapped_mixed == "some-other-slug"  # case-insensitive check works
-
-

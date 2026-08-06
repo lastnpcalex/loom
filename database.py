@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     style_nudge TEXT NOT NULL DEFAULT 'Natural',
     custom_scene TEXT,
     system_only INTEGER DEFAULT 0,
+    minimal_ooda_enabled INTEGER DEFAULT 1,
     system_prompt TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
@@ -353,6 +354,7 @@ async def _run_migrations(db):
         # Minimal Weave: skip character/state scaffolding and use only this
         # conversation-level system message plus branch history.
         "ALTER TABLE conversations ADD COLUMN system_only INTEGER DEFAULT 0",
+        "ALTER TABLE conversations ADD COLUMN minimal_ooda_enabled INTEGER DEFAULT 1",
         "ALTER TABLE conversations ADD COLUMN system_prompt TEXT",
         # Tier 3: branch-level state deltas stored per assistant message
         "ALTER TABLE messages ADD COLUMN state_deltas TEXT",
@@ -378,6 +380,14 @@ async def _run_migrations(db):
         # on a branch later run as Dream). NULL = legacy/unscoped, treated as
         # compatible so existing conversations keep resuming.
         "ALTER TABLE messages ADD COLUMN cc_session_mode TEXT",
+        # Codex app-server goal state. Stored in Loom too because Loom forks
+        # Codex threads per branch turn and may need to reapply the active goal.
+        "ALTER TABLE conversations ADD COLUMN codex_goal_objective TEXT",
+        "ALTER TABLE conversations ADD COLUMN codex_goal_status TEXT",
+        "ALTER TABLE conversations ADD COLUMN codex_goal_token_budget INTEGER",
+        "ALTER TABLE conversations ADD COLUMN codex_goal_tokens_used INTEGER DEFAULT 0",
+        "ALTER TABLE conversations ADD COLUMN codex_goal_time_used_seconds INTEGER DEFAULT 0",
+        "ALTER TABLE conversations ADD COLUMN codex_goal_updated_at REAL",
     ]
     for sql in migrations:
         try:
@@ -735,6 +745,7 @@ async def update_conversation_fields(conv_id: int, **fields):
         "style_nudge",
         "custom_scene",
         "title",
+        "mode",
         "claude_session_id",
         "total_cost_usd",
         "cc_model",
@@ -747,6 +758,7 @@ async def update_conversation_fields(conv_id: int, **fields):
         "incognito",
         "ooda_enabled",
         "system_only",
+        "minimal_ooda_enabled",
         "system_prompt",
         "canvas_enabled",
         "canvas_slug",
@@ -754,6 +766,12 @@ async def update_conversation_fields(conv_id: int, **fields):
         "backstage_parent_id",
         "bsky_token",
         "nrol_operator",
+        "codex_goal_objective",
+        "codex_goal_status",
+        "codex_goal_token_budget",
+        "codex_goal_tokens_used",
+        "codex_goal_time_used_seconds",
+        "codex_goal_updated_at",
     }
     updates = []
     params = []
@@ -1133,9 +1151,9 @@ async def fork_conversation(
     cursor = await db.execute(
         """INSERT INTO conversations (title, character_id, persona_id, lore_ids,
            style_nudge, custom_scene, mode, project_dir, cc_model, cc_effort,
-           local_model, nrol_operator, incognito, system_only, system_prompt,
-           created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           local_model, nrol_operator, incognito, system_only, minimal_ooda_enabled,
+           system_prompt, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             title,
             orig.get("character_id"),
@@ -1157,6 +1175,7 @@ async def fork_conversation(
             # the exact contamination the incognito flag exists to control.
             int(orig.get("incognito", 0) or 0),
             int(orig.get("system_only", 0) or 0),
+            int(orig.get("minimal_ooda_enabled", 1) if orig.get("minimal_ooda_enabled") is not None else 1),
             orig.get("system_prompt"),
             now,
             now,

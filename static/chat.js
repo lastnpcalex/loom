@@ -823,7 +823,8 @@ function handleWSMessage(data) {
             if (!State._streamIsOurBranch || !streamingDiv) break;
             const tokEl = streamingDiv.querySelector('.gen-token-info');
             if (tokEl) {
-                tokEl.textContent = (data.input_tokens ? '↑' + _fmtTok(data.input_tokens) + ' ' : '') + '↓' + _fmtTok(data.output_tokens) + ' · ';
+                const canvasText = data.canvas_tokens ? ' / ' + _fmtTok(data.canvas_tokens) + ' canvas' : '';
+                tokEl.textContent = (data.input_tokens ? 'in ' + _fmtTok(data.input_tokens) + ' ' : '') + 'out ' + _fmtTok(data.output_tokens) + canvasText + ' - ';
                 tokEl.dataset.hasUsage = '1';  // stop timer from overwriting with chunk count
             }
             // If output tokens registered, work is happening — drop the
@@ -876,7 +877,7 @@ function handleWSMessage(data) {
             // If a snapshot reconstruction is in flight, queue the prompt —
             // rendering it now would attach it to a streamingDiv that's about
             // to be destroyed by _reconstructFromSnapshot's remove+re-append.
-            if ((!data.conv_id || _sameConvId(data.conv_id, State.currentConvId)) && _isOurBranch(data)) {
+            if (!data.conv_id || _sameConvId(data.conv_id, State.currentConvId)) {
                 if (State._reconstructing) {
                     (State._pendingPermPrompts = State._pendingPermPrompts || []).push(data);
                 } else {
@@ -1561,18 +1562,312 @@ function _translateSlashCommand(content, skills) {
     return { prompt, skillName: skill.name };
 }
 
+function _isCodexConversation() {
+    const conv = State.currentConv;
+    if (!conv) return false;
+    return (conv.mode || '').toLowerCase() === 'codex';
+}
+
+function _addChatSystemMessage(html, extraClass = '') {
+    const container = document.getElementById('messages');
+    if (!container) return;
+    const el = document.createElement('div');
+    el.className = 'system-message ' + extraClass;
+    el.innerHTML = html;
+    container.appendChild(el);
+    el.scrollIntoView({ behavior: 'smooth' });
+}
+
+function _goalPayloadWithBudget(payload) {
+    if (!payload.objective) return payload;
+    const match = payload.objective.match(/\s+--budget\s+(\d+)\s*$/i);
+    if (!match) return payload;
+    return {
+        ...payload,
+        objective: payload.objective.slice(0, match.index).trim(),
+        token_budget: Number(match[1]),
+    };
+}
+
+function _parseGoalCommand(args) {
+    const text = (args || '').trim();
+    if (!text) return { action: 'get' };
+
+    const parts = text.split(/\s+/);
+    const verb = parts[0].toLowerCase();
+    const rest = parts.slice(1).join(' ').trim();
+
+    if (['clear', 'reset', 'off'].includes(verb)) return { action: 'clear' };
+    if (verb === 'pause') return { action: 'pause' };
+    if (verb === 'resume') return { action: 'resume' };
+    if (['view', 'show', 'status'].includes(verb)) return { action: 'get' };
+    if (['set', 'edit'].includes(verb)) {
+        if (!rest) return { error: '/goal needs an objective.' };
+        return _goalPayloadWithBudget({ action: 'set', objective: rest });
+    }
+    return _goalPayloadWithBudget({ action: 'set', objective: text, start: true });
+}
+
+function _codexGoalFromState() {
+    const conv = State.currentConv;
+    if (!conv) return null;
+    const objective = (conv.codex_goal_objective || '').trim();
+    if (!objective) return null;
+    return {
+        objective,
+        status: conv.codex_goal_status || 'active',
+        tokenBudget: conv.codex_goal_token_budget || null,
+        tokensUsed: conv.codex_goal_tokens_used || 0,
+        timeUsedSeconds: conv.codex_goal_time_used_seconds || 0,
+    };
+}
+
+function _applyCodexGoalResult(data) {
+    if (!State.currentConv || !data) return;
+    const goal = data.goal || null;
+    if (data.thread_id) State.currentConv.claude_session_id = data.thread_id;
+    State.currentConv.codex_goal_objective = goal ? goal.objective : null;
+    State.currentConv.codex_goal_status = goal ? (goal.status || 'active') : null;
+    State.currentConv.codex_goal_token_budget = goal ? (goal.tokenBudget || null) : null;
+    State.currentConv.codex_goal_tokens_used = goal ? (goal.tokensUsed || 0) : 0;
+    State.currentConv.codex_goal_time_used_seconds = goal ? (goal.timeUsedSeconds || 0) : 0;
+    renderCodexGoalRow();
+}
+
+function _formatCodexGoalResult(data) {
+    const goal = data && data.goal;
+    if (!goal) {
+        return data && data.action === 'clear'
+            ? 'Codex goal cleared.'
+            : 'No Codex goal is set.';
+    }
+    const status = goal.status || 'active';
+    const lines = [`Codex goal (${status})`, '', goal.objective || ''];
+    if (goal.tokenBudget) lines.push('', `Token budget: ${goal.tokenBudget}`);
+    if (goal.tokensUsed || goal.timeUsedSeconds) {
+        lines.push(`Progress: ${goal.tokensUsed || 0} tokens, ${goal.timeUsedSeconds || 0}s`);
+    }
+    return `<pre style="font-size:0.85em;color:var(--text-muted);white-space:pre-wrap">${escapeHtml(lines.join('\n'))}</pre>`;
+}
+
+async function _postCodexGoal(payload, { systemMessage = false, toast = true } = {}) {
+    const convId = State.currentConvId;
+    if (!convId) throw new Error('No conversation selected');
+    if (!_isCodexConversation()) throw new Error('/goal is only available for Codex conversations');
+    if (toast) showToast(payload.action === 'get' ? 'Reading Codex goal...' : 'Updating Codex goal...');
+    const data = await API.post(`/api/conversations/${convId}/codex-goal`, payload);
+    if (State.currentConvId === convId) {
+        _applyCodexGoalResult(data);
+        if (systemMessage) _addChatSystemMessage(_formatCodexGoalResult(data));
+    }
+    return data;
+}
+
+function _codexGoalProgressText(goal) {
+    if (!goal) return '0 tokens, 0s';
+    const tokens = Number(goal.tokensUsed || 0);
+    const seconds = Number(goal.timeUsedSeconds || 0);
+    const budget = goal.tokenBudget ? ` / ${goal.tokenBudget}` : '';
+    return `${tokens}${budget} tokens, ${seconds}s`;
+}
+
+function _setCodexGoalModalBusy(busy) {
+    document.querySelectorAll('#modal-codex-goal button, #modal-codex-goal textarea, #modal-codex-goal input')
+        .forEach(el => { el.disabled = !!busy; });
+    if (!busy) _populateCodexGoalModal();
+}
+
+function _populateCodexGoalModal() {
+    const goal = _codexGoalFromState();
+    const status = goal ? (goal.status || 'active') : 'none';
+    const statusEl = document.getElementById('codex-goal-window-status');
+    const objectiveEl = document.getElementById('codex-goal-objective-input');
+    const budgetEl = document.getElementById('codex-goal-budget-input');
+    const progressEl = document.getElementById('codex-goal-progress');
+    const toggleBtn = document.getElementById('btn-codex-goal-modal-toggle');
+    const clearBtn = document.getElementById('btn-codex-goal-modal-clear');
+    const startBtn = document.getElementById('btn-codex-goal-modal-start');
+
+    if (statusEl) {
+        statusEl.dataset.status = status;
+        statusEl.textContent = goal ? `Goal ${status}` : 'No goal set';
+    }
+    if (objectiveEl) objectiveEl.value = goal?.objective || '';
+    if (budgetEl) budgetEl.value = goal?.tokenBudget || '';
+    if (progressEl) progressEl.textContent = _codexGoalProgressText(goal);
+    if (toggleBtn) {
+        toggleBtn.textContent = status === 'paused' ? 'Resume' : 'Pause';
+        toggleBtn.disabled = !goal;
+    }
+    if (clearBtn) clearBtn.disabled = !goal;
+    if (startBtn) startBtn.disabled = !goal || status === 'paused';
+}
+
+async function openCodexGoalWindow({ refresh = false, focus = false } = {}) {
+    if (!_isCodexConversation()) {
+        showToast('/goal is only available for Codex conversations', 'error');
+        return;
+    }
+    _populateCodexGoalModal();
+    const modal = document.getElementById('modal-codex-goal');
+    if (modal) modal.classList.remove('hidden');
+    if (refresh) {
+        try {
+            _setCodexGoalModalBusy(true);
+            await _postCodexGoal({ action: 'get' }, { systemMessage: false, toast: false });
+            _populateCodexGoalModal();
+        } catch (err) {
+            const msg = err.detail || err.message || 'Codex goal command failed';
+            showToast(msg, 'error');
+        } finally {
+            _setCodexGoalModalBusy(false);
+        }
+    }
+    if (focus) {
+        setTimeout(() => document.getElementById('codex-goal-objective-input')?.focus(), 0);
+    }
+}
+
+function renderCodexGoalRow() {
+    const row = document.getElementById('codex-goal-row');
+    if (!row) return;
+    row.classList.add('hidden');
+    const statusEl = document.getElementById('codex-goal-status');
+    const objectiveEl = document.getElementById('codex-goal-objective');
+    const editBtn = document.getElementById('btn-codex-goal-edit');
+    const toggleBtn = document.getElementById('btn-codex-goal-toggle');
+    const clearBtn = document.getElementById('btn-codex-goal-clear');
+    const isCodex = _isCodexConversation();
+    if (!isCodex) return;
+    row.classList.toggle('hidden', State.currentView === 'home');
+
+    const goal = _codexGoalFromState();
+    const status = goal ? (goal.status || 'active') : 'none';
+    if (statusEl) statusEl.textContent = status;
+    if (objectiveEl) {
+        objectiveEl.textContent = goal ? goal.objective : 'No goal set';
+        objectiveEl.title = goal ? goal.objective : 'No Codex goal set';
+    }
+    if (editBtn) editBtn.textContent = goal ? 'Edit' : 'Set';
+    if (toggleBtn) {
+        const paused = status === 'paused';
+        toggleBtn.textContent = paused ? 'Resume' : 'Pause';
+        toggleBtn.disabled = !goal;
+        toggleBtn.title = paused ? 'Resume Codex goal' : 'Pause Codex goal';
+    }
+    if (clearBtn) clearBtn.disabled = !goal;
+    _populateCodexGoalModal();
+}
+
+function initCodexGoalControls() {
+    const viewBtn = document.getElementById('btn-codex-goal-view');
+    const editBtn = document.getElementById('btn-codex-goal-edit');
+    const toggleBtn = document.getElementById('btn-codex-goal-toggle');
+    const clearBtn = document.getElementById('btn-codex-goal-clear');
+    const modalSaveBtn = document.getElementById('btn-codex-goal-modal-save');
+    const modalToggleBtn = document.getElementById('btn-codex-goal-modal-toggle');
+    const modalClearBtn = document.getElementById('btn-codex-goal-modal-clear');
+    const modalStartBtn = document.getElementById('btn-codex-goal-modal-start');
+    if (!viewBtn || viewBtn.dataset.codexGoalBound === '1') return;
+    viewBtn.dataset.codexGoalBound = '1';
+
+    viewBtn.addEventListener('click', () => openCodexGoalWindow({ refresh: true }));
+
+    editBtn?.addEventListener('click', () => openCodexGoalWindow({ refresh: true, focus: true }));
+
+    modalSaveBtn?.addEventListener('click', async () => {
+        const text = (document.getElementById('codex-goal-objective-input')?.value || '').trim();
+        if (!text) {
+            showToast('/goal needs an objective.', 'error');
+            return;
+        }
+        const budgetRaw = (document.getElementById('codex-goal-budget-input')?.value || '').trim();
+        const payload = { action: 'set', objective: text };
+        if (budgetRaw) payload.token_budget = Number(budgetRaw);
+        try {
+            _setCodexGoalModalBusy(true);
+            await _postCodexGoal(payload, { systemMessage: false });
+            _populateCodexGoalModal();
+            showToast('Codex goal updated');
+        } catch (err) {
+            const msg = err.detail || err.message || 'Codex goal command failed';
+            showToast(msg, 'error');
+        } finally {
+            _setCodexGoalModalBusy(false);
+        }
+    });
+
+    const toggleGoal = async () => {
+        const current = _codexGoalFromState();
+        if (!current) return;
+        const action = current.status === 'paused' ? 'resume' : 'pause';
+        try {
+            _setCodexGoalModalBusy(true);
+            await _postCodexGoal({ action }, { systemMessage: false });
+            _populateCodexGoalModal();
+            showToast(action === 'resume' ? 'Codex goal resumed' : 'Codex goal paused');
+        } catch (err) {
+            const msg = err.detail || err.message || 'Codex goal command failed';
+            showToast(msg, 'error');
+        } finally {
+            _setCodexGoalModalBusy(false);
+        }
+    };
+    toggleBtn?.addEventListener('click', toggleGoal);
+    modalToggleBtn?.addEventListener('click', toggleGoal);
+
+    clearBtn?.addEventListener('click', () => openCodexGoalWindow({ refresh: false }));
+
+    modalClearBtn?.addEventListener('click', async () => {
+        if (!_codexGoalFromState()) return;
+        try {
+            _setCodexGoalModalBusy(true);
+            await _postCodexGoal({ action: 'clear' }, { systemMessage: false });
+            _populateCodexGoalModal();
+            showToast('Codex goal cleared');
+        } catch (err) {
+            const msg = err.detail || err.message || 'Codex goal command failed';
+            showToast(msg, 'error');
+        } finally {
+            _setCodexGoalModalBusy(false);
+        }
+    });
+
+    modalStartBtn?.addEventListener('click', async () => {
+        const current = _codexGoalFromState();
+        if (!current || current.status === 'paused') return;
+        document.getElementById('modal-codex-goal')?.classList.add('hidden');
+        try {
+            await _startCodexGoalTurn(current.objective);
+        } catch (err) {
+            const msg = err.detail || err.message || 'Failed to start Codex goal';
+            showToast(msg, 'error');
+        }
+    });
+
+    renderCodexGoalRow();
+}
+
+async function _startCodexGoalTurn(objective) {
+    if (!objective) return;
+    const msg = await API.post(`/api/conversations/${State.currentConvId}/messages`, {
+        role: 'user',
+        content: objective,
+    });
+    State.messages.push(msg);
+    renderMessages();
+    scrollToBottom(true);
+    const count = State.branchCount || 1;
+    showGenStatus(count > 1 ? `Starting goal with ${count} branches...` : 'Starting goal...');
+    _triggerParallelGenerate(count, msg.id);
+}
+
 /**
  * Handle meta commands that Loom processes natively (not sent to CC).
  */
 function _handleMetaCommand(name, args) {
     function addSystemMessage(html, extraClass = '') {
-        const container = document.getElementById('messages-container');
-        if (!container) return;
-        const el = document.createElement('div');
-        el.className = 'system-message ' + extraClass;
-        el.innerHTML = html;
-        container.appendChild(el);
-        el.scrollIntoView({ behavior: 'smooth' });
+        _addChatSystemMessage(html, extraClass);
     }
 
     switch (name) {
@@ -1624,6 +1919,43 @@ function _handleMetaCommand(name, args) {
                     .catch(err => showToast('Failed to load task file: ' + err, 'error'));
             }).catch(err => showToast('Failed to check workspace artifacts: ' + err, 'error'));
             break;
+        case 'goal': {
+            if (!State.currentConvId) {
+                showToast('No conversation selected', 'error');
+                break;
+            }
+            if (!_isCodexConversation()) {
+                showToast('/goal is only available for Codex conversations', 'error');
+                break;
+            }
+            const payload = _parseGoalCommand(args);
+            if (payload.error) {
+                addSystemMessage(escapeHtml(payload.error));
+                showToast(payload.error, 'error');
+                break;
+            }
+            _postCodexGoal(payload, { systemMessage: true }).then(data => {
+                if (payload.start && data.goal && payload.objective) {
+                    showToast('Starting Codex goal...');
+                    _startCodexGoalTurn(payload.objective).catch(err => {
+                        const msg = err.detail || err.message || 'Failed to start Codex goal';
+                        addSystemMessage(escapeHtml(msg));
+                        showToast(msg, 'error');
+                    });
+                } else {
+                    if (payload.action === 'get') showToast(data.goal ? 'Codex goal loaded' : 'No active Codex goal');
+                    else if (payload.action === 'clear') showToast('Codex goal cleared');
+                    else if (payload.action === 'pause') showToast('Codex goal paused');
+                    else if (payload.action === 'resume') showToast('Codex goal resumed');
+                    else showToast(data.goal ? 'Codex goal updated' : 'No active Codex goal');
+                }
+            }).catch(err => {
+                const msg = err.detail || err.message || 'Codex goal command failed';
+                addSystemMessage(escapeHtml(msg));
+                showToast(msg, 'error');
+            });
+            break;
+        }
         case 'artifacts':
         case 'artifact':
             if (!State.currentConvId) {
@@ -2738,7 +3070,7 @@ function _flushPendingGenerate() {
 /** Attach cc_model/effort/permission to a WS message from current UI state */
 function _attachCCSettings(msg) {
     const conv = State.currentConv;
-    if (!conv || (conv.mode !== 'claude' && conv.mode !== 'local' && conv.mode !== 'codex' && conv.mode !== 'gemini' && conv.mode !== 'umans')) return;
+    if (!conv || (conv.mode !== 'claude' && conv.mode !== 'local' && conv.mode !== 'codex' && conv.mode !== 'gemini' && conv.mode !== 'goose' && conv.mode !== 'umans' && conv.mode !== 'openrouter')) return;
     const modelSel = document.getElementById('cc-model-inline');
     const effortSel = document.getElementById('cc-effort-inline');
     const permSel = document.getElementById('cc-permission-mode-inline');
@@ -2780,6 +3112,14 @@ function _agentKindForModel(model, conv) {
     const msgModel = (model || '').toLowerCase();
     const mode = (conv?.mode || '').toLowerCase();
     if (mode === 'hermes' || msgModel.startsWith('hermes:')) return 'hermes';
+    if (mode === 'goose' || msgModel.startsWith('goose:')) return 'goose';
+    if (
+        msgModel.startsWith('openrouter:') ||
+        msgModel === 'z-ai/glm-5.2' ||
+        msgModel === 'moonshotai/kimi-k2.7-code' ||
+        msgModel === 'openai/gpt-5.6-luna' ||
+        msgModel === 'deepseek/deepseek-v4-flash-0731'
+    ) return 'openrouter';
     if (
         msgModel.startsWith('codex') ||
         msgModel.startsWith('gpt-5') ||
@@ -2804,7 +3144,7 @@ function _agentKindForModel(model, conv) {
     ) return 'claude';
     if (msgModel.startsWith('umans-')) return 'umans';
     if (msgModel.endsWith('.gguf') || msgModel.includes('@llama-server')) return 'local';
-    if (['claude', 'gemini', 'codex', 'local', 'hermes', 'umans', 'dream'].includes(mode)) return mode;
+    if (['claude', 'gemini', 'codex', 'goose', 'local', 'hermes', 'umans', 'openrouter', 'dream'].includes(mode)) return mode;
     return '';
 }
 
@@ -2813,6 +3153,8 @@ function _assistantRoleLabelForModel(model, conv) {
     const agentKind = _agentKindForModel(model, conv);
     if (agentKind === 'gemini') return 'Gemini';
     if (agentKind === 'codex') return 'Codex';
+    if (agentKind === 'goose') return 'Goose';
+    if (agentKind === 'openrouter') return 'OpenRouter';
     if (agentKind === 'umans') return 'Umans';
     if (agentKind === 'local') return 'Braid';
     if (agentKind === 'hermes') return 'Hermes';
@@ -2848,7 +3190,7 @@ function createMessageElement(msg, cost, elapsed) {
     const isClaudeMode = agentKind === 'claude';
     const isLocalMode = agentKind === 'local';
     const isHermesMode = agentKind === 'hermes';
-    const isCliAgentMode = ['claude', 'gemini', 'codex', 'local', 'hermes', 'umans'].includes(agentKind);
+    const isCliAgentMode = ['claude', 'gemini', 'codex', 'goose', 'local', 'hermes', 'umans', 'openrouter'].includes(agentKind);
     const roleLabel = msg.role === 'system' ? 'System'
         : msg.role === 'user' ? 'You'
         : _assistantRoleLabelForModel(msgModel, State.currentConv);
@@ -2939,10 +3281,11 @@ function createMessageElement(msg, cost, elapsed) {
         const durMs = c.duration_ms || msg.generation_ms || (msg.role === 'assistant' && elapsed ? elapsed * 1000 : 0);
         const parts = [];
         if (timestampHtml) parts.push(timestampHtml);
-        if (outTok) {
-            parts.push(inTok
-                ? `${(inTok/1000).toFixed(1)}k in / ${(outTok/1000).toFixed(1)}k out`
-                : `${(outTok/1000).toFixed(1)}k out`);
+        if (inTok || outTok) {
+            const tokenParts = [];
+            if (inTok) tokenParts.push(`${_fmtTok(inTok)} in`);
+            if (outTok) tokenParts.push(`${_fmtTok(outTok)} out`);
+            parts.push(tokenParts.join(' / '));
         }
         if (usd) parts.push(`$${usd.toFixed(4)}`);
         if (msg.role === 'assistant' && durMs) {
@@ -4588,8 +4931,8 @@ function showPermissionPrompt(data) {
     if (data.request_id && document.querySelector(`.permission-prompt[data-request-id="${data.request_id}"]`)) {
         return;
     }
-    if (!streamingDiv) appendStreamingMessage();
-    const contentEl = streamingDiv.querySelector('.message-content');
+    const contentEl = _permissionPromptHost(data);
+    if (!contentEl) return;
 
     const prompt = document.createElement('div');
     prompt.dataset.requestId = data.request_id;
@@ -4676,6 +5019,31 @@ function showPermissionPrompt(data) {
 
     contentEl.appendChild(prompt);
     scrollToBottom();
+}
+
+function _permissionPromptHost(data) {
+    // During an active stream, permission prompts belong in the draft assistant
+    // message. Outside an active stream, render a standalone prompt message
+    // without creating/changing streamingDiv; a fake streamingDiv leaks state
+    // and can make later turns look split or stuck.
+    if (streamingDiv && !streamingDiv.isConnected) {
+        streamingDiv = null;
+    }
+    if (State.isStreaming) {
+        if (!streamingDiv) appendStreamingMessage(data.cc_model || data.local_model);
+        return streamingDiv?.querySelector('.message-content') || null;
+    }
+
+    const container = document.getElementById('messages');
+    if (!container) return null;
+    const host = document.createElement('div');
+    host.className = 'message assistant permission-message';
+    host.innerHTML = '<div class="message-header">' +
+        '<span class="message-role">Loom</span>' +
+        '</div>' +
+        '<div class="message-content"></div>';
+    container.appendChild(host);
+    return host.querySelector('.message-content');
 }
 
 function resolvePermissionPrompt(requestId, allowed) {

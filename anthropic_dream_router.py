@@ -67,6 +67,13 @@ def _thinking_min_tokens() -> int:
     return int(getattr(config, "dream_thinking_min_tokens", 4096) or 0)
 
 
+def _dream_min_output_tokens() -> int:
+    try:
+        return max(0, int(getattr(config, "dream_min_output_tokens", 2048) or 0))
+    except (TypeError, ValueError):
+        return 2048
+
+
 def _max_tokens_from_body(body: dict[str, Any]) -> int:
     value = body.get("max_tokens")
     if value is None:
@@ -75,7 +82,8 @@ def _max_tokens_from_body(body: dict[str, Any]) -> int:
         parsed = int(value)
     except (TypeError, ValueError):
         return DEFAULT_MAX_TOKENS
-    return parsed if parsed > 0 else DEFAULT_MAX_TOKENS
+    value = parsed if parsed > 0 else DEFAULT_MAX_TOKENS
+    return max(value, _dream_min_output_tokens())
 
 
 def _split_channel_scaffold(text: str) -> tuple[str, str]:

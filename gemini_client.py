@@ -1,7 +1,12 @@
 """Antigravity (agy) CLI subprocess wrapper.
 
-Runs agy in plain text mode (-p flag) and collects the raw output.
-Model is set via ~/.gemini/antigravity-cli/settings.json (not a CLI flag).
+Runs agy print mode (-p flag) with structured stream-json output.
+Model and effort are passed directly on the agy command line.
+
+Since the July/August 2026 agy updates, print mode supports structured
+`--output-format stream-json` plus direct `--model` and `--effort` flags.
+run_gemini reads agy's stdout as NDJSON and maps it into Loom's normal
+event stream. Transcript tailing has been removed.
 """
 
 import asyncio
@@ -147,6 +152,18 @@ def _loom_model_to_agy(model: str, effort: str) -> str:
     if model.lower().startswith("gemini:"):
         model = model[7:]
     ml = model.lower()
+    if "gemini 3.6 flash" in ml or "gemini-3.6-flash" in ml:
+        return {
+            "low": "gemini-3.6-flash-low",
+            "medium": "gemini-3.6-flash-medium",
+            "high": "gemini-3.6-flash-high",
+        }.get(effort, "gemini-3.6-flash-high")
+    if "gemini 3.6 pro" in ml or "gemini-3.6-pro" in ml:
+        return {
+            "low": "gemini-3.6-pro-low",
+            "medium": "gemini-3.6-pro-high",
+            "high": "gemini-3.6-pro-high",
+        }.get(effort, "gemini-3.6-pro-high")
     if "gemini 3.5 flash" in ml or "gemini-3.5-flash" in ml:
         return {
             "low": "gemini-3.5-flash-low",
@@ -441,6 +458,233 @@ def _determine_block_name(etype: str, content: str) -> str:
     return etype.replace("_", " ").title()
 
 
+def _agy_stream_event_name(raw: dict) -> str:
+    return str(raw.get("event") or raw.get("type") or raw.get("method") or "").lower()
+
+
+def _agy_stream_payload(raw: dict) -> dict:
+    event = _agy_stream_event_name(raw)
+    payload = raw.get(event) if event else None
+    if isinstance(payload, dict):
+        return payload
+    for key in ("result", "step_update", "step", "init", "payload", "data", "params"):
+        payload = raw.get(key)
+        if isinstance(payload, dict):
+            return payload
+    return raw
+
+
+def _agy_text_from_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        parts = [_agy_text_from_value(v) for v in value]
+        return "\n".join(p for p in parts if p)
+    if isinstance(value, dict):
+        for key in ("text", "content", "response", "message", "output", "result", "summary", "error"):
+            text = _agy_text_from_value(value.get(key))
+            if text:
+                return text
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _agy_usage(payload: dict) -> dict | None:
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = usage.get("input_tokens") or usage.get("inputTokens") or 0
+    output_tokens = usage.get("output_tokens") or usage.get("outputTokens") or 0
+    thinking_tokens = usage.get("thinking_tokens") or usage.get("thinkingTokens") or 0
+    if not input_tokens and not output_tokens and not thinking_tokens:
+        total = usage.get("total_tokens") or usage.get("totalTokens") or 0
+        if not total:
+            return None
+    return {
+        "type": "usage",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "thinking_tokens": thinking_tokens,
+    }
+
+
+def _agy_tool_event(payload: dict) -> tuple[str, str, dict, str] | None:
+    tool = None
+    for key in ("tool_info", "toolInfo", "tool", "tool_call", "toolCall"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            tool = value
+            break
+    if not tool:
+        return None
+
+    raw_name = (
+        tool.get("name")
+        or tool.get("tool_name")
+        or tool.get("toolName")
+        or tool.get("display_name")
+        or tool.get("displayName")
+        or "Tool"
+    )
+    tool_id = str(
+        tool.get("id")
+        or tool.get("tool_id")
+        or tool.get("toolId")
+        or payload.get("id")
+        or payload.get("step_id")
+        or payload.get("stepId")
+        or raw_name
+    )
+    args = (
+        tool.get("input")
+        or tool.get("args")
+        or tool.get("arguments")
+        or tool.get("parameters")
+        or {}
+    )
+    if not isinstance(args, dict):
+        args = {"input": args}
+    result = _agy_text_from_value(
+        tool.get("result")
+        or tool.get("output")
+        or tool.get("observation")
+        or payload.get("tool_result")
+        or payload.get("toolResult")
+    )
+    return str(raw_name), tool_id, args, result
+
+
+def _agy_step_events(raw: dict, state: dict) -> list[dict]:
+    event = _agy_stream_event_name(raw)
+    payload = _agy_stream_payload(raw)
+    events: list[dict] = []
+
+    if event == "init":
+        session_id = (
+            payload.get("conversation_id")
+            or payload.get("conversationId")
+            or payload.get("session_id")
+            or payload.get("sessionId")
+        )
+        model = payload.get("model") or payload.get("model_id") or payload.get("modelId")
+        if session_id or model:
+            events.append({
+                "type": "session_info",
+                "session_id": str(session_id or state.get("session_id") or ""),
+                "model": str(model or state.get("model") or ""),
+            })
+        return events
+
+    if event == "result":
+        result = payload
+        text = _agy_text_from_value(
+            result.get("response")
+            or result.get("text")
+            or result.get("content")
+            or result.get("output")
+            or result.get("result")
+        )
+        status = str(result.get("status") or "").lower()
+        error = _agy_text_from_value(result.get("error"))
+        usage_evt = _agy_usage(result)
+        if usage_evt:
+            events.append(usage_evt)
+        events.append({
+            "type": "result",
+            "is_error": bool(error) or status in {"error", "failed", "cancelled", "canceled"},
+            "result_text": text,
+            "error": error or None,
+            "session_id": str(
+                result.get("conversation_id")
+                or result.get("conversationId")
+                or result.get("session_id")
+                or result.get("sessionId")
+                or state.get("session_id")
+                or ""
+            ),
+            "duration_ms": int(float(result.get("duration_seconds") or 0) * 1000),
+            "num_turns": result.get("num_turns") or result.get("numTurns") or 0,
+        })
+        return events
+
+    if event not in {"step_update", "stepupdate", "step"}:
+        text = _agy_text_from_value(payload)
+        if text:
+            events.append({"type": "status", "text": text[:500]})
+        return events
+
+    usage_evt = _agy_usage(payload)
+    if usage_evt:
+        events.append(usage_evt)
+
+    tool_evt = _agy_tool_event(payload)
+    status = str(payload.get("status") or payload.get("state") or payload.get("phase") or "").lower()
+    if tool_evt:
+        raw_name, tool_id, args, result = tool_evt
+        name = normalize_tool_name(raw_name)
+        if tool_id not in state.setdefault("tool_starts", set()):
+            state["tool_starts"].add(tool_id)
+            events.append({
+                "type": "tool_start",
+                "name": name,
+                "tool_id": tool_id,
+                "input": json.dumps(normalize_tool_args(raw_name, args), ensure_ascii=False),
+            })
+        if result or status in {"completed", "complete", "finished", "success", "succeeded", "failed", "error"}:
+            events.append({
+                "type": "tool_result",
+                "tool_id": tool_id,
+                "content": result,
+                "is_error": status in {"failed", "error"},
+            })
+        return events
+
+    subagent = payload.get("subagent_info") or payload.get("subagentInfo") or payload.get("subagent")
+    if isinstance(subagent, dict):
+        name = subagent.get("name") or subagent.get("agent") or subagent.get("id") or "subagent"
+        state_text = subagent.get("status") or subagent.get("state") or subagent.get("phase") or "updated"
+        detail = _agy_text_from_value(
+            subagent.get("message")
+            or subagent.get("summary")
+            or subagent.get("description")
+        )
+        events.append({
+            "type": "status",
+            "text": f"{name}: {state_text}{f' - {detail}' if detail else ''}",
+        })
+        return events
+
+    text = _agy_text_from_value(
+        payload.get("delta")
+        or payload.get("text_delta")
+        or payload.get("textDelta")
+        or payload.get("content_delta")
+        or payload.get("contentDelta")
+        or payload.get("text")
+        or payload.get("response")
+    )
+    if text:
+        events.append({"type": "text_delta", "text": text})
+        return events
+
+    message = _agy_text_from_value(
+        payload.get("message")
+        or payload.get("summary")
+        or payload.get("description")
+        or payload.get("content")
+    )
+    if message:
+        events.append({"type": "status", "text": message[:500]})
+    return events
+
+
 async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 8000,
                      model: str = "Gemini 3.5 Flash (High)", effort: str = "high",
                      permission_mode: str = "default",
@@ -464,73 +708,49 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         prompt = _prepare_agy_prompt(prompt, backstage_parent_id, nrol_operator)
 
     agy_model = _loom_model_to_agy(model, effort)
-    _set_agy_model(agy_model)
+    agy_effort = effort if effort in {"low", "medium", "high"} else "high"
 
     queue = asyncio.Queue()
     _active_queues[conv_id] = queue
 
-    # Setup transcript watching paths
+    # stdout-driven: no transcript tailing. We still keep a stable session_id
+    # for Loom's persistence layer; for agy this is simply the conversation ID
+    # (or resumed session ID) we pass on the CLI.
+    import time as _time
+    launch_ts = _time.time()
+
+    # Setup paths for session forking (still needed for resume/fork parity).
     if sys.platform == "win32":
         home = Path(os.environ.get("USERPROFILE", Path.home()))
     else:
         home = Path.home()
     brain_path = home / ".gemini" / "antigravity-cli" / "brain"
 
-    def find_latest_transcript(path: Path) -> tuple[Path | None, float]:
-        latest_file = None
-        latest_time = 0.0
-        if path.exists():
-            for root, dirs, files in os.walk(path):
-                for f in files:
-                    if f == "transcript.jsonl":
-                        fp = Path(root) / f
-                        try:
-                            mtime = fp.stat().st_mtime
-                            if mtime > latest_time:
-                                latest_time = mtime
-                                latest_file = fp
-                        except OSError:
-                            pass
-        return latest_file, latest_time
-
-    # Operator turns are fresh-conv-by-design: the launch already suppresses
-    # --conversation (see cc_args below) so each turn reads a fresh tool
-    # registry from .agents/mcp_config.json. The poller MUST match the
-    # launch — if use_resume/fork_session stay True (driven by the persisted
-    # turn-1 cc_session_id), the poller pins to the OLD session's transcript
-    # and structurally skips the new-UUID-folder scan. agy then succeeds into
-    # a fresh folder the poller never inspects → "exited with no response".
-    # Forcing fresh-conv on both halves makes turn 2+ take the same path
-    # that works on turn 1. See [[agy-operator-turn2-no-response]].
+    # Operator turns are fresh-conv-by-design: each turn reads a fresh tool
+    # registry from .agents/mcp_config.json. See [[agy-operator-turn2-no-response]].
     if nrol_operator and (resume_session_id or fork_session):
-        suppressed_resume_id = resume_session_id
         resume_session_id = None
         fork_session = False
-        print(
-            f"[AGY] operator turn: forcing fresh-conv poller "
-            f"(nrol_operator=True, suppressed resume_id={suppressed_resume_id})"
-        )
+        print("[AGY] operator turn: forcing fresh-conv")
 
-    # Fork session if requested
+    # Fork session if requested: copy brain/<src> to a new UUID folder and
+    # update the conversation DB/PB so --resume points at the fork.
     if resume_session_id and fork_session:
-        import uuid
+        import uuid, shutil, sqlite3
         new_session_id = str(uuid.uuid4())
         src = brain_path / resume_session_id
         dst = brain_path / new_session_id
         if src.exists() and not dst.exists():
-            import shutil
             try:
                 shutil.copytree(src, dst)
                 print(f"[AGY] Forked session {resume_session_id} to new session {new_session_id}")
-                
-                # Also fork the conversation database/pb in the conversations folder
+
                 conversations_path = brain_path.parent / "conversations"
                 if conversations_path.exists():
                     db_src = conversations_path / f"{resume_session_id}.db"
                     db_dst = conversations_path / f"{new_session_id}.db"
                     if db_src.exists():
                         shutil.copy2(db_src, db_dst)
-                        # Also copy WAL and SHM if they exist
                         for suffix in [".db-wal", ".db-shm"]:
                             sub_src = conversations_path / f"{resume_session_id}{suffix}"
                             sub_dst = conversations_path / f"{new_session_id}{suffix}"
@@ -539,21 +759,19 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                                     shutil.copy2(sub_src, sub_dst)
                                 except Exception as se:
                                     log.warning(f"[AGY] Failed to copy {suffix} file: {se}")
-                        # Update cascade_id in trajectory_meta table
-                        import sqlite3
                         try:
-                            conn = sqlite3.connect(db_dst)
+                            conn = sqlite3.connect(str(db_dst))
                             cursor = conn.cursor()
                             cursor.execute(
                                 "UPDATE trajectory_meta SET cascade_id = ? WHERE cascade_id = ?",
-                                (new_session_id, resume_session_id)
+                                (new_session_id, resume_session_id),
                             )
                             conn.commit()
                             conn.close()
                             print(f"[AGY] Updated cascade_id in {db_dst.name}")
                         except Exception as sqle:
                             log.warning(f"[AGY] Failed to update sqlite DB: {sqle}")
-                    
+
                     pb_src = conversations_path / f"{resume_session_id}.pb"
                     pb_dst = conversations_path / f"{new_session_id}.pb"
                     if pb_src.exists():
@@ -561,55 +779,16 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                             pb_data = pb_src.read_bytes()
                             pb_data_updated = pb_data.replace(
                                 resume_session_id.encode("utf-8"),
-                                new_session_id.encode("utf-8")
+                                new_session_id.encode("utf-8"),
                             )
                             pb_dst.write_bytes(pb_data_updated)
                             print(f"[AGY] Copied and updated protobuf file: {pb_dst.name}")
                         except Exception as pbe:
                             log.warning(f"[AGY] Failed to update protobuf file: {pbe}")
-                
+
                 resume_session_id = new_session_id
             except Exception as e:
                 log.warning(f"[AGY] Failed to fork session: {e}")
-
-    # Determine baseline before launching process to avoid race conditions
-    import time as _time
-    launch_ts = _time.time()
-
-    use_resume = bool(resume_session_id)
-    baseline_file = None
-    baseline_time = launch_ts
-    initial_size = 0
-
-    target_session = resume_session_id or str(conv_id)
-    expected_session_dir = brain_path / target_session
-
-    if use_resume:
-        explicit_baseline = expected_session_dir / ".system_generated" / "logs" / "transcript.jsonl"
-        if explicit_baseline.exists():
-            baseline_file = explicit_baseline
-            try:
-                initial_size = baseline_file.stat().st_size
-                baseline_time = baseline_file.stat().st_mtime
-            except OSError:
-                pass
-
-    if not baseline_file and use_resume:
-        baseline_file, _temp_time = find_latest_transcript(expected_session_dir)
-        if baseline_file:
-            try:
-                initial_size = baseline_file.stat().st_size
-                baseline_time = baseline_file.stat().st_mtime
-            except OSError:
-                pass
-
-    # Record existing brain directories to identify newly created ones in new conversations
-    existing_dirs = set()
-    if brain_path.exists():
-        try:
-            existing_dirs = {p.name for p in brain_path.iterdir() if p.is_dir()}
-        except OSError:
-            pass
 
     agy_exe = _find_agy_exe()
 
@@ -657,6 +836,9 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
 
     cc_args += [
         "-p", cli_prompt,
+        "--output-format", "stream-json",
+        "--model", agy_model,
+        "--effort", agy_effort,
         "--dangerously-skip-permissions",
         "--print-timeout", "60m",
     ]
@@ -699,17 +881,33 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         **kwargs
     )
 
-    # Drain stderr in the background (agy emits nothing on stderr, but we
-    # must drain the pipe to avoid a blocked-subprocess deadlock on Windows).
+    # stdout/stderr reading tasks. agy stream-json emits one JSON event per
+    # stdout line; stderr remains noisy diagnostics only.
+    stdout_lines: asyncio.Queue[str | None] = asyncio.Queue()
+    stderr_lines: list[str] = []
+
     async def _read_stderr():
         try:
             async for line in proc.stderr:
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
+                    stderr_lines.append(text)
                     print(f"[AGY-stderr] {text}")
         except Exception as e:
             log.error(f"[AGY] Error reading stderr: {e}")
-    asyncio.create_task(_read_stderr())
+    stderr_task = asyncio.create_task(_read_stderr())
+
+    async def _read_stdout():
+        try:
+            async for line in proc.stdout:
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    stdout_lines.put_nowait(text)
+        except Exception as e:
+            log.error(f"[AGY] Error reading stdout: {e}")
+        finally:
+            stdout_lines.put_nowait(None)
+    stdout_task = asyncio.create_task(_read_stdout())
 
     # Clean up the temp prompt file when the process finishes
     if prompt_file:
@@ -722,502 +920,124 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                 log.warning(f"[AGY] Failed to clean up prompt file: {e}")
         asyncio.create_task(_cleanup_prompt_file())
 
-    # We also drain stdout to avoid blocking
-    async def _drain_stdout():
-        try:
-            while True:
-                chunk = await proc.stdout.read(4096)
-                if not chunk:
-                    break
-        except Exception as e:
-            log.error(f"[AGY] Error draining stdout: {e}")
-    asyncio.create_task(_drain_stdout())
-
-    # Asynchronous task to monitor and tail the transcript.jsonl file
-    async def _tail_transcript_to_queue():
-        active_file = None
-        if use_resume and baseline_file:
-            active_file = baseline_file
-            print(
-                f"[AGY] resume mode: pinned active_file={active_file} "
-                f"baseline_time={baseline_time:.3f} initial_size={initial_size}"
-            )
-        else:
-            # Poll for the active transcript file being created or modified
-            # Keep polling while the process is running, up to 60 seconds (1200 * 0.05s) max.
-            polls = 0
-            while True:
-                latest_file = None
-                latest_time = 0.0
-                is_active = False
-
-                # 1. Prefer expected_session_dir if it exists (resume/fork paths).
-                if expected_session_dir.exists():
-                    latest_file, latest_time = find_latest_transcript(expected_session_dir)
-                    if latest_file:
-                        if baseline_file:
-                            if latest_file != baseline_file or latest_time > baseline_time + 0.1:
-                                is_active = True
-                            elif polls % 40 == 0:
-                                print(
-                                    f"[AGY] candidate transcript={latest_file} rejected: "
-                                    f"mtime={latest_time:.3f} baseline={baseline_time:.3f}"
-                                )
-                        else:
-                            if latest_time > launch_ts - 2.0:
-                                is_active = True
-                            elif polls % 40 == 0:
-                                print(
-                                    f"[AGY] candidate transcript={latest_file} rejected: "
-                                    f"mtime={latest_time:.3f} launch_ts={launch_ts:.3f}"
-                                )
-
-                # 2. Fallback: find newly created folders (not in existing_dirs) for new conversations
-                # where agy generates a new random UUID folder. Entered if no active file exists in expected_session_dir.
-                if not is_active and brain_path.exists():
-                    latest_file = None
-                    latest_time = 0.0
-                    try:
-                        for p in brain_path.iterdir():
-                            if not p.is_dir() or p.name in existing_dirs:
-                                continue
-                            fp, mtime = find_latest_transcript(p)
-                            if fp and mtime > latest_time:
-                                latest_file = fp
-                                latest_time = mtime
-                    except OSError:
-                        pass
-
-                    if latest_file:
-                        if baseline_file:
-                            if latest_file != baseline_file or latest_time > baseline_time + 0.1:
-                                is_active = True
-                            elif polls % 40 == 0:
-                                print(
-                                    f"[AGY] fallback candidate transcript={latest_file} rejected: "
-                                    f"mtime={latest_time:.3f} baseline={baseline_time:.3f}"
-                                )
-                        else:
-                            if latest_time > launch_ts - 2.0:
-                                is_active = True
-                            elif polls % 40 == 0:
-                                print(
-                                    f"[AGY] fallback candidate transcript={latest_file} rejected: "
-                                    f"mtime={latest_time:.3f} launch_ts={launch_ts:.3f}"
-                                )
-
-                if is_active:
-                    print(
-                        f"[AGY] selected transcript={latest_file} "
-                        f"mtime={latest_time:.3f} launch_ts={launch_ts:.3f} "
-                        f"baseline_file={baseline_file} use_resume={use_resume} "
-                        f"expected={expected_session_dir}"
-                    )
-                    active_file = latest_file
-                    break
-
-                # If the process is no longer running and we have polled for at least 2 seconds, stop
-                if proc.returncode is not None and polls > 40:
-                    break
-
-                # Timeout safety limit (60 seconds)
-                if polls > 1200:
-                    break
-
-                polls += 1
-                await asyncio.sleep(0.05)
-
-        if not active_file:
-            log.error("[AGY] Timeout waiting for active transcript file. Waiting for process completion.")
-            await proc.wait()
-            # Post-completion scan: check if it was written during process shutdown
-            latest_file = None
-            latest_time = 0.0
-            is_active = False
-            if expected_session_dir.exists():
-                latest_file, latest_time = find_latest_transcript(expected_session_dir)
-                if latest_file:
-                    if baseline_file:
-                        if latest_file != baseline_file or latest_time > baseline_time + 0.1:
-                            is_active = True
-                    else:
-                        if latest_time > launch_ts - 2.0:
-                            is_active = True
-
-            if not is_active and brain_path.exists():
-                latest_file = None
-                latest_time = 0.0
-                try:
-                    for p in brain_path.iterdir():
-                        if not p.is_dir() or p.name in existing_dirs:
-                            continue
-                        fp, mtime = find_latest_transcript(p)
-                        if fp and mtime > latest_time:
-                            latest_file = fp
-                            latest_time = mtime
-                except OSError:
-                    pass
-
-                if latest_file:
-                    if baseline_file:
-                        if latest_file != baseline_file or latest_time > baseline_time + 0.1:
-                            is_active = True
-                    else:
-                        if latest_time > launch_ts - 2.0:
-                            is_active = True
-
-            if is_active:
-                active_file = latest_file
-                print(f"[AGY] Found transcript post-completion: {active_file}")
-            else:
-                err = _scan_agy_log_for_error(launch_ts)
-                if err:
-                    print(f"[AGY] CLI log diagnosis: {err}")
-                queue.put_nowait({
-                    "type": "result",
-                    "is_error": True if err else (proc.returncode != 0),
-                    "result_text": "",
-                    "error": err,
-                    "session_id": resume_session_id or str(conv_id),
-                })
-                queue.put_nowait(None)
-                return
-
-        session_id = ""
-        try:
-            rel = active_file.relative_to(brain_path)
-            session_id = rel.parts[0]
-        except ValueError:
-            session_id = active_file.parent.parent.parent.parent.name
-
-        # Put session info event into queue
+    # stream-json event producer. This is agy's structured print-mode contract.
+    async def _produce_stream_json_events():
+        session_id = resume_session_id or str(conv_id)
         queue.put_nowait({
             "type": "session_info",
             "session_id": session_id,
             "model": agy_model,
         })
 
-        # Wait a moment for file updates to begin
-        await asyncio.sleep(0.1)
-        
-        try:
-            with open(active_file, "r", encoding="utf-8", errors="replace") as f:
-                if active_file == baseline_file and initial_size > 0:
-                    # Seek to where the file was before agy launched.
-                    # JSONL files always end on a newline boundary, so
-                    # initial_size lands right at the start of the next line
-                    # (or at true EOF). Do NOT consume a readline — that
-                    # would eat the first real event agy writes.
-                    f.seek(initial_size)
-                
-                full_text = ""
-                processed_steps = set()
-                active_tool_calls = []
-                _eof_polls = 0  # heartbeat counter for liveness signal
-                _dead_since = None  # timestamp when agy log first went stale (sustained-dead detector)
-                _fatal_err = None  # fatal error caught by a heartbeat break (carried into the result event)
+        full_text = ""
+        _empty_polls = 0
+        _dead_since = None
+        stream_state = {"session_id": session_id, "model": agy_model}
+        got_result = False
+        while True:
+            try:
+                line = await asyncio.wait_for(stdout_lines.get(), timeout=1.5)
+            except asyncio.TimeoutError:
+                line = ""
 
-                while True:
-                    line = f.readline()
-                    if line:
-                        _eof_polls = 0  # reset heartbeat on any content
-                        if not line.strip():
-                            continue
+            if line is None:
+                break
+            if line:
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    queue.put_nowait({"type": "status", "text": line[:500]})
+                    continue
+                for evt in _agy_step_events(raw, stream_state):
+                    if evt.get("type") == "session_info":
+                        stream_state["session_id"] = evt.get("session_id") or stream_state["session_id"]
+                        stream_state["model"] = evt.get("model") or stream_state["model"]
+                    elif evt.get("type") == "text_delta":
+                        full_text += evt.get("text", "")
+                    elif evt.get("type") == "result":
+                        got_result = True
+                        if evt.get("result_text"):
+                            if not full_text:
+                                full_text = evt["result_text"]
+                        elif full_text:
+                            evt["result_text"] = full_text.strip()
+                    queue.put_nowait(evt)
+                if got_result:
+                    break
+                continue
+
+            # Liveness heartbeat and error detection while still running.
+            _empty_polls += 1
+            if _empty_polls % 30 == 0:
+                elapsed = int(_time.time() - launch_ts)
+                agy_alive = _is_agy_alive(launch_ts)
+                if not full_text and not agy_alive:
+                    queue.put_nowait({
+                        "type": "status",
+                        "text": f"Working ({elapsed}s) - waiting for agy stdout...",
+                    })
+                if agy_alive:
+                    _dead_since = None
+                    if not full_text:
+                        queue.put_nowait({
+                            "type": "status",
+                            "text": f"Working ({elapsed}s) — agy is processing...",
+                        })
+                else:
+                    if _dead_since is None:
+                        _dead_since = _time.time()
+                    elif _time.time() - _dead_since > 60.0:
+                        msg = (f"Antigravity appears to have shut down "
+                               f"(no log activity for {int(_time.time() - _dead_since)}s) "
+                               "without producing a final result")
+                        print(f"[AGY] Sustained-dead break ({elapsed}s): {msg}")
+                        queue.put_nowait({"type": "status", "text": msg})
                         try:
-                            event = json.loads(line)
-                            step_index = event.get("step_index")
-                            if step_index in processed_steps:
-                                continue
-                            processed_steps.add(step_index)
+                            await asyncio.wait_for(proc.wait(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            proc.kill()
+                        break
 
-                            etype = event.get("type")
-                            source = event.get("source")
-                            content = event.get("content")
-                            tool_calls = event.get("tool_calls")
+                log_err = _scan_agy_log_for_error(launch_ts)
+                if log_err:
+                    print(f"[AGY] Live log diagnosis ({elapsed}s): {log_err}")
+                    queue.put_nowait({"type": "status", "text": log_err})
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                    break
 
-                            if etype == "PLANNER_RESPONSE":
-                                thinking = event.get("thinking")
-                                content = event.get("content")
+            await asyncio.sleep(0.05)
 
-                                # Stream thinking process if present
-                                if thinking:
-                                    chunk_size = 128
-                                    for i in range(0, len(thinking), chunk_size):
-                                        chunk = thinking[i:i+chunk_size]
-                                        queue.put_nowait({"type": "thinking_delta", "text": chunk})
-                                        await asyncio.sleep(0.005)
+        # Ensure stdout reader finished so all output is captured.
+        if not stdout_task.done():
+            try:
+                await asyncio.wait_for(stdout_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                stdout_task.cancel()
 
-                                # Process tool calls with Claude-compatible mappings
-                                if tool_calls:
-                                    for idx, tool in enumerate(tool_calls):
-                                        tool_id = str(step_index)
-                                        tool_name = tool.get("name")
-                                        tool_args = tool.get("args", {})
-                                        
-                                        mapped_name = normalize_tool_name(tool_name)
-                                        mapped_args = normalize_tool_args(tool_name, tool_args)
-                                        
-                                        active_tool_calls.append(tool_id)
-                                        
-                                        queue.put_nowait({
-                                            "type": "tool_start",
-                                            "name": mapped_name,
-                                            "tool_id": tool_id,
-                                        })
-                                        queue.put_nowait({
-                                            "type": "tool_input_delta",
-                                            "json": json.dumps(mapped_args, indent=2),
-                                            "tool_id": tool_id,
-                                        })
-                                        if tool_name in ("ask_question", "AskUserQuestion"):
-                                            queue.put_nowait({
-                                                "type": "ask_user_question",
-                                                "questions": tool_args.get("questions", []),
-                                                "tool_id": tool_id,
-                                            })
-                                        elif tool_name in ("ExitPlanMode", "exit_plan_mode"):
-                                            queue.put_nowait({
-                                                "type": "plan_ready",
-                                                "plan": tool_args.get("plan", ""),
-                                                "plan_file": tool_args.get("planFilePath", tool_args.get("plan_file", "")),
-                                                "tool_id": tool_id,
-                                            })
+        post_err = None
+        if not got_result:
+            post_err = _scan_agy_log_for_error(launch_ts)
+            if post_err:
+                print(f"[AGY] CLI log diagnosis: {post_err}")
+            elif proc.returncode != 0:
+                post_err = f"Antigravity exited with code {proc.returncode}"
+            elif not full_text:
+                post_err = "Antigravity exited cleanly but produced no stream-json result"
+                print(f"[AGY] CLI log diagnosis: {post_err}")
 
-                                # Stream content (commentary or final response) as text_delta
-                                if content:
-                                    chunk_size = 64
-                                    for i in range(0, len(content), chunk_size):
-                                        chunk = content[i:i+chunk_size]
-                                        queue.put_nowait({"type": "text_delta", "text": chunk})
-                                        await asyncio.sleep(0.01)
-                                    full_text += content
-
-                            elif etype not in ("USER_INPUT", "CONVERSATION_HISTORY"):
-                                if active_tool_calls:
-                                    tool_id = active_tool_calls.pop(0)
-                                    queue.put_nowait({
-                                        "type": "tool_result",
-                                        "content": content or "",
-                                        "tool_id": tool_id,
-                                        "is_error": False,
-                                    })
-                                else:
-                                    if content:
-                                        tool_id = f"sys-{step_index}"
-                                        block_name = _determine_block_name(etype, content)
-                                        queue.put_nowait({
-                                            "type": "tool_start",
-                                            "name": block_name,
-                                            "tool_id": tool_id,
-                                        })
-                                        queue.put_nowait({
-                                            "type": "tool_result",
-                                            "content": content,
-                                            "tool_id": tool_id,
-                                            "is_error": False,
-                                        })
-                        except Exception as e:
-                            log.error(f"[AGY] Error parsing transcript line: {e}")
-                    else:
-                        # EOF. Check if process is finished
-                        if proc.returncode is not None:
-                            # Read any remaining lines
-                            for line in f:
-                                if not line.strip():
-                                    continue
-                                try:
-                                    event = json.loads(line)
-                                    step_index = event.get("step_index")
-                                    if step_index in processed_steps:
-                                        continue
-                                    processed_steps.add(step_index)
-
-                                    etype = event.get("type")
-                                    content = event.get("content")
-                                    thinking = event.get("thinking")
-                                    tool_calls = event.get("tool_calls")
-
-                                    if etype == "PLANNER_RESPONSE":
-                                        if thinking:
-                                            queue.put_nowait({"type": "thinking_delta", "text": thinking})
-
-                                        if tool_calls:
-                                            for idx, tool in enumerate(tool_calls):
-                                                tool_id = str(step_index)
-                                                tool_name = tool.get("name")
-                                                tool_args = tool.get("args", {})
-                                                
-                                                mapped_name = normalize_tool_name(tool_name)
-                                                mapped_args = normalize_tool_args(tool_name, tool_args)
-                                                
-                                                active_tool_calls.append(tool_id)
-                                                queue.put_nowait({
-                                                    "type": "tool_start",
-                                                    "name": mapped_name,
-                                                    "tool_id": tool_id,
-                                                })
-                                                queue.put_nowait({
-                                                    "type": "tool_input_delta",
-                                                    "json": json.dumps(mapped_args, indent=2),
-                                                    "tool_id": tool_id,
-                                                })
-                                                if tool_name in ("ask_question", "AskUserQuestion"):
-                                                    queue.put_nowait({
-                                                        "type": "ask_user_question",
-                                                        "questions": tool_args.get("questions", []),
-                                                        "tool_id": tool_id,
-                                                    })
-                                                elif tool_name in ("ExitPlanMode", "exit_plan_mode"):
-                                                    queue.put_nowait({
-                                                        "type": "plan_ready",
-                                                        "plan": tool_args.get("plan", ""),
-                                                        "plan_file": tool_args.get("planFilePath", tool_args.get("plan_file", "")),
-                                                        "tool_id": tool_id,
-                                                    })
-                                        if content:
-                                            queue.put_nowait({"type": "text_delta", "text": content})
-                                            full_text += content
-                                    elif etype not in ("USER_INPUT", "CONVERSATION_HISTORY"):
-                                        if active_tool_calls:
-                                            tool_id = active_tool_calls.pop(0)
-                                            queue.put_nowait({
-                                                "type": "tool_result",
-                                                "content": content or "",
-                                                "tool_id": tool_id,
-                                                "is_error": False,
-                                            })
-                                        else:
-                                            if content:
-                                                tool_id = f"sys-{step_index}"
-                                                block_name = _determine_block_name(etype, content)
-                                                queue.put_nowait({
-                                                    "type": "tool_start",
-                                                    "name": block_name,
-                                                    "tool_id": tool_id,
-                                                })
-                                                queue.put_nowait({
-                                                    "type": "tool_result",
-                                                    "content": content,
-                                                    "tool_id": tool_id,
-                                                    "is_error": False,
-                                                })
-                                except Exception as e:
-                                    log.error(f"[AGY] Error parsing final transcript line: {e}")
-                            break
-
-                        # Clear EOF flag to allow reading new appends (buffered TextIOWrapper cache workaround)
-                        try:
-                            f.seek(f.tell())
-                        except OSError:
-                            pass
-
-                        # Liveness heartbeat: every ~1.5s (30 polls × 0.05s)
-                        # of no new transcript content, check if agy is alive
-                        # by watching the CLI log mtime. agy writes to its log
-                        # for every API call, so a changing mtime means activity
-                        # even when the transcript hasn't flushed.
-                        _eof_polls += 1
-                        if _eof_polls % 30 == 0:
-                            elapsed = int(_time.time() - launch_ts)
-                            agy_alive = _is_agy_alive(launch_ts)
-                            # Signal liveness if agy is still working and we
-                            # haven't streamed final text yet. (The error scan
-                            # below runs regardless of full_text — agy can stall
-                            # mid-turn after emitting partial content.)
-                            if agy_alive and not full_text:
-                                queue.put_nowait({
-                                    "type": "status",
-                                    "text": f"Working ({elapsed}s) — agy is processing, waiting for step to complete...",
-                                })
-                            # Check for fatal errors (429/auth/permission/planner-stall)
-                            log_err = _scan_agy_log_for_error(launch_ts)
-                            if log_err:
-                                # Fatal error discovered — surface and abort.
-                                _fatal_err = log_err
-                                print(f"[AGY] Live log diagnosis ({elapsed}s): {log_err}")
-                                queue.put_nowait({
-                                    "type": "status",
-                                    "text": log_err,
-                                })
-                                # Give agy a moment to exit on its own,
-                                # then force-terminate so we don't stall.
-                                try:
-                                    await asyncio.wait_for(proc.wait(), timeout=5.0)
-                                except asyncio.TimeoutError:
-                                    proc.kill()
-                                break
-
-                            # Sustained-dead detector: agy's planner-loop
-                            # shutdown logs "Language server shutting down"
-                            # but the OS process never exits (proc.returncode
-                            # stays None), so the EOF break never fires and we
-                            # would hang forever emitting "Working". If the log
-                            # has been stale (no mtime change) for 60s sustained
-                            # AND no tool call is in flight, agy is effectively
-                            # dead even though returncode is None. The
-                            # active_tool_calls guard prevents a false positive
-                            # during a legitimate long bash run (up to 20min
-                            # via BASH_DEFAULT_TIMEOUT_MS), during which agy
-                            # writes no log lines but is genuinely busy.
-                            if agy_alive:
-                                _dead_since = None
-                            elif active_tool_calls:
-                                _dead_since = None  # waiting on a tool, not dead
-                            else:
-                                if _dead_since is None:
-                                    _dead_since = _time.time()
-                                elif _time.time() - _dead_since > 60.0:
-                                    msg = (f"Antigravity appears to have shut down "
-                                           f"(no log activity for {int(_time.time() - _dead_since)}s) "
-                                           "without producing a final result")
-                                    _fatal_err = msg
-                                    print(f"[AGY] Sustained-dead break ({elapsed}s): {msg}")
-                                    queue.put_nowait({"type": "status", "text": msg})
-                                    try:
-                                        await asyncio.wait_for(proc.wait(), timeout=5.0)
-                                    except asyncio.TimeoutError:
-                                        proc.kill()
-                                    break
-
-                        await asyncio.sleep(0.05)
-
-                post_err = None
-                if not full_text:
-                    post_err = _scan_agy_log_for_error(launch_ts)
-                    if post_err:
-                        print(f"[AGY] CLI log diagnosis (post-transcript): {post_err}")
-                    elif proc.returncode == 0:
-                        # agy exited cleanly (code 0) but wrote no transcript
-                        # text and left no fatal log signature. Catches rare
-                        # graceful-exit shapes that write nothing at all, so the
-                        # turn surfaces an error instead of a silent success.
-                        post_err = "Antigravity exited cleanly but produced no transcript output"
-                        print(f"[AGY] CLI log diagnosis (post-transcript): {post_err}")
-                # If a heartbeat break caught a fatal error (planner-stall or
-                # sustained-dead), carry it into the result event even when
-                # partial text was streamed — otherwise the result's `error`
-                # field is empty and the UI shows a blank message.
-                if not post_err and _fatal_err:
-                    post_err = _fatal_err
-                queue.put_nowait({
-                    "type": "result",
-                    "is_error": bool(post_err) or proc.returncode != 0,
-                    "result_text": full_text,
-                    "error": post_err,
-                    "session_id": session_id,
-                })
-        except Exception as e:
-            log.error(f"[AGY] Error tailing transcript: {e}")
             queue.put_nowait({
                 "type": "result",
-                "is_error": True,
-                "error": str(e),
-                "session_id": session_id,
+                "is_error": bool(post_err) or proc.returncode != 0,
+                "result_text": full_text.strip(),
+                "error": post_err,
+                "session_id": stream_state.get("session_id") or session_id,
             })
-        finally:
-            queue.put_nowait(None)
+        queue.put_nowait(None)
 
-    asyncio.create_task(_tail_transcript_to_queue())
+    asyncio.create_task(_produce_stream_json_events())
 
     async def _event_stream():
         got_result = False
@@ -1265,6 +1085,18 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                 break
 
         _active_queues.pop(conv_id, None)
+        # Ensure stdout/stderr readers finish before reaping the process so we
+        # capture all output and avoid a blocked-pipe deadlock on Windows.
+        if not stdout_task.done():
+            try:
+                await asyncio.wait_for(stdout_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                stdout_task.cancel()
+        if not stderr_task.done():
+            try:
+                await asyncio.wait_for(stderr_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                stderr_task.cancel()
         await proc.wait()
 
         # Emit default result if not already yielded
