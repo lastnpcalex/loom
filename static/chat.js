@@ -1169,13 +1169,49 @@ function handleWSMessage(data) {
                     });
                 }
             } else {
-                // No usable snapshot. Treat the persisted branch as ground truth
-                // and wait for future stream_start if the task is genuinely live.
+                // No usable snapshot. Some providers may not maintain live
+                // snapshots, so preserve the old "keep the stream receptive"
+                // behavior only when the DB still shows an empty assistant
+                // draft. If the branch already landed, clear the stale live UI.
                 State.isStreaming = false;
-                State._streamIsOurBranch = undefined;
+                State._streamIsOurBranch = true;
                 State._followingGenId = null;
                 if (!State._reconstructing) {
-                    loadMessages(State.currentConvId);
+                    State._reconstructing = true;
+                    const activeWs = State.ws;
+                    let discardQueuedEvents = false;
+                    loadMessages(State.currentConvId).then(() => {
+                        if (State.ws !== activeWs) {
+                            discardQueuedEvents = true;
+                            return;
+                        }
+                        const hasEmptyDraft = State.messages.some(
+                            m => m.role === 'assistant' && !(m.content || '').trim()
+                        );
+                        if (hasEmptyDraft) {
+                            State.isStreaming = true;
+                            State._streamIsOurBranch = true;
+                            if (!streamingDiv || !streamingDiv.isConnected) {
+                                appendStreamingMessage();
+                            }
+                        } else {
+                            removeStreamingMessage();
+                            _clearTerminalStreamState({ clearParallel: true });
+                            hideGenStatus();
+                            refreshTree();
+                            _flushQueuedGeneration();
+                            discardQueuedEvents = true;
+                        }
+                    }).catch((err) => {
+                        console.warn('[WS] generation_active no-snapshot sync failed:', err);
+                    }).finally(() => {
+                        State._reconstructing = false;
+                        if (discardQueuedEvents || State.ws !== activeWs) {
+                            _queuedStreamEventsDuringReconstruct = [];
+                        } else {
+                            _drainQueuedStreamEvents();
+                        }
+                    });
                 }
             }
             if (State.ws) State.ws._needsSync = false;
