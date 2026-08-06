@@ -1126,21 +1126,16 @@ function handleWSMessage(data) {
                             discardQueuedEvents = true;
                             return;
                         }
-                        // If the draft message has already landed from the DB
-                        // (loadMessages picked up the committed final response),
-                        // we're done — nothing to reconstruct.
-                        const draftLanded = snap.draft_msg_id && State.messages.some(
-                            m => m.id === snap.draft_msg_id && (m.content || '').trim()
-                        );
-                        if (draftLanded) {
-                            removeStreamingMessage();
-                            _clearTerminalStreamState({ clearParallel: true });
-                            hideGenStatus();
-                            refreshTree();
-                            _flushQueuedGeneration();
-                            return;
-                        }
-                        // Otherwise reconstruct from snapshot — covers the race
+                        // Reconstruct from snapshot. Do not treat a non-empty
+                        // draft row as terminal here: several providers persist
+                        // partial text to the draft while the turn is still
+                        // active, specifically so reconnect/refresh can recover
+                        // streamed content.
+                        //
+                        // Terminal state is handled only by explicit stream_end
+                        // or generation_idle events.
+                        //
+                        // This covers the race
                         // where stream_end fired during loadMessages but the
                         // assistant row wasn't yet committed to the DB. Don't
                         // gate on State.isStreaming: a fast/rate-limited turn
@@ -1170,43 +1165,26 @@ function handleWSMessage(data) {
                 }
             } else {
                 // No usable snapshot. Some providers may not maintain live
-                // snapshots, so preserve the old "keep the stream receptive"
-                // behavior only when the DB still shows an empty assistant
-                // draft. If the branch already landed, clear the stale live UI.
-                State.isStreaming = false;
+                // snapshots, so keep the UI receptive and reconstruct from
+                // the persisted draft row if one is visible.
+                State.isStreaming = true;
                 State._streamIsOurBranch = true;
                 State._followingGenId = null;
                 if (!State._reconstructing) {
                     State._reconstructing = true;
                     const activeWs = State.ws;
-                    let discardQueuedEvents = false;
                     loadMessages(State.currentConvId).then(() => {
                         if (State.ws !== activeWs) {
-                            discardQueuedEvents = true;
                             return;
                         }
-                        const hasEmptyDraft = State.messages.some(
-                            m => m.role === 'assistant' && !(m.content || '').trim()
-                        );
-                        if (hasEmptyDraft) {
-                            State.isStreaming = true;
-                            State._streamIsOurBranch = true;
-                            if (!streamingDiv || !streamingDiv.isConnected) {
-                                appendStreamingMessage();
-                            }
-                        } else {
-                            removeStreamingMessage();
-                            _clearTerminalStreamState({ clearParallel: true });
-                            hideGenStatus();
-                            refreshTree();
-                            _flushQueuedGeneration();
-                            discardQueuedEvents = true;
+                        if (!streamingDiv || !streamingDiv.isConnected) {
+                            appendStreamingMessage();
                         }
                     }).catch((err) => {
                         console.warn('[WS] generation_active no-snapshot sync failed:', err);
                     }).finally(() => {
                         State._reconstructing = false;
-                        if (discardQueuedEvents || State.ws !== activeWs) {
+                        if (State.ws !== activeWs) {
                             _queuedStreamEventsDuringReconstruct = [];
                         } else {
                             _drainQueuedStreamEvents();
