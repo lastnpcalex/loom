@@ -823,8 +823,7 @@ function handleWSMessage(data) {
             if (!State._streamIsOurBranch || !streamingDiv) break;
             const tokEl = streamingDiv.querySelector('.gen-token-info');
             if (tokEl) {
-                const canvasText = data.canvas_tokens ? ' / ' + _fmtTok(data.canvas_tokens) + ' canvas' : '';
-                tokEl.textContent = (data.input_tokens ? 'in ' + _fmtTok(data.input_tokens) + ' ' : '') + 'out ' + _fmtTok(data.output_tokens) + canvasText + ' - ';
+                tokEl.textContent = (data.input_tokens ? 'in ' + _fmtTok(data.input_tokens) + ' ' : '') + 'out ' + _fmtTok(data.output_tokens) + ' - ';
                 tokEl.dataset.hasUsage = '1';  // stop timer from overwriting with chunk count
             }
             // If output tokens registered, work is happening — drop the

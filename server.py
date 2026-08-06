@@ -9028,8 +9028,12 @@ async def _handle_ooda_generation(
         )
         weave_model = conv.get("local_model") or None
         ooda_max_tokens = int(getattr(config, "max_tokens", 2048) or 2048)
-        raw_pass1 = await sync_chat(
-            messages, max_tokens=ooda_max_tokens, think=False, model=weave_model
+        raw_pass1, usage_pass1 = await sync_chat(
+            messages,
+            max_tokens=ooda_max_tokens,
+            think=False,
+            model=weave_model,
+            return_usage=True,
         )
         # Check if cancelled during the sync call
         if asyncio.current_task().cancelled():
@@ -9161,8 +9165,12 @@ async def _handle_ooda_generation(
                     "paragraphs of in-character prose. Do not include any other commentary."
                 ),
             }]
-            raw_pass2 = await sync_chat(
-                repair_messages, max_tokens=ooda_max_tokens, think=False, model=weave_model
+            raw_pass2, usage_pass2 = await sync_chat(
+                repair_messages,
+                max_tokens=ooda_max_tokens,
+                think=False,
+                model=weave_model,
+                return_usage=True,
             )
             if asyncio.current_task().cancelled():
                 raise asyncio.CancelledError()
@@ -9187,6 +9195,21 @@ async def _handle_ooda_generation(
                 final_prose = cleaned_pass2
                 final_prose = _re.sub(r"<ooda>[\s\S]*?</ooda>\s*", "", final_prose).strip()
                 final_prose = _re.sub(r"<ooda>[\s\S]*$", "", final_prose).strip()
+
+        ooda_input_tokens = int((usage_pass1 or {}).get("input_tokens") or 0)
+        ooda_output_tokens = int((usage_pass1 or {}).get("output_tokens") or 0)
+        if "usage_pass2" in locals():
+            ooda_input_tokens += int((usage_pass2 or {}).get("input_tokens") or 0)
+            ooda_output_tokens += int((usage_pass2 or {}).get("output_tokens") or 0)
+        if ooda_input_tokens or ooda_output_tokens:
+            await _ws_send(
+                conv_id,
+                {
+                    "type": "usage",
+                    "input_tokens": ooda_input_tokens,
+                    "output_tokens": ooda_output_tokens,
+                },
+            )
 
         # Stream prose to client
         for i in range(0, len(final_prose), 8):
@@ -9226,7 +9249,13 @@ async def _handle_ooda_generation(
 
         # Update draft with final content
         _ooda_gen_ms = int((_time.time() - _ooda_start_t) * 1000)
-        await db.update_message_content(draft_msg_id, content=final_prose, generation_ms=_ooda_gen_ms)
+        await db.update_message_content(
+            draft_msg_id,
+            content=final_prose,
+            turn_input_tokens=ooda_input_tokens,
+            turn_output_tokens=ooda_output_tokens,
+            generation_ms=_ooda_gen_ms,
+        )
         await db.set_active_branch(conv_id, draft_msg_id)
         from context_manager import update_rolling_summary
         asyncio.create_task(update_rolling_summary(conv_id))
@@ -9447,6 +9476,8 @@ async def _handle_weave_generation(
 
         full_response = ""
         _thinking_buffer = ""
+        total_input_tokens = 0
+        total_output_tokens = 0
         weave_model = conv.get("local_model") or None
         async for item in stream_chat(messages, model=weave_model):
             if isinstance(item, dict):
@@ -9457,6 +9488,9 @@ async def _handle_weave_generation(
                     )
                 else:
                     # thinking_start, thinking_end, usage — forward as-is
+                    if item.get("type") == "usage":
+                        total_input_tokens = int(item.get("input_tokens") or total_input_tokens or 0)
+                        total_output_tokens = int(item.get("output_tokens") or total_output_tokens or 0)
                     await _ws_send(conv_id, item)
                 continue
             full_response += item
@@ -9498,7 +9532,13 @@ async def _handle_weave_generation(
 
         # Update draft with final content
         _weave_gen_ms = int((_time.time() - _weave_start_t) * 1000)
-        await db.update_message_content(draft_msg_id, content=full_response, generation_ms=_weave_gen_ms)
+        await db.update_message_content(
+            draft_msg_id,
+            content=full_response,
+            turn_input_tokens=total_input_tokens,
+            turn_output_tokens=total_output_tokens,
+            generation_ms=_weave_gen_ms,
+        )
         await db.set_active_branch(conv_id, draft_msg_id)
         from context_manager import update_rolling_summary
         asyncio.create_task(update_rolling_summary(conv_id))

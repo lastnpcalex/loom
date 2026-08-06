@@ -714,14 +714,12 @@ async def stream_chat(
                         break
 
             if _is_dream_model(raw_model):
-                usage_event = {
+                yield {
                     "type": "usage",
                     "input_tokens": _input_tokens,
-                    "output_tokens": _content_tokens,
+                    "output_tokens": _output_tokens or _content_tokens,
+                    "content_chunks": _content_tokens,
                 }
-                if _output_tokens:
-                    usage_event["canvas_tokens"] = _output_tokens
-                yield usage_event
             else:
                 yield {
                     "type": "usage",

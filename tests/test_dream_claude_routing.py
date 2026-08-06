@@ -70,7 +70,7 @@ async def test_dream_stream_floors_tiny_requested_max_tokens(monkeypatch):
         async def aiter_lines(self):
             yield (
                 'data: {"choices":[{"delta":{"content":"ok"}}],'
-                '"usage":{"prompt_tokens":1,"completion_tokens":1}}'
+                '"usage":{"prompt_tokens":11,"completion_tokens":42}}'
             )
             yield "data: [DONE]"
 
@@ -97,6 +97,10 @@ async def test_dream_stream_floors_tiny_requested_max_tokens(monkeypatch):
     assert seen["payload"]["chat_template_kwargs"] == {"enable_thinking": True}
     assert chunks[0] == "ok"
     assert chunks[-1]["type"] == "usage"
+    assert chunks[-1]["input_tokens"] == 11
+    assert chunks[-1]["output_tokens"] == 42
+    assert chunks[-1]["content_chunks"] == 1
+    assert "canvas_tokens" not in chunks[-1]
 
 
 @pytest.mark.asyncio

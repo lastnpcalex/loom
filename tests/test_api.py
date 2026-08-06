@@ -258,6 +258,46 @@ async def test_system_only_weave_generation_uses_only_system_prompt(monkeypatch)
     assert "Background" not in prompt_text
 
 
+async def test_weave_generation_persists_streamed_usage(monkeypatch):
+    import server
+
+    conv = await db.create_conversation(
+        "Weave Usage",
+        mode="weave",
+    )
+    await db.update_conversation_fields(
+        conv["id"],
+        system_only=1,
+        system_prompt="ONLY THIS SYSTEM MESSAGE",
+        local_model="diffusion-gemma-test",
+    )
+    user_msg = await db.add_message(conv["id"], "user", "Start here.")
+    conv = await db.get_conversation(conv["id"])
+
+    async def fake_stream_chat(messages, model=None):
+        yield "ok"
+        yield {"type": "usage", "input_tokens": 123, "output_tokens": 45}
+
+    async def fake_update_rolling_summary(conv_id):
+        return None
+
+    monkeypatch.setattr(server, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr("context_manager.update_rolling_summary", fake_update_rolling_summary)
+
+    await server._handle_weave_generation(
+        None,
+        conv["id"],
+        conv,
+        {"action": "generate", "parent_id": user_msg["id"]},
+    )
+
+    children = await db.get_children(user_msg["id"])
+    assistant = next(m for m in children if m["role"] == "assistant")
+    assert assistant["content"] == "ok"
+    assert assistant["turn_input_tokens"] == 123
+    assert assistant["turn_output_tokens"] == 45
+
+
 async def test_system_only_weave_generation_can_disable_minimal_ooda(monkeypatch):
     """Minimal Weave can send only the stored system prompt with no private OODA add-in."""
     import server
