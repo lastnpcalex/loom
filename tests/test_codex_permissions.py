@@ -387,6 +387,22 @@ def test_permission_scope_gen_id_parses_generation_scope():
     assert server._permission_scope_gen_id("manual") is None
 
 
+def test_test_permission_request_hook_decision_output():
+    from tools import test_permission_request_hook
+
+    allow_output = test_permission_request_hook._hook_decision({"allow": True})
+    assert allow_output["hookSpecificOutput"]["hookEventName"] == "PermissionRequest"
+    assert allow_output["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+
+    deny_output = test_permission_request_hook._hook_decision({
+        "allow": False,
+        "message": "nope",
+    })
+    assert deny_output["hookSpecificOutput"]["hookEventName"] == "PermissionRequest"
+    assert deny_output["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+    assert deny_output["hookSpecificOutput"]["decision"]["message"] == "nope"
+
+
 def test_permission_hook_denies_image_reads(monkeypatch):
     import cc_permission_hook
 
