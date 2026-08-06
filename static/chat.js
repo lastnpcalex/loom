@@ -1085,9 +1085,9 @@ function handleWSMessage(data) {
             // Reconnected while a generation is still running — use snapshot to rebuild UI
             hideRetryBar();
             hidePlanBar();
-            State.isStreaming = true;
             const snapshots = data.snapshots || [];
             if (snapshots.length > 0) {
+                State.isStreaming = true;
                 const snap = snapshots[0];
                 // Check if this generation is on our current branch
                 const myMsgIds = new Set(State.messages.map(m => m.id));
@@ -1133,6 +1133,11 @@ function handleWSMessage(data) {
                             m => m.id === snap.draft_msg_id && (m.content || '').trim()
                         );
                         if (draftLanded) {
+                            removeStreamingMessage();
+                            _clearTerminalStreamState({ clearParallel: true });
+                            hideGenStatus();
+                            refreshTree();
+                            _flushQueuedGeneration();
                             return;
                         }
                         // Otherwise reconstruct from snapshot — covers the race
@@ -1164,8 +1169,11 @@ function handleWSMessage(data) {
                     });
                 }
             } else {
-                // No snapshot — just load messages
-                State._streamIsOurBranch = true;  // assume ours, will be corrected by stream_start
+                // No usable snapshot. Treat the persisted branch as ground truth
+                // and wait for future stream_start if the task is genuinely live.
+                State.isStreaming = false;
+                State._streamIsOurBranch = undefined;
+                State._followingGenId = null;
                 if (!State._reconstructing) {
                     loadMessages(State.currentConvId);
                 }

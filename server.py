@@ -4335,7 +4335,7 @@ async def _ws_send(conv_id: int, data: dict):
     # Auto-tag with gen_id so client can distinguish parallel streams
     task = asyncio.current_task()
     gen_key = getattr(task, "_gen_key", None)
-    if gen_key and "gen_id" not in data:
+    if gen_key and data.get("type") != "generation_idle" and "gen_id" not in data:
         data = {**data, "gen_id": gen_key[2]}
     clients = _active_websockets.get(conv_id)
     _t = data.get("type", "?")
@@ -4374,6 +4374,18 @@ async def _ws_send(conv_id: int, data: dict):
             dead.append(ws)
     for ws in dead:
         clients.discard(ws)
+
+
+def _has_active_generation_for_conv(conv_id: int) -> bool:
+    return any(
+        k[0] == conv_id and not task.done()
+        for k, task in _active_generations.items()
+    )
+
+
+async def _send_generation_idle_if_quiescent(conv_id: int):
+    if not _has_active_generation_for_conv(conv_id):
+        await _ws_send(conv_id, {"type": "generation_idle"})
 
 
 async def _ws_broadcast_all(data: dict):
@@ -7062,6 +7074,7 @@ async def _handle_claude_generation(
             _active_generations.pop(_gen_key, None)
             _generation_snapshots.pop(_gen_key, None)
             _auto_approve_permissions.pop((conv_id, f"gen:{_gen_key[2]}"), None)
+        await _send_generation_idle_if_quiescent(conv_id)
         # Drop the orphan-tracking row — the generation finished (success,
         # cancel, or error), so there's nothing to reap on next startup.
         try:
@@ -7413,6 +7426,10 @@ async def _handle_goose_generation(
         else:
             await _ws_send(conv_id, {"type": "error", "error": str(exc)})
     finally:
+        _gen_key = getattr(asyncio.current_task(), "_gen_key", None)
+        if _gen_key:
+            _active_generations.pop(_gen_key, None)
+            _generation_snapshots.pop(_gen_key, None)
         _active_goose_procs.pop(conv_id, None)
         if proc is not None:
             try:
@@ -7429,6 +7446,7 @@ async def _handle_goose_generation(
                 await db.unregister_active_generation(draft_msg_id)
             except Exception:
                 pass
+        await _send_generation_idle_if_quiescent(conv_id)
         for rid in list(_pending_hook_permissions):
             if _pending_hook_permissions[rid].get("conv_id") == conv_id:
                 _pending_hook_permissions.pop(rid, None)
@@ -7593,6 +7611,7 @@ async def _handle_dream_completion(
         if _gen_key:
             _active_generations.pop(_gen_key, None)
             _generation_snapshots.pop(_gen_key, None)
+        await _send_generation_idle_if_quiescent(conv_id)
 
 
 def _dream_openai_base_url() -> str:
@@ -8193,6 +8212,7 @@ async def _handle_prometheus_generation(
         if _gen_key:
             _active_generations.pop(_gen_key, None)
             _generation_snapshots.pop(_gen_key, None)
+        await _send_generation_idle_if_quiescent(conv_id)
         try:
             if draft_msg_id:
                 await db.unregister_active_generation(draft_msg_id)
@@ -8507,6 +8527,7 @@ async def _handle_dream_generation(
         if _gen_key:
             _active_generations.pop(_gen_key, None)
             _generation_snapshots.pop(_gen_key, None)
+        await _send_generation_idle_if_quiescent(conv_id)
 
         # Clear the SQLite active generation row so it doesn't clutter the
         # admin "Active Generations" panel with dead sessions.
@@ -8842,6 +8863,7 @@ async def _handle_hermes_generation(
             _active_generations.pop(_gen_key, None)
             _generation_snapshots.pop(_gen_key, None)
             _auto_approve_permissions.pop((conv_id, f"gen:{_gen_key[2]}"), None)
+        await _send_generation_idle_if_quiescent(conv_id)
 
         # Clear the SQLite active generation row
         try:
@@ -9244,6 +9266,7 @@ async def _handle_ooda_generation(
         if _gen_key:
             _active_generations.pop(_gen_key, None)
             _generation_snapshots.pop(_gen_key, None)
+        await _send_generation_idle_if_quiescent(conv_id)
 
 
 async def _handle_weave_generation(
@@ -9518,6 +9541,7 @@ async def _handle_weave_generation(
         if _gen_key:
             _active_generations.pop(_gen_key, None)
             _generation_snapshots.pop(_gen_key, None)
+        await _send_generation_idle_if_quiescent(conv_id)
 
 
 if __name__ == "__main__":
