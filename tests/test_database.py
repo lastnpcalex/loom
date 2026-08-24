@@ -137,6 +137,23 @@ async def test_cc_session_mode_column_exists():
     assert "cc_session_mode" in col_names
 
 
+async def test_model_attestation_round_trip():
+    """Provider-returned model evidence persists separately from the model label."""
+    conv = await db.create_conversation("Model Proof", mode="codex")
+    msg = await db.add_message(conv["id"], "assistant", "proved")
+    proof = '{"status":"verified","effective_model":"gpt-5.6-sol"}'
+
+    await db.update_message_content(
+        msg["id"],
+        cc_model_used="gpt-5.6-sol",
+        model_attestation=proof,
+    )
+
+    fetched = await db.get_message(msg["id"])
+    assert fetched["cc_model_used"] == "gpt-5.6-sol"
+    assert fetched["model_attestation"] == proof
+
+
 async def test_codex_goal_columns_round_trip():
     conv = await db.create_conversation("Codex Goal", mode="codex")
     await db.update_conversation_fields(
@@ -158,12 +175,11 @@ async def test_codex_goal_columns_round_trip():
     assert updated["codex_goal_updated_at"] == 42.0
 
 
-async def test_cc_session_mode_round_trip_and_null_compat():
+async def test_cc_session_mode_round_trip_and_null_is_unscoped():
     """update_message_content persists cc_session_mode; NULL is the legacy default.
 
-    The resume walk treats NULL as 'legacy/unscoped, compatible' so existing
-    conversations keep resuming instead of forcing a full-history rebuild.
-    Only a non-NULL mode that mismatches the current backend is skipped.
+    A NULL mode cannot prove which harness owns the native session. The shared
+    provider contract therefore rebuilds that turn from Loom history.
     """
     conv = await db.create_conversation("Mode Tag Test")
     m1 = await db.add_message(conv["id"], "user", "hello")
@@ -176,13 +192,13 @@ async def test_cc_session_mode_round_trip_and_null_compat():
     assert fetched["cc_session_id"] == "dream-sess-1"
     assert fetched["cc_session_mode"] == "dream"
 
-    # m1 was never tagged — NULL mode, the resume-walk compatibility case.
+    # m1 was never tagged — NULL mode, therefore unscoped.
     m1_fetched = await db.get_message(m1["id"])
     assert m1_fetched.get("cc_session_mode") is None
 
-    # The compatibility predicate a resume walk uses: NULL or matching mode.
+    # Only an explicit matching mode is compatible.
     def _compatible(msg_mode, current_mode):
-        return msg_mode is None or msg_mode == current_mode
-    assert _compatible(m1_fetched.get("cc_session_mode"), "dream")   # NULL → compatible
+        return bool(msg_mode) and msg_mode == current_mode
+    assert not _compatible(m1_fetched.get("cc_session_mode"), "dream")
     assert _compatible(fetched["cc_session_mode"], "dream")          # same mode → compatible
     assert not _compatible(fetched["cc_session_mode"], "hermes")     # cross-mode → skip

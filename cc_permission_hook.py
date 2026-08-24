@@ -190,6 +190,7 @@ def main():
     sys.stderr.write(f"[PERM-HOOK] Hook started for event {event_name}\n")
     port = os.environ.get("LOOM_PORT", "3000")
     conv_id = os.environ.get("LOOM_CONV_ID", "")
+    permission_scope = os.environ.get("LOOM_PERMISSION_SCOPE", "")
     backstage_parent = os.environ.get("LOOM_BACKSTAGE_PARENT_ID", "")
     nrol_operator = os.environ.get("LOOM_NROL_OPERATOR", "")
     sys.stderr.write(f"[PERM-HOOK] port={port} conv={conv_id} backstage={backstage_parent} nrol={nrol_operator}\n")
@@ -404,6 +405,8 @@ def main():
         allow(f"nrol-ao MCP tool (commits gated server-side): {mapped_name}", event_name=event_name)
 
     request["loom_conv_id"] = conv_id
+    if permission_scope:
+        request["permission_scope"] = permission_scope
     request["tool_name"] = mapped_name # Normalize for Loom API
     request["tool_input"] = mapped_input
 

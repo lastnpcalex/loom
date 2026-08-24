@@ -12,6 +12,8 @@ if sys.platform == "win32":
 import asyncio
 import json
 import os
+import re
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -83,6 +85,12 @@ except ModuleNotFoundError as e:
 import codex_client
 import goose_client
 import model_context
+from provider_contract import select_resume_session
+from workspace_safety import (
+    capture_workspace_snapshot,
+    default_recovery_root,
+    finalize_workspace_snapshot,
+)
 import local_summary
 import openrouter_client
 from skill_scanner import get_all_skills, BUILTIN_COMMANDS
@@ -119,13 +127,19 @@ def _truthy_setting(value) -> bool:
     return bool(value)
 
 
+_AGENT_WORKSPACE_MODES = frozenset({
+    "claude", "local", "hermes", "dream", "gemini",
+    "codex", "goose", "umans", "openrouter",
+})
+
+
 def _minimal_ooda_enabled(conv: dict | None) -> bool:
     if not conv or conv.get("minimal_ooda_enabled") is None:
         return True
     return _truthy_setting(conv.get("minimal_ooda_enabled"))
 
 
-def _mode_for_cc_model(cc_model: str | None) -> str:
+def _mode_for_cc_model(cc_model: str | None) -> str | None:
     cc_model = cc_model or ""
     is_gemini = is_gemini_model(cc_model)
     is_codex = is_codex_model(cc_model)
@@ -138,7 +152,8 @@ def _mode_for_cc_model(cc_model: str | None) -> str:
         else "goose" if is_goose
         else "openrouter" if is_openrouter
         else "umans" if is_umans
-        else "claude"
+        else "claude" if model_context.is_anthropic(cc_model) or is_dream_claude_model(cc_model)
+        else None
     )
 
 
@@ -1129,6 +1144,305 @@ def _permission_scope_gen_id(permission_scope: str) -> int | None:
         return None
 
 
+def _generation_branch_for_scope(conv_id: int, permission_scope: str) -> dict:
+    """Return branch identifiers for a generation-scoped permission request."""
+    gen_id = _permission_scope_gen_id(permission_scope)
+    if gen_id is None:
+        return {}
+    for key, snapshot in _generation_snapshots.items():
+        if key[0] == conv_id and key[2] == gen_id:
+            return {
+                "gen_id": gen_id,
+                "parent_id": snapshot.get("parent_id"),
+                "draft_msg_id": snapshot.get("draft_msg_id"),
+            }
+    return {"gen_id": gen_id}
+
+
+_COMMAND_KEYS = {"command", "cmd", "shell_command", "script"}
+_TOOL_NAME_KEYS = {"name", "title", "tool_name", "toolName", "kind"}
+_SHELL_TOOL_HINTS = (
+    "bash",
+    "shell",
+    "cmd",
+    "powershell",
+    "terminal",
+    "execute",
+    "run_command",
+)
+_GOOSE_AUTO_ALLOW_TOOL_NAMES = {"tree"}
+_DESTRUCTIVE_COMMAND_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
+    (
+        re.compile(r"(?i)\brm\s+-[^\s;&|]*r[^\s;&|]*"),
+        "recursive rm is blocked",
+    ),
+    (
+        re.compile(r"(?i)\b(?:remove-item|ri)\b[^\r\n;&|]*-(?:recurse|r)\b"),
+        "recursive Remove-Item is blocked",
+    ),
+    (
+        re.compile(r"(?i)\brm\b[^\r\n;&|]*-(?:recurse|r)\b"),
+        "recursive PowerShell rm is blocked",
+    ),
+    (
+        re.compile(r"(?i)\b(?:rd|rmdir)\b[^\r\n;&|]*/s\b"),
+        "recursive rmdir/rd is blocked",
+    ),
+    (
+        re.compile(r"(?i)\b(?:del|erase)\b[^\r\n;&|]*/s\b"),
+        "recursive del/erase is blocked",
+    ),
+    (
+        re.compile(r"(?i)\brobocopy\b[^\r\n;&|]*/(?:mir|purge)\b"),
+        "robocopy mirror/purge is blocked",
+    ),
+    (
+        re.compile(r"(?i)\bformat(?:\.com)?\b"),
+        "format is blocked",
+    ),
+    (
+        re.compile(r"(?i)\bdiskpart\b"),
+        "diskpart is blocked",
+    ),
+)
+_DESTRUCTIVE_GIT_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
+    (
+        re.compile(r"(?i)\bgit\s+clean\b[^\r\n;&|]*-[^\r\n;&|]*f"),
+        "git clean can permanently remove untracked workspace files",
+    ),
+    (
+        re.compile(r"(?i)\bgit\s+reset\b[^\r\n;&|]*--hard\b"),
+        "git reset --hard discards tracked workspace changes",
+    ),
+    (
+        re.compile(r"(?i)\bgit\s+restore\b"),
+        "git restore overwrites current workspace content",
+    ),
+    (
+        re.compile(r"(?i)\bgit\s+checkout\b[^\r\n;&|]*\s--(?:\s|$)"),
+        "git checkout -- overwrites current workspace content",
+    ),
+    (
+        re.compile(r"(?i)\bgit\s+stash\s+(?:drop|clear)\b"),
+        "dropping Git stashes can destroy recoverable work",
+    ),
+    (
+        re.compile(r"(?i)\bgit\s+branch\b[^\r\n;&|]*\s-D(?:\s|$)"),
+        "git branch -D deletes an unmerged branch",
+    ),
+    (
+        re.compile(r"(?i)\bgit\s+(?:checkout|switch)\b[^\r\n;&|]*(?:\s-f(?:\s|$)|--force\b|--discard-changes\b)"),
+        "forced Git branch switching can discard workspace changes",
+    ),
+    (
+        re.compile(r"(?i)\bgit\s+push\b[^\r\n;&|]*(?:--force(?:-with-lease|-if-includes)?\b|\s-f(?:\s|$))"),
+        "force-pushing rewrites remote branch history",
+    ),
+    (
+        re.compile(r"(?i)\bgit\s+push\b[^\r\n;&|]*\s(?::[^\s;&|]+|--delete\b)"),
+        "deleting a remote Git branch changes shared history",
+    ),
+)
+_DESTRUCTIVE_VERB_RE = re.compile(r"(?i)\b(?:rm|remove-item|ri|rd|rmdir|del|erase)\b")
+_UNBOUNDED_SCAN_PATTERNS: tuple[tuple[re.Pattern, str], ...] = (
+    (
+        re.compile(r"(?i)\btree(?:\.com)?(?:\s|$)"),
+        "unbounded tree scan is blocked",
+    ),
+    (
+        re.compile(r"(?i)\bdir\b[^\r\n;&|]*/s\b"),
+        "unbounded dir /s scan is blocked",
+    ),
+    (
+        re.compile(r"(?i)\b(?:get-childitem|gci|ls)\b[^\r\n;&|]*-(?:recurse|r)\b"),
+        "unbounded recursive directory scan is blocked",
+    ),
+    (
+        re.compile(r"(?i)\bls\b[^\r\n;&|]*-[A-Za-z]*R[A-Za-z]*\b"),
+        "unbounded ls -R scan is blocked",
+    ),
+)
+_BROAD_TARGET_RE = re.compile(
+    r"(?i)(?:^|\s)(?:"
+    r"[A-Z]:[\\/](?:\s|$)"
+    r"|[\\/](?:\s|$)"
+    r"|\.{1,2}(?:\s|$)"
+    r"|\*"
+    r"|%USERPROFILE%"
+    r"|%HOMEPATH%"
+    r"|\$HOME"
+    r"|\$PWD"
+    r")"
+)
+
+
+def _iter_permission_dicts(value, *, _depth: int = 0):
+    if _depth > 8:
+        return
+    if isinstance(value, dict):
+        yield value
+        for item in value.values():
+            yield from _iter_permission_dicts(item, _depth=_depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_permission_dicts(item, _depth=_depth + 1)
+
+
+def _iter_permission_strings(value, *, _depth: int = 0):
+    if _depth > 8:
+        return
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                yield key
+            yield from _iter_permission_strings(item, _depth=_depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_permission_strings(item, _depth=_depth + 1)
+
+
+def _permission_tool_names(tool_name: str, tool_input) -> set[str]:
+    names = {str(tool_name or "").strip().lower()}
+    for obj in _iter_permission_dicts(tool_input):
+        for key in _TOOL_NAME_KEYS:
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                names.add(value.strip().lower())
+    return names
+
+
+def _extract_permission_command(tool_name: str, tool_input) -> str:
+    if isinstance(tool_input, str):
+        return tool_input if any(h in str(tool_name or "").lower() for h in _SHELL_TOOL_HINTS) else ""
+    for obj in _iter_permission_dicts(tool_input):
+        for key in _COMMAND_KEYS:
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for key in ("arguments", "input", "args"):
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    for command_key in _COMMAND_KEYS:
+                        command = parsed.get(command_key)
+                        if isinstance(command, str) and command.strip():
+                            return command.strip()
+    raw_tool = str(tool_name or "")
+    shell_prefixes = tuple(f"{hint} {chr(0x00B7)}" for hint in _SHELL_TOOL_HINTS)
+    lowered = raw_tool.lower()
+    for prefix in shell_prefixes:
+        if lowered.startswith(prefix):
+            return raw_tool.split(chr(0x00B7), 1)[1].strip()
+    return ""
+
+
+def _looks_like_shell_permission(tool_name: str, tool_input, command: str) -> bool:
+    if command:
+        return True
+    return any(
+        hint in name
+        for name in _permission_tool_names(tool_name, tool_input)
+        for hint in _SHELL_TOOL_HINTS
+    )
+
+
+def _has_unclosed_quote(command: str) -> bool:
+    quote = ""
+    escaped = False
+    for ch in command:
+        if escaped:
+            escaped = False
+            continue
+        if ch in ("\\", "^", "`"):
+            escaped = True
+            continue
+        if ch in ("'", '"'):
+            if not quote:
+                quote = ch
+            elif quote == ch:
+                quote = ""
+    return bool(quote)
+
+
+def _unsafe_shell_command_reason(tool_name: str, tool_input) -> str:
+    command = _extract_permission_command(tool_name, tool_input)
+    if not _looks_like_shell_permission(tool_name, tool_input, command):
+        return ""
+    if not command:
+        return ""
+
+    for pattern, reason in _DESTRUCTIVE_COMMAND_PATTERNS:
+        if pattern.search(command):
+            if _has_unclosed_quote(command):
+                return f"{reason}; command also has unclosed quotes"
+            return reason
+
+    if _DESTRUCTIVE_VERB_RE.search(command) and _BROAD_TARGET_RE.search(command):
+        if _has_unclosed_quote(command):
+            return "broad destructive command with unclosed quotes is blocked"
+        return "broad destructive command target is blocked"
+
+    if _has_unclosed_quote(command) and _DESTRUCTIVE_VERB_RE.search(command):
+        return "destructive command with unclosed quotes is blocked"
+
+    for pattern, reason in _UNBOUNDED_SCAN_PATTERNS:
+        if pattern.search(command):
+            return reason
+
+    return ""
+
+
+def _destructive_git_command_reason(tool_name: str, tool_input) -> str:
+    """Return a reason that requires explicit Loom approval, not an auto-deny."""
+    command = _extract_permission_command(tool_name, tool_input)
+    if not _looks_like_shell_permission(tool_name, tool_input, command) or not command:
+        return ""
+    for pattern, reason in _DESTRUCTIVE_GIT_PATTERNS:
+        if pattern.search(command):
+            if _has_unclosed_quote(command):
+                return f"{reason}; command also has unclosed quotes"
+            return reason
+    return ""
+
+
+def _looks_like_goose_permission(data: dict) -> bool:
+    tool_input = data.get("tool_input")
+    return (
+        isinstance(tool_input, dict)
+        and isinstance(tool_input.get("params"), dict)
+        and (
+            "toolCall" in tool_input
+            or "tool_call" in tool_input
+            or "toolCall" in tool_input.get("params", {})
+            or "tool_call" in tool_input.get("params", {})
+        )
+    )
+
+
+def _goose_auto_allow_reason(tool_name: str, tool_input) -> str:
+    """Allow low-risk native Goose housekeeping tools without a Loom prompt."""
+    command = _extract_permission_command(tool_name, tool_input)
+    if command:
+        return ""
+
+    names = _permission_tool_names(tool_name, tool_input)
+    if any(name in _GOOSE_AUTO_ALLOW_TOOL_NAMES or name.startswith("tree ") for name in names):
+        return "Goose native tree tool"
+
+    text = "\n".join(_iter_permission_strings(tool_input)).lower()
+    if any("todo" in name for name in names):
+        return "Goose todo bookkeeping"
+    if ".goose" in text and "todo" in text:
+        return "Goose todo bookkeeping"
+    return ""
+
+
 def _update_gen_snapshot(gen_key: tuple, **fields):
     """Update the live snapshot for an active generation (called on every stream event)."""
     snap = _generation_snapshots.get(gen_key)
@@ -1167,7 +1481,17 @@ def _parse_image_paths(image_path) -> list[str]:
 
 # ── Static files ──
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+class _LoomStaticFiles(StaticFiles):
+    """Revalidate executable UI assets so source and browser cannot drift."""
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        if Path(path).suffix.lower() in {".html", ".js", ".css"}:
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/static", _LoomStaticFiles(directory="static"), name="static")
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 
@@ -1266,7 +1590,10 @@ async def serve_canvas_file(conv_id: int, file_path: str = "index.html"):
 
 @app.get("/")
 async def index():
-    return FileResponse("static/index.html")
+    return FileResponse(
+        "static/index.html",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/{slug}")
@@ -1766,14 +2093,37 @@ async def _refresh_all_engines_cache() -> dict:
 
     live_models = status.get("models", [])
     model_name_map = status.get("model_name_map", {})
+    model_meta = status.get("model_meta", {})
     out: list[dict] = []
     for m in disk_models:
         is_loaded = False
+        server_id = model_name_map.get(m)
         if m in model_name_map and model_name_map[m] in live_models:
             is_loaded = True
         elif live_models and m == status.get("target_model"):
             is_loaded = True
-        out.append({"name": m, "backend": "llama", "loaded": is_loaded})
+            server_id = m
+        configured = bool(config.llama_model and models_match(m, config.llama_model))
+        out.append({
+            "name": m,
+            "backend": "llama",
+            "loaded": is_loaded,
+            "configured": configured,
+            "server_id": server_id,
+            "runtime": model_meta.get(server_id or m, {}),
+        })
+
+    for server_id in live_models:
+        if any((model_name_map.get(m) == server_id) or (m == server_id) for m in disk_models):
+            continue
+        out.append({
+            "name": server_id,
+            "backend": "llama",
+            "loaded": True,
+            "configured": bool(config.llama_model and models_match(server_id, config.llama_model)),
+            "server_id": server_id,
+            "runtime": model_meta.get(server_id, {}),
+        })
 
     # Append Dream Engine models from an OpenAI-compatible DiffusionGemma
     # endpoint. backend:"dream" routes direct generation through dream_client.
@@ -1781,7 +2131,7 @@ async def _refresh_all_engines_cache() -> dict:
     dream_seen: set[str] = set()
     dream_model = (getattr(config, "dream_model", "") or "").strip()
     if dream_model:
-        out.append({"name": dream_model, "backend": "dream", "loaded": False})
+        out.append({"name": dream_model, "backend": "dream", "loaded": False, "configured": True})
         dream_seen.add(dream_model)
 
     if isinstance(dh, dict) and dh is not None:
@@ -1794,12 +2144,15 @@ async def _refresh_all_engines_cache() -> dict:
                     if model.get("backend") == "dream" and model.get("name") == name:
                         model["loaded"] = loaded
                 continue
-            out.append({"name": name, "backend": "dream", "loaded": loaded})
+            out.append({"name": name, "backend": "dream", "loaded": loaded, "configured": name == dream_model})
             dream_seen.add(name)
 
     _ALL_ENGINES_CACHE = {
         "models": out,
         "active_backend": "llama",
+        "llama_host": config.llama_host,
+        "target_model": config.llama_model,
+        "live_models": live_models,
         "fetched_at": time.time(),
     }
     return _ALL_ENGINES_CACHE
@@ -2199,6 +2552,7 @@ async def api_create_conversation(data: dict = None):
     mode = data.get("mode", "weave")
     project_dir = data.get("project_dir")
     nrol_operator = 1 if data.get("nrol_operator") else 0
+    parallel_agents_enabled = 1 if _truthy_setting(data.get("parallel_agents_enabled")) else 0
     if nrol_operator:
         # Operator conversations are CC sessions launched from a neutral
         # workspace — never the Loom repo or the NROL engine repo — so any
@@ -2254,11 +2608,25 @@ async def api_create_conversation(data: dict = None):
             raise HTTPException(status_code=400, detail=blocked)
 
     if mode == "claude":
-        mode = _mode_for_cc_model(cc_model)
+        resolved_mode = _mode_for_cc_model(cc_model)
+        if resolved_mode is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown model selector '{cc_model}'; refresh the picker or choose an available model",
+            )
+        mode = resolved_mode
         is_umans = is_umans_model(cc_model)
         is_openrouter = openrouter_client.is_openrouter_model(cc_model)
         if is_umans or is_openrouter:
             _reject_disabled_umans_for_new_selection(cc_model)
+
+    if parallel_agents_enabled:
+        if nrol_operator:
+            raise HTTPException(400, "Parallel agents are not available for NROL-AO operator conversations")
+        if mode not in _AGENT_WORKSPACE_MODES:
+            raise HTTPException(400, "Parallel agents are only available for agent conversations")
+        if not project_dir:
+            raise HTTPException(400, "Parallel agents require a working directory")
 
     conv = await db.create_conversation(
         title, character_id, mode=mode, project_dir=project_dir
@@ -2277,6 +2645,7 @@ async def api_create_conversation(data: dict = None):
         ooda_enabled=0 if system_only else (1 if mode == "weave" else 0),
         system_only=1 if system_only else 0,
         system_prompt=(system_prompt.strip() if isinstance(system_prompt, str) and system_prompt.strip() else None),
+        parallel_agents_enabled=parallel_agents_enabled,
     )
     if nrol_operator:
         fields["nrol_operator"] = 1
@@ -2466,7 +2835,7 @@ async def api_get_conversation(conv_id: int):
                 await db.update_conversation_fields(conv_id, cc_model=config.llama_model)
     if conv.get("cc_model") and (conv.get("mode") or "").lower() in {"claude", "codex", "gemini", "goose", "umans", "openrouter"}:
         expected_mode = _mode_for_cc_model(conv.get("cc_model"))
-        if expected_mode != conv.get("mode"):
+        if expected_mode and expected_mode != conv.get("mode"):
             conv["mode"] = expected_mode
             await db.update_conversation_fields(conv_id, mode=expected_mode)
     # Lazy-mint a slug for conversations that had canvas enabled before
@@ -2487,6 +2856,9 @@ async def api_update_conversation(conv_id: int, data: dict):
     import json as _json
 
     fields = {}
+    conv = await db.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
     if "style_nudge" in data:
         fields["style_nudge"] = data["style_nudge"]
     if "persona_id" in data:
@@ -2502,8 +2874,17 @@ async def api_update_conversation(conv_id: int, data: dict):
     if "nsfw" in data:
         fields["nsfw"] = int(data["nsfw"])
     if "cc_model" in data:
-        fields["cc_model"] = data["cc_model"]
-        fields["mode"] = _mode_for_cc_model(data["cc_model"])
+        cc_model = data["cc_model"]
+        if conv and conv.get("mode") == "goose":
+            cc_model = _goose_selector_for_model(cc_model) or cc_model
+        resolved_mode = _mode_for_cc_model(cc_model)
+        if resolved_mode is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown model selector '{cc_model}'; refresh the picker or choose an available model",
+            )
+        fields["cc_model"] = cc_model
+        fields["mode"] = resolved_mode
     if "cc_effort" in data:
         fields["cc_effort"] = data["cc_effort"]
     if "cc_permission_mode" in data:
@@ -2526,6 +2907,17 @@ async def api_update_conversation(conv_id: int, data: dict):
         fields["system_prompt"] = value.strip() if isinstance(value, str) and value.strip() else None
     if "folder" in data:
         fields["folder"] = data["folder"]
+    if "parallel_agents_enabled" in data:
+        desired = 1 if _truthy_setting(data.get("parallel_agents_enabled")) else 0
+        if desired:
+            mode = fields.get("mode") or conv.get("mode")
+            if conv.get("nrol_operator"):
+                raise HTTPException(400, "Parallel agents are not available for NROL-AO operator conversations")
+            if mode not in _AGENT_WORKSPACE_MODES:
+                raise HTTPException(400, "Parallel agents are only available for agent conversations")
+            if not conv.get("project_dir"):
+                raise HTTPException(400, "Parallel agents require a working directory")
+        fields["parallel_agents_enabled"] = desired
     if fields:
         await db.update_conversation_fields(conv_id, **fields)
     return await db.get_conversation(conv_id)
@@ -3272,15 +3664,79 @@ async def api_upload(file: UploadFile = File(...)):
 # ── Config ──
 
 
+def _resolve_llama_server_exe_for_config(raw: str | None, models_dir: str | None) -> str | None:
+    raw = (raw or "").strip().strip('"')
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return str(p) if p.is_file() else None
+    found = shutil.which(raw)
+    if found:
+        return found
+
+    candidates = [Path(__file__).parent / p]
+    if raw.lower() in {"llama-server", "llama-server.exe"}:
+        model_root = Path(models_dir or config.llama_models_dir).expanduser()
+        candidates.extend([
+            model_root.parent / "bin" / "llama-server.exe",
+            model_root.parent / "llama-server.exe",
+            Path.home() / "OneDrive" / "Documents" / "LS" / "bin" / "llama-server.exe",
+            Path.home() / "Documents" / "LS" / "bin" / "llama-server.exe",
+            Path(r"C:\LlamaServer\bin\llama-server.exe"),
+            Path(r"C:\LlamaServer\llama-server.exe"),
+        ])
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _normalized_config_dict() -> dict:
+    data = config.to_dict()
+    resolved = _resolve_llama_server_exe_for_config(
+        data.get("llama_server_exe"),
+        data.get("llama_models_dir"),
+    )
+    if resolved and resolved != data.get("llama_server_exe"):
+        config.llama_server_exe = resolved
+        config.save()
+        data = config.to_dict()
+    return data
+
+
 @app.get("/api/config")
 async def api_get_config():
-    return config.to_dict()
+    config.load()
+    return _normalized_config_dict()
 
 
 @app.put("/api/config")
 async def api_update_config(data: dict):
+    config.load()
+    if "llama_server_exe" in data:
+        incoming = str(data.get("llama_server_exe") or "").strip()
+        current = _resolve_llama_server_exe_for_config(
+            config.llama_server_exe,
+            config.llama_models_dir,
+        )
+        incoming_is_unresolved_bare = (
+            incoming.lower() in {"llama-server", "llama-server.exe"}
+            and not shutil.which(incoming)
+        )
+        if incoming_is_unresolved_bare and current:
+            data = dict(data)
+            data["llama_server_exe"] = current
+        else:
+            resolved = _resolve_llama_server_exe_for_config(
+                incoming,
+                data.get("llama_models_dir") or config.llama_models_dir,
+            )
+            if resolved:
+                data = dict(data)
+                data["llama_server_exe"] = resolved
     config.update_from_dict(data)
-    return config.to_dict()
+    return _normalized_config_dict()
 
 
 # ── OpenRouter ──
@@ -3299,6 +3755,8 @@ async def api_post_openrouter_secrets(data: dict):
         ("api_key", "OPENROUTER_API_KEY"),
         ("management_key", "OPENROUTER_MANAGEMENT_KEY"),
     ):
+        if key not in data:
+            continue
         value = data.get(key)
         if value is None or value == "":
             clear_names.add(env_name)
@@ -3362,10 +3820,8 @@ def get_initial_codex_models() -> list[dict]:
     if local_models:
         return local_models
     return [
-        {"value": "codex-gpt-5.5", "label": "Codex (GPT-5.5)"},
-        {"value": "codex-gpt-5.4", "label": "Codex (GPT-5.4)"},
-        {"value": "codex-gpt-5.4-mini", "label": "Codex (GPT-5.4-mini)"},
-        {"value": "codex-gpt-5.3-codex", "label": "Codex (GPT-5.3-codex)"},
+        {"value": "codex-gpt-5.6-sol", "label": "Codex (GPT-5.6-Sol)"},
+        {"value": "codex-gpt-5.6-terra", "label": "Codex (GPT-5.6-Terra)"},
         {"value": "codex-gpt-4o", "label": "Codex (GPT-4o)"},
     ]
 
@@ -3440,11 +3896,11 @@ CC_MODELS = [
             "label": f"Goose Dream ({config.dream_model})",
         },
     ]},
-    {"group": "Goose ACP - Auto/Subagents", "models": [
-        {"value": "goose:auto:openrouter:z-ai/glm-5.2", "label": "Goose Auto GLM 5.2"},
+    {"group": "Goose ACP - Smart/Subagents", "models": [
+        {"value": "goose:auto:openrouter:z-ai/glm-5.2", "label": "Goose Smart GLM 5.2"},
         {
             "value": f"goose:auto:dream:{config.dream_model}",
-            "label": f"Goose Auto Dream ({config.dream_model})",
+            "label": f"Goose Smart Dream ({config.dream_model})",
         },
     ]},
     {"group": "OpenRouter", "models": [
@@ -3468,13 +3924,52 @@ CC_MODELS = [
 ]
 
 
+def _runtime_goose_llama_model(auto: bool = False) -> dict | None:
+    """Goose selector for the currently configured local llama-server model."""
+    model = (config.llama_model or "").strip()
+    if not model:
+        return None
+    prefix = "goose:auto:llama:" if auto else "goose:llama:"
+    label_prefix = "Goose Smart Llama Server" if auto else "Goose Llama Server"
+    return {
+        "value": f"{prefix}{model}",
+        "label": f"{label_prefix} ({Path(model).name})",
+    }
+
+
+def _cc_models_with_runtime_goose_llama() -> list[dict]:
+    """Return CC model groups plus runtime-derived Goose local entries.
+
+    CC_MODELS is mutated by remote-model refreshes and is intentionally kept as
+    the base list. The local llama model can change through Settings without a
+    process restart, so derive the Goose-local selector when serving the picker.
+    """
+    groups: list[dict] = []
+    for group in CC_MODELS:
+        copied = {
+            "group": group.get("group", ""),
+            "models": list(group.get("models", [])),
+        }
+        if copied["group"] == "Goose ACP":
+            entry = _runtime_goose_llama_model(auto=False)
+            if entry and not any(m.get("value") == entry["value"] for m in copied["models"]):
+                copied["models"].append(entry)
+        elif copied["group"] == "Goose ACP - Smart/Subagents":
+            entry = _runtime_goose_llama_model(auto=True)
+            if entry and not any(m.get("value") == entry["value"] for m in copied["models"]):
+                copied["models"].append(entry)
+        groups.append(copied)
+    return groups
+
+
 def _visible_cc_models() -> list[dict]:
     """Return CC model groups, hiding disabled compatibility provider groups."""
+    groups = _cc_models_with_runtime_goose_llama()
     if config.enable_umans_models and config.enable_goose:
-        return CC_MODELS
+        return groups
     return [
         group
-        for group in CC_MODELS
+        for group in groups
         if (config.enable_umans_models or "umans" not in group.get("group", "").lower())
         and (config.enable_goose or "goose" not in group.get("group", "").lower())
     ]
@@ -3882,8 +4377,29 @@ async def handle_cc_permission(data: dict):
     permission_key = _permission_fingerprint(tool_name, tool_input, approval_method)
     scoped_key = (conv_id, permission_scope)
 
+    unsafe_reason = _unsafe_shell_command_reason(tool_name, tool_input)
+    if unsafe_reason:
+        command = _extract_permission_command(tool_name, tool_input)
+        msg = (
+            f"Blocked by Loom command safeguard: {unsafe_reason}. "
+            "Use a narrower non-recursive command, a structured file tool, or ask the user to run it manually."
+        )
+        print(f"[PERM] Auto-denied unsafe command for conv={conv_id}: {unsafe_reason} :: {command[:240]}")
+        return {"allow": False, "message": msg}
+
+    destructive_git_reason = _destructive_git_command_reason(tool_name, tool_input)
+
+    if _looks_like_goose_permission(data):
+        auto_allow_reason = _goose_auto_allow_reason(tool_name, tool_input)
+        if auto_allow_reason:
+            print(f"[PERM] Auto-allowed Goose tool for conv={conv_id}: {auto_allow_reason} :: {tool_name}")
+            return {"allow": True, "always": True, "message": auto_allow_reason}
+
     # Auto-approve only the same request within the same branch generation.
-    if permission_key in _auto_approve_permissions.get(scoped_key, set()):
+    if (
+        not destructive_git_reason
+        and permission_key in _auto_approve_permissions.get(scoped_key, set())
+    ):
         print(f"[PERM] Auto-approved scoped permission: scope={permission_scope} key={permission_key}")
         return {"allow": True, "always": True}
 
@@ -3946,9 +4462,15 @@ async def handle_cc_permission(data: dict):
         "permission_key": permission_key,
         "permission_scope": permission_scope,
     }
-    gen_id = _permission_scope_gen_id(permission_scope)
-    if gen_id is not None:
-        perm_msg["gen_id"] = gen_id
+    if destructive_git_reason:
+        perm_msg.update(
+            {
+                "risk_level": "destructive",
+                "risk_reason": destructive_git_reason,
+                "supports_allow_all": False,
+            }
+        )
+    perm_msg.update(_generation_branch_for_scope(conv_id, permission_scope))
     # Persist to DB first (survives server restart)
     await db.save_pending_permission(
         request_id, conv_id, tool_name, tool_input, input_summary
@@ -3985,6 +4507,11 @@ async def handle_cc_permission(data: dict):
         "approval_method": approval_method,
         "permission_key": permission_key,
         "permission_scope": permission_scope,
+        "risk_level": "destructive" if destructive_git_reason else "",
+        "risk_reason": destructive_git_reason,
+        "supports_allow_all": not bool(destructive_git_reason),
+        "parent_id": perm_msg.get("parent_id"),
+        "draft_msg_id": perm_msg.get("draft_msg_id"),
     }
 
     # Wait for user response with a timeout.
@@ -4331,12 +4858,19 @@ def _scrub_surrogates(obj):
 async def _ws_send(conv_id: int, data: dict):
     """Best-effort broadcast to ALL active WebSockets for a conversation.
     Silently skips dead clients — generation continues regardless.
-    Auto-injects gen_id from the current task if present."""
-    # Auto-tag with gen_id so client can distinguish parallel streams
+    Auto-injects generation and branch identity from the current task."""
+    # Auto-tag every generation event so clients can distinguish parallel
+    # streams and reconnect to the branch they are actually viewing.
     task = asyncio.current_task()
     gen_key = getattr(task, "_gen_key", None)
-    if gen_key and data.get("type") != "generation_idle" and "gen_id" not in data:
-        data = {**data, "gen_id": gen_key[2]}
+    if gen_key and data.get("type") != "generation_idle":
+        snapshot = _generation_snapshots.get(gen_key) or {}
+        tagged = dict(data)
+        tagged.setdefault("gen_id", gen_key[2])
+        tagged.setdefault("parent_id", snapshot.get("parent_id", gen_key[1]))
+        if snapshot.get("draft_msg_id") is not None:
+            tagged.setdefault("draft_msg_id", snapshot.get("draft_msg_id"))
+        data = tagged
     clients = _active_websockets.get(conv_id)
     _t = data.get("type", "?")
     # Per-conv tracker for the /api/debug/stream-state endpoint: lets a
@@ -4383,9 +4917,71 @@ def _has_active_generation_for_conv(conv_id: int) -> bool:
     )
 
 
+def _active_generation_keys_for_cancel(
+    conv_id: int,
+    gen_id: int | str | None = None,
+    draft_msg_id: int | str | None = None,
+) -> list[tuple[int, int | None, int]]:
+    """Resolve a cancel request to one generation, or all for legacy clients."""
+    selected = []
+    gen_text = str(gen_id) if gen_id is not None else None
+    draft_text = str(draft_msg_id) if draft_msg_id is not None else None
+    scoped = gen_text is not None or draft_text is not None
+    for key, task in _active_generations.items():
+        if key[0] != conv_id or task.done():
+            continue
+        snapshot = _generation_snapshots.get(key) or {}
+        if gen_text is not None and str(key[2]) != gen_text:
+            continue
+        if draft_text is not None and str(snapshot.get("draft_msg_id")) != draft_text:
+            continue
+        selected.append(key)
+    if scoped:
+        return selected
+    return [
+        key for key, task in _active_generations.items()
+        if key[0] == conv_id and not task.done()
+    ]
+
+
 async def _send_generation_idle_if_quiescent(conv_id: int):
     if not _has_active_generation_for_conv(conv_id):
         await _ws_send(conv_id, {"type": "generation_idle"})
+
+
+async def _handle_generation_with_workspace_safety(
+    websocket: WebSocket, conv_id: int, data: dict
+):
+    """Wrap every tool-capable provider turn in one neutral recovery boundary."""
+    snapshot = None
+    conv = await db.get_conversation(conv_id)
+    project_dir = conv.get("project_dir") if conv else None
+    mode = conv.get("mode") if conv else None
+    if project_dir and mode in _AGENT_WORKSPACE_MODES:
+        gen_key = getattr(asyncio.current_task(), "_gen_key", None)
+        generation_id = gen_key[2] if gen_key else data.get("_gen_id")
+        recovery_root = default_recovery_root()
+        try:
+            snapshot = await asyncio.to_thread(
+                capture_workspace_snapshot,
+                project_dir,
+                recovery_root,
+                conversation_id=conv_id,
+                generation_id=generation_id,
+            )
+        except Exception as exc:
+            print(f"[WORKSPACE-SAFETY] Snapshot failed for conv={conv_id}: {exc!r}")
+
+    try:
+        await _handle_generation(websocket, conv_id, data)
+    finally:
+        if snapshot is not None:
+            try:
+                report = await asyncio.to_thread(finalize_workspace_snapshot, snapshot)
+                if report.get("changed_count") or report.get("warnings"):
+                    await _ws_send(conv_id, report)
+            except Exception as exc:
+                print(f"[WORKSPACE-SAFETY] Change report failed for conv={conv_id}: {exc!r}")
 
 
 async def _ws_broadcast_all(data: dict):
@@ -4429,6 +5025,7 @@ async def _send_active_gen_state(websocket: WebSocket, conv_id: int) -> bool:
                     "output_tokens": snap.get("output_tokens", 0),
                     "started_at": snap.get("started_at", 0),
                     "cc_model": snap.get("cc_model", ""),
+                    "model_attestation": snap.get("model_attestation"),
                     "mode": snap.get("mode", "claude"),
                 }
             )
@@ -4468,6 +5065,11 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                     "approval_method": pending.get("approval_method", ""),
                     "permission_key": pending.get("permission_key", ""),
                     "permission_scope": pending.get("permission_scope", ""),
+                    "risk_level": pending.get("risk_level", ""),
+                    "risk_reason": pending.get("risk_reason", ""),
+                    "supports_allow_all": pending.get("supports_allow_all", True),
+                    "parent_id": pending.get("parent_id"),
+                    "draft_msg_id": pending.get("draft_msg_id"),
                 }
                 gen_id = _permission_scope_gen_id(pending.get("permission_scope", ""))
                 if gen_id is not None:
@@ -4494,6 +5096,11 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                     "approval_method": pending.get("approval_method", ""),
                     "permission_key": pending.get("permission_key", ""),
                     "permission_scope": pending.get("permission_scope", ""),
+                    "risk_level": pending.get("risk_level", ""),
+                    "risk_reason": pending.get("risk_reason", ""),
+                    "supports_allow_all": pending.get("supports_allow_all", True),
+                    "parent_id": pending.get("parent_id"),
+                    "draft_msg_id": pending.get("draft_msg_id"),
                 }
                 gen_id = _permission_scope_gen_id(pending.get("permission_scope", ""))
                 if gen_id is not None:
@@ -4529,26 +5136,41 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 continue
 
             if action == "cancel":
-                # Cancel all active generations for this conversation
-                cancelled_keys = [k for k in _active_generations if k[0] == conv_id]
+                # New clients identify the visible generation. Legacy clients
+                # omit both selectors and retain the old cancel-all behavior.
+                cancelled_keys = _active_generation_keys_for_cancel(
+                    conv_id,
+                    gen_id=data.get("gen_id"),
+                    draft_msg_id=data.get("draft_msg_id"),
+                )
+                if not cancelled_keys:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "error": "The selected generation is no longer active",
+                            "gen_id": data.get("gen_id"),
+                            "draft_msg_id": data.get("draft_msg_id"),
+                        }
+                    )
+                    continue
+                cancelled_snapshots = {
+                    key: dict(_generation_snapshots.get(key) or {})
+                    for key in cancelled_keys
+                }
                 cancelled_tasks = []
                 for key in cancelled_keys:
                     task = _active_generations.pop(key, None)
                     if task:
                         task.cancel()
                         cancelled_tasks.append(task)
-                proc = _active_claude_procs.pop(conv_id, None)
-                if proc:
-                    await claude_client.cancel_claude(proc)
-                hproc = _active_hermes_procs.pop(conv_id, None)
-                if hproc and hermes_client is not None:
-                    await hermes_client.cancel_hermes(hproc)
-                gproc = _active_goose_procs.pop(conv_id, None)
-                if gproc:
-                    await goose_client.cancel_goose(gproc)
                 # Clean up pending permissions from memory and DB
                 for rid in list(_pending_hook_permissions):
-                    if _pending_hook_permissions[rid].get("conv_id") == conv_id:
+                    pending = _pending_hook_permissions[rid]
+                    pending_gen_id = _permission_scope_gen_id(pending.get("permission_scope", ""))
+                    if pending.get("conv_id") == conv_id and (
+                        data.get("gen_id") is None
+                        or str(pending_gen_id) == str(data.get("gen_id"))
+                    ):
                         _pending_hook_permissions.pop(rid, None)
                         await db.delete_pending_permission(rid)
                 # Wait for tasks to finish their CancelledError handler (saves partial content).
@@ -4563,8 +5185,20 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                         )
                     except asyncio.TimeoutError:
                         pass  # tasks hung — already cleaned up, continue
-                # Send cancelled event immediately so UI responds
-                await _ws_send(conv_id, {"type": "cancelled"})
+                # Send one scoped event per cancelled generation. The task's
+                # own CancelledError handler may also emit this; the client
+                # filters/idempotently clears only the stream it owns.
+                for key in cancelled_keys:
+                    snapshot = cancelled_snapshots.get(key) or {}
+                    await _ws_send(
+                        conv_id,
+                        {
+                            "type": "cancelled",
+                            "gen_id": key[2],
+                            "parent_id": snapshot.get("parent_id", key[1]),
+                            "draft_msg_id": snapshot.get("draft_msg_id"),
+                        },
+                    )
                 continue
 
             if action == "permission_response":
@@ -4580,7 +5214,9 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                         pending.get("approval_method", ""),
                     )
                     permission_scope = pending.get("permission_scope") or _permission_scope_for_active_generation(pending_conv_id)
-                    always = bool(data.get("always"))
+                    always = bool(data.get("always")) and bool(
+                        pending.get("supports_allow_all", True)
+                    )
                     if allow and always:
                         _auto_approve_permissions.setdefault((pending_conv_id, permission_scope), set()).add(permission_key)
                     pending["response"] = {
@@ -4624,10 +5260,22 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 # Weave/OODA and allowed to spawn parallel CC subprocesses.)
                 is_subprocess_agent = mode in (
                     "claude", "local", "hermes", "dream",
-                    "gemini", "codex", "umans", "openrouter",
+                    "gemini", "codex", "goose", "umans", "openrouter",
+                )
+                parallel_same_checkout = bool(
+                    conv and _truthy_setting(conv.get("parallel_agents_enabled"))
                 )
 
-                if is_subprocess_agent:
+                if parallel_same_checkout and action == "generate" and "parent_id" not in data:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "error": "parent_id is required when parallel agents are enabled so Loom cannot launch on the wrong branch",
+                        }
+                    )
+                    continue
+
+                if is_subprocess_agent and not parallel_same_checkout:
                     # Only one agent generation per conversation
                     cc_busy = any(
                         k[0] == conv_id and not t.done()
@@ -4674,7 +5322,9 @@ async def ws_chat(websocket: WebSocket, conv_id: int):
                 data["_gen_id"] = (
                     _gen_seq  # unique ID so client can filter parallel streams
                 )
-                task = asyncio.create_task(_handle_generation(websocket, conv_id, data))
+                task = asyncio.create_task(
+                    _handle_generation_with_workspace_safety(websocket, conv_id, data)
+                )
                 task._origin_ws = websocket
                 task._gen_key = gen_key
                 _active_generations[gen_key] = task
@@ -4923,31 +5573,30 @@ async def _run_compact_handoff(
     re-parented under the marker) the unchanged user message id.
     Returns (None, None, None) on failure.
     """
-    # Find the most recent assistant session we can actually /compact.
-    # Needs to be Anthropic (gemini has no --fork-session, local doesn't have
-    # /compact) and ideally 1M-context since we're over 175k.
-    session_id = None
+    # Compact only the nearest assistant boundary. Searching farther back for
+    # an older Claude session after another harness has spoken would create a
+    # summary that silently omits the intervening turn.
     branch = await db.get_branch_to_root(parent_leaf_id)
-    for msg in reversed(branch):
-        if msg["role"] != "assistant":
-            continue
-        if not msg.get("cc_session_id"):
-            continue
-        prev_model = msg.get("cc_model_used") or ""
-        # Only Anthropic sessions can run /compact.
-        _base = prev_model.split("[")[0] if "[" in prev_model else prev_model
-        if _base not in {"sonnet", "opus", "haiku"}:
-            continue
-        session_id = msg["cc_session_id"]
-        compact_model = prev_model or "sonnet[1m]"
-        break
-
-    if not session_id:
+    resume_decision = select_resume_session(branch, "claude")
+    source_message = next(
+        (msg for msg in branch if msg.get("id") == resume_decision.message_id),
+        None,
+    )
+    prev_model = (source_message or {}).get("cc_model_used") or ""
+    if not resume_decision.can_resume or not model_context.is_anthropic(prev_model):
         await _ws_send(
             conv_id,
-            {"type": "status", "text": "Handoff skipped — no compactable session in this branch"},
+            {
+                "type": "status",
+                "text": (
+                    "Handoff skipped — nearest assistant boundary is not a "
+                    f"compactable Anthropic session ({resume_decision.reason})"
+                ),
+            },
         )
         return None, None, None
+    session_id = resume_decision.session_id
+    compact_model = prev_model
 
     await _ws_send(
         conv_id,
@@ -4962,6 +5611,7 @@ async def _run_compact_handoff(
             conv_id=conv_id,
             server_port=server_port,
             model=compact_model,
+            requested_model=compact_model,
             effort=cc_effort,
             resume_session_id=session_id,
             fork_session=False,
@@ -5070,20 +5720,28 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
             await _ws_send(conv_id, {"type": "error", "error": "/compact is only available in Claude mode"})
             return
 
-        # Find the most recent CC session ID
-        session_id = conv.get("claude_session_id")
-        if not session_id:
-            # Fall back to scanning the branch for a session ID
-            leaf = await db.get_active_leaf(conv_id)
-            if leaf:
-                branch = await db.get_branch_to_root(leaf["id"])
-                for msg in reversed(branch):
-                    if msg["role"] == "assistant" and msg.get("cc_session_id"):
-                        session_id = msg["cc_session_id"]
-                        break
+        # Resolve from the active branch, never from the conversation-global
+        # cache: that cache may point to a session from before a provider switch.
+        session_id = None
+        resume_reason = "empty_branch"
+        leaf = await db.get_active_leaf(conv_id)
+        if leaf:
+            branch = await db.get_branch_to_root(leaf["id"])
+            resume_decision = select_resume_session(branch, "claude")
+            session_id = resume_decision.session_id
+            resume_reason = resume_decision.reason
 
         if not session_id:
-            await _ws_send(conv_id, {"type": "error", "error": "No CC session to compact — send at least one message first"})
+            await _ws_send(
+                conv_id,
+                {
+                    "type": "error",
+                    "error": (
+                        "No compatible nearest Claude session to compact "
+                        f"({resume_reason}); continue once to rebuild from Loom history"
+                    ),
+                },
+            )
             return
 
         project_dir = conv.get("project_dir") or "."
@@ -5118,6 +5776,7 @@ async def _handle_compact(websocket: WebSocket, conv_id: int, data: dict):
             conv_id=conv_id,
             server_port=server_port,
             model=cc_model,
+            requested_model=cc_model,
             effort=cc_effort,
             resume_session_id=session_id,
             fork_session=False,  # compact in place, don't fork
@@ -5272,6 +5931,22 @@ def _dream_claude_model_id(model: str) -> str:
     return model or (getattr(config, "dream_model", "") or "diffusiongemma")
 
 
+def _goose_selector_for_model(model: str | None) -> str | None:
+    """Return a Goose-routed selector for models Goose can host directly."""
+    raw = (model or "").strip()
+    if not raw:
+        return None
+    if goose_client.is_goose_model(raw):
+        return raw
+    if openrouter_client.is_openrouter_model(raw):
+        return f"goose:openrouter:{openrouter_client.model_slug(raw)}"
+    if raw.lower().endswith(".gguf"):
+        return f"goose:llama:{raw}"
+    if is_dream_claude_model(raw):
+        return f"goose:dream:{_dream_claude_model_id(raw)}"
+    return None
+
+
 def _dream_shim_url() -> str:
     port = os.getenv("DREAM_SHIM_PORT", "8788")
     base = os.getenv("DREAM_SHIM_BASE_URL", f"http://127.0.0.1:{port}")
@@ -5379,6 +6054,109 @@ def models_match(a: str, b: str) -> bool:
     return na == nb or na in nb or nb in na
 
 
+_MODEL_ATTESTATION_SOURCE_DEFAULTS = {
+    "codex_app_server_thread_response": ("Codex app-server", "harness"),
+    "claude_code_system_init": ("Claude Code", "harness"),
+    "anthropic_compatible_message_start": ("Claude Code", "provider_response"),
+    "agy_cli_launch_arguments": ("Antigravity (agy)", "launch"),
+    "antigravity_stream_init": ("Antigravity (agy)", "harness"),
+    "goose_process_environment": ("Goose ACP", "launch"),
+    "goose_acp_session_model_state": ("Goose ACP", "harness"),
+    "hermes_acp_session_model_state": ("Hermes ACP", "harness"),
+    "hermes_acp_set_model_ack": ("Hermes ACP", "harness"),
+    "openrouter_request_accepted": ("OpenRouter API", "launch"),
+    "openrouter_request_configuration": ("OpenRouter API", "launch"),
+    "openrouter_stream_chunk": ("OpenRouter API", "provider_response"),
+    "openrouter_completion_response": ("OpenRouter API", "provider_response"),
+    "dream_request_configuration": ("Dream", "launch"),
+    "llama_server_request_configuration": ("Llama Server", "launch"),
+}
+
+
+def _normalize_turn_model_attestation(attestation: dict) -> dict:
+    """Fill schema fields omitted by attestations from older live adapters."""
+    normalized = dict(attestation)
+    defaults = _MODEL_ATTESTATION_SOURCE_DEFAULTS.get(normalized.get("source"))
+    if defaults:
+        if not normalized.get("harness"):
+            normalized["harness"] = defaults[0]
+        if not normalized.get("verification_level"):
+            normalized["verification_level"] = defaults[1]
+    if not normalized.get("harness"):
+        normalized["harness"] = "Unknown harness"
+    if not normalized.get("verification_level"):
+        normalized["verification_level"] = (
+            "harness" if normalized.get("status") == "verified" else "selection"
+        )
+    return normalized
+
+
+async def _record_turn_model_attestation(
+    conv_id: int,
+    draft_msg_id: int,
+    parent_id: int | None,
+    attestation: dict | None,
+    gen_key=None,
+) -> dict | None:
+    """Persist and broadcast the strongest model identity evidence for a turn."""
+    if not isinstance(attestation, dict):
+        return None
+    candidate = _normalize_turn_model_attestation(attestation)
+    existing = None
+    message = await db.get_message(draft_msg_id)
+    if message and message.get("model_attestation"):
+        try:
+            existing = _normalize_turn_model_attestation(
+                json.loads(message["model_attestation"])
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            existing = None
+    if isinstance(existing, dict):
+        existing_status = existing.get("status")
+        candidate_status = candidate.get("status")
+        weak_statuses = {"requested", "configured", "unverified"}
+        if existing_status in {"verified", "mismatch"} and candidate_status in weak_statuses:
+            return existing
+        if (
+            existing_status == "verified"
+            and candidate_status == "verified"
+            and existing.get("verification_level") == "provider_response"
+            and candidate.get("verification_level") != "provider_response"
+        ):
+            return existing
+
+    await db.update_message_content(
+        draft_msg_id,
+        model_attestation=json.dumps(candidate, separators=(",", ":")),
+    )
+    if gen_key:
+        _update_gen_snapshot(gen_key, model_attestation=candidate)
+    await _ws_send(
+        conv_id,
+        {
+            "type": "model_attestation",
+            "draft_msg_id": draft_msg_id,
+            "parent_id": parent_id,
+            "attestation": candidate,
+        },
+    )
+    return candidate
+
+
+def _model_attestation_status_text(attestation: dict) -> str:
+    status = attestation.get("status") or "unverified"
+    harness = attestation.get("harness") or "agent harness"
+    effective = attestation.get("effective_model") or attestation.get("launch_model") or "unknown"
+    provider = attestation.get("model_provider") or "unknown provider"
+    if status == "verified":
+        return f"Verified by {harness}: {effective} via {provider}"
+    if status == "mismatch":
+        return f"Model mismatch in {harness}: runtime reported {effective}"
+    if status == "configured":
+        return f"Configured {harness}: {effective}; effective model not exposed by runtime"
+    return f"Unverified {harness} model identity"
+
+
 async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
     """Handle a generation request over WebSocket — routes by conversation mode."""
     parent_id = data.get("parent_id")
@@ -5412,7 +6190,27 @@ async def _handle_generation(websocket: WebSocket, conv_id: int, data: dict):
     mode = conv.get("mode", "weave") if conv else "weave"
     if mode in {"claude", "codex", "gemini", "openrouter", "umans", "goose"}:
         requested_cc_model = data.get("cc_model") or conv.get("cc_model") or ""
+        if mode == "goose":
+            goose_routed_model = _goose_selector_for_model(requested_cc_model)
+            if goose_routed_model:
+                requested_cc_model = goose_routed_model
+                data["cc_model"] = goose_routed_model
         target_mode = _mode_for_cc_model(requested_cc_model)
+        if target_mode is None:
+            await _ws_send(
+                conv_id,
+                {
+                    "type": "error",
+                    "provider": mode,
+                    "stage": "model_resolution",
+                    "requested_model": requested_cc_model,
+                    "error": (
+                        f"Unknown model selector '{requested_cc_model}'; "
+                        "refresh the picker or choose an available model"
+                    ),
+                },
+            )
+            return
         if target_mode != mode:
             conv = dict(conv)
             conv["mode"] = target_mode
@@ -5500,6 +6298,9 @@ async def _handle_claude_generation(
 ):
     """Handle Claude Code CLI generation with session resume support."""
     print(f"[CC-GEN] Entered: conv_id={conv_id}, action={data.get('action')}, parent_id={data.get('parent_id')}, cc_model={data.get('cc_model')}, _use_llama={conv.get('_use_llama')}")
+    proc = None
+    is_gemini = False
+    is_codex = False
     try:
         action = data.get("action")
         parent_id = data.get("parent_id")
@@ -5534,9 +6335,20 @@ async def _handle_claude_generation(
             or conv.get("cc_permission_mode")
             or "default"
         )
-        # Persist client-provided settings back to DB for reload continuity
+        # Persist the exact generation settings together. This closes the race
+        # where a send can outrun the dropdown's independent PUT request.
+        generation_settings = {}
         if data.get("cc_model") and data["cc_model"] != conv.get("cc_model"):
-            await db.update_conversation_fields(conv_id, cc_model=cc_model)
+            generation_settings["cc_model"] = cc_model
+        if data.get("cc_effort") and data["cc_effort"] != conv.get("cc_effort"):
+            generation_settings["cc_effort"] = cc_effort
+        if (
+            data.get("cc_permission_mode")
+            and data["cc_permission_mode"] != conv.get("cc_permission_mode")
+        ):
+            generation_settings["cc_permission_mode"] = cc_permission_mode
+        if generation_settings:
+            await db.update_conversation_fields(conv_id, **generation_settings)
 
         # Identify provider based on model name. Accepts aliases (sonnet/opus/
         # haiku), pinned full IDs (claude-opus-4-6), and `[1m]` suffix variants.
@@ -5578,7 +6390,9 @@ async def _handle_claude_generation(
             else openrouter_client.model_slug(cc_model) if use_openrouter else cc_model
         )
         cc_session_mode = (
-            "dream-claude" if use_dream
+            "gemini" if is_gemini
+            else "codex" if is_codex
+            else "dream-claude" if use_dream
             else "openrouter-claude" if use_openrouter
             else "claude"
         )
@@ -5639,7 +6453,6 @@ async def _handle_claude_generation(
         fork_session = True  # always fork — every turn creates a new snapshot
         use_resume = False
         branch = []
-        crossed_provider = False
 
         # Group models that use Claude Code sessions
         is_cc_compatible = not (is_gemini or is_codex)
@@ -5659,55 +6472,13 @@ async def _handle_claude_generation(
             # replay, which will truncate at the compact marker.
             print(f"[CC] Handoff replay for {cc_model}")
         elif parent_id and branch:
-            # Find nearest ancestor assistant with a session ID AND real content
-            # Skip empty drafts, error messages, and broken sessions
-            for msg in reversed(branch):
-                if msg["role"] != "assistant":
-                    continue
-                if not msg.get("cc_session_id"):
-                    continue
-                content = msg.get("content") or ""
-                blocks_raw = msg.get("content_blocks") or ""
-                has_blocks = False
-                if blocks_raw:
-                    try:
-                        _b = json.loads(blocks_raw) if isinstance(blocks_raw, str) else blocks_raw
-                        has_blocks = bool(_b)
-                    except (json.JSONDecodeError, TypeError):
-                        has_blocks = False
-                if content.startswith("[Error:"):
-                    print(f"[CC] Skipping error session on msg {msg['id']}")
-                    continue
-                if not content.strip() and not has_blocks:
-                    print(f"[CC] Skipping empty session on msg {msg['id']}")
-                    continue
-                # Check if the session was created by a different provider system.
-                # Dream-Claude runs through the same CLI but a different local
-                # provider shim; keep its sessions isolated until proven safe.
-                prev_session_mode = msg.get("cc_session_mode")
-                if prev_session_mode and prev_session_mode != cc_session_mode:
-                    print(
-                        f"[CC] Cross-provider turn at msg {msg['id']} ({prev_session_mode}), will rebuild full history"
-                    )
-                    crossed_provider = True
-                    break
-                prev_model = msg.get("cc_model_used") or ""
-                prev_is_gemini = is_gemini_model(prev_model)
-                prev_is_codex = is_codex_model(prev_model)
-                prev_is_cc_compatible = bool(prev_model) and not (prev_is_gemini or prev_is_codex)
-                
-                if (
-                    (prev_is_gemini != is_gemini)
-                    or (prev_is_codex != is_codex)
-                    or (prev_is_cc_compatible != is_cc_compatible)
-                ):
-                    print(
-                        f"[CC] Cross-provider turn at msg {msg['id']} ({prev_model}), will rebuild full history"
-                    )
-                    crossed_provider = True
-                    break
-                resume_session_id = msg["cc_session_id"]
-                break
+            resume_decision = select_resume_session(branch, cc_session_mode)
+            resume_session_id = resume_decision.session_id
+            if not resume_session_id:
+                print(
+                    f"[CC] Native session rebuild: reason={resume_decision.reason} "
+                    f"boundary_msg={resume_decision.message_id} target={cc_session_mode}"
+                )
 
         if resume_session_id:
             use_resume = True
@@ -6028,6 +6799,7 @@ async def _handle_claude_generation(
                     conv_id=conv_id,
                     server_port=config.port,
                     model=provider_model,
+                    requested_model=cc_model,
                     effort=cc_effort,
                     permission_mode=cc_permission_mode,
                     resume_session_id=resume_session_id if use_resume else None,
@@ -6076,6 +6848,7 @@ async def _handle_claude_generation(
                         conv_id=conv_id,
                         server_port=config.port,
                         model=provider_model,
+                        requested_model=cc_model,
                         effort=cc_effort,
                         permission_mode=cc_permission_mode,
                         use_llama=use_llama,
@@ -6110,18 +6883,47 @@ async def _handle_claude_generation(
         result_info = {}
         new_session_id = ""
         actual_model = ""  # what CC actually ran (may differ from cc_model if CC fell back)
+        model_attestation: dict | None = None
         total_input_tokens = 0
         total_output_tokens = 0
         got_error = False
         rate_limit_data: dict | None = None
         synthetic_error: dict | None = None
 
+        async def _record_model_attestation(evt: dict) -> None:
+            """Persist and broadcast provider-returned model identity evidence."""
+            nonlocal model_attestation
+            attestation = evt.get("model_attestation")
+            if not isinstance(attestation, dict):
+                return
+            recorded = await _record_turn_model_attestation(
+                conv_id,
+                draft_msg_id,
+                parent_id,
+                attestation,
+                _gen_key_local,
+            )
+            if recorded is None:
+                return
+            model_attestation = recorded
+            await _ws_send(
+                conv_id,
+                {
+                    "type": "status",
+                    "text": _model_attestation_status_text(recorded),
+                    "parent_id": parent_id,
+                },
+            )
+
         async for evt in event_stream:
             etype = evt["type"]
 
             if etype == "session_info":
                 new_session_id = evt.get("session_id", "") or new_session_id
-                actual_model = evt.get("model", "") or actual_model
+                reported_model = evt.get("model", "")
+                if reported_model and evt.get("model_confirmed", True):
+                    actual_model = reported_model
+                await _record_model_attestation(evt)
                 # Patch session_id onto the tracking row for future rescue support
                 try:
                     await db.update_active_generation_session(draft_msg_id, new_session_id)
@@ -6140,7 +6942,8 @@ async def _handle_claude_generation(
                     {
                         "type": "status",
                         "text": (
-                            f"Codex launch: approval={evt.get('approval_policy')}, "
+                            f"Codex request: model={evt.get('model')} "
+                            f"(fallback disabled), approval={evt.get('approval_policy')}, "
                             f"sandbox={evt.get('sandbox')}, cwd={evt.get('cwd')}"
                         ),
                     },
@@ -6424,7 +7227,8 @@ async def _handle_claude_generation(
                     output_tokens=total_output_tokens,
                 )
 
-        _active_claude_procs.pop(conv_id, None)
+        if _active_claude_procs.get(conv_id) is proc:
+            _active_claude_procs.pop(conv_id, None)
 
         # If --resume failed, retry with full history fallback. Some local
         # backends can also accept a resumed session and exit 0 while producing
@@ -6590,6 +7394,7 @@ async def _handle_claude_generation(
                     conv_id=conv_id,
                     server_port=config.port,
                     model=provider_model,
+                    requested_model=cc_model,
                     effort=cc_effort,
                     permission_mode=cc_permission_mode,
                     use_llama=use_llama,
@@ -6614,6 +7419,9 @@ async def _handle_claude_generation(
                 if etype == "session_info":
                     new_session_id = evt.get("session_id", "") or new_session_id
                     model_name = evt.get("model", cc_model)
+                    if model_name and evt.get("model_confirmed", True):
+                        actual_model = model_name
+                    await _record_model_attestation(evt)
                     await _ws_send(
                         conv_id,
                         {
@@ -6628,7 +7436,8 @@ async def _handle_claude_generation(
                         {
                             "type": "status",
                             "text": (
-                                f"Codex launch: approval={evt.get('approval_policy')}, "
+                                f"Codex request: model={evt.get('model')} "
+                                f"(fallback disabled), approval={evt.get('approval_policy')}, "
                                 f"sandbox={evt.get('sandbox')}, cwd={evt.get('cwd')}"
                             ),
                         },
@@ -6801,7 +7610,8 @@ async def _handle_claude_generation(
                         output_tokens=total_output_tokens,
                     )
 
-            _active_claude_procs.pop(conv_id, None)
+            if _active_claude_procs.get(conv_id) is proc:
+                _active_claude_procs.pop(conv_id, None)
 
         # If CC produced no output at all, mark draft as error (don't delete)
         if not _cc_has_streamed_output(full_text, content_blocks):
@@ -6893,6 +7703,25 @@ async def _handle_claude_generation(
         else:
             model_used_field = resolved_model
 
+        if is_gemini and actual_model:
+            expected_model = gemini_client._loom_model_to_agy(cc_model, cc_effort)
+            if expected_model.casefold() != actual_model.casefold():
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "error",
+                        "provider": "antigravity",
+                        "stage": "model_confirmation",
+                        "requested_model": cc_model,
+                        "expected_model": expected_model,
+                        "actual_model": actual_model,
+                        "error": (
+                            f"Antigravity model mismatch: requested '{cc_model}' "
+                            f"(launch id '{expected_model}'), but agy reported '{actual_model}'"
+                        ),
+                    },
+                )
+
         fallback_note = _detect_model_fallback(cc_model, actual_model)
         if fallback_note:
             await _ws_send(
@@ -6917,6 +7746,10 @@ async def _handle_claude_generation(
             cc_session_id=new_session_id or None,
             cc_session_mode=cc_session_mode,
             cc_model_used=model_used_field,
+            model_attestation=(
+                json.dumps(model_attestation, separators=(",", ":"))
+                if model_attestation else None
+            ),
             generation_ms=_gen_ms,
         )
         msg = await db.get_message(draft_msg_id)
@@ -6941,6 +7774,10 @@ async def _handle_claude_generation(
                 draft_msg_id,
                 cc_session_mode=cc_session_mode,
                 cc_model_used=model_used_field,
+                model_attestation=(
+                    json.dumps(model_attestation, separators=(",", ":"))
+                    if model_attestation else None
+                ),
                 generation_ms=_gen_ms,
             )
             await db.set_active_branch(conv_id, draft_msg_id)
@@ -7023,7 +7860,8 @@ async def _handle_claude_generation(
         )
 
     except asyncio.CancelledError:
-        proc = _active_claude_procs.pop(conv_id, None)
+        if _active_claude_procs.get(conv_id) is proc:
+            _active_claude_procs.pop(conv_id, None)
         if proc:
             try:
                 if is_gemini:
@@ -7046,6 +7884,10 @@ async def _handle_claude_generation(
                 content_blocks=json.dumps(content_blocks) if content_blocks else None,
                 cc_session_id=new_session_id or resume_session_id or None,
                 cc_model_used=(actual_model or cc_model) if (actual_model or cc_model) else None,
+                model_attestation=(
+                    json.dumps(model_attestation, separators=(",", ":"))
+                    if model_attestation else None
+                ),
                 generation_ms=_gen_ms_cancel,
             )
             print(f"[GEN] Saved partial draft {draft_msg_id} on cancel (session={new_session_id or resume_session_id or 'none'})")
@@ -7054,7 +7896,8 @@ async def _handle_claude_generation(
             await db.delete_branch(draft_msg_id)
         await _ws_send(conv_id, {"type": "cancelled"})
     except Exception as e:
-        _active_claude_procs.pop(conv_id, None)
+        if _active_claude_procs.get(conv_id) is proc:
+            _active_claude_procs.pop(conv_id, None)
         print(f"[GEN] Claude generation error conv={conv_id}: {e}")
         import traceback
 
@@ -7082,9 +7925,15 @@ async def _handle_claude_generation(
                 await db.unregister_active_generation(draft_msg_id)
         except Exception:
             pass
-        # Clean up any pending hook permissions for this conversation (memory + DB)
+        # Clean up only this generation's pending permissions. A sibling agent
+        # in the same conversation may still be waiting for its own decision.
+        finished_scope = f"gen:{_gen_key[2]}" if _gen_key else "manual"
         for rid in list(_pending_hook_permissions):
-            if _pending_hook_permissions[rid].get("conv_id") == conv_id:
+            pending = _pending_hook_permissions[rid]
+            if (
+                pending.get("conv_id") == conv_id
+                and pending.get("permission_scope") == finished_scope
+            ):
                 _pending_hook_permissions.pop(rid, None)
                 await db.delete_pending_permission(rid)
 
@@ -7181,6 +8030,57 @@ def _build_claude_history_prompt(branch: list[dict], project_dir: Path = None) -
     return base
 
 
+def _copy_latest_user_attachments_for_goose(
+    branch: list[dict],
+    project_dir: str | Path,
+) -> tuple[list[Path], list[str]]:
+    """Copy latest user attachments into project_dir/attached_files for Goose.
+
+    Returns native image paths for ACP image content plus human-readable file notes.
+    """
+    last_user_msg = next((m for m in reversed(branch) if m.get("role") == "user"), None)
+    if not last_user_msg or not last_user_msg.get("image_path"):
+        return [], []
+
+    root = Path(project_dir or ".")
+    attached_dir = root / "attached_files"
+    image_paths: list[Path] = []
+    file_notes: list[str] = []
+
+    for raw_path in _parse_image_paths(last_user_msg["image_path"]):
+        src = Path(raw_path).expanduser()
+        if not src.is_file():
+            file_notes.append(str(src).replace("\\", "/"))
+            continue
+
+        dest = attached_dir / src.name
+        copied = False
+        try:
+            attached_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dest))
+            copied = True
+        except Exception as exc:
+            print(f"[Goose] Failed to copy attachment {src.name}: {exc}")
+
+        usable_path = dest if copied else src
+        if src.suffix.lower() in _IMAGE_EXTS:
+            image_paths.append(usable_path)
+        if copied:
+            file_notes.append(f"{src.name} (in attached_files/)")
+        else:
+            file_notes.append(str(src.resolve()).replace("\\", "/"))
+
+    return image_paths, file_notes
+
+
+def _append_attachment_notes(prompt: str, file_notes: list[str]) -> str:
+    if not file_notes:
+        return prompt
+    files_str = "\n".join(f"  • {note}" for note in file_notes)
+    header = f"[User attached {len(file_notes)} file(s). See attached_files/ for copied files.]"
+    return f"{prompt}\n\n{header}\n{files_str}" if prompt else f"{header}\n{files_str}"
+
+
 async def _handle_goose_generation(
     websocket: WebSocket, conv_id: int, conv: dict, data: dict
 ):
@@ -7195,8 +8095,22 @@ async def _handle_goose_generation(
     input_tokens = 0
     output_tokens = 0
     got_error = False
+    last_error = ""
+    result_info: dict = {}
+    model_attestation: dict | None = None
     start_t = _time.time()
     proc = None
+
+    def _goose_error_text(value, default: str = "Goose error") -> str:
+        if isinstance(value, BaseException):
+            if isinstance(value, (asyncio.TimeoutError, TimeoutError)) and not str(value).strip():
+                text = "Goose operation timed out"
+            else:
+                text = str(value).strip() or value.__class__.__name__
+        else:
+            text = str(value or "").strip()
+        return text or default
+
     try:
         action = data.get("action")
         parent_id = data.get("parent_id")
@@ -7209,14 +8123,34 @@ async def _handle_goose_generation(
             await _ws_send(conv_id, {"type": "error", "error": f"Working directory not found: {project_dir}"})
             return
 
-        cc_model = data.get("cc_model") or conv.get("cc_model") or config.goose_model
+        requested_model = data.get("cc_model") or conv.get("cc_model") or config.goose_model
+        cc_model = requested_model
         if not goose_client.is_goose_model(cc_model):
-            cc_model = config.goose_model if goose_client.is_goose_model(config.goose_model) else f"goose:openrouter:{cc_model}"
+            cc_model = _goose_selector_for_model(cc_model)
+            if not cc_model:
+                await _ws_send(conv_id, {
+                    "type": "error",
+                    "provider": "goose",
+                    "stage": "model_resolution",
+                    "requested_model": requested_model,
+                    "error": (
+                        f"Goose model resolution failed for '{requested_model}': "
+                        "the selector is not a Goose, OpenRouter, loaded GGUF, or Dream model"
+                    ),
+                })
+                return
         cc_permission_mode = data.get("cc_permission_mode") or conv.get("cc_permission_mode") or config.goose_mode or "approve"
         cc_permission_mode = goose_client.permission_mode_for_model(cc_model, cc_permission_mode)
-        if data.get("cc_model") and data["cc_model"] != conv.get("cc_model"):
-            await db.update_conversation_fields(conv_id, cc_model=cc_model)
-
+        cc_effort = data.get("cc_effort") or conv.get("cc_effort") or "high"
+        settings_updates = {}
+        if cc_model != conv.get("cc_model"):
+            settings_updates["cc_model"] = cc_model
+        if cc_effort != conv.get("cc_effort"):
+            settings_updates["cc_effort"] = cc_effort
+        if cc_permission_mode != conv.get("cc_permission_mode"):
+            settings_updates["cc_permission_mode"] = cc_permission_mode
+        if settings_updates:
+            await db.update_conversation_fields(conv_id, **settings_updates)
         if conv.get("nrol_operator"):
             blocked = _nrol_operator_block_reason(cc_model)
             if blocked:
@@ -7224,28 +8158,74 @@ async def _handle_goose_generation(
                 return
 
         branch = await db.get_branch_to_root(parent_id) if parent_id else []
+        if (
+            action == "generate"
+            and parent_id
+            and not model_context.is_1m_anthropic(cc_model)
+        ):
+            branch_tokens = await db.sum_branch_tokens(parent_id)
+            if model_context.needs_handoff(cc_model, branch_tokens):
+                threshold = model_context.handoff_threshold(cc_model)
+                await _ws_send(
+                    conv_id,
+                    {
+                        "type": "status",
+                        "text": f"Branch is {branch_tokens:,} tokens (> {threshold:,} for {cc_model}) - preparing handoff...",
+                    },
+                )
+                marker_id, _new_session, new_parent = await _run_compact_handoff(
+                    conv_id, conv, parent_id, cc_model, cc_effort, project_dir
+                )
+                if marker_id:
+                    parent_id = new_parent or marker_id
+                    branch = await db.get_branch_to_root(parent_id) if parent_id else []
+
         resume_session_id = None
         use_resume = False
-        for msg in reversed(branch):
-            if msg.get("role") != "assistant" or not msg.get("cc_session_id"):
-                continue
-            mode = msg.get("cc_session_mode")
-            if mode is not None and mode != "goose":
-                continue
-            resume_session_id = msg.get("cc_session_id")
-            use_resume = True
-            break
+        resume_decision = select_resume_session(
+            branch,
+            "goose",
+            target_model=cc_model,
+            models_match=lambda recorded, target: (
+                goose_client.model_label(recorded) == goose_client.model_label(target)
+            ),
+        )
+        resume_session_id = resume_decision.session_id
+        use_resume = resume_decision.can_resume
+        if not use_resume:
+            print(
+                f"[GOOSE] Native session rebuild: reason={resume_decision.reason} "
+                f"boundary_msg={resume_decision.message_id}"
+            )
 
         if use_resume:
             latest_user = next((m for m in reversed(branch) if m.get("role") == "user"), None)
             prompt = (latest_user or {}).get("content") or "(continue)"
         else:
-            prompt = _build_claude_history_prompt(branch, Path(project_dir)) or "(continue)"
+            prompt = _build_claude_history_prompt(branch, None) or "(continue)"
+
+        goose_image_paths, goose_file_notes = _copy_latest_user_attachments_for_goose(branch, project_dir)
+        prompt = _append_attachment_notes(prompt, goose_file_notes)
 
         draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
         draft_msg_id = draft_msg["id"]
         await db.update_message_content(draft_msg_id, cc_model_used=cc_model)
         await db.set_active_branch(conv_id, draft_msg_id)
+
+        _gen_key_local = getattr(asyncio.current_task(), "_gen_key", None)
+        if _gen_key_local:
+            _update_gen_snapshot(
+                _gen_key_local,
+                full_text="",
+                content_blocks=[],
+                input_tokens=0,
+                output_tokens=0,
+                started_at=_time.time(),
+                draft_msg_id=draft_msg_id,
+                parent_id=parent_id,
+                cc_model=cc_model,
+                mode="goose",
+            )
 
         await _ws_send(
             conv_id,
@@ -7261,9 +8241,48 @@ async def _handle_goose_generation(
             {"type": "stream_start", "parent_id": parent_id, "draft_msg_id": draft_msg_id, "cc_model": cc_model},
         )
 
-        try:
-            proc, event_stream = await goose_client.run_goose(
-                prompt,
+        async def _register_goose_proc() -> None:
+            if proc is None:
+                return
+            _active_goose_procs[conv_id] = proc
+            try:
+                await db.register_active_generation(
+                    draft_msg_id=draft_msg_id,
+                    conv_id=conv_id,
+                    pid=getattr(proc, "pid", 0) or 0,
+                    project_dir=project_dir,
+                    mode="goose",
+                )
+            except Exception:
+                pass
+
+        async def _retire_goose_proc() -> None:
+            nonlocal proc
+            old_proc = proc
+            if _active_goose_procs.get(conv_id) is old_proc:
+                _active_goose_procs.pop(conv_id, None)
+            proc = None
+            if old_proc is None:
+                return
+            try:
+                await asyncio.wait_for(old_proc.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                try:
+                    await goose_client.cancel_goose(old_proc)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        async def _start_goose(
+            start_prompt: str,
+            *,
+            start_resume_session_id: str | None = None,
+            start_fork_session: bool = False,
+        ):
+            nonlocal proc
+            proc, start_stream = await goose_client.run_goose(
+                start_prompt,
                 conv_id=conv_id,
                 model=cc_model,
                 cwd=project_dir,
@@ -7271,109 +8290,203 @@ async def _handle_goose_generation(
                 goose_exe=config.goose_exe or None,
                 permission_mode=cc_permission_mode,
                 branch=branch,
-                resume_session_id=resume_session_id if use_resume else None,
-                fork_session=use_resume,
+                resume_session_id=start_resume_session_id,
+                fork_session=start_fork_session,
                 nrol_operator=bool(conv.get("nrol_operator")),
                 builtins=config.goose_builtins,
+                effort=cc_effort,
+                image_paths=goose_image_paths,
             )
-        except Exception:
-            if use_resume:
-                await _ws_send(conv_id, {"type": "status", "text": "Goose session fork failed - rebuilding from history..."})
-                prompt = _build_claude_history_prompt(branch, Path(project_dir)) or "(continue)"
-                proc, event_stream = await goose_client.run_goose(
-                    prompt,
-                    conv_id=conv_id,
-                    model=cc_model,
-                    cwd=project_dir,
-                    loom_port=config.port,
-                    goose_exe=config.goose_exe or None,
-                    permission_mode=cc_permission_mode,
-                    branch=branch,
-                    nrol_operator=bool(conv.get("nrol_operator")),
-                    builtins=config.goose_builtins,
-                )
-                use_resume = False
-            else:
-                raise
+            await _register_goose_proc()
+            return start_stream
 
-        _active_goose_procs[conv_id] = proc
-        try:
-            await db.register_active_generation(
-                draft_msg_id=draft_msg_id,
-                conv_id=conv_id,
-                pid=proc.pid,
-                project_dir=project_dir,
-                mode="goose",
-            )
-        except Exception:
-            pass
+        async def _consume_goose_stream(event_stream, *, emit_error_events: bool) -> None:
+            nonlocal full_text, content_blocks, current_block
+            nonlocal new_session_id, input_tokens, output_tokens
+            nonlocal got_error, last_error, result_info
+            nonlocal model_attestation
 
-        async for evt in event_stream:
-            etype = evt.get("type")
-            if etype == "session_info":
-                new_session_id = evt.get("session_id") or new_session_id
-                try:
-                    await db.update_active_generation_session(draft_msg_id, new_session_id)
-                except Exception:
-                    pass
-            elif etype == "status":
-                await _ws_send(conv_id, {"type": "status", "text": evt.get("text", ""), "parent_id": parent_id})
-            elif etype == "text_delta":
-                text = evt.get("text", "")
-                if not text:
-                    continue
-                full_text += text
-                if current_block and current_block.get("type") == "text":
-                    current_block["text"] += text
-                else:
-                    current_block = {"type": "text", "text": text}
+            async for evt in event_stream:
+                etype = evt.get("type")
+                if etype == "session_info":
+                    new_session_id = evt.get("session_id") or new_session_id
+                    attestation = evt.get("model_attestation")
+                    if isinstance(attestation, dict):
+                        recorded = await _record_turn_model_attestation(
+                            conv_id,
+                            draft_msg_id,
+                            parent_id,
+                            attestation,
+                            _gen_key_local,
+                        )
+                        if recorded:
+                            model_attestation = recorded
+                            await _ws_send(
+                                conv_id,
+                                {
+                                    "type": "status",
+                                    "text": _model_attestation_status_text(recorded),
+                                    "parent_id": parent_id,
+                                },
+                            )
+                    if model_attestation and model_attestation.get("status") == "mismatch":
+                        raise RuntimeError(
+                            f"Goose model mismatch: requested '{cc_model}', ACP reported "
+                            f"'{model_attestation.get('effective_model')}'"
+                        )
+                    try:
+                        await db.update_active_generation_session(draft_msg_id, new_session_id)
+                    except Exception:
+                        pass
+                elif etype == "status":
+                    await _ws_send(conv_id, {"type": "status", "text": evt.get("text", ""), "parent_id": parent_id})
+                elif etype == "text_delta":
+                    text = evt.get("text", "")
+                    if not text:
+                        continue
+                    full_text += text
+                    if current_block and current_block.get("type") == "text":
+                        current_block["text"] += text
+                    else:
+                        current_block = {"type": "text", "text": text}
+                        content_blocks.append(current_block)
+                    await _ws_send(conv_id, {"type": "stream_chunk", "content": text})
+                elif etype == "thinking_delta":
+                    text = evt.get("text", "")
+                    if text:
+                        if current_block and current_block.get("type") == "thinking":
+                            current_block["text"] += text
+                        else:
+                            current_block = {"type": "thinking", "text": text}
+                            content_blocks.append(current_block)
+                        await _ws_send(conv_id, {"type": "thinking_chunk", "content": text})
+                elif etype == "tool_start":
+                    current_block = {
+                        "type": "tool_use",
+                        "name": evt.get("name", "goose_tool"),
+                        "tool_id": evt.get("tool_id", ""),
+                        "input": "",
+                        "result": "",
+                    }
                     content_blocks.append(current_block)
-                await _ws_send(conv_id, {"type": "stream_chunk", "content": text})
-            elif etype == "thinking_delta":
-                text = evt.get("text", "")
-                if text:
-                    content_blocks.append({"type": "thinking", "text": text})
-                    await _ws_send(conv_id, {"type": "thinking_chunk", "content": text})
-            elif etype == "tool_start":
-                current_block = {
-                    "type": "tool_use",
-                    "name": evt.get("name", "goose_tool"),
-                    "tool_id": evt.get("tool_id", ""),
-                    "input": "",
-                    "result": "",
-                }
-                content_blocks.append(current_block)
-                await _ws_send(conv_id, {"type": "tool_start", "name": current_block["name"], "tool_id": current_block["tool_id"]})
-            elif etype == "tool_input_delta":
-                if current_block and current_block.get("type") == "tool_use":
-                    current_block["input"] += evt.get("json", "")
-                await _ws_send(conv_id, {"type": "tool_input_chunk", "content": evt.get("json", ""), "tool_id": evt.get("tool_id", "")})
-            elif etype == "tool_result":
-                tool_id = evt.get("tool_id", "")
-                result = evt.get("content", "")
-                for block in reversed(content_blocks):
-                    if block.get("type") == "tool_use" and block.get("tool_id") == tool_id:
-                        block["result"] = result
-                        break
-                current_block = None
-                await _ws_send(conv_id, {"type": "tool_result", "content": result, "tool_id": tool_id, "is_error": evt.get("is_error", False)})
-            elif etype == "usage":
-                input_tokens += int(evt.get("input_tokens") or 0)
-                output_tokens += int(evt.get("output_tokens") or 0)
-                await _ws_send(conv_id, {"type": "usage", "input_tokens": input_tokens, "output_tokens": output_tokens})
-            elif etype == "permission_request":
-                pass
-            elif etype == "error":
-                got_error = True
-                await _ws_send(conv_id, {"type": "error", "error": evt.get("error", "Goose error")})
-            elif etype == "result" and evt.get("session_id"):
-                new_session_id = evt.get("session_id")
+                    await _ws_send(conv_id, {"type": "tool_start", "name": current_block["name"], "tool_id": current_block["tool_id"]})
+                elif etype == "tool_input_delta":
+                    if current_block and current_block.get("type") == "tool_use":
+                        current_block["input"] += evt.get("json", "")
+                    await _ws_send(conv_id, {"type": "tool_input_chunk", "content": evt.get("json", ""), "tool_id": evt.get("tool_id", "")})
+                elif etype == "tool_result":
+                    tool_id = evt.get("tool_id", "")
+                    result = evt.get("content", "")
+                    for block in reversed(content_blocks):
+                        if block.get("type") == "tool_use" and block.get("tool_id") == tool_id:
+                            block["result"] = result
+                            break
+                    current_block = None
+                    await _ws_send(conv_id, {"type": "tool_result", "content": result, "tool_id": tool_id, "is_error": evt.get("is_error", False)})
+                elif etype == "usage":
+                    input_tokens += int(evt.get("input_tokens") or 0)
+                    output_tokens += int(evt.get("output_tokens") or 0)
+                    await _ws_send(conv_id, {"type": "usage", "input_tokens": input_tokens, "output_tokens": output_tokens})
+                elif etype == "permission_request":
+                    pass
+                elif etype == "error":
+                    got_error = True
+                    last_error = _goose_error_text(evt.get("error"))
+                    if emit_error_events:
+                        await _ws_send(conv_id, {
+                            "type": "error",
+                            "provider": "goose",
+                            "stage": "generation",
+                            "requested_model": cc_model,
+                            "error": last_error,
+                        })
+                elif etype == "result":
+                    result_info = evt
+                    new_session_id = evt.get("session_id") or new_session_id
 
-        if not full_text.strip() and not any(b.get("type") != "thinking" for b in content_blocks):
-            if draft_msg_id:
-                await db.delete_branch(draft_msg_id)
+                if _gen_key_local:
+                    _update_gen_snapshot(
+                        _gen_key_local,
+                        full_text=full_text,
+                        content_blocks=content_blocks,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                    )
+
+        try:
+            event_stream = await _start_goose(
+                prompt,
+                start_resume_session_id=resume_session_id if use_resume else None,
+                start_fork_session=use_resume,
+            )
+            await _consume_goose_stream(event_stream, emit_error_events=not use_resume)
+        except Exception as exc:
+            if not use_resume:
+                raise
+            got_error = True
+            last_error = _goose_error_text(exc)
+
+        empty_resume = use_resume and not got_error and not _cc_has_streamed_output(full_text, content_blocks)
+        if use_resume and (got_error or empty_resume):
+            if empty_resume:
+                status_text = "Goose session returned no response - retrying with full history..."
+            else:
+                status_text = "Goose session failed - rebuilding from history..."
+            await _ws_send(conv_id, {"type": "status", "text": status_text, "parent_id": parent_id})
+            await _retire_goose_proc()
+            full_text = ""
+            content_blocks = []
+            current_block = None
+            new_session_id = ""
+            input_tokens = 0
+            output_tokens = 0
+            got_error = False
+            last_error = ""
+            result_info = {}
+            if _gen_key_local:
+                _update_gen_snapshot(
+                    _gen_key_local,
+                    full_text="",
+                    content_blocks=[],
+                    input_tokens=0,
+                    output_tokens=0,
+                    cc_model=cc_model,
+                    mode="goose",
+                )
+            prompt = _build_claude_history_prompt(branch, None) or "(continue)"
+            prompt = _append_attachment_notes(prompt, goose_file_notes)
+            event_stream = await _start_goose(prompt)
+            await _consume_goose_stream(event_stream, emit_error_events=True)
+
+        if not _cc_has_streamed_output(full_text, content_blocks):
+            error_msg = (
+                _goose_error_text(last_error, "")
+                or _goose_error_text(_cc_result_error_detail(result_info), "")
+                or "Goose exited with no response"
+            )
+            content = f"[Error: {error_msg}]"
+            gen_ms = int((_time.time() - start_t) * 1000)
+            await db.update_message_content(
+                draft_msg_id,
+                content=content,
+                turn_input_tokens=input_tokens,
+                turn_output_tokens=output_tokens,
+                cc_session_id=new_session_id or None,
+                cc_session_mode="goose",
+                cc_model_used=cc_model,
+                generation_ms=gen_ms,
+            )
+            await db.set_active_branch(conv_id, draft_msg_id)
             if not got_error:
-                await _ws_send(conv_id, {"type": "error", "error": "Goose exited with no response"})
+                await _ws_send(conv_id, {
+                    "type": "error",
+                    "provider": "goose",
+                    "stage": "generation",
+                    "requested_model": cc_model,
+                    "error": error_msg,
+                })
+            msg = await db.get_message(draft_msg_id)
+            await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
             return
 
         gen_ms = int((_time.time() - start_t) * 1000)
@@ -7381,8 +8494,8 @@ async def _handle_goose_generation(
             draft_msg_id,
             content=full_text,
             content_blocks=json.dumps(content_blocks) if content_blocks else None,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            turn_input_tokens=input_tokens,
+            turn_output_tokens=output_tokens,
             cc_session_id=new_session_id or None,
             cc_session_mode="goose",
             cc_model_used=cc_model,
@@ -7418,19 +8531,31 @@ async def _handle_goose_generation(
                 await db.delete_branch(draft_msg_id)
         raise
     except Exception as exc:
-        print(f"[Goose] Error: {exc}")
+        error_msg = _goose_error_text(exc)
+        print(f"[Goose] Error: {error_msg}")
+        await _ws_send(conv_id, {
+            "type": "error",
+            "provider": "goose",
+            "stage": "launch_or_stream",
+            "requested_model": locals().get("cc_model") or locals().get("requested_model"),
+            "error": error_msg,
+        })
         if draft_msg_id:
-            await db.update_message_content(draft_msg_id, content=f"[Error: {exc}]", cc_model_used=locals().get("cc_model"))
+            await db.update_message_content(
+                draft_msg_id,
+                content=f"[Error: {error_msg}]",
+                cc_model_used=locals().get("cc_model"),
+                generation_ms=int((_time.time() - start_t) * 1000),
+            )
             msg = await db.get_message(draft_msg_id)
             await _ws_send(conv_id, {"type": "stream_end", "message": dict(msg)})
-        else:
-            await _ws_send(conv_id, {"type": "error", "error": str(exc)})
     finally:
         _gen_key = getattr(asyncio.current_task(), "_gen_key", None)
         if _gen_key:
             _active_generations.pop(_gen_key, None)
             _generation_snapshots.pop(_gen_key, None)
-        _active_goose_procs.pop(conv_id, None)
+        if _active_goose_procs.get(conv_id) is proc:
+            _active_goose_procs.pop(conv_id, None)
         if proc is not None:
             try:
                 await asyncio.wait_for(proc.wait(), timeout=3.0)
@@ -7447,8 +8572,13 @@ async def _handle_goose_generation(
             except Exception:
                 pass
         await _send_generation_idle_if_quiescent(conv_id)
+        finished_scope = f"gen:{_gen_key[2]}" if _gen_key else "manual"
         for rid in list(_pending_hook_permissions):
-            if _pending_hook_permissions[rid].get("conv_id") == conv_id:
+            pending = _pending_hook_permissions[rid]
+            if (
+                pending.get("conv_id") == conv_id
+                and pending.get("permission_scope") == finished_scope
+            ):
                 _pending_hook_permissions.pop(rid, None)
                 await db.delete_pending_permission(rid)
 
@@ -8092,9 +9222,14 @@ async def _handle_prometheus_generation(
 
         draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
         draft_msg_id = draft_msg["id"]
+        await db.update_message_content(
+            draft_msg_id,
+            cc_model_used=f"prometheus:{backend.get('model') or 'unknown'}",
+        )
         backend_tag = backend["backend"]
         await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id,
                                  "draft_msg_id": draft_msg_id,
+                                 "cc_model": f"prometheus:{backend.get('model') or ''}",
                                  "local_model": backend["model"],
                                  "prometheus_backend": backend_tag})
         _gen_key_local = getattr(asyncio.current_task(), "_gen_key", None)
@@ -8151,7 +9286,23 @@ async def _handle_prometheus_generation(
 
         async for event in event_stream:
             etype = event.get("type", "")
-            if etype == "text_delta":
+            if etype == "session_info":
+                attestation = event.get("model_attestation")
+                if isinstance(attestation, dict):
+                    await _record_turn_model_attestation(
+                        conv_id,
+                        draft_msg_id,
+                        parent_id,
+                        attestation,
+                        _gen_key_local,
+                    )
+                session_id = event.get("session_id") or ""
+                if session_id:
+                    try:
+                        await db.update_active_generation_session(draft_msg_id, session_id)
+                    except Exception:
+                        pass
+            elif etype == "text_delta":
                 delta = event.get("text", "")
                 full_text += delta
                 if content_blocks and content_blocks[-1].get("type") == "text":
@@ -8262,17 +9413,13 @@ async def _handle_dream_generation(
         use_resume = False
         fork_session = True  # Always fork to keep branch history isolated
 
-        if branch:
-            for msg in reversed(branch):
-                if msg.get("cc_session_id"):
-                    # Skip session IDs issued by a different backend — a Hermes
-                    # or Claude Code session id is meaningless in the Dream
-                    # home's state.db. NULL mode = legacy/unscoped, compatible.
-                    mode = msg.get("cc_session_mode")
-                    if mode is not None and mode != "dream":
-                        continue
-                    resume_session_id = msg["cc_session_id"]
-                    break
+        resume_decision = select_resume_session(branch, "dream")
+        resume_session_id = resume_decision.session_id
+        if not resume_session_id:
+            print(
+                f"[DREAM] Native session rebuild: reason={resume_decision.reason} "
+                f"boundary_msg={resume_decision.message_id}"
+            )
 
         if resume_session_id:
             use_resume = True
@@ -8293,8 +9440,13 @@ async def _handle_dream_generation(
         # Draft message so the tree shows a ghost node while streaming.
         draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
         draft_msg_id = draft_msg["id"]
+        await db.update_message_content(
+            draft_msg_id,
+            cc_model_used=f"dream:{config.dream_model}",
+        )
         await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id,
                                  "draft_msg_id": draft_msg_id,
+                                 "cc_model": f"dream:{config.dream_model}",
                                  "local_model": config.dream_model})
         await _ws_send(conv_id, {"type": "status", "text": "Dream Space generating…"})
 
@@ -8315,6 +9467,7 @@ async def _handle_dream_generation(
                 # the model every prior message twice. Fresh sessions (use_resume
                 # False) get the full orientation block.
                 is_first_turn=not use_resume,
+                isolated=bool(conv.get("parallel_agents_enabled")),
             )
         except Exception as e:
             if use_resume:
@@ -8335,6 +9488,7 @@ async def _handle_dream_generation(
                         # Fallback opens a fresh session/new — it needs the full
                         # branch orientation since there is no forked history.
                         is_first_turn=True,
+                        isolated=bool(conv.get("parallel_agents_enabled")),
                     )
                 except Exception as e2:
                     if draft_msg_id:
@@ -8379,6 +9533,15 @@ async def _handle_dream_generation(
             etype = evt.get("type")
             if etype == "session_info":
                 new_session_id = evt.get("session_id", "") or new_session_id
+                attestation = evt.get("model_attestation")
+                if isinstance(attestation, dict):
+                    await _record_turn_model_attestation(
+                        conv_id,
+                        draft_msg_id,
+                        parent_id,
+                        attestation,
+                        _gen_key_local,
+                    )
                 try:
                     await db.update_active_generation_session(draft_msg_id, new_session_id)
                 except Exception:
@@ -8472,7 +9635,8 @@ async def _handle_dream_generation(
                     output_tokens=total_output_tokens,
                 )
 
-        _active_hermes_procs.pop(conv_id, None)
+        if _active_hermes_procs.get(conv_id) is proc:
+            _active_hermes_procs.pop(conv_id, None)
 
         if not full_text.strip() and not content_blocks:
             if draft_msg_id:
@@ -8583,17 +9747,13 @@ async def _handle_hermes_generation(
         use_resume = False
         fork_session = True  # Always fork to keep branch history isolated, parallel to Claude Code
 
-        if branch:
-            for msg in reversed(branch):
-                if msg.get("cc_session_id"):
-                    # Skip session IDs issued by a different backend — a Dream
-                    # or Claude Code session id is meaningless in the llama
-                    # Hermes home's state.db. NULL mode = legacy/unscoped, compatible.
-                    mode = msg.get("cc_session_mode")
-                    if mode is not None and mode != "hermes":
-                        continue
-                    resume_session_id = msg["cc_session_id"]
-                    break
+        resume_decision = select_resume_session(branch, "hermes")
+        resume_session_id = resume_decision.session_id
+        if not resume_session_id:
+            print(
+                f"[HERMES] Native session rebuild: reason={resume_decision.reason} "
+                f"boundary_msg={resume_decision.message_id}"
+            )
 
         if resume_session_id:
             use_resume = True
@@ -8611,8 +9771,14 @@ async def _handle_hermes_generation(
         # Draft message so the tree shows a ghost node while streaming.
         draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
         draft_msg_id = draft_msg["id"]
+        await db.update_message_content(
+            draft_msg_id,
+            cc_model_used=f"hermes:{model or 'default'}",
+        )
         await _ws_send(conv_id, {"type": "stream_start", "parent_id": parent_id,
-                                 "draft_msg_id": draft_msg_id})
+                                 "draft_msg_id": draft_msg_id,
+                                 "cc_model": f"hermes:{model or 'default'}",
+                                 "local_model": model or ""})
 
         try:
             proc, event_stream = await hermes_client.run_hermes(
@@ -8631,6 +9797,7 @@ async def _handle_hermes_generation(
                 # the model every prior message twice. Fresh sessions (use_resume
                 # False) get the full orientation block.
                 is_first_turn=not use_resume,
+                isolated=bool(conv.get("parallel_agents_enabled")),
             )
         except Exception as e:
             if use_resume:
@@ -8651,6 +9818,7 @@ async def _handle_hermes_generation(
                         # Fallback opens a fresh session/new — it needs the full
                         # branch orientation since there is no forked history.
                         is_first_turn=True,
+                        isolated=bool(conv.get("parallel_agents_enabled")),
                     )
                 except Exception as e2:
                     if draft_msg_id:
@@ -8695,6 +9863,15 @@ async def _handle_hermes_generation(
             etype = evt.get("type")
             if etype == "session_info":
                 new_session_id = evt.get("session_id", "") or new_session_id
+                attestation = evt.get("model_attestation")
+                if isinstance(attestation, dict):
+                    await _record_turn_model_attestation(
+                        conv_id,
+                        draft_msg_id,
+                        parent_id,
+                        attestation,
+                        _gen_key_local,
+                    )
                 try:
                     await db.update_active_generation_session(draft_msg_id, new_session_id)
                 except Exception:
@@ -8806,7 +9983,8 @@ async def _handle_hermes_generation(
                     output_tokens=total_output_tokens,
                 )
 
-        _active_hermes_procs.pop(conv_id, None)
+        if _active_hermes_procs.get(conv_id) is proc:
+            _active_hermes_procs.pop(conv_id, None)
 
         if not full_text.strip() and not any(b["type"] == "tool_use" for b in content_blocks):
             if draft_msg_id:
@@ -8872,15 +10050,21 @@ async def _handle_hermes_generation(
         except Exception:
             pass
 
-        # Clean up any pending hook permissions for this conversation (memory + DB)
+        # Clean up only this generation's pending permissions.
+        finished_scope = f"gen:{_gen_key[2]}" if _gen_key else "manual"
         for rid in list(_pending_hook_permissions):
-            if _pending_hook_permissions[rid].get("conv_id") == conv_id:
+            pending = _pending_hook_permissions[rid]
+            if (
+                pending.get("conv_id") == conv_id
+                and pending.get("permission_scope") == finished_scope
+            ):
                 _pending_hook_permissions.pop(rid, None)
                 await db.delete_pending_permission(rid)
 
         # Persistent Hermes ACP runtimes stay alive across turns. Explicit
         # cancellation still terminates the runtime in the CancelledError path.
-        _active_hermes_procs.pop(conv_id, None)
+        if _active_hermes_procs.get(conv_id) is proc:
+            _active_hermes_procs.pop(conv_id, None)
 
 
 async def _handle_ooda_generation(
@@ -9002,6 +10186,20 @@ async def _handle_ooda_generation(
         # Create draft message in DB so it appears as ghost node on tree
         draft_msg = await db.add_message(conv_id, "assistant", "", parent_id=parent_id)
         draft_msg_id = draft_msg["id"]
+        weave_model = conv.get("local_model") or config.llama_model or ""
+        await db.update_message_content(draft_msg_id, cc_model_used=weave_model)
+        _gen_key_local = getattr(asyncio.current_task(), "_gen_key", None)
+        if _gen_key_local:
+            _update_gen_snapshot(
+                _gen_key_local,
+                full_text="",
+                content_blocks=[],
+                started_at=_time.time(),
+                draft_msg_id=draft_msg_id,
+                parent_id=parent_id,
+                cc_model=weave_model,
+                mode="weave-ooda",
+            )
 
         print(
             f"[OODA] System prompt: {len(ooda_system)} chars, {len(messages)} messages, {len(state_cards)} state cards"
@@ -9012,6 +10210,7 @@ async def _handle_ooda_generation(
                 "type": "stream_start",
                 "parent_id": parent_id,
                 "draft_msg_id": draft_msg_id,
+                "local_model": weave_model,
             },
         )
         _ooda_start_t = _time.time()
@@ -9026,14 +10225,21 @@ async def _handle_ooda_generation(
                 "parent_id": parent_id,
             },
         )
-        weave_model = conv.get("local_model") or None
-        ooda_max_tokens = int(getattr(config, "max_tokens", 2048) or 2048)
+        weave_model = weave_model or None
+        ooda_max_tokens = int(getattr(config, "weave_max_tokens", None) or getattr(config, "max_tokens", 2048) or 2048)
         raw_pass1, usage_pass1 = await sync_chat(
             messages,
             max_tokens=ooda_max_tokens,
             think=False,
             model=weave_model,
             return_usage=True,
+        )
+        await _record_turn_model_attestation(
+            conv_id,
+            draft_msg_id,
+            parent_id,
+            (usage_pass1 or {}).get("model_attestation"),
+            _gen_key_local,
         )
         # Check if cancelled during the sync call
         if asyncio.current_task().cancelled():
@@ -9172,6 +10378,13 @@ async def _handle_ooda_generation(
                 model=weave_model,
                 return_usage=True,
             )
+            await _record_turn_model_attestation(
+                conv_id,
+                draft_msg_id,
+                parent_id,
+                (usage_pass2 or {}).get("model_attestation"),
+                _gen_key_local,
+            )
             if asyncio.current_task().cancelled():
                 raise asyncio.CancelledError()
             cleaned_pass2 = _re.sub(r"<think>[\s\S]*?</think>", "", raw_pass2)
@@ -9254,6 +10467,7 @@ async def _handle_ooda_generation(
             content=final_prose,
             turn_input_tokens=ooda_input_tokens,
             turn_output_tokens=ooda_output_tokens,
+            cc_model_used=weave_model,
             generation_ms=_ooda_gen_ms,
         )
         await db.set_active_branch(conv_id, draft_msg_id)
@@ -9446,6 +10660,8 @@ async def _handle_weave_generation(
         draft_msg_id = draft_msg["id"]
 
         # Stream the response
+        weave_model = conv.get("local_model") or config.llama_model or ""
+        await db.update_message_content(draft_msg_id, cc_model_used=weave_model)
         print(
             f"[GEN] Starting generation for conv={conv_id} parent={parent_id} model={config.llama_model}"
         )
@@ -9455,6 +10671,7 @@ async def _handle_weave_generation(
                 "type": "stream_start",
                 "parent_id": parent_id,
                 "draft_msg_id": draft_msg_id,
+                "local_model": weave_model,
             },
         )
 
@@ -9471,21 +10688,55 @@ async def _handle_weave_generation(
                 started_at=_time.time(),
                 draft_msg_id=draft_msg_id,
                 parent_id=parent_id,
+                cc_model=weave_model or "",
                 mode="weave",
             )
 
+        import llama_client as _llama_client
+        await _record_turn_model_attestation(
+            conv_id,
+            draft_msg_id,
+            parent_id,
+            _llama_client.configured_completion_attestation(weave_model),
+            _gen_key_local,
+        )
+
         full_response = ""
         _thinking_buffer = ""
+        content_blocks: list[dict] = []
+        current_block: dict | None = None
         total_input_tokens = 0
         total_output_tokens = 0
-        weave_model = conv.get("local_model") or None
-        async for item in stream_chat(messages, model=weave_model):
+        weave_model = weave_model or None
+        weave_max_tokens = int(getattr(config, "weave_max_tokens", None) or getattr(config, "max_tokens", 2048) or 2048)
+        async for item in stream_chat(messages, model=weave_model, max_tokens=weave_max_tokens):
             if isinstance(item, dict):
-                if item.get("type") == "thinking_delta":
+                if item.get("type") == "model_attestation":
+                    await _record_turn_model_attestation(
+                        conv_id,
+                        draft_msg_id,
+                        parent_id,
+                        item.get("model_attestation"),
+                        _gen_key_local,
+                    )
+                elif item.get("type") == "thinking_delta":
                     _thinking_buffer += item["text"]
+                    if current_block and current_block.get("type") == "thinking":
+                        current_block["text"] += item["text"]
+                    else:
+                        current_block = {"type": "thinking", "text": item["text"]}
+                        content_blocks.append(current_block)
                     await _ws_send(
                         conv_id, {"type": "thinking_chunk", "content": item["text"]}
                     )
+                    if _gen_key_local:
+                        _update_gen_snapshot(
+                            _gen_key_local,
+                            full_text=full_response,
+                            content_blocks=content_blocks,
+                            input_tokens=total_input_tokens,
+                            output_tokens=total_output_tokens,
+                        )
                 else:
                     # thinking_start, thinking_end, usage — forward as-is
                     if item.get("type") == "usage":
@@ -9494,6 +10745,11 @@ async def _handle_weave_generation(
                     await _ws_send(conv_id, item)
                 continue
             full_response += item
+            if current_block and current_block.get("type") == "text":
+                current_block["text"] += item
+            else:
+                current_block = {"type": "text", "text": item}
+                content_blocks.append(current_block)
             await _ws_send(
                 conv_id,
                 {
@@ -9503,7 +10759,13 @@ async def _handle_weave_generation(
             )
             # Keep live snapshot in sync
             if _gen_key_local:
-                _update_gen_snapshot(_gen_key_local, full_text=full_response)
+                _update_gen_snapshot(
+                    _gen_key_local,
+                    full_text=full_response,
+                    content_blocks=content_blocks,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                )
 
         # Strip thinking blocks from models that include tags in their content field
         # (qwen3 uses <think>.../», DeepSeek/llama.cpp uses <think>...</think>)
@@ -9515,6 +10777,13 @@ async def _handle_weave_generation(
             full_response = cleaned
 
         # If response is empty, send error instead of saving empty message
+        if not full_response.strip() and content_blocks:
+            full_response = "[No visible response]"
+            if current_block and current_block.get("type") == "text":
+                current_block["text"] += full_response
+            else:
+                content_blocks.append({"type": "text", "text": full_response})
+
         if not full_response.strip():
             print(
                 f"[WARN] Empty response. Raw length={len(full_response)} Cleaned length={len(cleaned)}"
@@ -9535,8 +10804,10 @@ async def _handle_weave_generation(
         await db.update_message_content(
             draft_msg_id,
             content=full_response,
+            content_blocks=json.dumps(content_blocks) if content_blocks else None,
             turn_input_tokens=total_input_tokens,
             turn_output_tokens=total_output_tokens,
+            cc_model_used=weave_model,
             generation_ms=_weave_gen_ms,
         )
         await db.set_active_branch(conv_id, draft_msg_id)

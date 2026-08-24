@@ -147,41 +147,79 @@ def _find_agy_exe() -> str:
     return agy_name
 
 
+def _agy_effort_for_model(model: str, effort: str) -> str:
+    """Use effort encoded by an agy selector; otherwise use Loom's control."""
+    raw = (model or "").removeprefix("gemini:").strip().lower()
+    explicit = re.search(r"(?:-|\()(?P<effort>low|medium|high)\)?$", raw)
+    if explicit:
+        return explicit.group("effort")
+    return effort if effort in {"low", "medium", "high"} else "high"
+
+
 def _loom_model_to_agy(model: str, effort: str) -> str:
-    """Map Loom's model selection to agy 2.0 model identifiers."""
-    if model.lower().startswith("gemini:"):
-        model = model[7:]
-    ml = model.lower()
-    if "gemini 3.6 flash" in ml or "gemini-3.6-flash" in ml:
-        return {
-            "low": "gemini-3.6-flash-low",
-            "medium": "gemini-3.6-flash-medium",
-            "high": "gemini-3.6-flash-high",
-        }.get(effort, "gemini-3.6-flash-high")
-    if "gemini 3.6 pro" in ml or "gemini-3.6-pro" in ml:
-        return {
-            "low": "gemini-3.6-pro-low",
-            "medium": "gemini-3.6-pro-high",
-            "high": "gemini-3.6-pro-high",
-        }.get(effort, "gemini-3.6-pro-high")
-    if "gemini 3.5 flash" in ml or "gemini-3.5-flash" in ml:
-        return {
-            "low": "gemini-3.5-flash-low",
-            "medium": "gemini-3.5-flash-medium",
-            "high": "gemini-3.5-flash-medium",
-        }.get(effort, "gemini-3.5-flash-medium")
-    if "gemini 3.1 pro" in ml or "gemini-3.1-pro" in ml:
-        return {
-            "low": "gemini-3.1-pro-low",
-            "medium": "gemini-3.1-pro-medium",
-        }.get(effort, "gemini-3.1-pro")
+    """Map a Loom selector without overriding model identity encoded in it."""
+    raw = (model or "").strip()
+    if raw.lower().startswith("gemini:"):
+        raw = raw[7:].strip()
+    ml = raw.lower()
+
+    # Discovered values are exact agy selectors, including their effort tier.
+    if re.fullmatch(r"gemini-\d+(?:\.\d+)+-(?:flash|pro)(?:-(?:low|medium|high))?", ml):
+        return raw
+
+    legacy_gemini = re.search(r"gemini\s+(\d+(?:\.\d+)+)\s+(flash|pro)", ml)
+    if legacy_gemini:
+        encoded_effort = _agy_effort_for_model(raw, effort)
+        return f"gemini-{legacy_gemini.group(1)}-{legacy_gemini.group(2)}-{encoded_effort}"
     if "sonnet" in ml:
         return "claude-sonnet"
     if "opus" in ml:
         return "claude-opus"
     if "gpt-oss" in ml:
         return "gpt-oss-120b"
-    return model
+    return raw
+
+
+def _agy_model_provider(model: str) -> str:
+    value = str(model or "").strip().lower()
+    if value.startswith("gemini"):
+        return "google"
+    if value.startswith("claude"):
+        return "anthropic"
+    if value.startswith(("gpt", "o3", "o4")):
+        return "openai"
+    return "antigravity"
+
+
+def _agy_model_attestation(
+    requested_model: str,
+    launch_model: str,
+    effective_model: str | None,
+    *,
+    source: str,
+    session_id: str = "",
+) -> dict:
+    effective = str(effective_model or "").strip()
+    if effective and effective.casefold() == str(launch_model or "").strip().casefold():
+        status = "verified"
+    elif effective:
+        status = "mismatch"
+    elif launch_model:
+        status = "configured"
+    else:
+        status = "unverified"
+    return {
+        "status": status,
+        "harness": "Antigravity (agy)",
+        "requested_model": str(requested_model or "").strip(),
+        "launch_model": str(launch_model or "").strip() or None,
+        "effective_model": effective or None,
+        "model_provider": _agy_model_provider(effective or launch_model),
+        "source": source,
+        "verification_level": "harness" if effective else "launch_configuration",
+        "session_id": session_id or None,
+        "fallback_allowed": False,
+    }
 
 
 def _set_agy_model(agy_model_id: str):
@@ -579,6 +617,7 @@ def _agy_step_events(raw: dict, state: dict) -> list[dict]:
                 "type": "session_info",
                 "session_id": str(session_id or state.get("session_id") or ""),
                 "model": str(model or state.get("model") or ""),
+                "model_confirmed": bool(model),
             })
         return events
 
@@ -708,14 +747,15 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         prompt = _prepare_agy_prompt(prompt, backstage_parent_id, nrol_operator)
 
     agy_model = _loom_model_to_agy(model, effort)
-    agy_effort = effort if effort in {"low", "medium", "high"} else "high"
+    agy_effort = _agy_effort_for_model(model, effort)
 
     queue = asyncio.Queue()
     _active_queues[conv_id] = queue
 
-    # stdout-driven: no transcript tailing. We still keep a stable session_id
-    # for Loom's persistence layer; for agy this is simply the conversation ID
-    # (or resumed session ID) we pass on the CLI.
+    # stdout-driven: no transcript tailing. Loom records the conversation_id
+    # agy emits on stdout. Fresh/replay turns deliberately launch without
+    # --conversation so Loom history is the only memory source for that turn;
+    # native same-agy resumes pass a real resume_session_id below.
     import time as _time
     launch_ts = _time.time()
 
@@ -821,9 +861,12 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # own context fill up across turns until it auto-compacts on what feels
     # to the user like turn 1. Fresh conv per turn → fresh tool registry
     # read from .agents/mcp_config.json, no carry-over compaction.
+    # Broader rule: no resume_session_id means no --conversation.
+    # That keeps full Loom replay/handoff prompts from mixing with agy's
+    # persistent conversation memory.
     cc_args = []
-    if not nrol_operator:
-        cc_args += ["--conversation", resume_session_id or str(conv_id)]
+    if not nrol_operator and resume_session_id:
+        cc_args += ["--conversation", resume_session_id]
 
     # Explicitly set the agy project ID so MCP config from .agents/ loads.
     # agy's default-project cache (cache/default_project_id.txt) gets clobbered
@@ -856,6 +899,9 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         "BASH_DEFAULT_TIMEOUT_MS": "1200000",  # 20 minutes (default is 2m)
         "BASH_MAX_TIMEOUT_MS": "3600000",      # 60 minutes (default is 10m)
     }
+    gen_key = getattr(asyncio.current_task(), "_gen_key", None)
+    if gen_key:
+        env["LOOM_PERMISSION_SCOPE"] = f"gen:{gen_key[2]}"
     if backstage_parent_id:
         env["LOOM_BACKSTAGE_PARENT_ID"] = str(backstage_parent_id)
     if nrol_operator:
@@ -922,11 +968,20 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
 
     # stream-json event producer. This is agy's structured print-mode contract.
     async def _produce_stream_json_events():
-        session_id = resume_session_id or str(conv_id)
+        session_id = resume_session_id or ""
         queue.put_nowait({
             "type": "session_info",
             "session_id": session_id,
+            "requested_model": model,
             "model": agy_model,
+            "model_confirmed": False,
+            "model_attestation": _agy_model_attestation(
+                model,
+                agy_model,
+                None,
+                source="agy_cli_launch_arguments",
+                session_id=session_id,
+            ),
         })
 
         full_text = ""
@@ -934,6 +989,7 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         _dead_since = None
         stream_state = {"session_id": session_id, "model": agy_model}
         got_result = False
+        terminal_error = None
         while True:
             try:
                 line = await asyncio.wait_for(stdout_lines.get(), timeout=1.5)
@@ -952,6 +1008,14 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                     if evt.get("type") == "session_info":
                         stream_state["session_id"] = evt.get("session_id") or stream_state["session_id"]
                         stream_state["model"] = evt.get("model") or stream_state["model"]
+                        if evt.get("model_confirmed"):
+                            evt["model_attestation"] = _agy_model_attestation(
+                                model,
+                                agy_model,
+                                evt.get("model"),
+                                source="antigravity_stream_init",
+                                session_id=stream_state["session_id"],
+                            )
                     elif evt.get("type") == "text_delta":
                         full_text += evt.get("text", "")
                     elif evt.get("type") == "result":
@@ -990,6 +1054,7 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                         msg = (f"Antigravity appears to have shut down "
                                f"(no log activity for {int(_time.time() - _dead_since)}s) "
                                "without producing a final result")
+                        terminal_error = msg
                         print(f"[AGY] Sustained-dead break ({elapsed}s): {msg}")
                         queue.put_nowait({"type": "status", "text": msg})
                         try:
@@ -1001,6 +1066,7 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                 log_err = _scan_agy_log_for_error(launch_ts)
                 if log_err:
                     print(f"[AGY] Live log diagnosis ({elapsed}s): {log_err}")
+                    terminal_error = log_err
                     queue.put_nowait({"type": "status", "text": log_err})
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=5.0)
@@ -1017,16 +1083,17 @@ async def run_gemini(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
             except asyncio.TimeoutError:
                 stdout_task.cancel()
 
-        post_err = None
+        post_err = terminal_error
         if not got_result:
-            post_err = _scan_agy_log_for_error(launch_ts)
-            if post_err:
-                print(f"[AGY] CLI log diagnosis: {post_err}")
-            elif proc.returncode != 0:
-                post_err = f"Antigravity exited with code {proc.returncode}"
-            elif not full_text:
-                post_err = "Antigravity exited cleanly but produced no stream-json result"
-                print(f"[AGY] CLI log diagnosis: {post_err}")
+            if not post_err:
+                post_err = _scan_agy_log_for_error(launch_ts)
+                if post_err:
+                    print(f"[AGY] CLI log diagnosis: {post_err}")
+                elif proc.returncode != 0:
+                    post_err = f"Antigravity exited with code {proc.returncode}"
+                elif not full_text:
+                    post_err = "Antigravity exited cleanly but produced no stream-json result"
+                    print(f"[AGY] CLI log diagnosis: {post_err}")
 
             queue.put_nowait({
                 "type": "result",

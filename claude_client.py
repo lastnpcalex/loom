@@ -263,6 +263,68 @@ async def read_compact_summary(session_id: str, timeout_sec: float = 8.0) -> str
         delay = min(delay * 1.5, 1.0)
 
 
+def _claude_models_equivalent(launch_model: str, effective_model: str) -> bool:
+    """Compare a Claude CLI selector with a runtime-reported model id."""
+    launch = str(launch_model or "").strip().lower().replace("[1m]", "")
+    effective = str(effective_model or "").strip().lower().replace("[1m]", "")
+    if not launch or not effective:
+        return False
+    if launch in {"sonnet", "opus", "haiku", "fable"}:
+        return launch in effective
+
+    def key(value: str) -> str:
+        for prefix in ("custom:", "openrouter:", "dream:"):
+            if value.startswith(prefix):
+                value = value[len(prefix):]
+        if value.endswith(".gguf"):
+            value = value[:-5]
+        return "".join(ch for ch in value if ch.isalnum())
+
+    left = key(launch)
+    right = key(effective)
+    if left == right:
+        return True
+    # llama-server may report the GGUF's internal model id rather than the
+    # selected filename. Restrict fuzzy containment to local-model-shaped ids.
+    if launch.endswith(".gguf") or effective.endswith(".gguf"):
+        return bool(left and right and (left in right or right in left))
+    return False
+
+
+def _claude_model_attestation(
+    requested_model: str,
+    launch_model: str,
+    effective_model: str | None,
+    *,
+    source: str,
+    session_id: str = "",
+    model_provider: str = "anthropic",
+    verification_level: str = "harness",
+) -> dict:
+    """Build Claude Code's requested -> launched -> effective model record."""
+    effective = str(effective_model or "").strip()
+    if effective and _claude_models_equivalent(launch_model, effective):
+        status = "verified"
+    elif effective:
+        status = "mismatch"
+    elif launch_model:
+        status = "configured"
+    else:
+        status = "unverified"
+    return {
+        "status": status,
+        "harness": "Claude Code",
+        "requested_model": str(requested_model or "").strip(),
+        "launch_model": str(launch_model or "").strip() or None,
+        "effective_model": effective or None,
+        "model_provider": model_provider or None,
+        "source": source,
+        "verification_level": verification_level,
+        "session_id": session_id or None,
+        "fallback_allowed": False,
+    }
+
+
 def _process_event(raw: dict, state: dict | None = None) -> list[dict]:
     """Process a raw CC stream-json event and return simplified event dicts.
 
@@ -321,10 +383,22 @@ def _process_event(raw: dict, state: dict | None = None) -> list[dict]:
                 "error": raw.get("error", ""),
             })
         else:
+            session_id = raw.get("session_id", "") or state.get("session_id", "")
+            reported_model = raw.get("model", "")
             events.append({
                 "type": "session_info",
-                "session_id": raw.get("session_id", ""),
-                "model": raw.get("model", ""),
+                "session_id": session_id,
+                "model": reported_model,
+                "model_confirmed": bool(reported_model),
+                "model_attestation": _claude_model_attestation(
+                    state.get("requested_model", ""),
+                    state.get("launch_model", ""),
+                    reported_model,
+                    source="claude_code_system_init",
+                    session_id=session_id,
+                    model_provider=state.get("model_provider", "anthropic"),
+                    verification_level="harness",
+                ),
             })
 
     elif etype == "stream_event":
@@ -333,6 +407,28 @@ def _process_event(raw: dict, state: dict | None = None) -> list[dict]:
         # be reassembled and parsed at content_block_stop.
         ev = raw.get("event", {})
         evt_type = ev.get("type", "")
+
+        if evt_type == "message_start":
+            message = ev.get("message") or {}
+            reported_model = str(message.get("model") or "").strip()
+            if reported_model and reported_model != state.get("provider_attested_model"):
+                state["provider_attested_model"] = reported_model
+                session_id = state.get("session_id", "")
+                events.append({
+                    "type": "session_info",
+                    "session_id": session_id,
+                    "model": reported_model,
+                    "model_confirmed": True,
+                    "model_attestation": _claude_model_attestation(
+                        state.get("requested_model", ""),
+                        state.get("launch_model", ""),
+                        reported_model,
+                        source="anthropic_compatible_message_start",
+                        session_id=session_id,
+                        model_provider=state.get("model_provider", "anthropic"),
+                        verification_level="provider_response",
+                    ),
+                })
 
         # message_delta carries the canonical per-API-call final usage and the
         # turn's stop_reason. With --include-partial-messages the `assistant`
@@ -700,7 +796,8 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
                      extra_mcp_servers: dict | None = None,
                      extra_disallowed_tools: list[str] | None = None,
                      append_system_prompt: str | None = None,
-                     extra_env: dict | None = None):
+                     extra_env: dict | None = None,
+                     requested_model: str | None = None):
     """Run Claude Code CLI and yield parsed events as an async generator.
 
     Returns (process, generator) so the caller can cancel via process.terminate().
@@ -891,6 +988,9 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
     # Pass Loom connection info to the hook script via env vars
     env = {**os.environ}
     env["LOOM_CONV_ID"] = str(conv_id)
+    gen_key = getattr(asyncio.current_task(), "_gen_key", None)
+    if gen_key:
+        env["LOOM_PERMISSION_SCOPE"] = f"gen:{gen_key[2]}"
     if nrol_operator:
         env["LOOM_NROL_OPERATOR"] = "1"
     if backstage_parent_id:
@@ -1068,6 +1168,15 @@ async def run_claude(prompt: str, cwd: str, conv_id: int = 0, server_port: int =
         stream_state: dict = {
             "conv_id": conv_id,
             "cwd": cwd,
+            "requested_model": requested_model or model,
+            "launch_model": model,
+            "model_provider": (
+                "llama-server" if use_llama else
+                "umans" if use_umans else
+                "dream" if use_dream else
+                "openrouter" if use_openrouter else
+                "anthropic"
+            ),
         }
         relaunches = 0
         # Buffer the `result` event across relaunches: the caller treats it

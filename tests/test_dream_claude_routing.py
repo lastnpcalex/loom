@@ -148,6 +148,98 @@ async def test_dream_stream_splits_channel_thinking_from_visible_content(monkeyp
     ]
 
 
+@pytest.mark.asyncio
+async def test_local_llama_stream_sends_reasoning_content_on_thinking_channel(monkeypatch):
+    import llama_client
+
+    class FakeStreamResponse:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aread(self):
+            return b""
+
+        async def aiter_lines(self):
+            yield 'data: {"choices":[{"delta":{"reasoning_content":"hidden plan"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":"visible"}}]}'
+            yield "data: [DONE]"
+
+    class FakeClient:
+        def stream(self, method, url, json, headers, timeout):
+            return FakeStreamResponse()
+
+    monkeypatch.setattr(llama_client, "_client", lambda: FakeClient())
+    llama_client._mock_mode = False
+
+    chunks = []
+    async for chunk in llama_client.stream_chat(
+        [{"role": "user", "content": "hello"}],
+        model="local-test-model",
+    ):
+        chunks.append(chunk)
+
+    assert chunks[:4] == [
+        {"type": "thinking_start"},
+        {"type": "thinking_delta", "text": "hidden plan"},
+        {"type": "thinking_end"},
+        "visible",
+    ]
+    assert "hidden plan" not in "".join(c for c in chunks if isinstance(c, str))
+
+
+@pytest.mark.asyncio
+async def test_local_llama_stream_hides_split_think_tags(monkeypatch):
+    import llama_client
+
+    class FakeStreamResponse:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def aread(self):
+            return b""
+
+        async def aiter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"<thi"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":"nk>hidden"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":" thought</"}}]}'
+            yield 'data: {"choices":[{"delta":{"content":"think>visible"}}]}'
+            yield "data: [DONE]"
+
+    class FakeClient:
+        def stream(self, method, url, json, headers, timeout):
+            return FakeStreamResponse()
+
+    monkeypatch.setattr(llama_client, "_client", lambda: FakeClient())
+    llama_client._mock_mode = False
+
+    chunks = []
+    async for chunk in llama_client.stream_chat(
+        [{"role": "user", "content": "hello"}],
+        model="local-test-model",
+    ):
+        chunks.append(chunk)
+
+    visible = "".join(c for c in chunks if isinstance(c, str))
+    thinking = "".join(
+        c["text"] for c in chunks if isinstance(c, dict) and c.get("type") == "thinking_delta"
+    )
+
+    assert visible == "visible"
+    assert thinking == "hidden thought"
+    assert "<think>" not in visible
+    assert "hidden thought" not in visible
+
+
 def test_diffusion_gemma_server_reports_length_finish_reason():
     source = Path("vendored/diffusion-gemma-server/diffusion-gemma-server.cpp").read_text(
         encoding="utf-8"
@@ -172,4 +264,16 @@ def test_settings_max_tokens_allows_dream_context_scale():
     html = Path("static/index.html").read_text(encoding="utf-8")
 
     assert 'id="cfg-max-tokens" step="256" min="64" max="131072"' in html
+    assert 'id="cfg-weave-max-tokens" step="256" min="64" max="32768"' in html
     assert 'id="cfg-dream-min-output-tokens" min="256" step="256"' in html
+
+
+def test_weave_generation_uses_separate_output_token_setting():
+    config_source = Path("config.py").read_text(encoding="utf-8")
+    app_source = Path("static/app.js").read_text(encoding="utf-8")
+    server_source = Path("server.py").read_text(encoding="utf-8")
+
+    assert "weave_max_tokens" in config_source
+    assert "cfg-weave-max-tokens" in app_source
+    assert 'getattr(config, "weave_max_tokens"' in server_source
+    assert "stream_chat(messages, model=weave_model, max_tokens=weave_max_tokens)" in server_source

@@ -929,6 +929,16 @@ function _truncTreeLabel(s, max = 14) {
     return head + '…' + tail;
 }
 
+async function runTreeUserMessage(data) {
+    if (data.role !== 'user') return;
+    await switchToBranch(data.id, data.id, { exact: true });
+    rememberConversationLeaf(State.currentConvId, data.id);
+    State._skipLoadOnChat = true;
+    switchView('chat');
+    const count = State.branchCount || 1;
+    _triggerParallelGenerate(count, data.id);
+}
+
 function createNode(node, branchNames) {
     const data = node.data;
     const isActive = node.isActive;
@@ -984,6 +994,7 @@ function createNode(node, branchNames) {
             ${hasImage ? '<span class="tree-node-img-badge" title="Has image">img</span>' : ''}
             <span class="tree-node-label" title="${escapeHtml(fullLabel)}">${escapeHtml(label)}</span>
             ${isForkPoint ? `<span class="tree-node-fork">${node.childCount} branches</span>` : ''}
+            ${data.role === 'user' ? '<button class="tree-node-run-btn" title="Run this user message on its exact branch">Run</button>' : ''}
             <button class="tree-node-bookmark-btn${isBookmarked ? ' active' : ''}" title="${isBookmarked ? 'Remove bookmark' : 'Bookmark this node'}">${isBookmarked ? '⏣' : '⬡'}</button>
             <button class="tree-node-delete-btn" title="Delete branch">&#x2715;</button>
         </div>
@@ -1001,13 +1012,25 @@ function createNode(node, branchNames) {
         `;
     }
 
+    const runBtn = el.querySelector('.tree-node-run-btn');
+    if (runBtn) {
+        runBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            await runTreeUserMessage(data);
+        });
+    }
+
     // Delete button
     const deleteBtn = el.querySelector('.tree-node-delete-btn');
     if (deleteBtn) {
         deleteBtn.addEventListener('click', async (e) => {
             e.stopPropagation();
             const childInfo = node.childCount > 0 ? ` and ${node.childCount} child branch${node.childCount > 1 ? 'es' : ''}` : '';
-            if (!confirm(`Delete this message${childInfo}? This cannot be undone.`)) return;
+            if (!await showLoomConfirm({
+                title: 'Delete branch?',
+                message: `Delete this message${childInfo}? This cannot be undone.`,
+                confirmLabel: 'Delete',
+            })) return;
             try {
                 await API.del(`/api/conversations/${State.currentConvId}/messages/${data.id}`);
                 showToast('Branch deleted');
@@ -1051,6 +1074,7 @@ function createNode(node, branchNames) {
         if (TREE.isPanning || TREE._touchMoved) return;
         if (e.target.closest('.tree-node-delete-btn')) return;
         if (e.target.closest('.tree-node-bookmark-btn')) return;
+        if (e.target.closest('.tree-node-run-btn')) return;
         e.stopPropagation();
         await switchToBranch(data.id, data.id);
         State._skipLoadOnChat = true; // prevent switchView('chat') from re-loading

@@ -182,6 +182,56 @@ def _loom_model_to_hermes(model: str | None) -> str | None:
     return f"custom:{resolved}"
 
 
+def _hermes_model_parts(model: str | None) -> tuple[str, str]:
+    value = str(model or "").strip()
+    if ":" in value:
+        head, tail = value.split(":", 1)
+        if head.lower() in _HERMES_PROVIDER_PREFIXES:
+            return head.lower(), tail
+    return "custom", value
+
+
+def _hermes_models_equivalent(left: str | None, right: str | None) -> bool:
+    left_provider, left_model = _hermes_model_parts(left)
+    right_provider, right_model = _hermes_model_parts(right)
+    if left_provider != right_provider:
+        return False
+    return left_model.strip().casefold() == right_model.strip().casefold()
+
+
+def _hermes_model_attestation(
+    requested_model: str | None,
+    launch_model: str | None,
+    effective_model: str | None,
+    *,
+    source: str,
+    session_id: str = "",
+    verified: bool = False,
+) -> dict:
+    effective = str(effective_model or "").strip()
+    if effective and launch_model and not _hermes_models_equivalent(launch_model, effective):
+        status = "mismatch"
+    elif effective and verified:
+        status = "verified"
+    elif launch_model:
+        status = "configured"
+    else:
+        status = "unverified"
+    provider, _ = _hermes_model_parts(effective or launch_model)
+    return {
+        "status": status,
+        "harness": "Hermes ACP",
+        "requested_model": str(requested_model or "").strip(),
+        "launch_model": str(launch_model or "").strip() or None,
+        "effective_model": effective or None,
+        "model_provider": provider or None,
+        "source": source,
+        "verification_level": "harness" if verified else "launch_configuration",
+        "session_id": session_id or None,
+        "fallback_allowed": False,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # JSON-RPC helpers
 # --------------------------------------------------------------------------- #
@@ -358,8 +408,14 @@ def _pick_option(options: list, kind: str) -> Optional[str]:
     return None
 
 
-async def _bridge_permission(rpc: _RpcConn, req_id: Any, params: dict,
-                             conv_id: int, loom_port: int) -> None:
+async def _bridge_permission(
+    rpc: _RpcConn,
+    req_id: Any,
+    params: dict,
+    conv_id: int,
+    loom_port: int,
+    permission_scope: str = "",
+) -> None:
     """Run the browser approval round-trip in its own task, then reply to the
     agent's `session/request_permission` request on the same JSON-RPC id.
 
@@ -376,6 +432,8 @@ async def _bridge_permission(rpc: _RpcConn, req_id: Any, params: dict,
         "tool_input": {"toolCall": tool_call},
         "hook_event_name": "PreToolUse",
     }
+    if permission_scope:
+        body["permission_scope"] = permission_scope
     # Detect protocol (HTTPS if certs exist). Resolve relative to this script.
     _certs_dir = Path(__file__).parent / "certs"
     protocol = "https" if (_certs_dir / "cert.pem").exists() and (_certs_dir / "key.pem").exists() else "http"
@@ -609,9 +667,10 @@ def _prepare_hermes_prompt(
 # --------------------------------------------------------------------------- #
 
 class _HermesTurn:
-    def __init__(self, conv_id: int, loom_port: int):
+    def __init__(self, conv_id: int, loom_port: int, permission_scope: str = ""):
         self.conv_id = conv_id
         self.loom_port = loom_port
+        self.permission_scope = permission_scope
         self.queue: asyncio.Queue[dict] = asyncio.Queue()
         self.state: dict = {}
         self.permission_tasks: set[asyncio.Task] = set()
@@ -755,7 +814,16 @@ class _HermesAcpRuntime:
                 "tool_name": tc.get("title") or tc.get("name") or "HermesTool",
                 "tool_input": tc,
             })
-            task = asyncio.create_task(_bridge_permission(self.rpc, req_id, params, turn.conv_id, turn.loom_port))
+            task = asyncio.create_task(
+                _bridge_permission(
+                    self.rpc,
+                    req_id,
+                    params,
+                    turn.conv_id,
+                    turn.loom_port,
+                    turn.permission_scope,
+                )
+            )
             turn.permission_tasks.add(task)
             task.add_done_callback(turn.permission_tasks.discard)
             return
@@ -785,7 +853,9 @@ class _HermesAcpRuntime:
 
             work_dir = cwd if (cwd and os.path.isdir(cwd)) else os.getcwd()
             acp_cwd = str(Path(work_dir)).replace("\\", "/")
-            turn = _HermesTurn(conv_id, loom_port)
+            gen_key = getattr(asyncio.current_task(), "_gen_key", None)
+            permission_scope = f"gen:{gen_key[2]}" if gen_key else ""
+            turn = _HermesTurn(conv_id, loom_port, permission_scope)
             self._active_turn = turn
             t0 = _time.time()
             session_id = ""
@@ -826,16 +896,14 @@ class _HermesAcpRuntime:
                     session_id = (new_result or {}).get("sessionId") or (new_result or {}).get("session_id") or ""
                     models_info = (new_result or {}).get("models") or {}
 
-                yield {"type": "session_info", "session_id": session_id,
-                       "model": models_info.get("currentModelId", "")}
-
                 target_model_id = _loom_model_to_hermes(model)
                 # session/set_model triggers a full agent re-init in Hermes
                 # (auxiliary auto-detect + context-length probe), so skip it
                 # when the forked/loaded session already runs the target model.
                 current_model_id = (models_info or {}).get("currentModelId") or ""
-                _norm = lambda m: m.split(":", 1)[1] if m.startswith("custom:") else m  # noqa: E731
-                if target_model_id and _norm(target_model_id) != _norm(current_model_id):
+                attestation_source = "hermes_acp_session_model_state"
+                model_verified = bool(current_model_id)
+                if target_model_id and not _hermes_models_equivalent(target_model_id, current_model_id):
                     try:
                         await self.rpc.request(
                             "session/set_model",
@@ -843,7 +911,28 @@ class _HermesAcpRuntime:
                             timeout=60.0,
                         )
                     except Exception as e:  # noqa: BLE001
-                        log.warning("[Hermes] set_model(%s) failed: %s", target_model_id, e)
+                        raise RuntimeError(
+                            f"Hermes refused model '{target_model_id}'; no prompt was sent: {e}"
+                        ) from e
+                    current_model_id = target_model_id
+                    attestation_source = "hermes_acp_set_model_ack"
+                    model_verified = True
+
+                attestation = _hermes_model_attestation(
+                    model,
+                    target_model_id or current_model_id,
+                    current_model_id,
+                    source=attestation_source,
+                    session_id=session_id,
+                    verified=model_verified,
+                )
+                yield {
+                    "type": "session_info",
+                    "session_id": session_id,
+                    "model": current_model_id,
+                    "model_confirmed": attestation["status"] == "verified",
+                    "model_attestation": attestation,
+                }
 
                 prompt_blocks: list[dict] = [{"type": "text", "text": prompt}]
                 prompt_blocks.extend(_collect_current_turn_image_blocks(branch))
@@ -1134,9 +1223,13 @@ async def _run_hermes_oneshot(
     rpc = _RpcConn(proc)
     state: dict = {}
     pending_tasks: set[asyncio.Task] = set()
+    gen_key = getattr(asyncio.current_task(), "_gen_key", None)
+    permission_scope = f"gen:{gen_key[2]}" if gen_key else ""
 
     def _spawn_bridge(req_id: Any, params: dict) -> None:
-        task = asyncio.create_task(_bridge_permission(rpc, req_id, params, conv_id, loom_port))
+        task = asyncio.create_task(
+            _bridge_permission(rpc, req_id, params, conv_id, loom_port, permission_scope)
+        )
         pending_tasks.add(task)
         task.add_done_callback(pending_tasks.discard)
 
@@ -1188,17 +1281,38 @@ async def _run_hermes_oneshot(
                 session_id = (new_result or {}).get("sessionId") or (new_result or {}).get("session_id") or ""
                 models_info = (new_result or {}).get("models") or {}
 
-            yield {"type": "session_info", "session_id": session_id,
-                   "model": models_info.get("currentModelId", "")}
-
             target_model_id = _loom_model_to_hermes(model)
-            if target_model_id:
+            current_model_id = (models_info or {}).get("currentModelId") or ""
+            attestation_source = "hermes_acp_session_model_state"
+            model_verified = bool(current_model_id)
+            if target_model_id and not _hermes_models_equivalent(target_model_id, current_model_id):
                 try:
                     await rpc_request_via_reader(
                         rpc, "session/set_model",
                         {"sessionId": session_id, "modelId": target_model_id}, proc, state)
                 except Exception as e:  # noqa: BLE001
-                    log.warning("[Hermes] set_model(%s) failed: %s", target_model_id, e)
+                    raise RuntimeError(
+                        f"Hermes refused model '{target_model_id}'; no prompt was sent: {e}"
+                    ) from e
+                current_model_id = target_model_id
+                attestation_source = "hermes_acp_set_model_ack"
+                model_verified = True
+
+            attestation = _hermes_model_attestation(
+                model,
+                target_model_id or current_model_id,
+                current_model_id,
+                source=attestation_source,
+                session_id=session_id,
+                verified=model_verified,
+            )
+            yield {
+                "type": "session_info",
+                "session_id": session_id,
+                "model": current_model_id,
+                "model_confirmed": attestation["status"] == "verified",
+                "model_attestation": attestation,
+            }
 
             # --- prompt turn ---
             # Issue the prompt request, then drain until its response arrives.
@@ -1312,9 +1426,24 @@ async def run_hermes(
     resume_session_id: str | None = None,
     fork_session: bool = False,
     is_first_turn: bool = True,
+    isolated: bool = False,
 ):
     """Run one prompt turn through a persistent `hermes acp` runtime."""
     del system  # reserved for parity with other provider clients
+    if isolated:
+        return await _run_hermes_oneshot(
+            prompt,
+            conv_id=conv_id,
+            model=model,
+            cwd=cwd,
+            loom_port=loom_port,
+            hermes_exe=hermes_exe,
+            hermes_home=hermes_home,
+            branch=branch,
+            resume_session_id=resume_session_id,
+            fork_session=fork_session,
+            is_first_turn=is_first_turn,
+        )
     prompt = _prepare_hermes_prompt(prompt, branch, model, is_first_turn=is_first_turn, cwd=cwd)
     exe = hermes_exe or default_hermes_exe(hermes_home)
     home = hermes_home or os.environ.get(

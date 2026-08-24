@@ -25,7 +25,7 @@ _PERSISTED_KEYS = (
     "openrouter_monthly_limit_usd", "openrouter_max_prompt_price_per_mtok",
     "openrouter_max_completion_price_per_mtok",
     "max_context_tokens", "verbatim_window",
-    "temperature", "top_p", "max_tokens", "repeat_penalty",
+    "temperature", "top_p", "max_tokens", "weave_max_tokens", "repeat_penalty",
     "db_path",
     # Dream Hermes — DiffusionGemma GPU orchestrator sidecar (nuspy OpenAI server).
     # dream_host is the OpenAI-compatible endpoint; dream_cwd is the nuspy repo dir
@@ -140,6 +140,7 @@ class Config:
     temperature: float = 0.8
     top_p: float = 0.9
     max_tokens: int = 16384
+    weave_max_tokens: int = int(os.getenv("WEAVE_MAX_TOKENS", "2048"))
     repeat_penalty: float = 1.08
 
     # --- Hermes Agent (ACP mode) — native Windows install ---

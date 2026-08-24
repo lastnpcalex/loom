@@ -85,6 +85,29 @@ def test_agy_special_roles_keep_original_prompt():
     ) == "audit topic"
 
 
+def test_goose_ordinary_prompt_gets_loom_host_safety_contract():
+    import goose_client
+
+    prompt = goose_client._prepare_goose_prompt("inspect the workspace")
+
+    assert '<loom_agent_contract provider="goose">' in prompt
+    assert "inside the active Loom instance" in prompt
+    assert "leave that lifecycle action to the human" in prompt
+
+
+def test_dedicated_roles_identify_loom_and_forbid_host_restart():
+    repo = Path(__file__).resolve().parent.parent
+    backstage = (repo / "backstage.md").read_text(encoding="utf-8")
+    operator = (repo / "mcp_servers" / "nrol_ao" / "OPERATOR.md").read_text(
+        encoding="utf-8"
+    )
+
+    for role_prompt in (backstage, operator):
+        assert "active Loom instance" in role_prompt
+        assert "restart" in role_prompt
+        assert "human operator" in role_prompt
+
+
 def test_existing_operator_file_landing_still_uses_dedicated_role(tmp_path):
     import codex_client
 

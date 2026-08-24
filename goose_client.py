@@ -7,14 +7,17 @@ event shape consumed by server.py for Claude/Codex/Hermes-style providers.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import os
 import shlex
 import shutil
 import sys
 from pathlib import Path
 from typing import Any, AsyncGenerator
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -26,6 +29,7 @@ MODEL_PREFIX = "goose:"
 _MODE_MARKERS = {"auto", "subagents", "approve", "smart-approve", "chat"}
 _PERMISSION_HTTP_TIMEOUT = 900.0
 _STREAM_LIMIT = 16 * 1024 * 1024
+_OPENROUTER_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max", "none"}
 
 
 class _RpcConn:
@@ -75,17 +79,20 @@ def default_goose_exe() -> str:
     """Find the Goose CLI in PATH or common Windows install locations."""
     env = os.environ.get("GOOSE_EXE", "").strip()
     if env:
-        return env
+        return _normalize_goose_exe(env)
     names = ["goose.exe", "goose.cmd", "goose"] if sys.platform == "win32" else ["goose"]
     for name in names:
         found = shutil.which(name)
         if found:
-            return found
+            return _normalize_goose_exe(found)
     if sys.platform == "win32":
         local = os.environ.get("LOCALAPPDATA", "")
         appdata = os.environ.get("APPDATA", "")
         candidates = [
+            Path(local) / "Programs" / "Goose" / "resources" / "bin" / "goose.exe",
+            Path(local) / "Programs" / "Goose" / "Goose.exe",
             Path(local) / "Programs" / "Goose" / "goose.exe",
+            Path(local) / "Goose" / "resources" / "bin" / "goose.exe",
             Path(local) / "Goose" / "goose.exe",
             Path(local) / "goose" / "bin" / "goose.exe",
             Path(appdata) / "Goose" / "goose.exe",
@@ -93,12 +100,30 @@ def default_goose_exe() -> str:
         ]
         for path in candidates:
             if path.exists():
-                return str(path)
+                return _normalize_goose_exe(str(path))
     return "goose"
 
 
+def _normalize_goose_exe(exe: str) -> str:
+    """Prefer Goose's CLI binary when a Windows desktop app path is discovered."""
+    if sys.platform != "win32":
+        return exe
+    try:
+        path = Path(exe)
+    except (OSError, ValueError):
+        return exe
+    if path.name.lower() != "goose.exe":
+        return exe
+    if path.parent.name.lower() == "bin" and path.parent.parent.name.lower() == "resources":
+        return str(path)
+    cli = path.parent / "resources" / "bin" / "goose.exe"
+    if cli.exists():
+        return str(cli)
+    return exe
+
+
 def _goose_command(goose_exe: str | None = None) -> list[str]:
-    exe = goose_exe or default_goose_exe()
+    exe = _normalize_goose_exe(goose_exe or default_goose_exe())
     if Path(exe).exists():
         return [exe]
     parts = shlex.split(exe, posix=sys.platform != "win32")
@@ -119,12 +144,21 @@ def _strip_selector_mode(raw: str) -> tuple[str | None, str]:
 
 
 def permission_mode_for_model(model: str | None, default: str | None = None) -> str:
-    """Return the Goose permission mode implied by a Loom selector, if any."""
+    """Return the safe Goose permission mode implied by a Loom selector.
+
+    Historical ``goose:auto:`` selectors are retained as stable model IDs, but
+    Loom must still receive write/destructive permission requests. Goose's true
+    auto mode bypasses ACP approval entirely, so route those selectors through
+    smart approval instead.
+    """
     raw = (model or "").strip()
     if raw.lower().startswith(MODEL_PREFIX):
         raw = raw.split(":", 1)[1]
     marker, _ = _strip_selector_mode(raw)
-    return marker or default or "approve"
+    selected = marker or default or "approve"
+    if selected in {"auto", "subagents"}:
+        return "smart_approve"
+    return selected.replace("-", "_")
 
 
 def split_goose_model(model: str | None) -> tuple[str, str]:
@@ -143,12 +177,55 @@ def split_goose_model(model: str | None) -> tuple[str, str]:
         return "openrouter", model_id.strip()
     if provider in {"openai", "custom"}:
         return "openai", model_id.strip()
+    if provider in {"llama", "local", "llama-server", "llamaserver"}:
+        return "llama", model_id.strip()
     return provider, model_id.strip()
 
 
 def model_label(model: str | None) -> str:
     provider, model_id = split_goose_model(model)
     return f"goose:{provider}:{model_id}" if model_id else "goose"
+
+
+def _goose_model_attestation(
+    requested_model: str | None,
+    effective_model: str | None = None,
+    *,
+    session_id: str = "",
+) -> dict:
+    """Describe Goose's model evidence without treating env config as proof."""
+    provider, model_id = split_goose_model(requested_model)
+    launch_model = f"{provider}:{model_id}" if model_id else provider
+    effective = str(effective_model or "").strip()
+    effective_label = effective
+    if effective_label.lower().startswith("goose:"):
+        _, effective_label = effective_label.split(":", 1)
+    if effective:
+        status = (
+            "verified"
+            if effective_label.casefold() == launch_model.casefold()
+            else "mismatch"
+        )
+        source = "goose_acp_session_model_state"
+        level = "harness"
+    else:
+        # ACP does not require Goose to expose an effective model. The process
+        # environment is exact launch configuration, but not downstream proof.
+        status = "configured" if model_id else "unverified"
+        source = "goose_process_environment"
+        level = "launch_configuration"
+    return {
+        "status": status,
+        "harness": "Goose ACP",
+        "requested_model": str(requested_model or "").strip(),
+        "launch_model": launch_model or None,
+        "effective_model": effective or None,
+        "model_provider": provider or None,
+        "source": source,
+        "verification_level": level,
+        "session_id": session_id or None,
+        "fallback_allowed": False,
+    }
 
 
 def _truthy(value: str | None) -> bool:
@@ -167,49 +244,154 @@ def _dream_openai_base_url() -> str:
     return host.replace("//localhost", "//127.0.0.1").rstrip("/")
 
 
-def _goose_env(model: str | None, permission_mode: str | None = None) -> dict[str, str]:
+def _llama_openai_base_url() -> str:
+    try:
+        from config import config as _config
+
+        host = _config.llama_host_url()
+    except Exception:
+        host = os.environ.get("LLAMA_HOST", "http://127.0.0.1:8000")
+    if not host.startswith(("http://", "https://")):
+        host = f"http://{host}"
+    return host.replace("//localhost", "//127.0.0.1").rstrip("/")
+
+
+def _llama_context_limit(model_id: str | None) -> int:
+    try:
+        from config import config as _config
+
+        configured = model_id or getattr(_config, "llama_model", "") or ""
+        cfg_path = Path(__file__).resolve().parent / "models_config.json"
+        if configured and cfg_path.is_file():
+            with cfg_path.open("r", encoding="utf-8") as f:
+                model_cfg = json.load(f)
+            ctx = model_cfg.get(configured, {}).get("ctx_size")
+            if ctx:
+                return int(ctx)
+        return int(getattr(_config, "max_context_tokens", 32768) or 32768)
+    except Exception:
+        return int(os.environ.get("LLAMA_CONTEXT_SIZE", "32768"))
+
+
+def _normalize_reasoning_effort(effort: str | None) -> str | None:
+    value = (effort or "").strip().lower().replace("-", "")
+    aliases = {
+        "extra": "xhigh",
+        "extrahigh": "xhigh",
+        "x-high": "xhigh",
+    }
+    value = aliases.get(value, value)
+    return value if value in _OPENROUTER_REASONING_EFFORTS else None
+
+
+def _merge_openrouter_parameters(raw: str | None, effort: str | None) -> str | None:
+    normalized = _normalize_reasoning_effort(effort)
+    if not normalized:
+        return raw
+    params: dict[str, Any] = {}
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                params = parsed
+        except json.JSONDecodeError:
+            params = {}
+    reasoning = params.get("reasoning")
+    if not isinstance(reasoning, dict):
+        reasoning = {}
+    reasoning["effort"] = normalized
+    reasoning.setdefault("enabled", True)
+    params["reasoning"] = reasoning
+    return json.dumps(params, separators=(",", ":"), ensure_ascii=False)
+
+
+def _goose_env(model: str | None, permission_mode: str | None = None, effort: str | None = None) -> dict[str, str]:
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"}
     provider, model_id = split_goose_model(model)
     mode = (permission_mode or os.environ.get("LOOM_GOOSE_MODE") or "approve").strip().lower()
+    mode = mode.replace("-", "_")
     if mode in {"default", "on-request", "request"}:
         mode = "approve"
-    if mode not in {"auto", "smart-approve", "approve", "chat"}:
+    if mode not in {"smart_approve", "approve", "chat"}:
         mode = "approve"
     env["GOOSE_MODE"] = mode
     if _truthy(os.environ.get("LOOM_GOOSE_DISABLE_KEYRING")):
         env["GOOSE_DISABLE_KEYRING"] = "true"
 
     if provider == "dream":
+        dream_host = _dream_openai_base_url().rstrip("/")
+        dream_api_key = os.environ.get("DREAM_GOOSE_API_KEY", "loom-local")
         env["GOOSE_PROVIDER"] = "openai"
         env["GOOSE_MODEL"] = model_id or os.environ.get("DREAM_MODEL", "diffusiongemma")
-        env["OPENAI_HOST"] = _dream_openai_base_url()
+        env["GOOSE_PROVIDER__TYPE"] = "openai"
+        env["GOOSE_PROVIDER__HOST"] = dream_host
+        env["GOOSE_PROVIDER__API_KEY"] = dream_api_key
+        env["OPENAI_HOST"] = dream_host
+        env["OPENAI_BASE_URL"] = dream_host
         env["OPENAI_BASE_PATH"] = os.environ.get("DREAM_GOOSE_OPENAI_BASE_PATH", "v1/chat/completions")
-        env.setdefault("OPENAI_API_KEY", os.environ.get("DREAM_GOOSE_API_KEY", "loom-local"))
+        env["OPENAI_API_KEY"] = dream_api_key
         try:
             from config import config as _config
 
             env.setdefault("GOOSE_CONTEXT_LIMIT", str(int(getattr(_config, "dream_context_size", 131072) or 131072)))
         except Exception:
             env.setdefault("GOOSE_CONTEXT_LIMIT", os.environ.get("DREAM_CONTEXT_SIZE", "131072"))
+    elif provider == "llama":
+        llama_host = _llama_openai_base_url().rstrip("/")
+        llama_api_key = os.environ.get("LLAMA_GOOSE_API_KEY", "loom-local")
+        if not model_id:
+            try:
+                from config import config as _config
+
+                model_id = getattr(_config, "llama_model", "") or os.environ.get("LLAMA_MODEL", "")
+            except Exception:
+                model_id = os.environ.get("LLAMA_MODEL", "")
+        env["GOOSE_PROVIDER"] = "openai"
+        env["GOOSE_MODEL"] = model_id
+        env["GOOSE_PROVIDER__TYPE"] = "openai"
+        env["GOOSE_PROVIDER__HOST"] = llama_host
+        env["GOOSE_PROVIDER__API_KEY"] = llama_api_key
+        env["OPENAI_HOST"] = llama_host
+        env["OPENAI_BASE_URL"] = llama_host
+        env["OPENAI_BASE_PATH"] = os.environ.get("LLAMA_GOOSE_OPENAI_BASE_PATH", "v1/chat/completions")
+        env["OPENAI_API_KEY"] = llama_api_key
+        env.setdefault("GOOSE_CONTEXT_LIMIT", str(_llama_context_limit(model_id)))
     elif provider == "openai":
         env["GOOSE_PROVIDER"] = "openai"
         env["GOOSE_MODEL"] = model_id
     elif provider == "openrouter":
         env["GOOSE_PROVIDER"] = "openrouter"
         env["GOOSE_MODEL"] = model_id
+        merged_params = _merge_openrouter_parameters(env.get("OPENROUTER_PARAMETERS"), effort)
+        if merged_params:
+            env["OPENROUTER_PARAMETERS"] = merged_params
         try:
             import openrouter_client
 
             key = openrouter_client.api_key()
             if key:
                 env["OPENROUTER_API_KEY"] = key
-            env.setdefault("OPENROUTER_HOST", openrouter_client.base_url())
+                env["GOOSE_PROVIDER__API_KEY"] = key
+            env.setdefault("OPENROUTER_HOST", _openrouter_host_for_goose(openrouter_client.base_url()))
+            env.setdefault("GOOSE_PROVIDER__TYPE", "openrouter")
+            env.setdefault("GOOSE_PROVIDER__HOST", env["OPENROUTER_HOST"])
         except Exception:
             pass
     else:
         env["GOOSE_PROVIDER"] = provider
         env["GOOSE_MODEL"] = model_id
     return env
+
+
+def _openrouter_host_for_goose(base_url: str) -> str:
+    raw = (base_url or "https://openrouter.ai").strip()
+    if not raw.startswith(("http://", "https://")):
+        raw = f"https://{raw}"
+    parsed = urlsplit(raw)
+    path = parsed.path.rstrip("/")
+    if path.lower().endswith("/api/v1"):
+        path = path[: -len("/api/v1")].rstrip("/")
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
 
 
 def _loom_mcp_servers() -> list[dict]:
@@ -222,6 +404,12 @@ def _loom_mcp_servers() -> list[dict]:
         "args": [str(web_tools)],
         "env": [],
     }]
+
+
+def _goose_work_dir(cwd: str | None) -> str:
+    """ACP requires an absolute cwd in session/new and session/load."""
+    candidate = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
+    return str(Path(candidate).resolve())
 
 
 def _content_to_text(value) -> str:
@@ -247,6 +435,22 @@ def _content_to_text(value) -> str:
 
 def _text_from_value(value) -> str:
     return _content_to_text(value)
+
+
+def _exception_text(exc: BaseException) -> str:
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) and not str(exc).strip():
+        return "Goose ACP operation timed out"
+    return str(exc).strip() or exc.__class__.__name__
+
+
+def _with_stderr_tail(message: str, stderr_tail: list[str]) -> str:
+    text = (message or "").strip()
+    tail = "\n".join(line for line in stderr_tail[-12:] if line.strip()).strip()
+    if not text:
+        text = "Goose ACP failed"
+    if tail:
+        return f"{text}\n{tail}"
+    return text
 
 
 def _normalize_update(update: dict) -> tuple[str, dict]:
@@ -345,7 +549,14 @@ def _pick_option(options: list, needle: str) -> str | None:
     return None
 
 
-async def _bridge_permission(rpc: _RpcConn, req_id: Any, params: dict, conv_id: int, loom_port: int) -> None:
+async def _bridge_permission(
+    rpc: _RpcConn,
+    req_id: Any,
+    params: dict,
+    conv_id: int,
+    loom_port: int,
+    permission_scope: str = "",
+) -> None:
     tool_call = params.get("toolCall") or params.get("tool_call") or params.get("tool") or {}
     tool_name = (
         tool_call.get("title")
@@ -360,6 +571,8 @@ async def _bridge_permission(rpc: _RpcConn, req_id: Any, params: dict, conv_id: 
         "tool_input": {"toolCall": tool_call, "params": params},
         "hook_event_name": "PreToolUse",
     }
+    if permission_scope:
+        body["permission_scope"] = permission_scope
     certs_dir = Path(__file__).parent / "certs"
     protocol = "https" if (certs_dir / "cert.pem").exists() and (certs_dir / "key.pem").exists() else "http"
     allow = False
@@ -393,6 +606,38 @@ def _prepare_goose_prompt(prompt: str, *, nrol_operator: bool = False) -> str:
     return prepend_loom_agent_context(prompt, "goose")
 
 
+def _image_prompt_block(path: str | Path) -> dict[str, Any] | None:
+    p = Path(path)
+    if not p.is_file():
+        return None
+    mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
+    if not mime.startswith("image/"):
+        return None
+    try:
+        data = base64.b64encode(p.read_bytes()).decode("ascii")
+    except OSError:
+        return None
+    block: dict[str, Any] = {
+        "type": "image",
+        "data": data,
+        "mimeType": mime,
+    }
+    try:
+        block["uri"] = p.resolve().as_uri()
+    except ValueError:
+        pass
+    return block
+
+
+def _prompt_blocks(prompt: str, image_paths: list[str | Path] | None = None) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for image_path in image_paths or []:
+        block = _image_prompt_block(image_path)
+        if block:
+            blocks.append(block)
+    return blocks
+
+
 async def _rpc_request_via_reader(
     rpc: _RpcConn,
     method: str,
@@ -412,7 +657,11 @@ async def _rpc_request_via_reader(
         if remaining <= 0:
             rpc._pending.pop(rid, None)
             raise asyncio.TimeoutError(f"goose {method} timed out")
-        raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+        try:
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            rpc._pending.pop(rid, None)
+            raise asyncio.TimeoutError(f"goose {method} timed out after {timeout:g}s") from exc
         if not raw:
             rpc._pending.pop(rid, None)
             raise RuntimeError(f"goose acp closed stdout during {method}")
@@ -452,6 +701,8 @@ async def run_goose(
     fork_session: bool = False,
     nrol_operator: bool = False,
     builtins: str | list[str] | None = None,
+    effort: str | None = None,
+    image_paths: list[str | Path] | None = None,
 ) -> tuple[asyncio.subprocess.Process, AsyncGenerator[dict, None]]:
     del branch  # reserved for parity; server owns history rendering.
     exe = goose_exe or default_goose_exe()
@@ -464,9 +715,9 @@ async def run_goose(
     if builtin_list:
         cmd.extend(["--with-builtin", ",".join(builtin_list)])
 
-    work_dir = cwd if (cwd and os.path.isdir(cwd)) else os.getcwd()
-    acp_cwd = str(Path(work_dir)).replace("\\", "/")
-    env = _goose_env(model, permission_mode)
+    work_dir = _goose_work_dir(cwd)
+    acp_cwd = work_dir.replace("\\", "/")
+    env = _goose_env(model, permission_mode, effort)
     prompt = _prepare_goose_prompt(prompt, nrol_operator=nrol_operator)
 
     kwargs = {}
@@ -485,20 +736,28 @@ async def run_goose(
         **kwargs,
     )
 
+    stderr_tail: list[str] = []
+
     async def _drain_stderr() -> None:
         assert proc.stderr is not None
         async for line in proc.stderr:
             text = line.decode("utf-8", errors="replace").rstrip()
             if text:
+                stderr_tail.append(text)
+                del stderr_tail[:-40]
                 print(f"[Goose-stderr] {text}")
 
     asyncio.create_task(_drain_stderr())
     rpc = _RpcConn(proc)
     state: dict = {}
     pending_tasks: set[asyncio.Task] = set()
+    gen_key = getattr(asyncio.current_task(), "_gen_key", None)
+    permission_scope = f"gen:{gen_key[2]}" if gen_key else ""
 
     def _spawn_bridge(req_id: Any, params: dict) -> None:
-        task = asyncio.create_task(_bridge_permission(rpc, req_id, params, conv_id, loom_port))
+        task = asyncio.create_task(
+            _bridge_permission(rpc, req_id, params, conv_id, loom_port, permission_scope)
+        )
         pending_tasks.add(task)
         task.add_done_callback(pending_tasks.discard)
 
@@ -507,6 +766,7 @@ async def run_goose(
 
         t0 = _time.time()
         session_id = ""
+        models_info: dict = {}
         prompt_fut: asyncio.Future | None = None
         prompt_req_id: int | None = None
         finished = False
@@ -515,11 +775,8 @@ async def run_goose(
                 rpc,
                 "initialize",
                 {
-                    "protocolVersion": 1,
-                    "clientCapabilities": {
-                        "fs": {"readTextFile": False, "writeTextFile": False},
-                        "terminal": False,
-                    },
+                    "protocolVersion": "v1",
+                    "clientCapabilities": {},
                     "clientInfo": {"name": "loom", "version": "1"},
                 },
                 proc,
@@ -533,12 +790,14 @@ async def run_goose(
                     params = {"sessionId": resume_session_id, "cwd": acp_cwd}
                     res = await _rpc_request_via_reader(rpc, method, params, proc, state)
                     session_id = (res or {}).get("sessionId") or (res or {}).get("session_id") or resume_session_id
+                    models_info = (res or {}).get("models") or {}
                 except Exception as exc:
                     try:
                         await cancel_goose(proc)
                     except Exception:
                         pass
-                    raise RuntimeError(f"Goose session resume/fork failed: {exc}") from exc
+                    detail = _with_stderr_tail(_exception_text(exc), stderr_tail)
+                    raise RuntimeError(f"Goose session resume/fork failed: {detail}") from exc
 
             if not session_id:
                 res = await _rpc_request_via_reader(
@@ -549,8 +808,26 @@ async def run_goose(
                     state,
                 )
                 session_id = (res or {}).get("sessionId") or (res or {}).get("session_id") or ""
+                models_info = (res or {}).get("models") or {}
 
-            yield {"type": "session_info", "session_id": session_id, "model": model_label(model)}
+            effective_model = (
+                models_info.get("currentModelId")
+                or models_info.get("current_model_id")
+                or ""
+            )
+            attestation = _goose_model_attestation(
+                model,
+                effective_model,
+                session_id=session_id,
+            )
+            yield {
+                "type": "session_info",
+                "session_id": session_id,
+                "requested_model": model,
+                "model": effective_model or model_label(model),
+                "model_confirmed": bool(effective_model),
+                "model_attestation": attestation,
+            }
 
             prompt_req_id = rpc._alloc_id()
             prompt_fut = asyncio.get_event_loop().create_future()
@@ -561,7 +838,7 @@ async def run_goose(
                 "method": "session/prompt",
                 "params": {
                     "sessionId": session_id,
-                    "prompt": [{"type": "text", "text": prompt}],
+                    "prompt": _prompt_blocks(prompt, image_paths),
                 },
             })
 
@@ -582,7 +859,8 @@ async def run_goose(
                         try:
                             result = prompt_fut.result()
                         except Exception as exc:  # noqa: BLE001
-                            yield {"type": "error", "error": f"Goose prompt failed: {exc}"}
+                            detail = _with_stderr_tail(_exception_text(exc), stderr_tail)
+                            yield {"type": "error", "error": f"Goose prompt failed: {detail}"}
                             result = {}
                             prompt_failed = True
                         usage = (result or {}).get("usage") or {}
@@ -630,7 +908,7 @@ async def run_goose(
             if not finished:
                 yield {
                     "type": "error",
-                    "error": "Goose ACP exited before completing the turn",
+                    "error": _with_stderr_tail("Goose ACP exited before completing the turn", stderr_tail),
                 }
                 yield {
                     "type": "result",
@@ -639,6 +917,18 @@ async def run_goose(
                     "duration_ms": int((_time.time() - t0) * 1000),
                     "num_turns": 1,
                 }
+        except Exception as exc:  # noqa: BLE001
+            yield {
+                "type": "error",
+                "error": _with_stderr_tail(_exception_text(exc), stderr_tail),
+            }
+            yield {
+                "type": "result",
+                "session_id": session_id,
+                "stop_reason": "error",
+                "duration_ms": int((_time.time() - t0) * 1000),
+                "num_turns": 1,
+            }
         finally:
             if prompt_req_id is not None:
                 rpc._pending.pop(prompt_req_id, None)

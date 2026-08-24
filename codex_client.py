@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -516,21 +517,99 @@ def _find_codex_exe() -> str:
     return "codex"
 
 
+_CODEX_MODEL_SLUG_RE = re.compile(r"gpt-[0-9][A-Za-z0-9_.-]*", re.IGNORECASE)
+
+
+def _normalize_codex_model_selector(model: str) -> str:
+    raw = str(model or "").strip()
+    lowered = raw.lower()
+    if lowered.startswith("codex-"):
+        raw = raw[len("codex-"):].strip()
+    elif lowered.startswith("codex:"):
+        raw = raw.split(":", 1)[1].strip()
+    elif lowered.startswith("codex "):
+        raw = raw.split(None, 1)[1].strip()
+
+    match = _CODEX_MODEL_SLUG_RE.search(raw)
+    if match:
+        return match.group(0).lower()
+    return raw
+
+
+def _default_codex_model() -> str:
+    env_default = os.environ.get("LOOM_CODEX_DEFAULT_MODEL") or os.environ.get("CODEX_MODEL")
+    if env_default and env_default.strip():
+        return _normalize_codex_model_selector(env_default)
+
+    cache_path = Path(os.environ.get("USERPROFILE") or Path.home()) / ".codex" / "models_cache.json"
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        for entry in data.get("models", []):
+            slug = entry.get("slug")
+            if slug and entry.get("supported_in_api", True) is not False:
+                return _normalize_codex_model_selector(slug)
+    except Exception:
+        pass
+
+    return "gpt-5.6-sol"
+
+
 def _loom_model_to_codex(model: str) -> str:
-    """Map Loom's model selection to codex model identifiers."""
-    ml = model.lower()
-    if "gpt-5.5" in ml:
-        return "gpt-5.5"
-    if "gpt-5.4-mini" in ml:
-        return "gpt-5.4-mini"
-    if "gpt-5.4" in ml:
-        return "gpt-5.4"
-    if "gpt-5.3-codex" in ml:
-        return "gpt-5.3-codex"
-    if "gpt-4o" in ml:
-        return "gpt-4o"
-    # Default to gpt-5.5 for codex in 2026
-    return "gpt-5.5"
+    """Map Loom's model selection to Codex model identifiers without silent downgrades."""
+    normalized = _normalize_codex_model_selector(model)
+    return normalized or _default_codex_model()
+
+
+def _codex_reasoning_effort(effort: str | None) -> str | None:
+    """Return an app-server reasoning effort without dropping current Codex values."""
+    normalized = str(effort or "").strip().lower()
+    if normalized == "minimal":
+        normalized = "low"
+    if normalized in {"none", "low", "medium", "high", "xhigh", "max", "ultra"}:
+        return normalized
+    return None
+
+
+def _codex_model_attestation(
+    requested_model: str,
+    launch_model: str,
+    thread_result: dict | None,
+    *,
+    session_id: str = "",
+    app_server_user_agent: str = "",
+) -> dict:
+    """Build the model chain-of-custody returned by Codex app-server.
+
+    ``requested_model`` is Loom's UI selector. ``launch_model`` is the exact
+    normalized value sent to app-server. The effective model and provider are
+    intentionally read only from the thread start/resume/fork response; never
+    substitute the requested value when app-server did not attest one.
+    """
+    result = thread_result if isinstance(thread_result, dict) else {}
+    effective_model = str(result.get("model") or "").strip()
+    model_provider = str(result.get("modelProvider") or "").strip()
+
+    if effective_model and effective_model.casefold() != launch_model.casefold():
+        status = "mismatch"
+    elif effective_model and model_provider:
+        status = "verified"
+    else:
+        status = "unverified"
+
+    return {
+        "status": status,
+        "harness": "Codex app-server",
+        "requested_model": str(requested_model or "").strip(),
+        "launch_model": launch_model,
+        "effective_model": effective_model or None,
+        "model_provider": model_provider or None,
+        "source": "codex_app_server_thread_response",
+        "verification_level": "harness",
+        "session_id": session_id or None,
+        "thread_id": session_id or None,
+        "app_server": app_server_user_agent or None,
+        "fallback_allowed": False,
+    }
 
 
 def _codex_approval_policy(permission_mode: str | None) -> str:
@@ -575,6 +654,9 @@ def _codex_thread_request(
     params = {
         "cwd": cwd,
         "model": codex_model,
+        # A selected Loom model is a contract, not a hint. Surface an explicit
+        # availability error instead of silently running a different model.
+        "allowProviderModelFallback": False,
         "approvalPolicy": approval_policy,
         "approvalsReviewer": "user",
         "sandbox": sandbox_mode,
@@ -974,7 +1056,9 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
     launch_info = {
         "type": "codex_launch_info",
         "surface": "app-server",
+        "requested_model": model,
         "model": codex_model,
+        "fallback_allowed": False,
         "approval_policy": approval_policy,
         "approvals_reviewer": "user",
         "sandbox": sandbox_mode,
@@ -1154,6 +1238,8 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                     await _cleanup()
                     yield {"type": "error", "message": json.dumps(init["error"])}
                     return
+                init_result = init.get("result") or {}
+                app_server_user_agent = str(init_result.get("userAgent") or "").strip()
                 await _send({"method": "initialized"})
 
                 method, thread_params = _codex_thread_request(
@@ -1178,11 +1264,43 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                 thread_result = thread_start.get("result") or {}
                 thread = thread_result.get("thread") or {}
                 session_id = thread.get("id") or thread.get("threadId") or session_id
+                model_attestation = _codex_model_attestation(
+                    model,
+                    codex_model,
+                    thread_result,
+                    session_id=session_id,
+                    app_server_user_agent=app_server_user_agent,
+                )
                 yield {
                     "type": "session_info",
                     "session_id": session_id,
-                    "model": thread_result.get("model") or codex_model,
+                    "model": model_attestation.get("effective_model") or "",
+                    "model_provider": model_attestation.get("model_provider") or "",
+                    "model_confirmed": model_attestation.get("status") == "verified",
+                    "model_attestation": model_attestation,
                 }
+                if model_attestation["status"] != "verified":
+                    await _cleanup()
+                    if model_attestation["status"] == "mismatch":
+                        message = (
+                            "Codex model mismatch: Loom launched "
+                            f"'{codex_model}', but app-server reported "
+                            f"'{model_attestation.get('effective_model')}'. "
+                            "No prompt was sent."
+                        )
+                    else:
+                        message = (
+                            "Codex app-server did not attest both its effective model "
+                            "and model provider. No prompt was sent."
+                        )
+                    yield {
+                        "type": "result",
+                        "is_error": True,
+                        "result_text": "",
+                        "session_id": session_id,
+                        "error": message,
+                    }
+                    return
                 if "nrol-ao" in mcp_servers_cfg:
                     yield {
                         "type": "status",
@@ -1222,7 +1340,7 @@ async def run_codex(prompt: str, cwd: str, conv_id: int = 0, server_port: int = 
                         "approvalPolicy": approval_policy,
                         "approvalsReviewer": "user",
                         "sandboxPolicy": _app_sandbox_policy(cwd, nrol_operator),
-                        "effort": effort if effort in ("minimal", "low", "medium", "high", "xhigh") else None,
+                        "effort": _codex_reasoning_effort(effort),
                     },
                 )
                 if turn_start.get("error"):

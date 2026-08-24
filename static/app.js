@@ -39,6 +39,54 @@ function truthySetting(value) {
     return !!value;
 }
 
+function showLoomConfirm({
+    title = 'Confirm action',
+    message = '',
+    confirmLabel = 'Confirm',
+    cancelLabel = 'Cancel',
+    danger = true,
+} = {}) {
+    return new Promise(resolve => {
+        const overlay = document.createElement('div');
+        overlay.className = 'loom-confirm-overlay';
+        const dialog = document.createElement('div');
+        dialog.className = 'loom-confirm-dialog';
+        const heading = document.createElement('h3');
+        heading.textContent = title;
+        const body = document.createElement('p');
+        body.textContent = message;
+        const actions = document.createElement('div');
+        actions.className = 'loom-confirm-actions';
+        const cancel = document.createElement('button');
+        cancel.className = 'btn-secondary';
+        cancel.textContent = cancelLabel;
+        const confirmButton = document.createElement('button');
+        confirmButton.className = danger ? 'btn-danger' : 'btn-primary';
+        confirmButton.textContent = confirmLabel;
+        actions.append(cancel, confirmButton);
+        dialog.append(heading, body, actions);
+        overlay.appendChild(dialog);
+        document.body.appendChild(overlay);
+
+        const finish = value => {
+            document.removeEventListener('keydown', onKey);
+            overlay.remove();
+            resolve(value);
+        };
+        const onKey = event => {
+            if (event.key === 'Escape') finish(false);
+            if (event.key === 'Enter') finish(true);
+        };
+        cancel.addEventListener('click', () => finish(false));
+        confirmButton.addEventListener('click', () => finish(true));
+        overlay.addEventListener('click', event => {
+            if (event.target === overlay) finish(false);
+        });
+        document.addEventListener('keydown', onKey);
+        confirmButton.focus();
+    });
+}
+
 function resetNewConversationMinimalFields({ resetModel = false } = {}) {
     const minimalToggle = document.getElementById('weave-system-only');
     if (minimalToggle) minimalToggle.checked = false;
@@ -145,7 +193,43 @@ function findActiveConversationLeaf(treeData) {
     return findBranchLeaf((treeData || []).filter(n => n.is_active));
 }
 
-function findLoadableConversationLeaf(treeData) {
+function _tabBranchKey(convId) {
+    return `loom-tab-branch:${convId}`;
+}
+
+function rememberConversationLeaf(convId, leafId) {
+    if (convId == null || leafId == null) return;
+    sessionStorage.setItem(_tabBranchKey(convId), String(leafId));
+}
+
+function findDescendantBranchLeaf(treeData, startId) {
+    const nodes = treeData || [];
+    const start = nodes.find(n => String(n.id) === String(startId));
+    if (!start) return null;
+    const children = new Map();
+    for (const node of nodes) {
+        if (node.parent_id == null) continue;
+        const key = String(node.parent_id);
+        if (!children.has(key)) children.set(key, []);
+        children.get(key).push(node);
+    }
+    // Follow only an unambiguous linear continuation. At a fork, stay on the
+    // remembered node until this tab explicitly follows one child; choosing the
+    // newest descendant would let a sibling agent steal the tab on reload.
+    let current = start;
+    while (true) {
+        const next = children.get(String(current.id)) || [];
+        if (next.length !== 1) return current;
+        current = next[0];
+    }
+}
+
+function findLoadableConversationLeaf(treeData, convId) {
+    const rememberedId = convId == null ? null : sessionStorage.getItem(_tabBranchKey(convId));
+    if (rememberedId != null) {
+        const remembered = (treeData || []).find(n => String(n.id) === String(rememberedId));
+        if (remembered) return findDescendantBranchLeaf(treeData, remembered.id) || remembered;
+    }
     const activeLeaf = findActiveConversationLeaf(treeData);
     if (activeLeaf) return activeLeaf;
     return findBranchLeaf(treeData || []);
@@ -585,7 +669,7 @@ async function checkHealth(retries = 2) {
                 if (State.currentConv.mode === 'dream') {
                     const dreamSel = document.getElementById('dream-model-inline');
                     if (dreamSel) {
-                        _populateWeaveModelDropdown(dreamSel, State.currentConv.local_model || '', true, false);
+                        _populateWeaveModelDropdown(dreamSel, State.currentConv.local_model || '', true, false, false);
                     }
                 } else if (State.currentConv.mode === 'hermes' || State.currentConv.mode === 'weave') {
                     const weaveSel = document.getElementById('weave-model-inline');
@@ -593,8 +677,9 @@ async function checkHealth(retries = 2) {
                         _populateWeaveModelDropdown(
                             weaveSel,
                             State.currentConv.local_model || '',
-                            State.currentConv.mode === 'weave' || State.currentConv.mode === 'hermes',
-                            State.currentConv.mode === 'weave'
+                            State.currentConv.mode === 'weave',
+                            State.currentConv.mode === 'weave',
+                            true
                         );
                     }
                 } else if (State.currentConv.mode === 'claude' || State.currentConv.mode === 'local' || State.currentConv.mode === 'codex' || State.currentConv.mode === 'gemini' || State.currentConv.mode === 'goose' || State.currentConv.mode === 'umans') {
@@ -798,7 +883,11 @@ function renderConversationList() {
         // Dissolve folder (move all conversations to unfiled)
         header.querySelector('.conv-folder-dissolve').addEventListener('click', async (e) => {
             e.stopPropagation();
-            if (!confirm(`Dissolve "${folderName}"? All conversations will be unfiled.`)) return;
+            if (!await showLoomConfirm({
+                title: 'Dissolve folder?',
+                message: `Dissolve "${folderName}"? All conversations will be unfiled.`,
+                confirmLabel: 'Dissolve',
+            })) return;
             for (const c of folders[folderName]) {
                 try {
                     await API.put(`/api/conversations/${c.id}`, { folder: '' });
@@ -1002,7 +1091,11 @@ function buildConvItem(conv) {
     // Delete
     div.querySelector('.conv-delete-btn').addEventListener('click', async (e) => {
         e.stopPropagation();
-        if (confirm('Delete this conversation?')) {
+        if (await showLoomConfirm({
+            title: 'Delete conversation?',
+            message: 'This removes the conversation and all of its branches.',
+            confirmLabel: 'Delete',
+        })) {
             await API.del(`/api/conversations/${conv.id}`);
             State.conversations = State.conversations.filter(c => c.id !== conv.id);
             if (State.currentConvId === conv.id) {
@@ -1169,9 +1262,10 @@ async function loadConversation(convId) {
 
     // Also load the active branch for chat. If active flags were lost, fall
     // back to an actual tree leaf so persisted DB messages still display.
-    const leaf = findLoadableConversationLeaf(treeData);
+    const leaf = findLoadableConversationLeaf(treeData, convId);
     if (leaf) {
         State.messages = await API.get(`/api/conversations/${convId}/branch/${leaf.id}`);
+        rememberConversationLeaf(convId, leaf.id);
     } else {
         State.messages = [];
     }
@@ -1204,6 +1298,7 @@ async function loadConversation(convId) {
 async function createConversation() {
     const mode = document.querySelector('#mode-toggle .toggle-btn.active')?.dataset.value || 'weave';
     const title = document.getElementById('new-conv-title').value.trim() || 'New Conversation';
+    const parallelAgentsEnabled = !!document.getElementById('parallel-agents-enabled')?.checked;
 
     if (mode === 'claude') {
         const projectDir = document.getElementById('project-dir').value.trim();
@@ -1219,6 +1314,7 @@ async function createConversation() {
             project_dir: projectDir,
             cc_model: ccModel,
             cc_effort: ccEffort,
+            parallel_agents_enabled: parallelAgentsEnabled,
         });
         State.conversations.unshift(conv);
         closeModal('modal-new-conv');
@@ -1256,11 +1352,16 @@ async function createConversation() {
             return;
         }
         const localProjectDir = document.getElementById('project-dir').value.trim();
+        if (parallelAgentsEnabled && !localProjectDir) {
+            showToast('A working directory is required for parallel agents', 'error');
+            return;
+        }
         const conv = await API.post('/api/conversations', {
             title,
             mode,
             local_model: localModel,
             project_dir: localProjectDir || undefined,
+            parallel_agents_enabled: parallelAgentsEnabled,
         });
         State.conversations.unshift(conv);
         closeModal('modal-new-conv');
@@ -1361,6 +1462,9 @@ async function openNewConvModal() {
     document.querySelector('#mode-toggle .toggle-btn[data-value="claude"]').classList.add('active');
     document.getElementById('project-dir-group').classList.remove('hidden');
     document.getElementById('project-dir').value = '';
+    document.getElementById('parallel-agents-group')?.classList.remove('hidden');
+    const parallelToggle = document.getElementById('parallel-agents-enabled');
+    if (parallelToggle) parallelToggle.checked = false;
     document.getElementById('cc-model-group').classList.remove('hidden');
     document.getElementById('cc-effort-group').classList.remove('hidden');
     
@@ -1469,7 +1573,7 @@ async function updateInlineCCControls(conv) {
         const modelSel = document.getElementById('cc-model-inline');
         const effortSel = document.getElementById('cc-effort-inline');
         const permSel = document.getElementById('cc-permission-mode-inline');
-        const ccModel = conv.cc_model || (isGemini ? 'Gemini 3.5 Flash (Medium)' : (isCodex ? 'codex-gpt-5.5' : (isGoose ? 'goose:openrouter:z-ai/glm-5.2' : 'sonnet')));
+        const ccModel = conv.cc_model || (isGemini ? 'Gemini 3.5 Flash (Medium)' : (isCodex ? '' : (isGoose ? 'goose:openrouter:z-ai/glm-5.2' : 'sonnet')));
         await populateCCModelDropdowns(ccModel);
         
         effortSel.value = conv.cc_effort || 'high';
@@ -1486,6 +1590,7 @@ async function updateInlineCCControls(conv) {
         // selects don't apply, so hide them.
         modelSel.style.display = isBraid ? 'none' : '';
         effortSel.style.display = (isBraid || !modelSupportsEffort) ? 'none' : '';
+        _syncEffortOptionsForModel('cc-effort-inline', resolvedModel);
         // Codex / Gemini Plan mode is hidden as it does not do anything
         if (permSel) permSel.style.display = (isCodex || isGemini) ? 'none' : '';
         statePanelChat?.classList.add('hidden');
@@ -1498,7 +1603,7 @@ async function updateInlineCCControls(conv) {
         statePanelChat?.classList.add('hidden');
         setBranchCount(1);
         const weaveSel = document.getElementById('weave-model-inline');
-        if (weaveSel) _populateWeaveModelDropdown(weaveSel, conv.local_model || '', true, false);
+        if (weaveSel) _populateWeaveModelDropdown(weaveSel, conv.local_model || '', false, false, true);
         const incogW = document.getElementById('incognito-toggle-weave');
         if (incogW) incogW.checked = !!conv.incognito;
     } else if (conv && conv.mode === 'dream') {
@@ -1510,7 +1615,7 @@ async function updateInlineCCControls(conv) {
         statePanelChat?.classList.add('hidden');
         setBranchCount(1);
         const dreamSel = document.getElementById('dream-model-inline');
-        if (dreamSel) _populateWeaveModelDropdown(dreamSel, conv.local_model || '', true, false);
+        if (dreamSel) _populateWeaveModelDropdown(dreamSel, conv.local_model || '', true, false, false);
         const incogD = document.getElementById('incognito-toggle-dream');
         if (incogD) incogD.checked = !!conv.incognito;
     } else if (conv && conv.mode === 'weave') {
@@ -1583,10 +1688,31 @@ function _isGooseValue(v) {
 function _isOpenRouterValue(v) {
     return _isOpenRouterModel(v);
 }
-// Anthropic and Codex models both take the thinking-effort knob
-// (codex_client forwards minimal..xhigh); gemini/local models do not.
+// Anthropic, Codex, OpenRouter, and Goose-backed models can take a
+// thinking-effort knob. Gemini/local models do not use this control.
 function _supportsEffortValue(v) {
-    return _isAnthropicValue(v) || _isCodexValue(v) || _isOpenRouterValue(v);
+    return _isAnthropicValue(v) || _isCodexValue(v) || _isOpenRouterValue(v) || _isGooseValue(v);
+}
+function _allowsXhighEffortValue(v) {
+    return _isOpusValue(v) || _isCodexValue(v) || _isOpenRouterValue(v) || _isGooseValue(v);
+}
+function _allowsMaxEffortValue(v) {
+    return _isOpusValue(v) || _isCodexValue(v) || _isOpenRouterValue(v) || _isGooseValue(v);
+}
+function _syncEffortOptionsForModel(selectId, model) {
+    const effortSel = document.getElementById(selectId);
+    if (!effortSel) return;
+    const maxOpt = effortSel.querySelector('option[value="max"]');
+    const xhighOpt = effortSel.querySelector('option[value="xhigh"]');
+    const allowMax = _allowsMaxEffortValue(model);
+    const allowXhigh = _allowsXhighEffortValue(model);
+    if (maxOpt) maxOpt.disabled = !allowMax;
+    if (xhighOpt) xhighOpt.disabled = !allowXhigh;
+    if (effortSel.value === 'max' && !allowMax) {
+        effortSel.value = allowXhigh ? 'xhigh' : 'high';
+    } else if (effortSel.value === 'xhigh' && !allowXhigh) {
+        effortSel.value = 'high';
+    }
 }
 
 function _modelsMatch(a, b) {
@@ -1613,10 +1739,60 @@ function _isOpenRouterModel(model) {
         || m === 'deepseek/deepseek-v4-flash-0731';
 }
 
+function _gooseRouteModelValue(model) {
+    const raw = String(model || '').trim();
+    if (!raw || _isGooseValue(raw)) return raw;
+    if (_isOpenRouterValue(raw)) {
+        return `goose:openrouter:${raw.replace(/^openrouter:/i, '')}`;
+    }
+    if (raw.toLowerCase().endsWith('.gguf')) {
+        return `goose:llama:${raw}`;
+    }
+    if (raw.toLowerCase().startsWith('dream:')) {
+        return `goose:dream:${raw.slice('dream:'.length)}`;
+    }
+    if (_isDreamEngineModel(raw)) {
+        return `goose:dream:${raw}`;
+    }
+    return raw;
+}
+
+function _modelRuntimeCtx(model) {
+    const ctx = model && model.runtime && Number(model.runtime.n_ctx || 0);
+    return ctx ? `${ctx.toLocaleString()} ctx` : '';
+}
+
+function _modelOptionLabel(model, labelPrefix = '') {
+    const base = model && typeof model === 'object'
+        ? (model.label || model.name || model.value || '')
+        : String(model || '');
+    if (!model || typeof model !== 'object') return `${labelPrefix}${base}`;
+    const tags = [];
+    if ((model.backend || 'llama') === 'llama') {
+        if (model.loaded) tags.push('loaded');
+        else if (model.configured) tags.push('configured');
+        else if (model.disabled) tags.push('not loaded');
+        const ctx = _modelRuntimeCtx(model);
+        if (ctx) tags.push(ctx);
+    } else if (model.backend === 'dream') {
+        tags.push(model.loaded ? 'loaded' : 'offline');
+    }
+    return `${labelPrefix}${base}${tags.length ? ` (${tags.join(', ')})` : ''}`;
+}
+
 function _appendModelOption(select, model, labelPrefix = '') {
     const opt = document.createElement('option');
-    opt.value = model.name || model;
-    opt.textContent = `${labelPrefix}${model.label || model.name || model}`;
+    opt.value = model && typeof model === 'object'
+        ? (model.value || model.name || model.label || '')
+        : model;
+    opt.textContent = _modelOptionLabel(model, labelPrefix);
+    if (model && typeof model === 'object') {
+        opt.disabled = !!model.disabled;
+        if (model.backend) opt.dataset.backend = model.backend;
+        if (model.loaded !== undefined) opt.dataset.loaded = model.loaded ? '1' : '0';
+        if (model.configured !== undefined) opt.dataset.configured = model.configured ? '1' : '0';
+        if (model.title) opt.title = model.title;
+    }
     select.appendChild(opt);
     return opt;
 }
@@ -1643,24 +1819,28 @@ function _fetchAllModelsOnce() {
     return _allModelsFetch;
 }
 
-async function _fetchSelectableLocalModels(includeDream = true, includeOpenRouter = true) {
+async function _fetchSelectableLocalModels(includeDream = true, includeOpenRouter = true, includeLlama = true) {
     try {
         const data = await _fetchAllModelsOnce();
         const models = data.models || [];
+        const llamaModels = models.filter(m => (m.backend || 'llama') === 'llama');
+        const dreamModels = includeDream ? models.filter(m => m.backend === 'dream') : [];
         return {
-            llama: models.filter(m => (m.backend || 'llama') === 'llama' && m.loaded),
-            dream: includeDream ? models.filter(m => m.backend === 'dream') : [],
+            llama: includeLlama ? llamaModels.filter(m => m.loaded || m.configured) : [],
+            unavailableLlama: includeLlama ? llamaModels.filter(m => !m.loaded && !m.configured) : [],
+            dream: dreamModels.filter(m => m.loaded),
+            unavailableDream: dreamModels.filter(m => !m.loaded),
             openrouter: includeOpenRouter ? models.filter(m => m.backend === 'openrouter') : [],
         };
     } catch {
-        return { llama: [], dream: [], openrouter: [] };
+        return { llama: [], unavailableLlama: [], dream: [], unavailableDream: [], openrouter: [] };
     }
 }
 
 // Inline Weave/Braid model dropdown — populated from Llama Server
-async function _populateWeaveModelDropdown(select, currentModel, includeDream = true, includeOpenRouter = true) {
+async function _populateWeaveModelDropdown(select, currentModel, includeDream = true, includeOpenRouter = true, includeLlama = true) {
     if (!select) return;
-    const selectable = await _fetchSelectableLocalModels(includeDream, includeOpenRouter);
+    const selectable = await _fetchSelectableLocalModels(includeDream, includeOpenRouter, includeLlama);
     const allModels = [...selectable.llama, ...selectable.dream, ...selectable.openrouter];
     const prev = select.value;
     select.innerHTML = '<option value="">Local Model</option>';
@@ -1672,16 +1852,35 @@ async function _populateWeaveModelDropdown(select, currentModel, includeDream = 
     let target = currentModel || prev || '';
     if (target) {
         const match = allModels.find(m => target === m.name || _modelsMatch(target, m.name));
-        target = match ? match.name : '';
+        if (match) {
+            target = match.name;
+        } else {
+            const unavailable = [...selectable.unavailableLlama, ...selectable.unavailableDream]
+                .find(m => target === m.name || _modelsMatch(target, m.name));
+            if (unavailable) {
+                const group = document.createElement('optgroup');
+                group.label = 'Unavailable';
+                _appendModelOption(group, {
+                    ...unavailable,
+                    disabled: true,
+                    title: `${unavailable.name} is saved here but is not loaded right now.`,
+                });
+                select.appendChild(group);
+                target = unavailable.name;
+            } else {
+                target = '';
+            }
+        }
     }
     if (!target && allModels.length === 1) {
         target = allModels[0].name;
     }
     select.value = target;
-    const titleParts = ['Local'];
+    const titleParts = [];
+    if (includeLlama) titleParts.push('Llama Server');
     if (includeDream) titleParts.push('Dream Engine');
     if (includeOpenRouter) titleParts.push('OpenRouter');
-    select.title = `${titleParts.join(', ')} model`;
+    select.title = `${(titleParts.length ? titleParts.join(', ') : 'Model')} model`;
 }
 
 function initBranchCountPill() {
@@ -1714,6 +1913,9 @@ function initInlineCCControls() {
 
     async function saveCC(field, value) {
         if (!State.currentConvId || !State.currentConv) return;
+        if (field === 'cc_model' && State.currentConv.mode === 'goose') {
+            value = _gooseRouteModelValue(value);
+        }
         try {
             const updated = await API.put(`/api/conversations/${State.currentConvId}`, { [field]: value });
             Object.assign(State.currentConv, updated);
@@ -1722,6 +1924,7 @@ function initInlineCCControls() {
 
     function _syncEffortVisibility(model) {
         effortSel.style.display = _supportsEffortValue(model) ? '' : 'none';
+        _syncEffortOptionsForModel('cc-effort-inline', model);
     }
 
     modelSel.addEventListener('change', async () => {
@@ -1780,10 +1983,15 @@ function initInlineCCControls() {
                 await API.put(`/api/conversations/${State.currentConvId}`, { local_model: model });
                 State.currentConv.local_model = model;
                 
-                // If they chose a local model, restart Llama Server with it.
+                const selectedOption = weaveSel.selectedOptions && weaveSel.selectedOptions[0];
+                const selectedBackend = selectedOption?.dataset?.backend
+                    || (_isOpenRouterModel(model) ? 'openrouter' : (_isDreamEngineModel(model) ? 'dream' : 'llama'));
+
+                // If they chose a Llama Server model, restart Llama Server with it.
                 // Remote OpenRouter models are saved as a Weave model pin and
-                // route through the cloud client; there is no local server to restart.
-                if (model && !_isOpenRouterModel(model)) {
+                // Dream models route through the Dream sidecar; neither has a
+                // local llama-server restart to perform here.
+                if (model && selectedBackend === 'llama') {
                     showLoading(`Restarting Llama Server with ${model}...`);
                     try {
                         // Update global config first so the restart command picks it up
@@ -2321,18 +2529,20 @@ function showWeaveFields(show) {
 async function fetchLocalModels() {
     const select = document.getElementById('local-model');
     if (!select) return;
-    select.innerHTML = '<option value="">Local Model</option>';
     const mode = document.querySelector('#mode-toggle .toggle-btn.active')?.dataset.value || '';
-    const selectable = await _fetchSelectableLocalModels(
-        mode === 'weave' || mode === 'hermes' || mode === 'dream',
-        mode === 'weave'
-    );
+    select.innerHTML = `<option value="">${mode === 'dream' ? 'Dream Engine model' : 'Local Model'}</option>`;
+    const includeLlama = mode !== 'dream';
+    const includeDream = mode === 'weave' || mode === 'dream';
+    const includeOpenRouter = mode === 'weave';
+    const selectable = await _fetchSelectableLocalModels(includeDream, includeOpenRouter, includeLlama);
     _appendModelGroup(select, 'Llama Server', selectable.llama);
     _appendModelGroup(select, 'Dream Engine', selectable.dream);
     _appendModelGroup(select, 'OpenRouter', selectable.openrouter);
     const models = [...selectable.llama, ...selectable.dream, ...selectable.openrouter];
     if (models.length === 1) {
         select.value = models[0].name;
+    } else if (models.length === 0) {
+        select.options[0].textContent = mode === 'dream' ? 'Dream Engine offline' : 'No loaded local model';
     }
 }
 
@@ -2342,14 +2552,15 @@ async function populateCCModelDropdowns(selectedValue) {
     if (!_ccModelsCache) {
         try { _ccModelsCache = await API.get('/api/cc-models'); } catch { return; }
     }
-    // Fetch the loaded Llama Server model for local CC/Braid. Dream-Claude
+    // Fetch the loaded or configured Llama Server model for local CC/Braid. Dream-Claude
     // options come from /api/cc-models as explicit shim-backed entries, not
     // from the generic local-model list.
     let llamaModels = [];
     let loadedModel = null;
     try {
         const data = await _fetchAllModelsOnce();
-        const found = (data.models || []).find(m => (m.backend || 'llama') === 'llama' && m.loaded);
+        const found = (data.models || []).find(m => (m.backend || 'llama') === 'llama' && m.loaded)
+            || (data.models || []).find(m => (m.backend || 'llama') === 'llama' && m.configured);
         if (found) {
             loadedModel = found.name;
             llamaModels = [loadedModel];
@@ -2395,20 +2606,19 @@ async function populateCCModelDropdowns(selectedValue) {
             sel.appendChild(og);
         }
         if (prev) {
-            // Check if the previous model value is one of the Anthropic/Gemini/Codex/Umans API models
-            const isApi = _ccModelsCache.some(group => group.models.some(m => m.value === prev))
-                || _isUmansValue(prev);
-            if (!isApi) {
-                // Check if it's an umans model (umans-* prefix)
-                const isUmans = _isUmansValue(prev);
-                if (!isUmans) {
-                    if (loadedModel && _modelsMatch(prev, loadedModel)) {
-                        prev = loadedModel;
-                    } else {
-                        // Fallback to sonnet if no matching local model is loaded
-                        prev = 'sonnet';
-                    }
-                }
+            const isListed = Array.from(sel.options).some(opt => opt.value === prev);
+            if (!isListed && loadedModel && _modelsMatch(prev, loadedModel)) {
+                prev = loadedModel;
+            } else if (!isListed) {
+                // Discovery is allowed to be temporarily incomplete. Keep the
+                // persisted selector authoritative instead of changing models.
+                const og = document.createElement('optgroup');
+                og.label = 'Unavailable';
+                const opt = document.createElement('option');
+                opt.value = prev;
+                opt.textContent = `${prev} (currently unavailable)`;
+                og.appendChild(opt);
+                sel.appendChild(og);
             }
             sel.value = prev;
         }
@@ -2587,8 +2797,10 @@ function setupEventListeners() {
             document.getElementById('cc-model-group').classList.add('hidden');
             document.getElementById('cc-effort-group').classList.add('hidden');
             document.getElementById('local-model-group').classList.add('hidden');
+            document.getElementById('parallel-agents-group')?.classList.add('hidden');
             if (mode === 'claude') {
                 document.getElementById('project-dir-group').classList.remove('hidden');
+                document.getElementById('parallel-agents-group')?.classList.remove('hidden');
                 document.getElementById('cc-model-group').classList.remove('hidden');
                 document.getElementById('cc-effort-group').classList.remove('hidden');
                 showWeaveFields(false);
@@ -2601,6 +2813,7 @@ function setupEventListeners() {
             } else if (mode === 'local' || mode === 'hermes' || mode === 'dream') {
                 document.getElementById('local-model-group').classList.remove('hidden');
                 document.getElementById('project-dir-group').classList.remove('hidden');
+                document.getElementById('parallel-agents-group')?.classList.remove('hidden');
                 showWeaveFields(false);
                 fetchLocalModels();
             } else {
@@ -2620,17 +2833,7 @@ function setupEventListeners() {
             effortGroup.classList.add('hidden');
         } else {
             effortGroup.classList.remove('hidden');
-            const isOpus = _isOpusValue(model);
-            const allowXhigh = isOpus || _isCodexValue(model) || _isOpenRouterValue(model);
-            const maxOpt = document.querySelector('#cc-effort option[value="max"]');
-            const xhighOpt = document.querySelector('#cc-effort option[value="xhigh"]');
-            if (maxOpt) maxOpt.disabled = !isOpus;
-            if (xhighOpt) xhighOpt.disabled = !allowXhigh;
-            const effortSel = document.getElementById('cc-effort');
-            if ((effortSel.value === 'max' && !isOpus)
-                || (effortSel.value === 'xhigh' && !allowXhigh)) {
-                effortSel.value = 'high';
-            }
+            _syncEffortOptionsForModel('cc-effort', model);
         }
     });
 
@@ -2874,6 +3077,24 @@ function setupEventListeners() {
     function _localUrl(scheme, port, path) {
         return `${scheme}://${location.hostname}:${port}${path || ''}`;
     }
+
+    function _syncLlamaServerLink(host) {
+        const row = document.querySelector('#cfg-server-grid .server-row[data-server="llama"]');
+        if (!row) return;
+        let urlText = (host || '').trim() || 'http://localhost:8000';
+        if (!/^https?:\/\//i.test(urlText)) urlText = `http://${urlText}`;
+        let parsed = null;
+        try { parsed = new URL(urlText); } catch { parsed = null; }
+        const link = row.querySelector('.server-link');
+        const port = row.querySelector('.server-port');
+        if (link) link.href = parsed ? parsed.href : urlText;
+        if (port) {
+            const portText = parsed?.port || (parsed?.protocol === 'https:' ? '443' : '80');
+            port.textContent = portText ? `:${portText}` : '';
+            port.title = urlText;
+        }
+    }
+
     // All co-located services (admin, llama server, comfyui) run plain HTTP,
     // so a direct browser probe from HTTPS main Loom is blocked as mixed
     // content. Probe each through main Loom's same-origin proxy instead.
@@ -2928,15 +3149,20 @@ function setupEventListeners() {
         });
         if (!cfg || settingsSeq !== _settingsLoadSeq) return;
         State.config = cfg;
+        _syncLlamaServerLink(cfg.llama_host);
         const conv = State.currentConv;
 
         // Non-async values
         document.getElementById('cfg-temp').value = cfg.temperature ?? 0.85;
         document.getElementById('cfg-top-p').value = cfg.top_p ?? 0.92;
         document.getElementById('cfg-max-tokens').value = cfg.max_tokens ?? 16384;
+        const weaveMaxTokens = document.getElementById('cfg-weave-max-tokens');
+        if (weaveMaxTokens) weaveMaxTokens.value = cfg.weave_max_tokens ?? 2048;
         document.getElementById('cfg-repeat-penalty').value = cfg.repeat_penalty ?? 1.12;
         document.getElementById('cfg-cc-effort').value = (conv && conv.cc_effort) || 'high';
         document.getElementById('cfg-cc-permission').value = (conv && conv.mode !== 'codex' && conv.cc_permission_mode) || 'default';
+        const cfgParallelAgents = document.getElementById('cfg-parallel-agents-enabled');
+        if (cfgParallelAgents) cfgParallelAgents.checked = !!(conv && truthySetting(conv.parallel_agents_enabled));
         const dreamMinOutput = document.getElementById('cfg-dream-min-output-tokens');
         if (dreamMinOutput) dreamMinOutput.value = cfg.dream_min_output_tokens ?? 2048;
 
@@ -2955,10 +3181,10 @@ function setupEventListeners() {
         const settingsJobs = await Promise.allSettled([
             _loadModelConfigs(),
             _populateModelDropdown(),
-            _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), localModel, true, false),
-            _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), localModel, true, false),
+            _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), localModel, false, false, true),
+            _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), localModel, false, false, true),
             _populateWeaveModelDropdown(document.getElementById('cfg-weave-model'), localModel),
-            _populateWeaveModelDropdown(document.getElementById('cfg-dream-model'), localModel, true, false),
+            _populateWeaveModelDropdown(document.getElementById('cfg-dream-model'), localModel, true, false, false),
             populateCCModelDropdowns(conv && conv.cc_model || 'sonnet'),
             _populateKvQuantDropdown(),
             _populateMmprojDropdown(),
@@ -2968,6 +3194,9 @@ function setupEventListeners() {
         if (settingsFailures) {
             showToast(`${settingsFailures} settings control${settingsFailures === 1 ? '' : 's'} could not load`, 'warning');
         }
+        const cfgModelValue = document.getElementById('cfg-cc-model')?.value || '';
+        document.getElementById('cfg-cc-effort-group')?.classList.toggle('hidden', !_supportsEffortValue(cfgModelValue));
+        _syncEffortOptionsForModel('cfg-cc-effort', cfgModelValue);
         document.querySelectorAll('#modal-settings input, #modal-settings select, #modal-settings textarea').forEach(el => {
             el.disabled = false;
         });
@@ -2979,6 +3208,7 @@ function setupEventListeners() {
         const llamaModelSelect = document.getElementById('cfg-llama-model-select');
         const selModel = llamaModelSelect ? llamaModelSelect.value : '';
         _showModelTuning(selModel);
+        _refreshLlamaRuntimeStatus();
 
         // Per-conversation overrides: the settings layout stays invariant —
         // every group always renders, only the open conversation's group is
@@ -2989,7 +3219,7 @@ function setupEventListeners() {
         const mode = conv ? conv.mode : null;
         const ccModelName = conv ? (conv.cc_model || '') : '';
         const agentKind = (conv && typeof _agentKindForModel === 'function') ? _agentKindForModel(ccModelName, conv) : '';
-        const hasLoomOverrides = mode === 'claude' || mode === 'codex' || mode === 'gemini' || mode === 'goose' || mode === 'umans';
+        const hasLoomOverrides = mode === 'claude' || mode === 'codex' || mode === 'gemini' || mode === 'goose' || mode === 'umans' || mode === 'openrouter';
         const isActuallyCodex = mode === 'codex' || agentKind === 'codex';
         const isActuallyGemini = mode === 'gemini' || agentKind === 'gemini';
 
@@ -3009,6 +3239,10 @@ function setupEventListeners() {
         }
         const ccPermissionGroup = document.getElementById('cfg-cc-permission')?.closest('.form-group');
         if (ccPermissionGroup) ccPermissionGroup.classList.toggle('hidden', isActuallyCodex || isActuallyGemini);
+        const parallelGroup = document.getElementById('cfg-parallel-agents-group');
+        const supportsParallelAgents = !!(conv && ['claude', 'local', 'hermes', 'dream', 'gemini', 'codex', 'goose', 'umans', 'openrouter'].includes(mode) && conv.project_dir && !truthySetting(conv.nrol_operator));
+        if (parallelGroup) parallelGroup.classList.toggle('hidden', !supportsParallelAgents);
+        if (cfgParallelAgents) cfgParallelAgents.disabled = !supportsParallelAgents;
         const ovHint = document.getElementById('cfg-overrides-divider-hint');
         if (ovHint) ovHint.textContent = mode ? '' : '(open a conversation to edit)';
 
@@ -3061,6 +3295,7 @@ function setupEventListeners() {
                 try { await API.post('/api/local/refresh-models', {}); } catch {}
                 _invalidateModelCaches();
                 await checkHealth();
+                await _refreshLlamaRuntimeStatus();
             } else {
                 showToast('Llama Server restart failed: ' + (data.output || 'unknown error'), 'error');
             }
@@ -3085,11 +3320,13 @@ function setupEventListeners() {
             _invalidateModelCaches();
             await checkHealth();
             await Promise.all([
-                _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), document.getElementById('cfg-braid-model') ? document.getElementById('cfg-braid-model').value : '', true, false),
-                _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), document.getElementById('cfg-hermes-model') ? document.getElementById('cfg-hermes-model').value : '', true, false),
+                _populateModelDropdown(),
+                _populateWeaveModelDropdown(document.getElementById('cfg-braid-model'), document.getElementById('cfg-braid-model') ? document.getElementById('cfg-braid-model').value : '', false, false, true),
+                _populateWeaveModelDropdown(document.getElementById('cfg-hermes-model'), document.getElementById('cfg-hermes-model') ? document.getElementById('cfg-hermes-model').value : '', false, false, true),
                 _populateWeaveModelDropdown(document.getElementById('cfg-weave-model'), document.getElementById('cfg-weave-model') ? document.getElementById('cfg-weave-model').value : ''),
-                _populateWeaveModelDropdown(document.getElementById('cfg-dream-model'), document.getElementById('cfg-dream-model') ? document.getElementById('cfg-dream-model').value : '', true, false),
+                _populateWeaveModelDropdown(document.getElementById('cfg-dream-model'), document.getElementById('cfg-dream-model') ? document.getElementById('cfg-dream-model').value : '', true, false, false),
                 populateCCModelDropdowns(document.getElementById('cfg-cc-model') ? document.getElementById('cfg-cc-model').value : ''),
+                _refreshLlamaRuntimeStatus(),
             ]);
             showToast('Models refreshed');
         } catch (e) {
@@ -3151,6 +3388,7 @@ function setupEventListeners() {
     document.getElementById('cfg-cc-model').addEventListener('change', () => {
         const v = document.getElementById('cfg-cc-model').value || '';
         document.getElementById('cfg-cc-effort-group').classList.toggle('hidden', !_supportsEffortValue(v));
+        _syncEffortOptionsForModel('cfg-cc-effort', v);
     });
 
     async function _saveSettingsFromPanel() {
@@ -3180,6 +3418,7 @@ function setupEventListeners() {
             temperature: parseFloat(valueOf('cfg-temp', State.config.temperature ?? 0.85)),
             top_p: parseFloat(valueOf('cfg-top-p', State.config.top_p ?? 0.92)),
             max_tokens: parseInt(valueOf('cfg-max-tokens', State.config.max_tokens ?? 16384)),
+            weave_max_tokens: parseInt(valueOf('cfg-weave-max-tokens', State.config.weave_max_tokens ?? 2048)),
             repeat_penalty: parseFloat(valueOf('cfg-repeat-penalty', State.config.repeat_penalty ?? 1.12)),
             max_context_tokens: parseInt(valueOf('cfg-context', State.config.max_context_tokens ?? 28000)),
             verbatim_window: parseInt(valueOf('cfg-verbatim', State.config.verbatim_window ?? 8)),
@@ -3191,13 +3430,24 @@ function setupEventListeners() {
             openrouter_max_prompt_price_per_mtok: parseFloat(valueOf('cfg-openrouter-prompt-price', State.config.openrouter_max_prompt_price_per_mtok ?? 1)),
             openrouter_max_completion_price_per_mtok: parseFloat(valueOf('cfg-openrouter-completion-price', State.config.openrouter_max_completion_price_per_mtok ?? 4)),
         };
-        await API.put('/api/config', globalCfg);
-        State.config = globalCfg;
+        const savedGlobalCfg = await API.put('/api/config', globalCfg);
+        State.config = savedGlobalCfg || globalCfg;
+        const llamaServerExe = document.getElementById('cfg-llama-server-exe');
+        if (llamaServerExe && State.config.llama_server_exe) {
+            llamaServerExe.value = State.config.llama_server_exe;
+        }
+        _syncLlamaServerLink(State.config.llama_host);
 
         if (conv && State.currentConvId) {
             const updates = {};
+            if (['claude', 'local', 'hermes', 'dream', 'gemini', 'codex', 'goose', 'umans', 'openrouter'].includes(conv.mode) && conv.project_dir && !truthySetting(conv.nrol_operator)) {
+                updates.parallel_agents_enabled = !!document.getElementById('cfg-parallel-agents-enabled')?.checked;
+            }
             if (conv.mode === 'claude' || conv.mode === 'codex' || conv.mode === 'gemini' || conv.mode === 'goose' || conv.mode === 'umans' || conv.mode === 'openrouter') {
-                const modelName = valueOf('cfg-cc-model', conv.cc_model || (conv.mode === 'gemini' ? 'Gemini 3.5 Flash (Medium)' : 'sonnet'));
+                let modelName = valueOf('cfg-cc-model', conv.cc_model || (conv.mode === 'gemini' ? 'Gemini 3.5 Flash (Medium)' : (conv.mode === 'codex' ? '' : 'sonnet')));
+                if (conv.mode === 'goose') {
+                    modelName = _gooseRouteModelValue(modelName);
+                }
                 const agentKind = (typeof _agentKindForModel === 'function') ? _agentKindForModel(modelName, conv) : '';
                 const isActuallyCodex = conv.mode === 'codex' || agentKind === 'codex';
                 const isActuallyGemini = conv.mode === 'gemini' || agentKind === 'gemini';
@@ -3259,12 +3509,77 @@ function setupEventListeners() {
         } catch (e) { showToast('Failed to save model configs', 'error'); }
     }
 
+    function _fmtTokenCount(value) {
+        const n = Number(value || 0);
+        return n ? n.toLocaleString() : '';
+    }
+
+    function _setRuntimeText(id, text, title = '') {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = text || 'unknown';
+        el.title = title || text || '';
+    }
+
+    function _modelSettingsSummary(modelName) {
+        if (!modelName) return 'none';
+        const mc = _modelConfigs[modelName] || {};
+        const parts = [];
+        if (mc.ctx_size) parts.push(`ctx ${_fmtTokenCount(mc.ctx_size)}`);
+        if (mc.ngl !== undefined && mc.ngl !== null && mc.ngl !== '') parts.push(`GPU ${mc.ngl}`);
+        if (mc.kv_quant) parts.push(`KV ${mc.kv_quant}`);
+        if (mc.flash_attn !== undefined) parts.push(`FA ${mc.flash_attn === false ? 'off' : 'on'}`);
+        if (mc.mmproj) parts.push(`MMProj ${mc.mmproj}`);
+        if (mc.extra_args) parts.push(mc.extra_args);
+        return parts.length ? parts.join(' | ') : 'no saved tuning';
+    }
+
+    async function _refreshLlamaRuntimeStatus() {
+        const root = document.getElementById('llama-runtime-status');
+        if (!root) return;
+        root.dataset.state = 'unknown';
+        _setRuntimeText('llama-runtime-state', 'checking');
+        try {
+            const data = await _fetchAllModelsOnce();
+            const llamaModels = (data.models || []).filter(m => (m.backend || 'llama') === 'llama');
+            const loaded = llamaModels.filter(m => m.loaded);
+            const loadedNames = loaded.map(m => m.name).join(', ') || 'none';
+            const configured = data.target_model || State.config?.llama_model || '';
+            const selected = document.getElementById('cfg-llama-model-select')?.value || configured;
+            const loadedPrimary = loaded[0] || null;
+            const runtime = loadedPrimary?.runtime || {};
+            const runtimeCtx = _fmtTokenCount(runtime.n_ctx);
+            const trainCtx = _fmtTokenCount(runtime.n_ctx_train);
+            const drift = configured && loadedPrimary && !_modelsMatch(configured, loadedPrimary.name);
+            const state = loaded.length ? (drift ? 'online, drift' : 'online') : 'offline';
+            root.dataset.state = loaded.length ? 'online' : 'offline';
+            _setRuntimeText('llama-runtime-state', state);
+            _setRuntimeText('llama-runtime-loaded', loadedNames, loadedNames);
+            _setRuntimeText('llama-runtime-configured', configured || 'none', configured || 'none');
+            _setRuntimeText(
+                'llama-runtime-ctx',
+                runtimeCtx ? `${runtimeCtx}${trainCtx ? ` / ${trainCtx} train` : ''}` : (loaded.length ? 'unknown' : 'none')
+            );
+            _setRuntimeText('llama-runtime-saved-settings', _modelSettingsSummary(selected));
+        } catch (e) {
+            root.dataset.state = 'offline';
+            _setRuntimeText('llama-runtime-state', 'unavailable');
+            _setRuntimeText('llama-runtime-loaded', 'unknown');
+            _setRuntimeText('llama-runtime-configured', State.config?.llama_model || 'unknown');
+            _setRuntimeText('llama-runtime-ctx', 'unknown');
+            _setRuntimeText('llama-runtime-saved-settings', 'unknown');
+        }
+    }
+
     async function _populateModelDropdown() {
         const sel = document.getElementById('cfg-llama-model-select');
         if (!sel) return;
         try {
             const data = await _fetchDiskModels();
-            const models = data.models || [];
+            const models = (data.models || []).filter(m => {
+                const name = String(m || '').toLowerCase();
+                return !name.startsWith('mmproj') && !name.includes('mm-projector');
+            });
             sel.innerHTML = '';
             for (const m of models) {
                 const opt = document.createElement('option');
@@ -3370,6 +3685,7 @@ function setupEventListeners() {
     if (llamaModelSettingsSelect) {
         llamaModelSettingsSelect.addEventListener('change', function () {
             _showModelTuning(this.value);
+            _refreshLlamaRuntimeStatus();
         });
     }
 
@@ -3677,7 +3993,11 @@ function renderHomeCharacters() {
         // Delete button
         card.querySelector('.char-delete-btn').addEventListener('click', async (e) => {
             e.stopPropagation();
-            if (!confirm(`Delete character "${char.name}"? This cannot be undone.`)) return;
+            if (!await showLoomConfirm({
+                title: 'Delete character?',
+                message: `Delete character "${char.name}"? This cannot be undone.`,
+                confirmLabel: 'Delete',
+            })) return;
             try {
                 await API.del(`/api/characters/${char.id}`);
                 State.characters = State.characters.filter(c => c.id !== char.id);
@@ -3896,7 +4216,11 @@ function renderHomePersonas() {
         });
         card.querySelector('.char-delete-btn').addEventListener('click', async (e) => {
             e.stopPropagation();
-            if (!confirm(`Delete persona "${persona.name}"? This cannot be undone.`)) return;
+            if (!await showLoomConfirm({
+                title: 'Delete persona?',
+                message: `Delete persona "${persona.name}"? This cannot be undone.`,
+                confirmLabel: 'Delete',
+            })) return;
             try {
                 await API.del(`/api/personas/${persona.id}`);
                 State.personas = State.personas.filter(p => p.id !== persona.id);
@@ -4024,7 +4348,11 @@ function renderHomeLore() {
         });
         card.querySelector('.char-delete-btn').addEventListener('click', async (e) => {
             e.stopPropagation();
-            if (!confirm(`Delete lore entry "${entry.name}"? This cannot be undone.`)) return;
+            if (!await showLoomConfirm({
+                title: 'Delete lore entry?',
+                message: `Delete lore entry "${entry.name}"? This cannot be undone.`,
+                confirmLabel: 'Delete',
+            })) return;
             try {
                 await API.del(`/api/lore/${entry.id}`);
                 State.lore = State.lore.filter(l => l.id !== entry.id);

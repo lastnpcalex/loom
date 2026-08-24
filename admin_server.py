@@ -16,6 +16,7 @@ import importlib
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -809,6 +810,46 @@ def _resolve_llama_chat_template_file() -> str:
     return str(p)
 
 
+def _resolve_llama_server_exe(raw: str, models_dir: str) -> str:
+    """Resolve the configured llama-server executable before launching it."""
+    raw = (raw or "").strip().strip('"')
+    if not raw:
+        raw = "llama-server"
+
+    p = Path(raw).expanduser()
+    candidates: list[Path] = []
+
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        found = shutil.which(raw)
+        if found:
+            return found
+        candidates.append(Path(__file__).parent / p)
+
+        if raw.lower() in {"llama-server", "llama-server.exe"}:
+            model_root = Path(models_dir).expanduser()
+            candidates.extend([
+                model_root.parent / "bin" / "llama-server.exe",
+                model_root.parent / "llama-server.exe",
+                Path.home() / "OneDrive" / "Documents" / "LS" / "bin" / "llama-server.exe",
+                Path.home() / "Documents" / "LS" / "bin" / "llama-server.exe",
+                Path(r"C:\LlamaServer\bin\llama-server.exe"),
+                Path(r"C:\LlamaServer\llama-server.exe"),
+            ])
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+
+    searched = ", ".join(str(c) for c in candidates)
+    raise FileNotFoundError(
+        f"Configured llama_server_exe '{raw}' was not found. "
+        f"Set Llama Server Path to a full llama-server.exe path. "
+        f"Searched PATH and: {searched}"
+    )
+
+
 def _build_llama_cmd(model_name: str | None = None) -> str:
     """Build the llama-server launch command from per-model config."""
     override = os.getenv("LLAMA_LAUNCH_CMD")
@@ -820,6 +861,7 @@ def _build_llama_cmd(model_name: str | None = None) -> str:
               (_loom_config.llama_model if _loom_config else "Qwen3.6-27B-NVFP4.gguf"))).strip()
     exe = (_loom_config.llama_server_exe if _loom_config else LLAMA_SERVER_EXE).strip()
     models_dir = (_loom_config.llama_models_dir if _loom_config else LLAMA_MODELS_DIR).strip()
+    exe = _resolve_llama_server_exe(exe, models_dir)
     import os.path as _osp
     model_path = model if _osp.isabs(model) else _osp.join(models_dir, model)
 
@@ -905,6 +947,97 @@ def _spawn_detached(cmd: str, cwd: str | None = None, log_name: str | None = Non
     return proc
 
 
+_classroom_service_lock = asyncio.Lock()
+_CLASSROOM_FEATURES = {"labs", "radis", "raids"}
+_CLASSROOM_ACTIONS = {
+    "launch",
+    "shutdown",
+    "restart",
+    "service-start",
+    "service-stop",
+    "service-restart",
+    "tunnel-start",
+    "tunnel-stop",
+    "tunnel-restart",
+    "provision",
+    "status",
+}
+
+
+async def _run_classroom_controller(
+    feature: str | None = None,
+    action: str | None = None,
+) -> JSONResponse:
+    """Invoke the fixed FacultyOps controller without importing either app."""
+    facultyops_root = Path(os.environ.get("FACULTYOPS_ROOT", r"G:\Work Agents"))
+    controller = facultyops_root / "services" / "classroomctl.py"
+    if not controller.is_file():
+        return JSONResponse(
+            {"error": f"Classroom controller is missing: {controller}"},
+            status_code=409,
+        )
+    if feature is not None and feature not in _CLASSROOM_FEATURES:
+        return JSONResponse({"error": "Unknown classroom service."}, status_code=404)
+    if action is not None and action not in _CLASSROOM_ACTIONS:
+        return JSONResponse({"error": "Unknown classroom action."}, status_code=404)
+
+    command = [sys.executable, str(controller)]
+    if feature:
+        command.extend([feature, action or "status"])
+    command.append("--json")
+    timeout = 240 if action == "provision" else 45
+
+    async with _classroom_service_lock:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(facultyops_root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=os.environ.copy(),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return JSONResponse(
+                {"error": f"Classroom action timed out after {timeout} seconds."},
+                status_code=504,
+            )
+        except OSError as exc:
+            return JSONResponse(
+                {"error": f"Could not start the classroom controller: {exc}"},
+                status_code=500,
+            )
+
+    output = stdout.decode("utf-8", errors="replace").strip()
+    error = stderr.decode("utf-8", errors="replace").strip()
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        detail = error or output or f"Controller exited with code {process.returncode}"
+        return JSONResponse({"error": detail[-3000:]}, status_code=502)
+    return JSONResponse(payload, status_code=200 if process.returncode == 0 else 409)
+
+
+@app.get("/tools/classroom-services")
+async def tool_classroom_services_status():
+    return await _run_classroom_controller()
+
+
+@app.post("/tools/classroom-services/{feature}/{action}")
+async def tool_classroom_services_action(feature: str, action: str):
+    return await _run_classroom_controller(feature.strip().lower(), action.strip().lower())
+
+
+@app.post("/tools/classroom-tunnel-provision")
+async def tool_classroom_tunnel_provision(data: dict = Body(...)):
+    """Compatibility endpoint for the previous Canvas control script."""
+    feature = str(data.get("feature") or "").strip().lower()
+    return await _run_classroom_controller(feature, "provision")
+
+
 @app.post("/tools/llama-start")
 async def tool_llama_start(model: str | None = None):
     """Launch llama-server.exe with the currently configured model.
@@ -917,9 +1050,10 @@ async def tool_llama_start(model: str | None = None):
                 return JSONResponse({"status": "ok", "output": f"Llama Server is already running on :{port}"})
     except Exception:
         pass
-    _reload_config()
-    cmd = _build_llama_cmd(model)
+    cmd = ""
     try:
+        _reload_config()
+        cmd = _build_llama_cmd(model)
         proc = _spawn_detached(cmd)
         _child_procs["llama"] = proc
         # llama-server loads the model into VRAM before accepting requests
@@ -940,7 +1074,8 @@ async def tool_llama_start(model: str | None = None):
             "output": f"Llama Server launched (PID {proc.pid}) but not responding after 90s. Large models may need more time.\nCmd: {cmd}",
         })
     except Exception as e:
-        return JSONResponse({"status": "error", "output": f"Failed to launch Llama Server: {e}\nCmd: {cmd}"})
+        suffix = f"\nCmd: {cmd}" if cmd else ""
+        return JSONResponse({"status": "error", "output": f"Failed to launch Llama Server: {e}{suffix}"})
 
 
 @app.post("/tools/llama-stop")

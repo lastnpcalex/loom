@@ -193,7 +193,9 @@ function _resetStreamState() {
     State.isStreaming = false;
     State._streamIsOurBranch = undefined;
     State._followingGenId = null;
+    State._followingDraftMsgId = null;
     State._parallelCount = 0;
+    State._liveStreamDraft = null;
     _queuedStreamEventsDuringReconstruct = [];
     if (streamingDiv && !streamingDiv.isConnected) {
         streamingDiv = null;  // detached; drop the stale ref
@@ -214,8 +216,10 @@ function _clearTerminalStreamState({ clearParallel = false } = {}) {
     State._reconstructing = false;
     State._streamIsOurBranch = undefined;
     State._followingGenId = null;
+    State._followingDraftMsgId = null;
     State._compactedThisGen = false;
     State._compactData = null;
+    State._liveStreamDraft = null;
     if (clearParallel) State._parallelCount = 0;
     _queuedStreamEventsDuringReconstruct = [];
     const sendBtn = document.getElementById('btn-send');
@@ -275,12 +279,14 @@ async function _fetchActiveBranchMessages(convId) {
     State.treeData = treeData;  // keep branch indicators in sync
     if (typeof markTreeDataFresh === 'function') markTreeDataFresh(convId);
     hideRetryBar();
-    const leaf = findActiveConversationLeaf(treeData);
+    const leaf = findLoadableConversationLeaf(treeData, convId);
     if (leaf) {
         State.messages = await API.get(`/api/conversations/${convId}/branch/${leaf.id}`);
+        rememberConversationLeaf(convId, leaf.id);
     } else if (!State.messages.length) {
         State.messages = [];
     }
+    _mergeLiveStreamDraftIntoState();
 }
 
 async function _syncMessagesForStreaming(convId) {
@@ -396,7 +402,7 @@ function showRetryBar(errorMsg) {
         // Retry: send generate for the current active leaf
         if (State.ws && State.ws.readyState === WebSocket.OPEN) {
             showGenStatus('Retrying...');
-            const retryMsg = { action: 'generate' };
+            const retryMsg = { action: 'generate', parent_id: _currentVisibleLeafId() || null };
             _attachCCSettings(retryMsg);
             State.ws.send(JSON.stringify(retryMsg));
         }
@@ -412,6 +418,155 @@ function hideRetryBar() {
     const existing = document.getElementById('retry-bar');
     if (existing) existing.remove();
 }
+
+function _sameMessageId(a, b) {
+    if (a === undefined || a === null || b === undefined || b === null) return false;
+    return String(a) === String(b);
+}
+
+function _currentVisibleLeafId() {
+    const visible = (State.messages || []).filter(m => m && m.id != null);
+    return visible.length ? visible[visible.length - 1].id : null;
+}
+
+function _streamParentMatchesVisibleBranch(parentId, draftMsgId) {
+    if (draftMsgId != null && (State.messages || []).some(m => _sameMessageId(m.id, draftMsgId))) {
+        return true;
+    }
+    if (parentId == null) return _currentVisibleLeafId() == null;
+    return _sameMessageId(parentId, _currentVisibleLeafId());
+}
+
+function _draftBlocks(value) {
+    if (Array.isArray(value)) return value;
+    if (typeof value === 'string' && value) {
+        try {
+            const parsed = JSON.parse(value);
+            if (Array.isArray(parsed)) return parsed;
+        } catch {}
+    }
+    return [];
+}
+
+function _blockTextLength(blocks) {
+    return _draftBlocks(blocks).reduce((total, block) => {
+        return total + String(block?.text || '').length
+            + String(block?.input || '').length
+            + String(block?.result || '').length;
+    }, 0);
+}
+
+function _mergeLiveStreamDraftIntoState() {
+    const live = State._liveStreamDraft;
+    if (!live || live.id == null) return null;
+    const idx = (State.messages || []).findIndex(m => _sameMessageId(m.id, live.id));
+    if (idx < 0) {
+        State.messages.push(live);
+        return live;
+    }
+    const fetched = State.messages[idx];
+    if (String(fetched.content || '').length > String(live.content || '').length) {
+        live.content = fetched.content;
+    }
+    if (_blockTextLength(fetched.content_blocks) > _blockTextLength(live.content_blocks)) {
+        live.content_blocks = _draftBlocks(fetched.content_blocks);
+    }
+    if (!live.model_attestation && fetched.model_attestation) {
+        live.model_attestation = fetched.model_attestation;
+    }
+    State._liveStreamDraft = { ...fetched, ...live };
+    State.messages[idx] = State._liveStreamDraft;
+    return State._liveStreamDraft;
+}
+
+function _ensureLiveStreamDraft(data = {}) {
+    const draftId = data.draft_msg_id ?? State._followingDraftMsgId;
+    if (draftId == null) return null;
+    if (State._liveStreamDraft && _sameMessageId(State._liveStreamDraft.id, draftId)) {
+        return _mergeLiveStreamDraftIntoState();
+    }
+    const existing = (State.messages || []).find(m => _sameMessageId(m.id, draftId));
+    State._liveStreamDraft = {
+        ...(existing || {}),
+        id: draftId,
+        conversation_id: State.currentConvId,
+        role: 'assistant',
+        parent_id: data.parent_id ?? existing?.parent_id ?? null,
+        content: existing?.content || '',
+        content_blocks: _draftBlocks(existing?.content_blocks),
+        cc_model_used: data.cc_model || data.local_model || existing?.cc_model_used || '',
+    };
+    return _mergeLiveStreamDraftIntoState();
+}
+
+function _appendLiveDraftText(text) {
+    const draft = _ensureLiveStreamDraft();
+    if (!draft || !text) return;
+    draft.content = (draft.content || '') + text;
+    const blocks = _draftBlocks(draft.content_blocks);
+    const last = blocks[blocks.length - 1];
+    if (last?.type === 'text') last.text = (last.text || '') + text;
+    else blocks.push({ type: 'text', text });
+    draft.content_blocks = blocks;
+}
+
+function _appendLiveDraftThinking(text) {
+    const draft = _ensureLiveStreamDraft();
+    if (!draft || !text) return;
+    const blocks = _draftBlocks(draft.content_blocks);
+    const last = blocks[blocks.length - 1];
+    if (last?.type === 'thinking') last.text = (last.text || '') + text;
+    else blocks.push({ type: 'thinking', text });
+    draft.content_blocks = blocks;
+}
+
+function _startLiveDraftTool(data) {
+    const draft = _ensureLiveStreamDraft(data);
+    if (!draft) return;
+    const blocks = _draftBlocks(draft.content_blocks);
+    blocks.push({
+        type: 'tool_use',
+        name: data.name || 'Tool',
+        tool_id: data.tool_id || '',
+        input: '',
+        result: '',
+    });
+    draft.content_blocks = blocks;
+}
+
+function _liveDraftTool(toolId) {
+    const draft = _ensureLiveStreamDraft();
+    if (!draft) return null;
+    const blocks = _draftBlocks(draft.content_blocks);
+    draft.content_blocks = blocks;
+    for (let i = blocks.length - 1; i >= 0; i--) {
+        if (blocks[i]?.type === 'tool_use' && (!toolId || _sameMessageId(blocks[i].tool_id, toolId))) {
+            return blocks[i];
+        }
+    }
+    return null;
+}
+
+function _syncLiveDraftFromSnapshot(snap) {
+    const draft = _ensureLiveStreamDraft(snap || {});
+    if (!draft || !snap) return draft;
+    if (String(snap.full_text || '').length > String(draft.content || '').length) {
+        draft.content = snap.full_text;
+    }
+    if (_blockTextLength(snap.content_blocks) > _blockTextLength(draft.content_blocks)) {
+        draft.content_blocks = _draftBlocks(snap.content_blocks);
+    }
+    if (snap.model_attestation) {
+        draft.model_attestation = JSON.stringify(_parseModelAttestation(snap.model_attestation));
+    }
+    return draft;
+}
+
+const _OWNED_STREAM_EVENT_TYPES = new Set([
+    'thinking_start', 'thinking_end', 'thinking_chunk', 'stream_chunk',
+    'tool_start', 'tool_input_chunk', 'tool_result', 'usage',
+    'model_attestation', 'stream_end', 'cancelled', 'error', 'permission_request',
+]);
 
 function _isOurBranch(data) {
     // If we're following a specific gen_id, only match that one
@@ -429,10 +584,10 @@ function _isOurBranch(data) {
     // If we already determined this via stream_start, use cached result
     if (State._streamIsOurBranch !== undefined) return State._streamIsOurBranch;
     // For pre-stream messages (status, context_info), check parent_id if available
-    if (data.parent_id != null) {
-        const myMsgIds = new Set(State.messages.map(m => m.id));
-        return myMsgIds.has(data.parent_id);
+    if (data.parent_id != null || data.draft_msg_id != null) {
+        return _streamParentMatchesVisibleBranch(data.parent_id, data.draft_msg_id);
     }
+    if (_OWNED_STREAM_EVENT_TYPES.has(data.type) && data.gen_id != null) return false;
     // Unknown — assume ours (will be corrected on stream_start)
     return true;
 }
@@ -450,7 +605,7 @@ const _ACTIVITY_EVENT_TYPES = new Set([
     // the long-pre-first-token case it exists to narrate. The indicator
     // is removed separately on real stream_chunk / tool_* / usage>0.
     'tool_start', 'tool_input_chunk', 'tool_result', 'tool_use',
-    'permission_request', 'ask_user_question',
+    'ask_user_question',
     'state_update', 'compact_boundary', 'compact_summary_ready', 'compact_done',
     'plan_ready', 'plan_landed', 'canvas_updated', 'image_describe',
 ]);
@@ -458,7 +613,7 @@ const _ACTIVITY_EVENT_TYPES = new Set([
 const _RECONSTRUCT_QUEUE_EVENT_TYPES = new Set([
     'thinking_start', 'thinking_end', 'thinking_chunk',
     'stream_chunk', 'tool_start', 'tool_input_chunk', 'tool_result',
-    'usage', 'stream_end', 'cancelled', 'error', 'generation_idle',
+    'usage', 'model_attestation', 'stream_end', 'cancelled', 'error', 'permission_request', 'generation_idle',
 ]);
 let _queuedStreamEventsDuringReconstruct = [];
 
@@ -479,6 +634,13 @@ function _drainQueuedStreamEvents() {
     for (const event of queued) {
         handleWSMessage(event);
     }
+}
+
+function _permissionBelongsToVisibleBranch(data) {
+    if (data.gen_id != null && State._followingGenId != null) {
+        return String(data.gen_id) === String(State._followingGenId);
+    }
+    return _isOurBranch(data);
 }
 
 function handleWSMessage(data) {
@@ -581,6 +743,17 @@ function handleWSMessage(data) {
             if (!_isOurBranch(data)) break;
             showGenStatus(data.text || 'Looming...');
             break;
+
+        case 'model_attestation': {
+            if (!_isOurBranch(data)) break;
+            const attestation = _parseModelAttestation(data.attestation);
+            if (!attestation) break;
+            _updateStreamingModelAttestation(attestation);
+            const draft = _ensureLiveStreamDraft(data)
+                || State.messages?.find(m => _sameMessageId(m.id, data.draft_msg_id));
+            if (draft) draft.model_attestation = JSON.stringify(attestation);
+            break;
+        }
 
         case 'hermes_commands':
             // Hermes advertised its own slash commands — use them in the "/"
@@ -735,8 +908,7 @@ function handleWSMessage(data) {
         case 'stream_start': {
             // Check if this generation is for our current branch
             const parentId = data.parent_id;
-            const myMsgIds = new Set(State.messages.map(m => m.id));
-            const isOnOurBranch = parentId == null || myMsgIds.has(parentId);
+            const isOnOurBranch = _streamParentMatchesVisibleBranch(parentId, data.draft_msg_id);
             // If the isStreaming flag leaked from a previous turn (no live
             // streamingDiv attached) clear it now so we actually create a
             // fresh div for this stream. Without this, stream chunks fall
@@ -752,6 +924,8 @@ function handleWSMessage(data) {
             if (shouldFollow) {
                 State._streamIsOurBranch = true;
                 State._followingGenId = data.gen_id ?? null;
+                State._followingDraftMsgId = data.draft_msg_id ?? null;
+                if (data.draft_msg_id != null) rememberConversationLeaf(State.currentConvId, data.draft_msg_id);
                 State.isStreaming = true;
                 State._parallelCount = (State._parallelCount || 0) + 1;
                 if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
@@ -763,7 +937,12 @@ function handleWSMessage(data) {
                 _streamFlushTimer = null;
                 hideRetryBar();
                 hidePlanBar();
-                appendStreamingMessage(data.cc_model || data.local_model);
+                const draft = _ensureLiveStreamDraft(data);
+                appendStreamingMessage(
+                    data.cc_model || data.local_model,
+                    draft?.model_attestation,
+                    data.draft_msg_id,
+                );
             } else if (isOnOurBranch) {
                 // Parallel sibling — count it but don't render
                 State._parallelCount = (State._parallelCount || 0) + 1;
@@ -793,34 +972,54 @@ function handleWSMessage(data) {
             hideGenStatus();
             _streamTokenCount++;
             _lastChunkAt = Date.now();
+            _appendLiveDraftText(data.content);
             appendStreamChunk(data.content);
             break;
 
         case 'tool_start':
             if (!State._streamIsOurBranch) break;
             hideGenStatus();
+            _startLiveDraftTool(data);
             appendToolBlock(data.name, data.tool_id, data.ooda);
             break;
 
         case 'tool_input_chunk':
             if (!State._streamIsOurBranch) break;
             _removeStreamWaiting();
+            {
+                const tool = _liveDraftTool(data.tool_id);
+                if (tool) tool.input = (tool.input || '') + (data.content || '');
+            }
             appendToolInput(data.content, data.tool_id);
             break;
 
         case 'tool_result':
             if (!State._streamIsOurBranch) break;
             _removeStreamWaiting();
+            {
+                const tool = _liveDraftTool(data.tool_id);
+                if (tool) {
+                    tool.result = data.content || '';
+                    if (data.image_url) tool.image_url = data.image_url;
+                }
+            }
             finalizeToolBlock(data.content, data.tool_id, data.image_url, data.is_error);
             break;
 
         case 'thinking_chunk':
             if (!State._streamIsOurBranch) break;
+            _appendLiveDraftThinking(data.content);
             appendThinkingChunk(data.content);
             break;
 
         case 'usage': {
-            if (!State._streamIsOurBranch || !streamingDiv) break;
+            if (!State._streamIsOurBranch) break;
+            const draft = _ensureLiveStreamDraft(data);
+            if (draft) {
+                draft.turn_input_tokens = data.input_tokens || draft.turn_input_tokens || 0;
+                draft.turn_output_tokens = data.output_tokens || draft.turn_output_tokens || 0;
+            }
+            if (!streamingDiv) break;
             const tokEl = streamingDiv.querySelector('.gen-token-info');
             if (tokEl) {
                 tokEl.textContent = (data.input_tokens ? 'in ' + _fmtTok(data.input_tokens) + ' ' : '') + 'out ' + _fmtTok(data.output_tokens) + ' - ';
@@ -866,17 +1065,18 @@ function handleWSMessage(data) {
             }
             break;
 
-        case 'permission_request':
+        case 'permission_request': {
+            const permissionIsVisible = _permissionBelongsToVisibleBranch(data);
             // Permission request landing means tool work is happening — drop the
             // "still waiting for first token" indicator.
-            _removeStreamWaiting();
+            if (permissionIsVisible) _removeStreamWaiting();
             // Always add to notification bell (works from any conversation)
             addPermissionNotification(data);
             // Also render inline if we're viewing the right conversation.
             // If a snapshot reconstruction is in flight, queue the prompt —
             // rendering it now would attach it to a streamingDiv that's about
             // to be destroyed by _reconstructFromSnapshot's remove+re-append.
-            if (!data.conv_id || _sameConvId(data.conv_id, State.currentConvId)) {
+            if (permissionIsVisible && (!data.conv_id || _sameConvId(data.conv_id, State.currentConvId))) {
                 if (State._reconstructing) {
                     (State._pendingPermPrompts = State._pendingPermPrompts || []).push(data);
                 } else {
@@ -894,6 +1094,7 @@ function handleWSMessage(data) {
                 n.onclick = () => { window.focus(); n.close(); };
             }
             break;
+        }
 
         case 'permission_resolved':
             resolvePermissionPrompt(data.request_id, data.allowed);
@@ -927,6 +1128,28 @@ function handleWSMessage(data) {
                     icon: '/static/img/loom-ico-transparent.png',
                 });
             }
+            break;
+        }
+
+        case 'workspace_change_report': {
+            const changed = Number(data.changed_count || 0);
+            const removed = Number(data.removed_lines || 0);
+            const deleted = Number(data.deleted_count || 0);
+            const warningText = (data.warnings || []).join('; ');
+            const summary = `${changed} workspace file${changed === 1 ? '' : 's'} changed`
+                + (deleted ? `, ${deleted} deleted` : '')
+                + (removed ? `, ${removed} lines removed` : '');
+            _notifications.unshift({
+                type: 'workspace',
+                convId: State.currentConvId,
+                summary,
+                warningText,
+                manifestPath: data.manifest_path || '',
+                changedFiles: data.changed_files || [],
+                time: new Date(),
+            });
+            _renderNotifBell();
+            showToast(warningText ? `Workspace warning: ${warningText}` : summary, warningText ? 'error' : 'warning');
             break;
         }
 
@@ -999,6 +1222,7 @@ function handleWSMessage(data) {
                 break;
             }
             // Our followed stream ended
+            if (data.message && data.message.id) rememberConversationLeaf(State.currentConvId, data.message.id);
             _clearTerminalStreamState({ clearParallel: allDone });
             hideGenStatus();
             // Clear ghost node before tree refresh so it doesn't persist
@@ -1042,6 +1266,8 @@ function handleWSMessage(data) {
         }
 
         case 'cancelled':
+            if (!_isOurBranch(data)) break;
+            rememberConversationLeaf(State.currentConvId, data.parent_id || data.draft_msg_id);
             removeStreamingMessage();
             _clearTerminalStreamState({ clearParallel: true });
             hideGenStatus();
@@ -1085,14 +1311,15 @@ function handleWSMessage(data) {
             hideRetryBar();
             hidePlanBar();
             const snapshots = data.snapshots || [];
-            if (snapshots.length > 0) {
+            const snap = snapshots.find(s => _streamParentMatchesVisibleBranch(s.parent_id, s.draft_msg_id));
+            if (snap) {
                 State.isStreaming = true;
-                const snap = snapshots[0];
-                // Check if this generation is on our current branch
-                const myMsgIds = new Set(State.messages.map(m => m.id));
-                const isOurBranch = !snap.parent_id || myMsgIds.has(snap.parent_id);
-                State._streamIsOurBranch = isOurBranch;
+                const visibleDraft = State.messages.some(m => _sameMessageId(m.id, snap.draft_msg_id));
+                State._streamIsOurBranch = visibleDraft || _streamParentMatchesVisibleBranch(snap.parent_id, snap.draft_msg_id);
                 State._followingGenId = snap.gen_id ?? null;
+                State._followingDraftMsgId = snap.draft_msg_id ?? null;
+                if (snap.draft_msg_id != null) rememberConversationLeaf(State.currentConvId, snap.draft_msg_id);
+                _syncLiveDraftFromSnapshot(snap);
                 _streamStartTime = (snap.started_at || 0) * 1000;
                 _streamTokenCount = 0;
                 if (!State._reconstructing) {
@@ -1140,8 +1367,8 @@ function handleWSMessage(data) {
                         // gate on State.isStreaming: a fast/rate-limited turn
                         // can finish before we get here, and we still need to
                         // render the partial output until the final lands.
-                        const freshIds = new Set(State.messages.map(m => m.id));
-                        const stillOurs = !snap.parent_id || freshIds.has(snap.parent_id);
+                        const visibleDraft = State.messages.some(m => _sameMessageId(m.id, snap.draft_msg_id));
+                        const stillOurs = visibleDraft || _streamParentMatchesVisibleBranch(snap.parent_id, snap.draft_msg_id);
                         State._streamIsOurBranch = stillOurs;
                         if (stillOurs && _snapshotShouldReplaceLiveStream(snap)) {
                             _reconstructFromSnapshot(snap);
@@ -1162,6 +1389,11 @@ function handleWSMessage(data) {
                         _drainPendingPermPrompts();
                     });
                 }
+            } else if (snapshots.length > 0) {
+                // Other branches are active, but this tab is not following
+                // them. Keep the tree live without stealing the chat stream.
+                _clearTerminalStreamState();
+                refreshTree();
             } else {
                 // No usable snapshot. Some providers may not maintain live
                 // snapshots, so keep the UI receptive and reconstruct from
@@ -1188,6 +1420,7 @@ function handleWSMessage(data) {
                         } else {
                             _drainQueuedStreamEvents();
                         }
+                        _drainPendingPermPrompts();
                     });
                 }
             }
@@ -1387,8 +1620,9 @@ function _snapshotShouldReplaceLiveStream(snap) {
  * Called on WS reconnect when a generation is mid-flight.
  */
 function _reconstructFromSnapshot(snap) {
+    _syncLiveDraftFromSnapshot(snap);
     removeStreamingMessage();
-    appendStreamingMessage(snap.cc_model);
+    appendStreamingMessage(snap.cc_model, snap.model_attestation, snap.draft_msg_id);
     if (!streamingDiv) return;
 
     const contentEl = streamingDiv.querySelector('.message-content');
@@ -1472,9 +1706,15 @@ function _reconstructFromSnapshot(snap) {
         showPermissionPrompt({
             request_id: n.requestId,
             conv_id: n.convId,
+            gen_id: n.genId,
+            parent_id: n.parentId,
+            draft_msg_id: n.draftMsgId,
             tool_name: n.toolName,
             approval_method: n.approvalMethod,
             input_summary: n.inputSummary,
+            risk_level: n.riskLevel,
+            risk_reason: n.riskReason,
+            supports_allow_all: n.supportsAllowAll,
         });
     }
 
@@ -2307,6 +2547,11 @@ function _initSlashAutocomplete() {
 
 let _queuedGeneration = null;  // queued message to generate after current stream ends
 
+function _getTreePromptParentId() {
+    const remembered = findLoadableConversationLeaf(State.treeData || [], State.currentConvId);
+    return remembered ? remembered.id : _currentVisibleLeafId();
+}
+
 let _sendInFlight = false;
 async function sendMessage() {
     if (_sendInFlight) return;
@@ -2346,15 +2591,20 @@ async function sendMessage() {
     const describeInput = document.getElementById('describe-context');
     const describeContext = describeInput ? describeInput.value.trim() : '';
     const isFromTree = State.currentView === 'tree';
+    const treePromptParentId = isFromTree ? _getTreePromptParentId() : null;
     const msgData = {
         role: 'user',
         content: content,
         image_path: imagePaths,
     };
     if (describeContext) msgData.describe_context = describeContext;
-    // From tree view: create a new root branch
+    // A tree prompt is anchored to the focused node. Chat prompts are anchored
+    // to the leaf this tab actually renders; another agent may update the
+    // database-wide active flag while this user is typing.
     if (isFromTree) {
-        msgData.parent_id = null;
+        msgData.parent_id = treePromptParentId || null;
+    } else {
+        msgData.parent_id = _currentVisibleLeafId() || null;
     }
 
     _sendInFlight = true;
@@ -2369,13 +2619,13 @@ async function sendMessage() {
 
         // If sent from tree view, switch to that branch in chat
         if (isFromTree) {
-            await switchToBranch(msg.id, msg.id);
+            await switchToBranch(msg.id, msg.id, { exact: true });
+            rememberConversationLeaf(State.currentConvId, msg.id);
             State._skipLoadOnChat = true;
             switchView('chat');
-            if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-                showGenStatus('Sending...');
-                _triggerParallelGenerate(State.branchCount, msg.id);
-            }
+            showGenStatus('Sending...');
+            const count = State.branchCount || 1;
+            _triggerParallelGenerate(count, msg.id);
             return;
         }
 
@@ -2418,7 +2668,7 @@ async function sendMessage() {
             _triggerParallelGenerate(count, msg.id);
         }
     } catch (err) {
-        showToast('Failed to send message', 'error');
+        showToast(err.detail || err.message || 'Failed to send message', 'error');
     } finally {
         _sendInFlight = false;
     }
@@ -2570,7 +2820,11 @@ async function regenerateMessage(msgId) {
 
 function cancelGeneration() {
     if (State.ws && State.ws.readyState === WebSocket.OPEN) {
-        State.ws.send(JSON.stringify({ action: 'cancel' }));
+        const msg = { action: 'cancel' };
+        if (State._followingGenId != null) msg.gen_id = State._followingGenId;
+        const draftMsgId = State._followingDraftMsgId;
+        if (draftMsgId != null) msg.draft_msg_id = draftMsgId;
+        State.ws.send(JSON.stringify(msg));
     }
     // If not actively streaming (e.g. viewing a draft), reload after a short
     // delay to pick up the server-side cleanup (draft deletion)
@@ -2614,10 +2868,15 @@ function addPermissionNotification(data) {
         type: 'permission',
         requestId: data.request_id,
         convId: data.conv_id || State.currentConvId,
+        genId: data.gen_id,
+        parentId: data.parent_id,
+        draftMsgId: data.draft_msg_id,
         toolName: data.tool_name || 'Unknown',
         approvalMethod: data.approval_method || '',
         inputSummary: (data.input_summary || '').substring(0, 200),
-        supportsAllowAll: permissionSupportsAllowAll(data.tool_name),
+        riskLevel: data.risk_level || '',
+        riskReason: data.risk_reason || '',
+        supportsAllowAll: data.supports_allow_all !== false && permissionSupportsAllowAll(data.tool_name),
         resolved: false,
         time: new Date(),
     });
@@ -2675,6 +2934,8 @@ function _renderNotifDropdown() {
     for (const n of _notifications) {
         if (n.type === 'permission') {
             list.appendChild(_renderPermissionNotifItem(n));
+        } else if (n.type === 'workspace') {
+            list.appendChild(_renderWorkspaceNotifItem(n));
         } else {
             list.appendChild(_renderBranchNotifItem(n));
         }
@@ -2747,6 +3008,7 @@ function _renderPermissionNotifItem(n) {
             `<span class="notif-perm-tool">${escapeHtml(n.toolName)}</span>` +
             `</div>` +
             (n.approvalMethod ? `<div class="notif-perm-summary">${escapeHtml(n.approvalMethod)}</div>` : '') +
+            (n.riskReason ? `<div class="notif-perm-summary notif-perm-risk">Destructive Git operation: ${escapeHtml(n.riskReason)}. Approval applies once.</div>` : '') +
             `<div class="notif-perm-summary">${escapeHtml(n.inputSummary)}</div>` +
             `<div class="notif-perm-actions">` +
             `<button class="notif-perm-btn allow" data-action="allow">Allow</button>` +
@@ -2794,8 +3056,10 @@ function _renderPermissionNotifItem(n) {
         if (!_sameConvId(State.currentConvId, n.convId)) {
             State._skipLoadOnChat = true;
             await loadConversation(n.convId);
-            switchView('chat');
         }
+        const targetId = n.draftMsgId || n.parentId;
+        if (targetId != null) await switchToBranch(targetId, targetId, { exact: true });
+        switchView('chat');
     });
 
     return item;
@@ -2914,7 +3178,7 @@ function renderMessages() {
     if (lastMsg && lastMsg.role === 'assistant' && State.isStreaming) {
         const lastEl = container.querySelector(`.message[data-msg-id="${lastMsg.id}"]`);
         if (lastEl) lastEl.remove();
-        appendStreamingMessage(lastMsg.cc_model_used);
+        appendStreamingMessage(lastMsg.cc_model_used, lastMsg.model_attestation, lastMsg.id);
         // Render accumulated content_blocks from the draft
         if (lastMsg.content_blocks && streamingDiv) {
             try {
@@ -3045,6 +3309,7 @@ let _pendingGenerate = null;
 function _triggerParallelGenerate(count, parentId) {
     const isWeave = State.currentConv && State.currentConv.mode === 'weave';
     const n = isWeave ? Math.max(1, Math.min(5, count)) : 1;
+    const targetParentId = parentId || _currentVisibleLeafId();
 
     // Mobile safari / NAT can leave the socket reporting OPEN while it's
     // actually TCP-dead. send() goes into the void and no stream_start ever
@@ -3059,19 +3324,14 @@ function _triggerParallelGenerate(count, parentId) {
         || ws.readyState === WebSocket.CONNECTING;
     if (stale) {
         console.log('[WS] generate: socket stale or not open — reconnecting and stashing');
-        _pendingGenerate = { count: n, parentId };
+        _pendingGenerate = { count: n, parentId: targetParentId };
         showGenStatus('Reconnecting...');
-        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-            try { ws.close(); } catch {}
-        } else if (!ws || ws.readyState === WebSocket.CLOSED) {
-            connectWebSocket(State.currentConvId);
-        }
+        connectWebSocket(State.currentConvId);
         return;
     }
 
     for (let i = 0; i < n; i++) {
-        const msg = { action: 'generate' };
-        if (parentId) msg.parent_id = parentId;
+        const msg = { action: 'generate', parent_id: targetParentId || null };
         _attachCCSettings(msg);
         ws.send(JSON.stringify(msg));
     }
@@ -3132,8 +3392,10 @@ function _modelsMatch(a, b) {
 function _agentKindForModel(model, conv) {
     const msgModel = (model || '').toLowerCase();
     const mode = (conv?.mode || '').toLowerCase();
-    if (mode === 'hermes' || msgModel.startsWith('hermes:')) return 'hermes';
-    if (mode === 'goose' || msgModel.startsWith('goose:')) return 'goose';
+    // A conversation may hand off between harnesses. A persisted message's
+    // recorded model is stronger provenance than the current conversation mode.
+    if (msgModel.startsWith('hermes:')) return 'hermes';
+    if (msgModel.startsWith('goose:')) return 'goose';
     if (
         msgModel.startsWith('openrouter:') ||
         msgModel === 'z-ai/glm-5.2' ||
@@ -3225,6 +3487,9 @@ function createMessageElement(msg, cost, elapsed) {
         ? (activeModelName
             ? `<span class="local-model-tag">(${escapeHtml(activeModelName)})</span>`
             : `<span class="local-model-tag">(${isHermesMode ? 'Hermes' : 'local model'})</span>`)
+        : '';
+    const modelAttestationTag = msg.role === 'assistant'
+        ? _renderModelAttestation(msg.model_attestation)
         : '';
     const branchLabelFull = State.branchNames?.[msg.id] || '';
     // Middle-truncate long branch labels so they don't push action buttons off
@@ -3389,7 +3654,7 @@ function createMessageElement(msg, cost, elapsed) {
     div.innerHTML = '<div class="message-header">' +
         '<div class="message-header-left">' +
             '<span class="message-role">' + escapeHtml(roleLabel) + '</span>' +
-            (localModelTag ? `<span class="local-model-label">${localModelTag}</span>` : '') + (branchLabel ? '<span class="message-branch-label" title="' + escapeHtml(branchLabelFull) + ' — click to copy branch path">' + escapeHtml(branchLabel) + '</span>' : '') +
+            (localModelTag ? `<span class="local-model-label">${localModelTag}</span>` : '') + modelAttestationTag + (branchLabel ? '<span class="message-branch-label" title="' + escapeHtml(branchLabelFull) + ' — click to copy branch path">' + escapeHtml(branchLabel) + '</span>' : '') +
         '</div>' +
         '<div class="message-actions">' + branchPlaceholder + actionsHtml + '</div>' +
         '</div>' +
@@ -3638,16 +3903,22 @@ function loadBranchIndicator(msgId, slot) {
     slot.replaceWith(indicator);
 }
 
-async function switchToBranch(leafId, scrollToMsgId) {
+async function switchToBranch(leafId, scrollToMsgId, options = {}) {
     try {
         if (typeof showLoading === 'function') showLoading();
-        // Walk to deepest leaf from the clicked node
+        // Ordinary navigation follows the clicked branch to its newest leaf.
+        // Exact navigation is used by tree Run so its generation parent cannot
+        // drift to a newer descendant created by another agent.
         const [branch, treeData] = await Promise.all([
-            API.post(`/api/conversations/${State.currentConvId}/switch-branch/${leafId}`),
+            options.exact
+                ? API.get(`/api/conversations/${State.currentConvId}/branch/${leafId}`)
+                : API.post(`/api/conversations/${State.currentConvId}/switch-branch/${leafId}`),
             API.get(`/api/conversations/${State.currentConvId}/tree`),
         ]);
         State.messages = branch;
         State.treeData = treeData;
+        const loadedLeaf = branch[branch.length - 1];
+        if (loadedLeaf) rememberConversationLeaf(State.currentConvId, loadedLeaf.id);
         hideRetryBar();
         hideGenStatus();
         renderMessages();
@@ -4092,17 +4363,31 @@ function _stopGenTimer() {
     if (_loomAnimInterval) { clearInterval(_loomAnimInterval); _loomAnimInterval = null; }
 }
 
-function appendStreamingMessage(ccModel) {
+function appendStreamingMessage(ccModel, modelAttestation = null, draftMsgId = null) {
     const container = document.getElementById('messages');
     streamingDiv = document.createElement('div');
     streamingDiv.className = 'message assistant streaming';
+    if (draftMsgId != null) streamingDiv.dataset.msgId = draftMsgId;
     const isWeave = (State.currentConv?.mode || '').toLowerCase() === 'weave';
     const modelForLabel = isWeave
         ? (ccModel || State.currentConv?.local_model || State.currentConv?.cc_model)
         : (ccModel || State.currentConv?.cc_model || State.currentConv?.local_model);
     const label = _assistantRoleLabelForModel(modelForLabel, State.currentConv);
+    const initialHarness = isWeave ? 'Weave' : label;
+    const initialAttestation = modelAttestation
+        ? _parseModelAttestation(modelAttestation)
+        : (modelForLabel ? {
+            status: 'requested',
+            harness: initialHarness,
+            requested_model: modelForLabel,
+            source: 'loom_ui_selection',
+            fallback_allowed: false,
+        } : null);
     streamingDiv.innerHTML = '<div class="message-header">' +
-        '<span class="message-role">' + escapeHtml(label) + '</span>' +
+        '<div class="message-header-left">' +
+            '<span class="message-role">' + escapeHtml(label) + '</span>' +
+            '<span class="model-attestation-slot">' + _renderModelAttestation(initialAttestation) + '</span>' +
+        '</div>' +
         '</div>' +
         '<div class="message-content">' +
             '<span class="stream-waiting">' +
@@ -4119,6 +4404,153 @@ function appendStreamingMessage(ccModel) {
     _startGenTimer();
     _startStreamWaitingTicker();
     scrollToBottom();
+}
+
+function _renderWorkspaceNotifItem(n) {
+    const item = document.createElement('div');
+    item.className = 'notif-item notif-workspace';
+    const timeStr = n.time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const paths = (n.changedFiles || []).slice(0, 8).map(f => `${f.status}: ${f.path}`).join('\n');
+    item.innerHTML = `<div class="notif-perm-header">`
+        + `<span class="notif-time">${timeStr}</span>`
+        + `<span class="notif-perm-tool">Workspace change report</span></div>`
+        + `<div class="notif-perm-summary">${escapeHtml(n.summary || '')}</div>`
+        + (n.warningText ? `<div class="notif-perm-summary notif-perm-risk">${escapeHtml(n.warningText)}</div>` : '')
+        + (paths ? `<div class="notif-perm-summary"><pre>${escapeHtml(paths)}</pre></div>` : '')
+        + (n.manifestPath ? `<div class="notif-perm-summary" title="Recovery manifest">Recovery: ${escapeHtml(n.manifestPath)}</div>` : '');
+    return item;
+}
+
+const _ATTESTATION_SOURCE_DEFAULTS = {
+    codex_app_server_thread_response: ['Codex app-server', 'harness'],
+    claude_code_system_init: ['Claude Code', 'harness'],
+    anthropic_compatible_message_start: ['Claude Code', 'provider_response'],
+    agy_cli_launch_arguments: ['Antigravity (agy)', 'launch'],
+    antigravity_stream_init: ['Antigravity (agy)', 'harness'],
+    goose_process_environment: ['Goose ACP', 'launch'],
+    goose_acp_session_model_state: ['Goose ACP', 'harness'],
+    hermes_acp_session_model_state: ['Hermes ACP', 'harness'],
+    hermes_acp_set_model_ack: ['Hermes ACP', 'harness'],
+    openrouter_request_accepted: ['OpenRouter API', 'launch'],
+    openrouter_request_configuration: ['OpenRouter API', 'launch'],
+    openrouter_stream_chunk: ['OpenRouter API', 'provider_response'],
+    openrouter_completion_response: ['OpenRouter API', 'provider_response'],
+    dream_request_configuration: ['Dream', 'launch'],
+    llama_server_request_configuration: ['Llama Server', 'launch'],
+};
+
+function _harnessLabelForModel(model) {
+    const kind = _agentKindForModel(model, State.currentConv);
+    if (kind === 'codex') return 'Codex app-server';
+    if (kind === 'claude') return 'Claude Code';
+    if (kind === 'gemini') return 'Antigravity (agy)';
+    if (kind === 'goose') return 'Goose ACP';
+    if (kind === 'hermes') return 'Hermes ACP';
+    if (kind === 'openrouter') return 'OpenRouter API';
+    if (kind === 'local') return 'Llama Server';
+    if (kind === 'dream') return 'Dream';
+    if (kind === 'umans') return 'Claude Code (Umans)';
+    return '';
+}
+
+function _parseModelAttestation(value) {
+    if (!value) return null;
+    let parsed = value;
+    if (typeof value === 'string') {
+        try { parsed = JSON.parse(value); }
+        catch { return null; }
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+
+    // Attestations persisted before the cross-provider schema had source and
+    // model evidence but no harness/verification fields. Recover those fields
+    // from the evidence source so old verified Codex turns do not render as
+    // "Unknown harness" (or inherit an unrelated current conversation mode).
+    const att = { ...parsed };
+    const sourceDefaults = _ATTESTATION_SOURCE_DEFAULTS[att.source];
+    const model = att.effective_model || att.launch_model || att.requested_model || '';
+    if (!att.harness) {
+        att.harness = sourceDefaults?.[0] || _harnessLabelForModel(model) || 'Unknown harness';
+    }
+    if (!att.verification_level) {
+        att.verification_level = sourceDefaults?.[1]
+            || (att.status === 'verified' ? 'harness' : 'selection');
+    }
+    return att;
+}
+
+function _modelAttestationSourceLabel(source) {
+    if (source === 'codex_app_server_thread_response') return 'Codex app-server thread response';
+    if (source === 'claude_code_system_init') return 'Claude Code structured init';
+    if (source === 'anthropic_compatible_message_start') return 'Anthropic-compatible response metadata';
+    if (source === 'agy_cli_launch_arguments') return 'Antigravity launch arguments';
+    if (source === 'antigravity_stream_init') return 'Antigravity structured init';
+    if (source === 'goose_process_environment') return 'Goose process configuration';
+    if (source === 'goose_acp_session_model_state') return 'Goose ACP session model state';
+    if (source === 'hermes_acp_session_model_state') return 'Hermes ACP session model state';
+    if (source === 'hermes_acp_set_model_ack') return 'Hermes ACP set-model acknowledgement';
+    if (source === 'openrouter_request_accepted') return 'OpenRouter accepted request';
+    if (source === 'openrouter_request_configuration') return 'OpenRouter request configuration';
+    if (source === 'openrouter_stream_chunk') return 'OpenRouter response metadata';
+    if (source === 'openrouter_completion_response') return 'OpenRouter completion response';
+    if (source === 'openai_compatible_request_accepted') return 'OpenAI-compatible backend accepted request';
+    if (source === 'dream_request_configuration') return 'Dream request configuration';
+    if (source === 'llama_server_request_configuration') return 'llama-server request configuration';
+    if (source === 'openai_compatible_stream_chunk') return 'OpenAI-compatible response metadata';
+    if (source === 'openai_compatible_completion_response') return 'OpenAI-compatible completion response';
+    if (source === 'local_mock_response') return 'Local mock response (no model proof)';
+    if (source === 'loom_ui_selection') return 'Loom UI selection (not yet provider-confirmed)';
+    return source || 'Unknown';
+}
+
+function _renderModelAttestation(value) {
+    const att = _parseModelAttestation(value);
+    if (!att) return '';
+    const status = ['verified', 'mismatch', 'configured', 'unverified', 'requested'].includes(att.status)
+        ? att.status : 'unverified';
+    const model = att.effective_model || att.launch_model || att.requested_model || 'unknown model';
+    const harness = att.harness || 'Unknown harness';
+    const mark = status === 'verified' ? '&#10003;'
+        : status === 'mismatch' ? '&#10005;'
+        : status === 'configured' ? '&#9671;'
+        : status === 'requested' ? '&#8594;' : '?';
+    const suffix = status === 'requested' ? ' requested'
+        : status === 'mismatch' ? ' mismatch'
+        : status === 'configured' ? ' configured'
+        : status === 'unverified' ? ' unverified' : '';
+    const rows = [
+        ['Status', status],
+        ['Harness', att.harness],
+        ['UI selection', att.requested_model],
+        ['Launch request', att.launch_model],
+        ['Effective model', att.effective_model],
+        ['Provider', att.model_provider],
+        ['Verification', att.verification_level],
+        ['Evidence', _modelAttestationSourceLabel(att.source)],
+        ['Fallback', att.fallback_allowed === false ? 'disabled' : (att.fallback_allowed === true ? 'allowed' : '')],
+        ['Thread', att.thread_id],
+        ['App server', att.app_server],
+    ].filter(([, val]) => val !== undefined && val !== null && val !== '');
+    const title = status === 'verified'
+        ? `${model} was reported by ${harness}. Click for the full chain of custody.`
+        : status === 'configured'
+            ? `${harness} was configured for ${model}, but did not expose independent effective-model evidence.`
+        : status === 'requested'
+            ? `${model} is the selected model; waiting for provider confirmation.`
+            : `Model identity is ${status}. Click for details.`;
+    const panel = rows.map(([key, val]) =>
+        `<div><span>${escapeHtml(String(key))}</span><code>${escapeHtml(String(val))}</code></div>`
+    ).join('');
+    return `<details class="model-attestation model-attestation-${status}" title="${escapeHtml(title)}">` +
+        `<summary>${mark} ${escapeHtml(harness)} · ${escapeHtml(model)}${escapeHtml(suffix)}</summary>` +
+        `<div class="model-attestation-panel">${panel}</div>` +
+        `</details>`;
+}
+
+function _updateStreamingModelAttestation(attestation) {
+    if (!streamingDiv) return;
+    const slot = streamingDiv.querySelector('.model-attestation-slot');
+    if (slot) slot.innerHTML = _renderModelAttestation(attestation);
 }
 
 let _streamWaitingTicker = null;
@@ -4279,6 +4711,7 @@ function finalizeStreamingMessage(msg, cost) {
     const newEl = createMessageElement(msg, cost, elapsed);
     streamingDiv.replaceWith(newEl);
     streamingDiv = null;
+    State._liveStreamDraft = null;
     scrollToBottom();
 }
 
@@ -4937,11 +5370,13 @@ function _drainPendingPermPrompts() {
     if (!queue || !queue.length) return;
     State._pendingPermPrompts = [];
     for (const data of queue) {
+        if (!_permissionBelongsToVisibleBranch(data)) continue;
         showPermissionPrompt(data);
     }
 }
 
 function showPermissionPrompt(data) {
+    if (!_permissionBelongsToVisibleBranch(data)) return;
     // Detect and drop stale streamingDiv ref before attaching a prompt to it.
     if (streamingDiv && !streamingDiv.isConnected) {
         streamingDiv = null;
@@ -4982,19 +5417,22 @@ function showPermissionPrompt(data) {
             '<button class="btn-permission deny plan-revise" data-perm-action="deny" data-request-id="' + data.request_id + '">Revise</button>' +
             '</div>';
     } else {
-        prompt.className = 'permission-prompt';
+        const isDestructive = data.risk_level === 'destructive';
+        prompt.className = 'permission-prompt' + (isDestructive ? ' destructive-permission' : '');
         const inputSummary = escapeHtml(data.input_summary || JSON.stringify(data.tool_input || {}).substring(0, 300));
         const approvalMethod = escapeHtml(data.approval_method || '');
-        const allowAllButton = permissionSupportsAllowAll(data.tool_name)
+        const riskReason = escapeHtml(data.risk_reason || '');
+        const allowAllButton = data.supports_allow_all !== false && permissionSupportsAllowAll(data.tool_name)
             ? '<button class="btn-permission allow-all" data-perm-action="allow-all" data-request-id="' + data.request_id + '">Allow for Branch</button>'
             : '';
         prompt.innerHTML = '<div class="permission-header">' +
-            '<span class="permission-icon">&#x1f512;</span>' +
-            '<span class="permission-title">Permission Request</span>' +
+            '<span class="permission-icon">' + (isDestructive ? '&#x26A0;' : '&#x1f512;') + '</span>' +
+            '<span class="permission-title">' + (isDestructive ? 'Destructive Git Approval' : 'Permission Request') + '</span>' +
             '</div>' +
             '<div class="permission-body">' +
             '<div class="permission-tool">Tool: <strong>' + toolName + '</strong></div>' +
             (approvalMethod ? '<div class="permission-tool">Permission: <strong>' + approvalMethod + '</strong></div>' : '') +
+            (riskReason ? '<div class="permission-risk">' + riskReason + '. Loom will not remember this approval.</div>' : '') +
             (inputSummary ? '<div class="permission-input"><pre>' + inputSummary + '</pre></div>' : '') +
             '</div>' +
             '<div class="permission-actions">' +
@@ -5051,7 +5489,14 @@ function _permissionPromptHost(data) {
         streamingDiv = null;
     }
     if (State.isStreaming) {
-        if (!streamingDiv) appendStreamingMessage(data.cc_model || data.local_model);
+        if (!streamingDiv) {
+            const draft = _ensureLiveStreamDraft(data);
+            appendStreamingMessage(
+                data.cc_model || data.local_model || draft?.cc_model_used,
+                draft?.model_attestation,
+                data.draft_msg_id || draft?.id,
+            );
+        }
         return streamingDiv?.querySelector('.message-content') || null;
     }
 

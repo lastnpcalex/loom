@@ -16,6 +16,118 @@ def test_codex_default_permission_mode_requests_user_approval():
     assert codex_client._codex_approval_policy("never") == "never"
 
 
+def test_codex_model_mapping_preserves_explicit_latest_selection(monkeypatch):
+    import codex_client
+
+    monkeypatch.delenv("LOOM_CODEX_DEFAULT_MODEL", raising=False)
+    monkeypatch.delenv("CODEX_MODEL", raising=False)
+
+    assert codex_client._loom_model_to_codex("codex-gpt-5.6-sol") == "gpt-5.6-sol"
+    assert codex_client._loom_model_to_codex("Codex (GPT-5.6-Sol)") == "gpt-5.6-sol"
+    assert codex_client._loom_model_to_codex("gpt-5.6-terra") == "gpt-5.6-terra"
+    assert codex_client._loom_model_to_codex("codex-my-explicit-model") == "my-explicit-model"
+
+
+def test_codex_model_mapping_uses_cache_only_when_selection_missing(monkeypatch, tmp_path):
+    import codex_client
+
+    home = tmp_path / "home"
+    cache_dir = home / ".codex"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "models_cache.json").write_text(
+        json.dumps({
+            "models": [
+                {"slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol", "supported_in_api": True},
+                {"slug": "gpt-5.5", "display_name": "GPT-5.5", "supported_in_api": True},
+            ]
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.delenv("LOOM_CODEX_DEFAULT_MODEL", raising=False)
+    monkeypatch.delenv("CODEX_MODEL", raising=False)
+
+    assert codex_client._loom_model_to_codex("") == "gpt-5.6-sol"
+    assert codex_client._loom_model_to_codex("codex-new-provider-model") == "new-provider-model"
+
+
+def test_codex_reasoning_effort_preserves_current_levels():
+    import codex_client
+
+    assert codex_client._codex_reasoning_effort("xhigh") == "xhigh"
+    assert codex_client._codex_reasoning_effort("max") == "max"
+    assert codex_client._codex_reasoning_effort("ultra") == "ultra"
+    assert codex_client._codex_reasoning_effort("minimal") == "low"
+    assert codex_client._codex_reasoning_effort("invalid") is None
+
+
+def test_codex_thread_request_disables_silent_model_fallback():
+    import codex_client
+
+    method, params = codex_client._codex_thread_request(
+        "C:/workspace",
+        "gpt-5.6-sol",
+        "on-request",
+        "workspace-write",
+    )
+
+    assert method == "thread/start"
+    assert params["model"] == "gpt-5.6-sol"
+    assert params["allowProviderModelFallback"] is False
+
+
+def test_codex_model_attestation_separates_ui_request_from_effective_model():
+    import codex_client
+
+    attestation = codex_client._codex_model_attestation(
+        "codex-gpt-5.6-sol",
+        "gpt-5.6-sol",
+        {
+            "model": "gpt-5.6-sol",
+            "modelProvider": "openai",
+            "thread": {"id": "thread-123"},
+        },
+        session_id="thread-123",
+        app_server_user_agent="codex_cli_rs/1.2.3",
+    )
+
+    assert attestation == {
+        "status": "verified",
+        "harness": "Codex app-server",
+        "requested_model": "codex-gpt-5.6-sol",
+        "launch_model": "gpt-5.6-sol",
+        "effective_model": "gpt-5.6-sol",
+        "model_provider": "openai",
+        "source": "codex_app_server_thread_response",
+        "verification_level": "harness",
+        "session_id": "thread-123",
+        "thread_id": "thread-123",
+        "app_server": "codex_cli_rs/1.2.3",
+        "fallback_allowed": False,
+    }
+
+
+def test_codex_model_attestation_detects_mismatch_and_missing_evidence():
+    import codex_client
+
+    mismatch = codex_client._codex_model_attestation(
+        "codex-gpt-5.6-sol",
+        "gpt-5.6-sol",
+        {"model": "gpt-5.6-terra", "modelProvider": "openai"},
+    )
+    missing = codex_client._codex_model_attestation(
+        "codex-gpt-5.6-sol",
+        "gpt-5.6-sol",
+        {"model": "gpt-5.6-sol"},
+    )
+
+    assert mismatch["status"] == "mismatch"
+    assert mismatch["effective_model"] == "gpt-5.6-terra"
+    assert missing["status"] == "unverified"
+    assert missing["effective_model"] == "gpt-5.6-sol"
+    assert missing["model_provider"] is None
+
+
 def test_codex_app_server_approval_mapping_is_session_scoped():
     import codex_client
 
@@ -183,6 +295,7 @@ def test_codex_permission_hook_posts_to_loom_and_outputs_allow(monkeypatch):
     stdout = io.StringIO()
 
     monkeypatch.setenv("LOOM_CONV_ID", "42")
+    monkeypatch.setenv("LOOM_PERMISSION_SCOPE", "gen:314")
     monkeypatch.setenv("LOOM_PORT", "3000")
     monkeypatch.setattr(sys, "argv", ["cc_permission_hook.py", "--event", "PermissionRequest"])
     monkeypatch.setattr(sys, "stdin", stdin)
@@ -197,6 +310,7 @@ def test_codex_permission_hook_posts_to_loom_and_outputs_allow(monkeypatch):
     assert len(permission_calls) == 1
     sent_payload = permission_calls[0][1]
     assert sent_payload["loom_conv_id"] == "42"
+    assert sent_payload["permission_scope"] == "gen:314"
     assert sent_payload["tool_name"] == "shell_command"
     assert sent_payload["tool_input"] == {"command": "Set-Content proof.txt APPROVED"}
 
@@ -251,6 +365,266 @@ async def test_loom_permission_endpoint_blocks_until_user_decision(tmp_database)
     finally:
         if not request_task.done():
             request_task.cancel()
+
+
+def test_permission_command_guard_blocks_nested_goose_cmd_delete():
+    import server
+
+    tool_input = {
+        "toolCall": {
+            "title": "shell",
+            "arguments": {
+                "command": 'cmd /c rmdir /s /q "C:\\Users\\exast\\OneDrive\\Documents\\Design-Language"',
+            },
+        },
+        "params": {
+            "toolCall": {
+                "kind": "execute",
+                "name": "shell",
+            },
+        },
+    }
+
+    reason = server._unsafe_shell_command_reason("shell", tool_input)
+
+    assert "recursive rmdir" in reason
+
+
+def test_permission_command_guard_allows_non_destructive_windows_probe():
+    import server
+
+    reason = server._unsafe_shell_command_reason(
+        "Bash",
+        {"command": 'cd "C:/Users/exast/OneDrive/Documents/Design-Language" && git status --short'},
+    )
+
+    assert reason == ""
+
+
+def test_destructive_git_is_approval_gated_instead_of_blocked():
+    import server
+
+    tool_input = {"command": "git reset --hard HEAD"}
+    assert server._unsafe_shell_command_reason("Bash", tool_input) == ""
+    assert "discards tracked workspace changes" in server._destructive_git_command_reason(
+        "Bash", tool_input
+    )
+
+
+@pytest.mark.parametrize(
+    "command, reason_fragment",
+    [
+        ("git clean -fd", "untracked workspace files"),
+        ("git checkout -f main", "discard workspace changes"),
+        ("git switch --discard-changes main", "discard workspace changes"),
+        ("git push origin main --force-with-lease", "remote branch history"),
+        ("git push origin --delete obsolete", "deleting a remote Git branch"),
+    ],
+)
+def test_destructive_git_variants_require_loom_approval(command, reason_fragment):
+    import server
+
+    assert reason_fragment in server._destructive_git_command_reason(
+        "Bash", {"command": command}
+    )
+
+
+async def test_destructive_git_permission_waits_for_one_time_user_decision(tmp_database):
+    import database as db
+    import server
+
+    server._pending_hook_permissions.clear()
+    server._auto_approve_permissions.clear()
+    conv = await db.create_conversation(
+        "Destructive Git Approval",
+        mode="codex",
+        project_dir=str(server.Path.cwd()),
+    )
+    tool_input = {"command": "git restore -- static/chat.js"}
+    fingerprint = server._permission_fingerprint("Bash", tool_input)
+    server._auto_approve_permissions[(conv["id"], "manual")] = {fingerprint}
+
+    request_task = asyncio.create_task(
+        server.handle_cc_permission(
+            {
+                "loom_conv_id": conv["id"],
+                "tool_name": "Bash",
+                "tool_input": tool_input,
+            }
+        )
+    )
+    for _ in range(50):
+        if server._pending_hook_permissions:
+            break
+        await asyncio.sleep(0.02)
+
+    assert len(server._pending_hook_permissions) == 1
+    request_id, pending = next(iter(server._pending_hook_permissions.items()))
+    assert pending["risk_level"] == "destructive"
+    assert pending["supports_allow_all"] is False
+    assert "overwrites current workspace" in pending["risk_reason"]
+    try:
+        pending["response"] = {"allow": False, "always": False}
+        pending["event"].set()
+        response = await asyncio.wait_for(request_task, timeout=1)
+        assert response["allow"] is False
+    finally:
+        server._pending_hook_permissions.pop(request_id, None)
+        server._auto_approve_permissions.clear()
+        if not request_task.done():
+            request_task.cancel()
+
+
+def test_permission_command_guard_extracts_goose_json_arguments():
+    import server
+
+    reason = server._unsafe_shell_command_reason(
+        "shell",
+        {
+            "toolCall": {
+                "name": "shell",
+                "arguments": '{"command": "cmd /c del /s /q C:\\\\tmp\\\\bad"}',
+            }
+        },
+    )
+
+    assert "recursive del" in reason
+
+
+def test_permission_command_guard_allows_native_goose_tree_tool():
+    import server
+
+    reason = server._unsafe_shell_command_reason(
+        "tree · C:/Users/exast/OneDrive/Documents/Design-Language",
+        {
+            "toolCall": {
+                "title": "tree",
+                "arguments": {"path": "C:/Users/exast/OneDrive/Documents/Design-Language"},
+            }
+        },
+    )
+
+    assert reason == ""
+    assert server._goose_auto_allow_reason(
+        "tree · C:/Users/exast/OneDrive/Documents/Design-Language",
+        {
+            "toolCall": {
+                "title": "tree",
+                "arguments": {"path": "C:/Users/exast/OneDrive/Documents/Design-Language"},
+            }
+        },
+    ) == "Goose native tree tool"
+
+
+def test_permission_command_guard_blocks_unbounded_shell_scans():
+    import server
+
+    assert "tree scan" in server._unsafe_shell_command_reason(
+        "shell",
+        {"command": "cmd /c tree C:\\Users\\exast\\OneDrive\\Documents\\Design-Language /f"},
+    )
+    assert "recursive directory scan" in server._unsafe_shell_command_reason(
+        "shell",
+        {"command": 'powershell -NoProfile -Command "Get-ChildItem -Recurse C:\\Users\\exast"'},
+    )
+
+
+async def test_loom_permission_endpoint_auto_denies_unsafe_shell_command(tmp_database):
+    import database as db
+    import server
+
+    server._pending_hook_permissions.clear()
+    server._auto_approve_permissions.clear()
+    conv = await db.create_conversation(
+        "Unsafe Permission Test",
+        mode="goose",
+        project_dir=str(server.Path.cwd()),
+    )
+
+    response = await server.handle_cc_permission({
+        "loom_conv_id": conv["id"],
+        "tool_name": "shell",
+        "tool_input": {
+            "toolCall": {
+                "title": "shell",
+                "arguments": {
+                    "command": "powershell -NoProfile -Command \"Remove-Item -Recurse -Force .\"",
+                },
+            },
+        },
+    })
+
+    assert response["allow"] is False
+    assert "Blocked by Loom command safeguard" in response["message"]
+    assert not server._pending_hook_permissions
+
+    conn = await db.get_db()
+    rows = await conn.execute_fetchall(
+        "SELECT request_id FROM pending_permissions WHERE conv_id = ?",
+        (conv["id"],),
+    )
+    assert rows == []
+
+
+async def test_loom_permission_endpoint_auto_allows_native_goose_tree(tmp_database):
+    import database as db
+    import server
+
+    server._pending_hook_permissions.clear()
+    server._auto_approve_permissions.clear()
+    conv = await db.create_conversation(
+        "Safe Goose Permission Test",
+        mode="goose",
+        project_dir=str(server.Path.cwd()),
+    )
+
+    response = await server.handle_cc_permission({
+        "loom_conv_id": conv["id"],
+        "tool_name": "tree · C:/Users/exast/OneDrive/Documents/Design-Language",
+        "tool_input": {
+            "toolCall": {
+                "title": "tree",
+                "arguments": {"path": "C:/Users/exast/OneDrive/Documents/Design-Language"},
+            },
+            "params": {
+                "toolCall": {
+                    "title": "tree",
+                    "arguments": {"path": "C:/Users/exast/OneDrive/Documents/Design-Language"},
+                },
+            },
+        },
+    })
+
+    assert response["allow"] is True
+    assert "Goose native tree tool" in response["message"]
+    assert not server._pending_hook_permissions
+
+    conn = await db.get_db()
+    rows = await conn.execute_fetchall(
+        "SELECT request_id FROM pending_permissions WHERE conv_id = ?",
+        (conv["id"],),
+    )
+    assert rows == []
+
+
+def test_goose_auto_allow_detects_todo_bookkeeping():
+    import server
+
+    reason = server._goose_auto_allow_reason(
+        "Write",
+        {
+            "toolCall": {
+                "title": "Write",
+                "arguments": {
+                    "path": ".goose/todos.json",
+                    "content": "{\"todos\": []}",
+                },
+            },
+            "params": {"toolCall": {"title": "Write"}},
+        },
+    )
+
+    assert reason == "Goose todo bookkeeping"
 
 
 def test_loom_permission_fingerprint_scopes_remembered_grants():

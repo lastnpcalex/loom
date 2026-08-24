@@ -48,6 +48,16 @@ async def test_health_endpoint(client, mock_llama):
     assert "models" in data
 
 
+async def test_ui_entrypoint_and_executable_assets_are_revalidated(client):
+    index_resp = await client.get("/")
+    chat_resp = await client.get("/static/chat.js")
+
+    assert index_resp.status_code == 200
+    assert chat_resp.status_code == 200
+    assert "no-cache" in index_resp.headers.get("cache-control", "")
+    assert "no-cache" in chat_resp.headers.get("cache-control", "")
+
+
 async def test_local_models_endpoint(client, mock_llama):
     """GET /api/local/models returns the backend-aware model cache.
 
@@ -148,6 +158,41 @@ async def test_create_umans_conversation_blocked_when_disabled(client, monkeypat
     assert "deprecated" in resp.json()["detail"].lower()
 
 
+async def test_config_get_reloads_disk_before_returning(client, tmp_path, monkeypatch):
+    import server
+
+    exe = tmp_path / "llama-server.exe"
+    exe.write_text("", encoding="utf-8")
+    monkeypatch.setattr(server.config, "llama_server_exe", "llama-server")
+    monkeypatch.setattr(server.config, "save", lambda: None)
+
+    def fake_load():
+        server.config.llama_server_exe = str(exe)
+
+    monkeypatch.setattr(server.config, "load", fake_load)
+
+    resp = await client.get("/api/config")
+
+    assert resp.status_code == 200
+    assert resp.json()["llama_server_exe"] == str(exe)
+
+
+async def test_config_update_preserves_valid_llama_path_from_stale_ui(client, tmp_path, monkeypatch):
+    import server
+
+    exe = tmp_path / "llama-server.exe"
+    exe.write_text("", encoding="utf-8")
+    monkeypatch.setattr(server.config, "llama_server_exe", str(exe))
+    monkeypatch.setattr(server.config, "llama_models_dir", str(tmp_path / "models"))
+    monkeypatch.setattr(server.config, "load", lambda: None)
+    monkeypatch.setattr(server.config, "save", lambda: None)
+
+    resp = await client.put("/api/config", json={"llama_server_exe": "llama-server"})
+
+    assert resp.status_code == 200
+    assert resp.json()["llama_server_exe"] == str(exe)
+
+
 async def test_openrouter_secret_endpoint_writes_dotenv_without_echoing_key(client, tmp_path, monkeypatch):
     import server
 
@@ -177,6 +222,50 @@ async def test_openrouter_secret_endpoint_writes_dotenv_without_echoing_key(clie
     assert f"OPENROUTER_API_KEY={api_key}" in saved
     assert f"OPENROUTER_MANAGEMENT_KEY={management_key}" in saved
     assert saved.count("OPENROUTER_API_KEY=") == 1
+
+
+async def test_openrouter_secret_endpoint_preserves_omitted_keys(client, tmp_path, monkeypatch):
+    import server
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "OPENROUTER_API_KEY=old-inference\nOPENROUTER_MANAGEMENT_KEY=old-management\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server.openrouter_client, "_dotenv_path", lambda: env_path)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_MANAGEMENT_KEY", raising=False)
+
+    resp = await client.post("/api/openrouter/secrets", json={
+        "management_key": "new-management",
+    })
+
+    assert resp.status_code == 200
+    saved = env_path.read_text(encoding="utf-8")
+    assert "OPENROUTER_API_KEY=old-inference" in saved
+    assert "OPENROUTER_MANAGEMENT_KEY=new-management" in saved
+
+
+async def test_openrouter_secret_endpoint_clears_explicit_empty_key(client, tmp_path, monkeypatch):
+    import server
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "OPENROUTER_API_KEY=old-inference\nOPENROUTER_MANAGEMENT_KEY=old-management\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server.openrouter_client, "_dotenv_path", lambda: env_path)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_MANAGEMENT_KEY", raising=False)
+
+    resp = await client.post("/api/openrouter/secrets", json={
+        "api_key": "",
+    })
+
+    assert resp.status_code == 200
+    saved = env_path.read_text(encoding="utf-8")
+    assert "OPENROUTER_API_KEY=" not in saved
+    assert "OPENROUTER_MANAGEMENT_KEY=old-management" in saved
 
 
 async def test_system_only_weave_generation_uses_only_system_prompt(monkeypatch):
@@ -220,9 +309,10 @@ async def test_system_only_weave_generation_uses_only_system_prompt(monkeypatch)
 
     captured = {}
 
-    async def fake_stream_chat(messages, model=None):
+    async def fake_stream_chat(messages, model=None, **kwargs):
         captured["messages"] = messages
         captured["model"] = model
+        captured["max_tokens"] = kwargs.get("max_tokens")
         yield "ok"
 
     async def fake_update_rolling_summary(conv_id):
@@ -243,6 +333,7 @@ async def test_system_only_weave_generation_uses_only_system_prompt(monkeypatch)
 
     assert loader_calls == []
     assert captured["model"] == "Qwen3.6-27B-NVFP4.gguf"
+    assert captured["max_tokens"]
     assert captured["messages"][0]["role"] == "system"
     assert captured["messages"][0]["content"].startswith("ONLY THIS SYSTEM MESSAGE\n\n")
     assert "OODA" in captured["messages"][0]["content"]
@@ -274,7 +365,7 @@ async def test_weave_generation_persists_streamed_usage(monkeypatch):
     user_msg = await db.add_message(conv["id"], "user", "Start here.")
     conv = await db.get_conversation(conv["id"])
 
-    async def fake_stream_chat(messages, model=None):
+    async def fake_stream_chat(messages, model=None, **kwargs):
         yield "ok"
         yield {"type": "usage", "input_tokens": 123, "output_tokens": 45}
 
@@ -298,6 +389,49 @@ async def test_weave_generation_persists_streamed_usage(monkeypatch):
     assert assistant["turn_output_tokens"] == 45
 
 
+async def test_weave_generation_persists_thinking_blocks(monkeypatch):
+    import server
+
+    conv = await db.create_conversation(
+        "Weave Thinking",
+        mode="weave",
+    )
+    await db.update_conversation_fields(
+        conv["id"],
+        system_only=1,
+        system_prompt="ONLY THIS SYSTEM MESSAGE",
+        local_model="Qwen3.6-27B-NVFP4.gguf",
+    )
+    user_msg = await db.add_message(conv["id"], "user", "Start here.")
+    conv = await db.get_conversation(conv["id"])
+
+    async def fake_stream_chat(messages, model=None, **kwargs):
+        yield {"type": "thinking_delta", "text": "hidden "}
+        yield {"type": "thinking_delta", "text": "reasoning"}
+        yield "visible answer"
+
+    async def fake_update_rolling_summary(conv_id):
+        return None
+
+    monkeypatch.setattr(server, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr("context_manager.update_rolling_summary", fake_update_rolling_summary)
+
+    await server._handle_weave_generation(
+        None,
+        conv["id"],
+        conv,
+        {"action": "generate", "parent_id": user_msg["id"]},
+    )
+
+    children = await db.get_children(user_msg["id"])
+    assistant = next(m for m in children if m["role"] == "assistant")
+    assert assistant["content"] == "visible answer"
+    assert json.loads(assistant["content_blocks"]) == [
+        {"type": "thinking", "text": "hidden reasoning"},
+        {"type": "text", "text": "visible answer"},
+    ]
+
+
 async def test_system_only_weave_generation_can_disable_minimal_ooda(monkeypatch):
     """Minimal Weave can send only the stored system prompt with no private OODA add-in."""
     import server
@@ -319,7 +453,7 @@ async def test_system_only_weave_generation_can_disable_minimal_ooda(monkeypatch
 
     captured = {}
 
-    async def fake_stream_chat(messages, model=None):
+    async def fake_stream_chat(messages, model=None, **kwargs):
         captured["messages"] = messages
         captured["model"] = model
         yield "ok"
@@ -706,12 +840,25 @@ def test_load_local_gemini_models_and_mapping(tmp_path, monkeypatch):
     assert models[0]["value"] == "gemini:gemini-3.5-flash-custom"
     assert models[0]["label"] == "Gemini (Gemini 3.5 Flash Custom)"
 
-    # Test _loom_model_to_agy mapping strips gemini: prefix and supports mapping
+    # Discovered selectors are exact launch identities and must not be rewritten
+    # by a stale conversation effort setting.
     mapped = gemini_client._loom_model_to_agy("gemini:gemini-3.5-flash-custom", "high")
-    assert mapped == "gemini-3.5-flash-medium"  # mapped by gemini-3.5-flash pattern check
+    assert mapped == "gemini-3.5-flash-custom"
 
     mapped_raw = gemini_client._loom_model_to_agy("gemini:some-other-slug", "medium")
     assert mapped_raw == "some-other-slug"  # falls back to slug itself after stripping
 
     mapped_mixed = gemini_client._loom_model_to_agy("Gemini:some-other-slug", "medium")
     assert mapped_mixed == "some-other-slug"  # case-insensitive check works
+
+
+def test_antigravity_exact_selector_controls_effort():
+    import gemini_client
+
+    selector = "gemini:gemini-3.7-flash-low"
+    assert gemini_client._loom_model_to_agy(selector, "high") == "gemini-3.7-flash-low"
+    assert gemini_client._agy_effort_for_model(selector, "high") == "low"
+
+    legacy = "Gemini 3.6 Pro (High)"
+    assert gemini_client._loom_model_to_agy(legacy, "low") == "gemini-3.6-pro-high"
+    assert gemini_client._agy_effort_for_model(legacy, "low") == "high"

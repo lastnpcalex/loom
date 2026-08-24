@@ -9,7 +9,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
-    <link rel="stylesheet" href="/static/style.css?v=117">
+    <link rel="stylesheet" href="/static/style.css?v=121">
 </head>
 <body>
     <div id="blackhole-container"></div>
@@ -330,6 +330,13 @@
                 </div>
                 <div id="dir-browser" class="dir-browser hidden"></div>
             </div>
+            <div class="form-group hidden" id="parallel-agents-group">
+                <label for="parallel-agents-enabled">
+                    <input type="checkbox" id="parallel-agents-enabled">
+                    Parallel agents in same checkout
+                </label>
+                <span class="label-hint">Optional. Independent agents may run at once against this live working directory. Loom snapshots the workspace, but agents can still conflict, so use this only for genuinely separate tasks.</span>
+            </div>
             <div class="form-group hidden" id="cc-model-group">
                 <label for="cc-model">Model</label>
                 <select id="cc-model" class="form-select"></select>
@@ -414,21 +421,21 @@
                 <div class="settings-divider"><span>Generation defaults</span></div>
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="cfg-temp">Temperature</label>
+                        <label for="cfg-temp">Temperature <span class="field-help" tabindex="0" aria-label="Temperature help" data-tip="Default randomness for direct local llama calls. Higher is looser and more surprising; lower is steadier. Weave uses it through llama_client. Braid/Hermes provider CLIs may ignore it if their adapter controls sampling.">?</span></label>
                         <input type="number" id="cfg-temp" step="0.05" min="0" max="2">
                     </div>
                     <div class="form-group">
-                        <label for="cfg-top-p">Top P</label>
+                        <label for="cfg-top-p">Top P <span class="field-help" tabindex="0" aria-label="Top P help" data-tip="Nucleus sampling cutoff for direct local llama calls. Lower narrows word choice; higher allows more variety. Usually leave near 0.9 unless a local model rambles or gets flat.">?</span></label>
                         <input type="number" id="cfg-top-p" step="0.01" min="0" max="1">
                     </div>
                 </div>
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="cfg-max-tokens">Max Tokens</label>
+                        <label for="cfg-max-tokens">Max Tokens <span class="field-help" tabindex="0" aria-label="Max Tokens help" data-tip="Default output cap for direct local calls and helper passes. Weave has its own output-token override below. Claude, Codex, Gemini, Goose, and similar provider modes use their own caps.">?</span></label>
                         <input type="number" id="cfg-max-tokens" step="256" min="64" max="131072">
                     </div>
                     <div class="form-group">
-                        <label for="cfg-repeat-penalty">Repeat Penalty</label>
+                        <label for="cfg-repeat-penalty">Repeat Penalty <span class="field-help" tabindex="0" aria-label="Repeat Penalty help" data-tip="Local llama anti-loop pressure. Higher discourages repeated phrases and scenes; too high can make wording brittle. Mainly affects direct llama generation such as Weave.">?</span></label>
                         <input type="number" id="cfg-repeat-penalty" step="0.01" min="1" max="2">
                     </div>
                 </div>
@@ -436,27 +443,34 @@
                 <div class="settings-divider"><span>Conversation Context</span></div>
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="cfg-context">Max Context Tokens <span class="hint">(weave/braid context budget)</span></label>
+                        <label for="cfg-context">Max Context Tokens <span class="hint">(weave/braid context budget)</span> <span class="field-help" tabindex="0" aria-label="Max Context Tokens help" data-tip="Budget before Loom summarizes older branch history. Weave and Braid/local context prep use this most. Higher preserves more branch history but costs memory and prompt time.">?</span></label>
                         <input type="number" id="cfg-context" step="4096" min="4096" max="262144">
                     </div>
                     <div class="form-group">
-                        <label for="cfg-verbatim">Verbatim Window <span class="hint">(turns kept word-for-word)</span></label>
+                        <label for="cfg-verbatim">Verbatim Window <span class="hint">(turns kept word-for-word)</span> <span class="field-help" tabindex="0" aria-label="Verbatim Window help" data-tip="Number of newest branch messages kept exact when context is compacted. Higher preserves recent detail; lower leaves more room for older summarized context.">?</span></label>
                         <input type="number" id="cfg-verbatim" step="1" min="2" max="50">
                     </div>
                 </div>
 
                 <div class="settings-divider" id="cfg-conv-overrides-divider"><span>This conversation <span class="hint" id="cfg-overrides-divider-hint"></span></span></div>
+                <div class="form-group toggle-row" id="cfg-parallel-agents-group">
+                    <label for="cfg-parallel-agents-enabled">
+                        <input type="checkbox" id="cfg-parallel-agents-enabled">
+                        Parallel agents in same checkout
+                        <span class="hint">(opt in only for independent tasks; all agents share the live files)</span>
+                    </label>
+                </div>
                 <!-- Loom (claude) overrides -->
                 <div class="settings-overrides" id="cfg-overrides-loom">
                     <div class="form-group">
-                        <label for="cfg-cc-model">Loom Model</label>
+                        <label for="cfg-cc-model">Loom Model <span class="field-help" tabindex="0" aria-label="Loom Model help" data-tip="Per-conversation provider model for Loom agent spaces: Claude, Codex, Gemini, Goose, OpenRouter, and related entries. This does not change the model loaded in llama-server.">?</span></label>
                         <div class="label-with-action">
                             <button type="button" class="btn-mini" id="btn-refresh-cc-models" title="Query Anthropic API to refresh model version labels">↻ Refresh</button>
                         </div>
                         <select id="cfg-cc-model" class="form-select"></select>
                     </div>
                     <div class="form-group" id="cfg-cc-effort-group">
-                        <label for="cfg-cc-effort">Thinking Effort</label>
+                        <label for="cfg-cc-effort">Thinking Effort <span class="field-help" tabindex="0" aria-label="Thinking Effort help" data-tip="Provider-side reasoning budget where supported. Higher can help hard coding or planning tasks but takes longer and can cost more tokens. Local llama selectors do not use this knob.">?</span></label>
                         <select id="cfg-cc-effort" class="form-select">
                             <option value="low">Low</option>
                             <option value="medium">Medium</option>
@@ -466,7 +480,7 @@
                         </select>
                     </div>
                     <div class="form-group">
-                        <label for="cfg-cc-permission">Permission Mode</label>
+                        <label for="cfg-cc-permission">Permission Mode <span class="field-help" tabindex="0" aria-label="Permission Mode help" data-tip="Act lets supported agents request and run tools through Loom approvals. Plan keeps supported agents in planning mode until you switch back. Codex and Gemini hide this when it does not apply.">?</span></label>
                         <select id="cfg-cc-permission" class="form-select">
                             <option value="default">Act</option>
                             <option value="plan">Plan</option>
@@ -476,40 +490,45 @@
                 <!-- Braid (local CC) overrides -->
                 <div class="settings-overrides" id="cfg-overrides-braid">
                     <div class="form-group">
-                        <label for="cfg-braid-model">Braid Local Model</label>
+                        <label for="cfg-braid-model">Braid Local Model <span class="field-help" tabindex="0" aria-label="Braid Local Model help" data-tip="Per-conversation local model for Braid, the Claude Code-style agent routed through llama-server. Choosing a llama model here can restart llama-server with that model.">?</span></label>
                         <select id="cfg-braid-model" class="form-select"></select>
                     </div>
                 </div>
                 <!-- Hermes (ACP agent) overrides -->
                 <div class="settings-overrides" id="cfg-overrides-hermes">
                     <div class="form-group">
-                        <label for="cfg-hermes-model">Hermes Local Model</label>
+                        <label for="cfg-hermes-model">Hermes Local Model <span class="field-help" tabindex="0" aria-label="Hermes Local Model help" data-tip="Per-conversation llama model for the Hermes ACP agent. It uses the live llama attendant, so the selected model must be running unless Incognito routes through Prometheus.">?</span></label>
                         <select id="cfg-hermes-model" class="form-select"></select>
                     </div>
                 </div>
                 <!-- Weave overrides -->
                 <div class="settings-overrides" id="cfg-overrides-weave">
                     <div class="form-group">
-                        <label for="cfg-weave-model">Weave Local Model</label>
+                        <label for="cfg-weave-model">Weave Local Model <span class="field-help" tabindex="0" aria-label="Weave Local Model help" data-tip="Per-conversation model for Weave chat. It can use the loaded llama-server model, Dream when the Dream sidecar is up, or OpenRouter entries when enabled.">?</span></label>
                         <select id="cfg-weave-model" class="form-select"></select>
                     </div>
+                    <div class="form-group">
+                        <label for="cfg-weave-max-tokens">Weave Output Tokens <span class="field-help" tabindex="0" aria-label="Weave Output Tokens help" data-tip="Caps Weave and OODA generation length. Lower keeps turns compact; higher allows long RP or repair passes. This does not change provider-agent output caps.">?</span></label>
+                        <input type="number" id="cfg-weave-max-tokens" step="256" min="64" max="32768" placeholder="2048">
+                    </div>
                     <div class="form-group hidden" id="cfg-weave-system-prompt-group">
-                        <label for="cfg-weave-system-prompt">System message</label>
+                        <label for="cfg-weave-system-prompt">System message <span class="field-help" tabindex="0" aria-label="System message help" data-tip="Minimal Weave only. Replaces character, persona, and lore assembly with this instruction plus branch history.">?</span></label>
                         <textarea id="cfg-weave-system-prompt" rows="5" placeholder="Minimal Weave system message"></textarea>
                         <label for="cfg-weave-minimal-ooda-enabled" class="minimal-suboption">
                             <input type="checkbox" id="cfg-weave-minimal-ooda-enabled">
                             Private OODA add-in
                         </label>
+                        <span class="field-help" tabindex="0" aria-label="Private OODA help" data-tip="Minimal Weave helper scaffold kept in the prompt without visible state cards. Turn it off for plain system-prompt chat.">?</span>
                     </div>
                 </div>
                 <!-- Dream Engine (DiffusionGemma) overrides -->
                 <div class="settings-overrides" id="cfg-overrides-dream">
                     <div class="form-group">
-                        <label for="cfg-dream-model">Dream Engine Model</label>
+                        <label for="cfg-dream-model">Dream Engine Model <span class="field-help" tabindex="0" aria-label="Dream Engine Model help" data-tip="Dream Space uses Hermes ACP pointed at the Dream DiffusionGemma sidecar. This is separate from llama-server and only works when Dream is up.">?</span></label>
                         <select id="cfg-dream-model" class="form-select"></select>
                     </div>
                     <div class="form-group">
-                        <label for="cfg-dream-min-output-tokens">Minimum Output Tokens <span class="hint">(256-token canvas blocks)</span></label>
+                        <label for="cfg-dream-min-output-tokens">Minimum Output Tokens <span class="hint">(256-token canvas blocks)</span> <span class="field-help" tabindex="0" aria-label="Dream minimum output help" data-tip="Dream-only floor for generation length. Helps diffusion canvas blocks complete, but can make short replies slow or verbose.">?</span></label>
                         <input type="number" id="cfg-dream-min-output-tokens" min="256" step="256" placeholder="2048">
                     </div>
                 </div>
@@ -630,19 +649,26 @@
  <!-- Advanced -->
             <div id="settings-advanced" class="settings-section hidden">
                 <div class="form-group">
-                    <label for="cfg-host">Llama Server Host</label>
+                    <label for="cfg-host">Llama Server Host <span class="field-help" tabindex="0" aria-label="Llama Server Host help" data-tip="OpenAI-compatible llama endpoint Loom calls. Weave uses it directly; Braid and Hermes route local-agent traffic through it. Changing this only helps if a server is listening there.">?</span></label>
                     <input type="text" id="cfg-host" placeholder="http://localhost:11434">
                 </div>
                 <div class="form-group">
                     <div class="label-with-action">
-                        <label for="cfg-llama-model-select">Model (from models folder)</label>
+                        <label for="cfg-llama-model-select">Model (from models folder) <span class="field-help" tabindex="0" aria-label="Llama model file help" data-tip="Saved default GGUF for llama-server. Braid, Hermes, and Weave use this when the conversation has no override. Use Apply & Restart to actually load it.">?</span></label>
                         <button type="button" class="btn-mini" id="btn-refresh-models" title="Re-scan disk and re-fetch the loaded-model list">↻ Refresh</button>
                     </div>
                     <select id="cfg-llama-model-select" class="form-select"></select>
                 </div>
+                <div id="llama-runtime-status" class="llama-runtime-status">
+                    <div><span>Server</span><strong id="llama-runtime-state">unknown</strong></div>
+                    <div><span>Loaded</span><strong id="llama-runtime-loaded">unknown</strong></div>
+                    <div><span>Saved config</span><strong id="llama-runtime-configured">unknown</strong></div>
+                    <div><span>Runtime ctx</span><strong id="llama-runtime-ctx">unknown</strong></div>
+                    <div class="llama-runtime-wide"><span>Selected settings</span><strong id="llama-runtime-saved-settings">unknown</strong></div>
+                </div>
                 <div class="form-group">
                     <div class="label-with-action">
-                        <label for="cfg-llama-server-exe">Llama Server Path</label>
+                        <label for="cfg-llama-server-exe">Llama Server Path <span class="field-help" tabindex="0" aria-label="Llama Server Path help" data-tip="Executable used by the admin restart button. This does not change an already-running llama-server until you apply and restart.">?</span></label>
                         <button type="button" class="btn-mini" id="btn-llama-restart" title="Save settings, then stop and restart Llama Server with the selected model.">↻ Apply &amp; Restart</button>
                     </div>
                     <input type="text" id="cfg-llama-server-exe" placeholder="e.g. C:\LlamaServer\bin\llama-server.exe">
@@ -657,31 +683,31 @@
                     <div id="model-tuning-fields" class="hidden">
                         <div class="form-row">
                             <div class="form-group">
-                                <label for="cfg-mc-ctx-size">Context Size</label>
+                                <label for="cfg-mc-ctx-size">Context Size <span class="field-help" tabindex="0" aria-label="Context Size help" data-tip="llama-server context window for this GGUF at launch. Higher lets Weave, Braid, and Hermes fit more prompt but uses much more KV-cache memory. Runtime ctx above shows what is actually loaded.">?</span></label>
                                 <input type="number" id="cfg-mc-ctx-size" step="2048" min="2048" max="1048576">
                             </div>
                             <div class="form-group">
-                                <label for="cfg-mc-ngl">GPU Layers <span class="hint">(999 = all that fits)</span></label>
+                                <label for="cfg-mc-ngl">GPU Layers <span class="hint">(999 = all that fits)</span> <span class="field-help" tabindex="0" aria-label="GPU Layers help" data-tip="How many model layers llama-server offloads to GPU. More is usually faster and uses more VRAM. If launch fails or VRAM is tight, lower this.">?</span></label>
                                 <input type="number" id="cfg-mc-ngl" min="0" max="999" placeholder="999">
                             </div>
                         </div>
                         <div class="form-row">
                             <div class="form-group">
-                                <label for="cfg-mc-kv-quant">KV Cache Quant <span class="hint">(saves VRAM)</span></label>
+                                <label for="cfg-mc-kv-quant">KV Cache Quant <span class="hint">(saves VRAM)</span> <span class="field-help" tabindex="0" aria-label="KV Cache Quant help" data-tip="Quantizes the attention cache used by long context. K8_0 saves VRAM with modest quality risk; none uses more memory. This affects local llama-backed modes after restart.">?</span></label>
                                 <select id="cfg-mc-kv-quant" class="form-select"></select>
                             </div>
                             <div class="form-group">
-                                <label for="cfg-mc-threads">Threads</label>
+                                <label for="cfg-mc-threads">Threads <span class="field-help" tabindex="0" aria-label="Threads help" data-tip="CPU worker threads for llama-server. Auto is usually fine. Set manually when CPU-side layers or prompt ingestion are slow or unstable.">?</span></label>
                                 <input type="number" id="cfg-mc-threads" min="1" max="64" placeholder="auto">
                             </div>
                         </div>
                         <div class="form-row">
                             <div class="form-group">
-                                <label for="cfg-mc-batch">Batch Size</label>
+                                <label for="cfg-mc-batch">Batch Size <span class="field-help" tabindex="0" aria-label="Batch Size help" data-tip="Prompt-processing batch size for llama-server. Larger can ingest context faster but uses more memory. Lower it if startup or long prompts fail.">?</span></label>
                                 <input type="number" id="cfg-mc-batch" min="1" max="32768" placeholder="auto">
                             </div>
                             <div class="form-group">
-                                <label for="cfg-mc-ubatch">Upload Batch</label>
+                                <label for="cfg-mc-ubatch">Upload Batch <span class="field-help" tabindex="0" aria-label="Upload Batch help" data-tip="Microbatch size for splitting llama-server work. Smaller values reduce memory spikes; larger values can improve throughput on a stable GPU setup.">?</span></label>
                                 <input type="number" id="cfg-mc-ubatch" min="1" max="32768" placeholder="auto">
                             </div>
                         </div>
@@ -691,20 +717,22 @@
                                     <input type="checkbox" id="cfg-mc-flash-attn" checked>
                                     Flash Attention
                                 </label>
+                                <span class="field-help" tabindex="0" aria-label="Flash Attention help" data-tip="Faster, lower-memory attention path when the model and server build support it. Usually keep on; turn off if the selected GGUF or backend errors.">?</span>
                             </div>
                             <div class="form-group toggle-row">
                                 <label for="cfg-mc-mlock">
                                     <input type="checkbox" id="cfg-mc-mlock">
                                     Lock memory (no swap)
                                 </label>
+                                <span class="field-help" tabindex="0" aria-label="Lock Memory help" data-tip="Asks the OS to keep llama weights/cache out of swap. Can reduce stalls, but reserves RAM and may fail on memory-constrained systems.">?</span>
                             </div>
                         </div>
                         <div class="form-group">
-                            <label for="cfg-mc-mmproj">Vision MMProj <span class="hint">(separate projector for multimodal models)</span></label>
+                            <label for="cfg-mc-mmproj">Vision MMProj <span class="hint">(separate projector for multimodal models)</span> <span class="field-help" tabindex="0" aria-label="Vision MMProj help" data-tip="Projector file needed for compatible multimodal GGUFs. It enables image inputs for local llama vision paths; it is not a standalone chat model.">?</span></label>
                             <select id="cfg-mc-mmproj" class="form-select"></select>
                         </div>
                         <div class="form-group">
-                            <label for="cfg-mc-extra">Extra args <span class="hint">(appended verbatim)</span></label>
+                            <label for="cfg-mc-extra">Extra args <span class="hint">(appended verbatim)</span> <span class="field-help" tabindex="0" aria-label="Extra Args help" data-tip="Raw llama-server CLI flags appended on restart. Powerful but easy to break; use for backend flags not represented by the form.">?</span></label>
                             <input type="text" id="cfg-mc-extra" placeholder="--no-mmap">
                         </div>
                     </div>
@@ -880,8 +908,8 @@ assistant: *Another example response*"></textarea>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="/static/acidburn-galaxy.js?v=12"></script>
     <script src="/static/blackhole.js?v=14"></script>
-    <script src="/static/app.js?v=98"></script>
-    <script src="/static/chat.js?v=133"></script>
-    <script src="/static/tree.js?v=37"></script>
+    <script src="/static/app.js?v=101"></script>
+    <script src="/static/chat.js?v=137"></script>
+    <script src="/static/tree.js?v=39"></script>
 </body>
 </html>

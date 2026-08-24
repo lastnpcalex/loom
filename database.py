@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     system_only INTEGER DEFAULT 0,
     minimal_ooda_enabled INTEGER DEFAULT 1,
     system_prompt TEXT,
+    parallel_agents_enabled INTEGER DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -360,6 +361,9 @@ async def _run_migrations(db):
         "ALTER TABLE messages ADD COLUMN state_deltas TEXT",
         # Track which model generated each message (for provider switch detection)
         "ALTER TABLE messages ADD COLUMN cc_model_used TEXT",
+        # Provider-returned model identity chain. JSON kept separate from
+        # cc_model_used so a requested value can never masquerade as proof.
+        "ALTER TABLE messages ADD COLUMN model_attestation TEXT",
         # Canvas view: embedded website preview in tree view
         "ALTER TABLE conversations ADD COLUMN canvas_enabled INTEGER DEFAULT 0",
         # Vision model describe focus (sent only to vision model, never chat)
@@ -388,6 +392,8 @@ async def _run_migrations(db):
         "ALTER TABLE conversations ADD COLUMN codex_goal_tokens_used INTEGER DEFAULT 0",
         "ALTER TABLE conversations ADD COLUMN codex_goal_time_used_seconds INTEGER DEFAULT 0",
         "ALTER TABLE conversations ADD COLUMN codex_goal_updated_at REAL",
+        # Explicit opt-in for independent agents sharing one live checkout.
+        "ALTER TABLE conversations ADD COLUMN parallel_agents_enabled INTEGER DEFAULT 0",
     ]
     for sql in migrations:
         try:
@@ -772,6 +778,7 @@ async def update_conversation_fields(conv_id: int, **fields):
         "codex_goal_tokens_used",
         "codex_goal_time_used_seconds",
         "codex_goal_updated_at",
+        "parallel_agents_enabled",
     }
     updates = []
     params = []
@@ -849,6 +856,7 @@ async def update_message_content(
     turn_output_tokens: int = None,
     cc_session_id: str = None,
     cc_model_used: str = None,
+    model_attestation: str = None,
     generation_ms: int = None,
     cc_session_mode: str = None,
 ):
@@ -882,6 +890,9 @@ async def update_message_content(
     if cc_model_used is not None:
         updates.append("cc_model_used = ?")
         params.append(cc_model_used)
+    if model_attestation is not None:
+        updates.append("model_attestation = ?")
+        params.append(model_attestation)
     if generation_ms is not None:
         updates.append("generation_ms = ?")
         params.append(generation_ms)
@@ -1152,8 +1163,8 @@ async def fork_conversation(
         """INSERT INTO conversations (title, character_id, persona_id, lore_ids,
            style_nudge, custom_scene, mode, project_dir, cc_model, cc_effort,
            local_model, nrol_operator, incognito, system_only, minimal_ooda_enabled,
-           system_prompt, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           system_prompt, parallel_agents_enabled, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             title,
             orig.get("character_id"),
@@ -1177,6 +1188,7 @@ async def fork_conversation(
             int(orig.get("system_only", 0) or 0),
             int(orig.get("minimal_ooda_enabled", 1) if orig.get("minimal_ooda_enabled") is not None else 1),
             orig.get("system_prompt"),
+            int(orig.get("parallel_agents_enabled", 0) or 0),
             now,
             now,
         ),

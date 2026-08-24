@@ -385,6 +385,133 @@ async def test_permission_bridge_does_not_block_stream(monkeypatch):
     assert reply["result"]["outcome"]["optionId"] == "allow_once"
 
 
+async def test_hermes_permission_bridge_forwards_generation_scope(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def json(self):
+            return {"allow": True}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, *, json, timeout):
+            captured.update(json)
+            return FakeResponse()
+
+    class FakeRpc:
+        async def respond(self, req_id, *, result):
+            captured["reply"] = result
+
+    monkeypatch.setattr(hermes_client.httpx, "AsyncClient", FakeClient)
+    await hermes_client._bridge_permission(
+        FakeRpc(),
+        9,
+        {
+            "toolCall": {"title": "terminal"},
+            "options": [{"optionId": "allow_once", "kind": "allow_once"}],
+        },
+        7,
+        3000,
+        "gen:42",
+    )
+
+    assert captured["permission_scope"] == "gen:42"
+    assert captured["reply"]["outcome"]["optionId"] == "allow_once"
+
+
+async def test_parallel_hermes_turn_uses_isolated_runtime(monkeypatch):
+    called = {}
+    sentinel = (object(), object())
+
+    async def fake_oneshot(prompt, **kwargs):
+        called["prompt"] = prompt
+        called.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(hermes_client, "_run_hermes_oneshot", fake_oneshot)
+    result = await hermes_client.run_hermes(
+        "parallel",
+        conv_id=8,
+        cwd=".",
+        isolated=True,
+    )
+
+    assert result is sentinel
+    assert called["conv_id"] == 8
+    assert called["prompt"] == "parallel"
+
+
+async def test_hermes_switch_back_replays_intervening_codex_turn(monkeypatch, tmp_path):
+    """Hermes → Codex → Hermes must rebuild instead of resuming old Hermes state."""
+    import server
+
+    conv = await db.create_conversation(
+        "Hermes A-B-A", mode="hermes", project_dir=str(tmp_path)
+    )
+    await db.update_conversation_fields(conv["id"], local_model="qwen3.6:27b")
+    u1 = await db.add_message(conv["id"], "user", "first")
+    h1 = await db.add_message(
+        conv["id"], "assistant", "old hermes reply", parent_id=u1["id"],
+        cc_session_id="hermes-old",
+    )
+    await db.update_message_content(h1["id"], cc_session_mode="hermes")
+    u2 = await db.add_message(
+        conv["id"], "user", "ask codex", parent_id=h1["id"]
+    )
+    c1 = await db.add_message(
+        conv["id"], "assistant", "intervening codex reply", parent_id=u2["id"],
+        cc_session_id="codex-middle",
+    )
+    await db.update_message_content(c1["id"], cc_session_mode="codex")
+    u3 = await db.add_message(
+        conv["id"], "user", "back to hermes", parent_id=c1["id"]
+    )
+
+    captured = {}
+
+    async def fake_run_hermes(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured["resume_session_id"] = kwargs.get("resume_session_id")
+        captured["is_first_turn"] = kwargs.get("is_first_turn")
+
+        class Proc:
+            pid = 8123
+            returncode = 0
+
+            async def wait(self):
+                return 0
+
+        async def events():
+            yield {"type": "session_info", "session_id": "hermes-new", "model": "custom:qwen3.6:27b"}
+            yield {"type": "text_delta", "text": "replayed"}
+            yield {"type": "result", "session_id": "hermes-new"}
+
+        return Proc(), events()
+
+    monkeypatch.setattr(server.hermes_client, "run_hermes", fake_run_hermes)
+
+    await server._handle_hermes_generation(
+        websocket=None,
+        conv_id=conv["id"],
+        conv=await db.get_conversation(conv["id"]),
+        data={"action": "generate", "parent_id": u3["id"]},
+    )
+
+    assert captured["resume_session_id"] is None
+    assert captured["is_first_turn"] is True
+    assert "old hermes reply" in captured["prompt"]
+    assert "intervening codex reply" in captured["prompt"]
+    assert "back to hermes" in captured["prompt"]
+
+
 # --------------------------------------------------------------------------- #
 # is_first_turn / context-duplication regression (RC1)
 # --------------------------------------------------------------------------- #

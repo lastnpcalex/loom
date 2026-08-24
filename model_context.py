@@ -63,6 +63,19 @@ def is_1m_anthropic(model_id: str) -> bool:
     return floor is not None and version >= floor
 
 
+def _context_model_id(model_id: str) -> str:
+    """Normalize Loom wrapper selectors before applying context gates."""
+    if not model_id:
+        return ""
+    m = model_id.lower()
+    if not m.startswith("goose:"):
+        return m
+    body = m.split(":", 1)[1]
+    if body.startswith("auto:"):
+        body = body.split(":", 1)[1]
+    return body
+
+
 def is_anthropic(model_id: str) -> bool:
     """True for any Anthropic value Loom surfaces in the dropdown — either the
     sonnet/opus/haiku alias or a full `claude-<family>-...` ID, with optional
@@ -70,7 +83,8 @@ def is_anthropic(model_id: str) -> bool:
     and local-llama paths."""
     if not model_id:
         return False
-    base = model_id.split("[")[0] if "[" in model_id else model_id
+    mid = _context_model_id(model_id)
+    base = mid.split("[")[0] if "[" in mid else mid
     bl = base.lower()
     if bl in ("sonnet", "opus", "haiku"):
         return True
@@ -80,13 +94,13 @@ def is_anthropic(model_id: str) -> bool:
 def is_gemini(model_id: str) -> bool:
     if not model_id:
         return False
-    return model_id.lower().startswith("gemini")
+    return _context_model_id(model_id).startswith("gemini")
 
 
 def is_openrouter(model_id: str) -> bool:
     if not model_id:
         return False
-    ml = model_id.lower()
+    ml = _context_model_id(model_id)
     return (
         ml.startswith("openrouter:")
         or ml in {
@@ -99,7 +113,7 @@ def is_openrouter(model_id: str) -> bool:
 
 
 def _openrouter_slug(model_id: str) -> str:
-    m = (model_id or "").lower()
+    m = _context_model_id(model_id)
     return m.split(":", 1)[1] if m.startswith("openrouter:") else m
 
 

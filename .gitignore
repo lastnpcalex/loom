@@ -189,3 +189,24 @@ workspaces/
 # Runtime-generated / per-machine artifacts (never track)
 .mcp.json
 GEMINI.md
+classroom_features.local.json
+
+# Local recovery / forensic working artifacts (may contain recovered external files)
+canvas_workflow_recovery_out/
+missing_slide_evidence_out/
+recovery_stage_*/
+recovery_verify_*/
+tmp_*
+extract_missing_slide_evidence.py
+extract_missing_slide_reads.py
+find_canvas_workflow_targets.py
+find_missing_slide_evidence.py
+fix_restored_slide_syntax.py
+missing_slide_patterns.txt
+recover_canvas_from_loom_db.py
+recover_canvas_workflow_files.py
+restore_lab_workflows_from_branch.py
+restore_slide_recoverable_files.py
+stage_recovered_missing_slide_files.py
+summarize_missing_slide_chunks.py
+summarize_missing_slide_loomdb.py

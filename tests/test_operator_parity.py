@@ -441,6 +441,63 @@ async def test_gemini_client_resume_and_fork_args(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_gemini_client_replay_args_do_not_attach_conversation(monkeypatch, tmp_path):
+    """Full Loom-history replay must be fresh-conv for normal agy too.
+
+    If run_gemini receives no resume_session_id, the prompt is the source of
+    truth (first turn, cross-provider handoff, compact-marker replay, or
+    stale-session fallback). Passing --conversation <conv_id> here layers that
+    replay on top of agy's persistent memory and makes the turn behave like a
+    confused handoff/resume hybrid.
+    """
+    import asyncio
+    import gemini_client
+
+    args_captured = []
+
+    class MockProcess:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+            self.returncode = 0
+
+        async def wait(self):
+            return 0
+
+    mock_proc = MockProcess()
+    mock_proc.stdout.feed_data(
+        b'{"event":"init","init":{"conversation_id":"fresh-agy-session"}}\n'
+    )
+    mock_proc.stdout.feed_eof()
+    mock_proc.stderr.feed_eof()
+
+    async def mock_create_subprocess_exec(*args, **kwargs):
+        args_captured.append(args)
+        return mock_proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", mock_create_subprocess_exec)
+    monkeypatch.setattr(gemini_client, "_find_agy_exe", lambda: "agy")
+    monkeypatch.setattr(gemini_client, "_configure_permission_hook", lambda *args, **kwargs: None)
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    await gemini_client.run_gemini(
+        prompt="Human: prior turn\n\nHuman: latest turn",
+        cwd=str(tmp_path),
+        conv_id=321,
+        resume_session_id=None,
+        fork_session=False,
+        nrol_operator=False,
+    )
+
+    assert len(args_captured) == 1
+    cmd_args = args_captured[0]
+    assert cmd_args[0] == "agy"
+    assert "--conversation" not in cmd_args
+    assert "--output-format" in cmd_args
+
+
+@pytest.mark.asyncio
 async def test_gemini_operator_turn2_forces_fresh_conv(monkeypatch, tmp_path):
     """The launch/poller-mode invariant for agy NROL-operator turns.
 
@@ -614,7 +671,11 @@ async def test_agy_operator_turn2_server_builds_full_history_prompt(tmp_database
         conv["id"], "assistant", "Scan complete: 3 articles parked for slug-hormuz.",
         parent_id=u1["id"], cc_session_id="turn1-agy-session",
     )
-    await db.update_message_content(a1["id"], cc_model_used="gemini-3.5-flash")
+    await db.update_message_content(
+        a1["id"],
+        cc_model_used="gemini-3.5-flash",
+        cc_session_mode="gemini",
+    )
 
     # Turn 2: user references prior context — amnesia check.
     u2 = await db.add_message(
@@ -725,8 +786,8 @@ def test_codex_client_resume_and_fork(tmp_path):
 # The resume walk in _handle_dream_generation must skip a cc_session_id whose
 # cc_session_mode is non-NULL and not "dream" — a Hermes (llama) session id is
 # meaningless in the Dream home's state.db, and forking it there is how a
-# foreign conversation's tree leaks into a Dream session. NULL mode = legacy,
-# treated as compatible so existing conversations keep resuming.
+# foreign conversation's tree leaks into a Dream session. NULL mode is legacy
+# and unscoped, so it must rebuild once from Loom history.
 
 async def test_dream_resume_walk_skips_foreign_mode_session(monkeypatch):
     """A branch carrying a Hermes-mode session id must NOT be forked for Dream."""
@@ -789,6 +850,68 @@ async def test_dream_resume_walk_skips_foreign_mode_session(monkeypatch):
     )
 
 
+async def test_dream_switch_back_replays_intervening_hermes_turn(monkeypatch):
+    """Dream → Hermes → Dream must not resurrect the pre-Hermes Dream session."""
+    import server
+    import database as db
+
+    conv = await db.create_conversation("Dream A-B-A", mode="dream", project_dir=".")
+    u1 = await db.add_message(conv["id"], "user", "first turn")
+    d1 = await db.add_message(
+        conv["id"], "assistant", "old dream reply", parent_id=u1["id"],
+        cc_session_id="dream-old",
+    )
+    await db.update_message_content(d1["id"], cc_session_mode="dream")
+    u2 = await db.add_message(
+        conv["id"], "user", "switch to hermes", parent_id=d1["id"]
+    )
+    h1 = await db.add_message(
+        conv["id"], "assistant", "intervening hermes reply", parent_id=u2["id"],
+        cc_session_id="hermes-middle",
+    )
+    await db.update_message_content(h1["id"], cc_session_mode="hermes")
+    u3 = await db.add_message(
+        conv["id"], "user", "back to dream", parent_id=h1["id"]
+    )
+
+    captured = {}
+
+    async def fake_run_hermes(prompt, *args, **kwargs):
+        captured["prompt"] = prompt
+        captured["resume_session_id"] = kwargs.get("resume_session_id")
+        captured["is_first_turn"] = kwargs.get("is_first_turn", True)
+
+        class _Proc:
+            returncode = 0
+            pid = 4324
+
+            async def wait(self):
+                return 0
+
+        async def _events():
+            yield {"type": "session_info", "session_id": "dream-new", "model": "diffusiongemma"}
+            yield {"type": "text_delta", "text": "replayed"}
+            yield {"type": "result", "session_id": "dream-new", "stop_reason": "end_turn"}
+
+        return _Proc(), _events()
+
+    monkeypatch.setattr(server.hermes_client, "run_hermes", fake_run_hermes)
+    monkeypatch.setattr(server, "_ensure_dream_hermes_home", lambda: "/tmp/dream-home")
+
+    await server._handle_dream_generation(
+        websocket=None,
+        conv_id=conv["id"],
+        conv=await db.get_conversation(conv["id"]),
+        data={"action": "generate", "parent_id": u3["id"]},
+    )
+
+    assert captured["resume_session_id"] is None
+    assert captured["is_first_turn"] is True
+    assert "old dream reply" in captured["prompt"]
+    assert "intervening hermes reply" in captured["prompt"]
+    assert "back to dream" in captured["prompt"]
+
+
 async def test_dream_resume_walk_picks_up_same_mode_session(monkeypatch):
     """A branch carrying a Dream-mode session id IS resumed, with is_first_turn=False."""
     import server
@@ -806,9 +929,9 @@ async def test_dream_resume_walk_picks_up_same_mode_session(monkeypatch):
     captured: dict = {}
 
     async def fake_run_hermes(prompt, *args, **kwargs):
+        captured["prompt"] = prompt
         captured["resume_session_id"] = kwargs.get("resume_session_id")
         captured["is_first_turn"] = kwargs.get("is_first_turn", True)
-        captured["prompt"] = prompt
 
         class _Proc:
             returncode = 0
@@ -843,8 +966,8 @@ async def test_dream_resume_walk_picks_up_same_mode_session(monkeypatch):
     assert captured["prompt"] == "second turn"
 
 
-async def test_dream_resume_walk_null_mode_is_compatible(monkeypatch):
-    """Legacy rows with NULL cc_session_mode are treated as compatible (resume)."""
+async def test_dream_resume_walk_null_mode_forces_replay(monkeypatch):
+    """Legacy rows with NULL cc_session_mode rebuild because ownership is unknown."""
     import server
     import database as db
 
@@ -860,6 +983,7 @@ async def test_dream_resume_walk_null_mode_is_compatible(monkeypatch):
     captured: dict = {}
 
     async def fake_run_hermes(prompt, *args, **kwargs):
+        captured["prompt"] = prompt
         captured["resume_session_id"] = kwargs.get("resume_session_id")
         captured["is_first_turn"] = kwargs.get("is_first_turn", True)
 
@@ -888,9 +1012,12 @@ async def test_dream_resume_walk_null_mode_is_compatible(monkeypatch):
         data={"action": "generate", "parent_id": u2["id"]},
     )
 
-    # NULL mode = legacy/unscoped → compatible, so the session is resumed.
-    assert captured["resume_session_id"] == "legacy-sess-1"
-    assert captured["is_first_turn"] is False
+    # NULL mode = legacy/unscoped → fresh bounded replay, then future Dream
+    # turns can resume the newly mode-stamped session.
+    assert captured["resume_session_id"] is None
+    assert captured["is_first_turn"] is True
+    assert "legacy reply" in captured["prompt"]
+    assert "next turn" in captured["prompt"]
 
 
 # --- agy planner-loop / sustained-dead detection -----------------------------

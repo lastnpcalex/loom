@@ -36,6 +36,8 @@ A Shadow Loom is a self-hosted web interface for branching AI conversations acro
 `local_tools.py` — Tool definitions for local-mode agents; read_file, write_file, list_dir
 `character_loader.py` — Parse/save character, persona, and lore .md files with YAML frontmatter
 `model_context.py` — Model context-window table + handoff gate; 1M detection, per-provider thresholds
+`provider_contract.py` — Provider-independent native-session boundary selection; prevents A → B → A from reviving a stale harness session
+`workspace_safety.py` — Provider-independent pre-turn recovery snapshots and post-turn change reports; preserves live and completed file versions outside the checkout
 `loom_agent_prompt.py` — Shared Loom agent contract loader; `prepend_loom_agent_context()`, prompt merging
 `loom_agent.md` — Plaintext Loom agent contract (read by loom_agent_prompt.py)
 `skill_scanner.py` — Scan Claude Code skills, built-in commands, user skills for slash-command autocomplete
@@ -106,6 +108,7 @@ A Shadow Loom is a self-hosted web interface for branching AI conversations acro
 `tests/test_hermes_smoke.py` — Hermes ACP smoke tests
 `tests/test_local_mode.py` — Local mode generation tests
 `tests/test_loom_agent_prompt.py` — Loom agent contract injection tests
+`tests/test_model_attestation.py` — Cross-provider harness/model identity and evidence-level tests
 `tests/test_nrol_ao_mcp.py` — NROL-AO MCP server tests
 `tests/test_ooda_harness.py` — OODA harness parsing and execution tests
 `tests/test_operator_parity.py` — Operator parity tests
@@ -138,6 +141,9 @@ A Shadow Loom is a self-hosted web interface for branching AI conversations acro
 | Active generations / session state | `server.py` — module-level `_active_generations` dict, `_reap_orphan_generations()`, `/api/generations` endpoints |
 | Model registry / discovery | `llama_client.py` — `list_local_models()` scans `config.llama_models_dir`; `models_config.json` for per-model tuning |
 | Model context + handoff gate | `model_context.py` — `is_1m_anthropic()`, provider thresholds, `needs_handoff()` |
+| Provider session continuity | `provider_contract.py` — nearest-assistant boundary contract shared by all agent handlers |
+| Per-turn model identity | Provider clients emit `model_attestation`; `database.py` persists it on messages; `static/chat.js` renders harness + effective-model evidence |
+| Workspace preservation | `workspace_safety.py` — external recovery snapshots and per-generation change reports |
 | Context window management | `context_manager.py` — token counting, rolling summaries via `local_summary.py` |
 | System prompt assembly | `prompt_engine.py` — `build_system_prompt()`, `assemble_prompt()`, style nudges |
 | Database (tree storage) | `database.py` — SQLite schema, conversations/messages/summaries/branches tables |

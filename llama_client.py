@@ -46,6 +46,8 @@ _DREAM_THOUGHT_BLOCK_RE = re.compile(
     r"<\|channel>thought\s*(.*?)<channel\|>",
     re.IGNORECASE | re.DOTALL,
 )
+_THINK_OPEN_TAG = "<think>"
+_THINK_CLOSE_TAG = "</think>"
 
 
 def _split_channel_scaffold(text: str) -> tuple[str, str]:
@@ -73,6 +75,71 @@ def _split_channel_scaffold(text: str) -> tuple[str, str]:
     if normalized.strip() in {"<|channel>", "<channel|>", "thought"}:
         return "", ""
     return "", normalized
+
+
+def _trailing_tag_prefix_len(text: str, tag: str) -> int:
+    """Length of a trailing fragment that may become `tag` next chunk."""
+    max_len = min(len(text), len(tag) - 1)
+    for size in range(max_len, 0, -1):
+        if text.endswith(tag[:size]):
+            return size
+    return 0
+
+
+def _consume_think_markup(
+    buffer: str, in_think: bool, *, final: bool = False
+) -> tuple[list[tuple[str, str]], str, bool]:
+    """Split streamed `<think>...</think>` markup into visible/thinking events.
+
+    llama.cpp-compatible templates sometimes place reasoning in the normal
+    `content` delta wrapped in tags instead of using `reasoning_content`.
+    Streaming can split tags across chunks, so keep incomplete tag fragments in
+    `buffer` until the next delta.
+    """
+    events: list[tuple[str, str]] = []
+    pending = buffer or ""
+    while pending:
+        if in_think:
+            close_idx = pending.find(_THINK_CLOSE_TAG)
+            if close_idx >= 0:
+                thought = pending[:close_idx]
+                if thought:
+                    events.append(("thinking", thought))
+                pending = pending[close_idx + len(_THINK_CLOSE_TAG):]
+                in_think = False
+                continue
+            if final:
+                if pending:
+                    events.append(("thinking", pending))
+                pending = ""
+                break
+            keep = _trailing_tag_prefix_len(pending, _THINK_CLOSE_TAG)
+            emit = pending[:-keep] if keep else pending
+            if emit:
+                events.append(("thinking", emit))
+            pending = pending[-keep:] if keep else ""
+            break
+
+        open_idx = pending.find(_THINK_OPEN_TAG)
+        if open_idx >= 0:
+            visible = pending[:open_idx]
+            if visible:
+                events.append(("visible", visible))
+            pending = pending[open_idx + len(_THINK_OPEN_TAG):]
+            in_think = True
+            continue
+        if final:
+            if pending:
+                events.append(("visible", pending))
+            pending = ""
+            break
+        keep = _trailing_tag_prefix_len(pending, _THINK_OPEN_TAG)
+        emit = pending[:-keep] if keep else pending
+        if emit:
+            events.append(("visible", emit))
+        pending = pending[-keep:] if keep else ""
+        break
+    return events, pending, in_think
 
 
 def _client() -> httpx.AsyncClient:
@@ -138,6 +205,70 @@ def _resolve_model(name: str) -> str:
     # Populate the runtime map so subsequent calls skip the file read.
     _model_name_map[name] = name
     return name
+
+
+def _completion_model_attestation(
+    requested_model: str,
+    launch_model: str,
+    effective_model: str | None,
+    *,
+    provider: str,
+    source: str,
+) -> dict:
+    """Build model evidence for direct OpenAI-compatible completion paths."""
+    effective = str(effective_model or "").strip()
+    launch = str(launch_model or "").strip()
+    if effective:
+        left = _model_key(launch)
+        right = _model_key(effective)
+        equivalent = left == right
+        if provider == "llama-server" and left and right:
+            equivalent = equivalent or left in right or right in left
+        status = "verified" if equivalent else "mismatch"
+    elif launch:
+        status = "configured"
+    else:
+        status = "unverified"
+    harness = {
+        "openrouter": "OpenRouter API",
+        "dream": "Dream Engine",
+        "llama-server": "Llama Server",
+    }.get(provider, "Direct completion")
+    return {
+        "status": status,
+        "harness": harness,
+        "requested_model": str(requested_model or "").strip(),
+        "launch_model": launch or None,
+        "effective_model": effective or None,
+        "model_provider": provider,
+        "source": source,
+        "verification_level": "provider_response" if effective else "launch_configuration",
+        "fallback_allowed": False,
+    }
+
+
+def configured_completion_attestation(model: str | None) -> dict:
+    """Return the exact direct-completion launch configuration for a model."""
+    raw_model = model or config.llama_model
+    if openrouter_client.is_openrouter_model(raw_model):
+        provider = "openrouter"
+        target_model = openrouter_client.model_slug(raw_model)
+        source = "openrouter_request_configuration"
+    elif _is_dream_model(raw_model):
+        provider = "dream"
+        target_model = config.dream_model
+        source = "dream_request_configuration"
+    else:
+        provider = "llama-server"
+        target_model = _resolve_model(raw_model)
+        source = "llama_server_request_configuration"
+    return _completion_model_attestation(
+        raw_model,
+        target_model,
+        None,
+        provider=provider,
+        source=source,
+    )
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -386,6 +517,7 @@ async def _stream_openrouter_chat(
                 "output_tokens": 0,
                 "cost_usd": 0.0,
             }
+            _attested_model = ""
             async for line in response.aiter_lines():
                 if not line or line.startswith(":") or not line.startswith("data:"):
                     continue
@@ -401,6 +533,20 @@ async def _stream_openrouter_chat(
                     if isinstance(err, dict):
                         err = err.get("message") or err.get("code") or err
                     raise RuntimeError(f"OpenRouter error: {err}")
+
+                reported_model = str(chunk.get("model") or "").strip()
+                if reported_model and reported_model != _attested_model:
+                    _attested_model = reported_model
+                    yield {
+                        "type": "model_attestation",
+                        "model_attestation": _completion_model_attestation(
+                            raw_model,
+                            target_model,
+                            reported_model,
+                            provider="openrouter",
+                            source="openrouter_stream_chunk",
+                        ),
+                    }
 
                 usage = chunk.get("usage")
                 if usage:
@@ -490,7 +636,14 @@ async def _sync_openrouter_chat(
                 err = f"HTTP {resp.status_code}"
             raise RuntimeError(f"OpenRouter error: {err}")
         data = resp.json()
-        usage_info = openrouter_client.usage_from_openai_payload(data.get("usage"))
+        usage_info = dict(openrouter_client.usage_from_openai_payload(data.get("usage")))
+        usage_info["model_attestation"] = _completion_model_attestation(
+            raw_model,
+            target_model,
+            data.get("model"),
+            provider="openrouter",
+            source="openrouter_completion_response",
+        )
         choices = data.get("choices") or []
         if not choices:
             return ("", usage_info) if return_usage else ""
@@ -523,7 +676,20 @@ async def health_check() -> dict:
             resp = await client.get(f"{_llama_host()}/v1/models")
             resp.raise_for_status()
             data = resp.json()
-            models = [m["id"] for m in data.get("data", [])]
+            server_items = [m for m in data.get("data", []) if isinstance(m, dict)]
+            models = [str(m.get("id") or "") for m in server_items if m.get("id")]
+            model_meta = {}
+            for item in server_items:
+                mid = str(item.get("id") or "")
+                if not mid:
+                    continue
+                meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+                model_meta[mid] = {
+                    "n_ctx": meta.get("n_ctx"),
+                    "n_ctx_train": meta.get("n_ctx_train"),
+                    "n_params": meta.get("n_params"),
+                    "capabilities": item.get("capabilities") or [],
+                }
             local = list_local_models()
             # Build filename → server-ID mapping.
             # If server and local lists match in size, pair them directly.
@@ -559,6 +725,7 @@ async def health_check() -> dict:
                 "mock_mode": False,
                 "local_models": local,
                 "model_name_map": dict(_model_name_map),
+                "model_meta": model_meta,
             }
     except Exception as e:
         _mock_mode = True
@@ -584,8 +751,9 @@ async def stream_chat(
     """Stream chat completion tokens from Llama Server (or mock).
 
     Yields:
-      str token chunks for content,
-      {"type": "thinking_start"} / {"type": "thinking_end"} for reasoning_content,
+      str token chunks for visible content,
+      {"type": "thinking_start"} / {"type": "thinking_delta"} /
+      {"type": "thinking_end"} for reasoning content,
       {"type": "usage", "input_tokens": N, "output_tokens": N} as the final event.
     """
     global _mock_mode
@@ -603,6 +771,16 @@ async def stream_chat(
         return
     if _mock_mode and not _is_dream_model(raw_model):
         print("[LLAMA] WARNING: running in MOCK MODE")
+        mock_attestation = _completion_model_attestation(
+            raw_model,
+            _resolve_model(raw_model),
+            None,
+            provider="llama-server",
+            source="local_mock_response",
+        )
+        mock_attestation["status"] = "unverified"
+        mock_attestation["verification_level"] = "none"
+        yield {"type": "model_attestation", "model_attestation": mock_attestation}
         async for tok in _mock_stream(messages):
             yield tok
         return
@@ -659,6 +837,10 @@ async def stream_chat(
             _content_tokens = 0
             _input_tokens = 0
             _output_tokens = 0
+            _think_markup_buffer = ""
+            _in_think_markup = False
+            _attested_model = ""
+            backend_provider = "dream" if _is_dream_model(raw_model) else "llama-server"
 
             async for line in response.aiter_lines():
                 if not line:
@@ -676,6 +858,20 @@ async def stream_chat(
                     continue
                 if chunk.get("error"):
                     raise RuntimeError(f"Llama Server error: {chunk['error']}")
+
+                reported_model = str(chunk.get("model") or "").strip()
+                if reported_model and reported_model != _attested_model:
+                    _attested_model = reported_model
+                    yield {
+                        "type": "model_attestation",
+                        "model_attestation": _completion_model_attestation(
+                            raw_model,
+                            target_model,
+                            reported_model,
+                            provider=backend_provider,
+                            source="openai_compatible_stream_chunk",
+                        ),
+                    }
 
                 usage = chunk.get("usage")
                 if usage:
@@ -702,16 +898,66 @@ async def stream_chat(
                     if not _was_thinking:
                         _was_thinking = True
                         yield {"type": "thinking_start"}
-                    yield reasoning
+                    if _is_dream_model(raw_model):
+                        yield reasoning
+                    else:
+                        yield {"type": "thinking_delta", "text": reasoning}
 
+                stop_stream = False
                 if token:
-                    if _was_thinking:
-                        _was_thinking = False
-                        yield {"type": "thinking_end"}
-                    _content_tokens += 1
-                    yield token
-                    if not _is_dream_model(raw_model) and _content_tokens >= effective_max:
-                        break
+                    if _is_dream_model(raw_model):
+                        if _was_thinking:
+                            _was_thinking = False
+                            yield {"type": "thinking_end"}
+                        _content_tokens += 1
+                        yield token
+                    else:
+                        events, _think_markup_buffer, _in_think_markup = _consume_think_markup(
+                            _think_markup_buffer + token,
+                            _in_think_markup,
+                        )
+                        for kind, text in events:
+                            if not text:
+                                continue
+                            if kind == "thinking":
+                                if not _was_thinking:
+                                    _was_thinking = True
+                                    yield {"type": "thinking_start"}
+                                yield {"type": "thinking_delta", "text": text}
+                                continue
+                            if _was_thinking:
+                                _was_thinking = False
+                                yield {"type": "thinking_end"}
+                            _content_tokens += 1
+                            yield text
+                            if _content_tokens >= effective_max:
+                                stop_stream = True
+                                break
+                if stop_stream:
+                    break
+
+            if not _is_dream_model(raw_model) and _think_markup_buffer:
+                events, _think_markup_buffer, _in_think_markup = _consume_think_markup(
+                    _think_markup_buffer,
+                    _in_think_markup,
+                    final=True,
+                )
+                for kind, text in events:
+                    if not text:
+                        continue
+                    if kind == "thinking":
+                        if not _was_thinking:
+                            _was_thinking = True
+                            yield {"type": "thinking_start"}
+                        yield {"type": "thinking_delta", "text": text}
+                    else:
+                        if _was_thinking:
+                            _was_thinking = False
+                            yield {"type": "thinking_end"}
+                        _content_tokens += 1
+                        yield text
+            if _was_thinking:
+                yield {"type": "thinking_end"}
 
             if _is_dream_model(raw_model):
                 yield {
@@ -760,6 +1006,15 @@ async def sync_chat(
             "output_tokens": len(fallback) // 3,
             "cost_usd": 0.0,
         }
+        usage["model_attestation"] = _completion_model_attestation(
+            raw_model,
+            _resolve_model(raw_model),
+            None,
+            provider="llama-server",
+            source="local_mock_response",
+        )
+        usage["model_attestation"]["status"] = "unverified"
+        usage["model_attestation"]["verification_level"] = "none"
         return (fallback, usage) if return_usage else fallback
     target_model = config.dream_model if _is_dream_model(raw_model) else _resolve_model(raw_model)
     chat_host = _chat_host_for_model(raw_model)
@@ -794,7 +1049,15 @@ async def sync_chat(
         )
         resp.raise_for_status()
         data = resp.json()
-        usage_info = openrouter_client.usage_from_openai_payload(data.get("usage"))
+        usage_info = dict(openrouter_client.usage_from_openai_payload(data.get("usage")))
+        backend_provider = "dream" if _is_dream_model(raw_model) else "llama-server"
+        usage_info["model_attestation"] = _completion_model_attestation(
+            raw_model,
+            target_model,
+            data.get("model"),
+            provider=backend_provider,
+            source="openai_compatible_completion_response",
+        )
         choices = data.get("choices") or []
         if not choices:
             return ("", usage_info) if return_usage else ""
@@ -822,6 +1085,15 @@ async def sync_chat(
             "output_tokens": len(fallback) // 3,
             "cost_usd": 0.0,
         }
+        usage["model_attestation"] = _completion_model_attestation(
+            raw_model,
+            _resolve_model(raw_model),
+            None,
+            provider="llama-server",
+            source="local_mock_response",
+        )
+        usage["model_attestation"]["status"] = "unverified"
+        usage["model_attestation"]["verification_level"] = "none"
         return (fallback, usage) if return_usage else fallback
 
 
