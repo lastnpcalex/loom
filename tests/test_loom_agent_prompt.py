@@ -9,6 +9,16 @@ def test_loom_agent_contract_is_role_neutral():
     assert "inside Loom" in text
     assert "Do not assume the task is software engineering" in text
     assert "Claude Code backed by a local model" in text
+    assert "inside the active Loom instance" in text
+    assert "Do not stop, restart, kill, replace, or reconfigure either host" in text
+    assert "leave that lifecycle action to the human" in text
+    assert "files currently on disk are the canonical workspace state" in text
+    assert "never use them as a substitute for reading the live file" in text
+    assert "Destructive Git operations are allowed only after Loom presents" in text
+    assert "normally end in a focused local commit" in text
+    assert "A dirty worktree is not a reason" in text
+    assert "Stage only the files or hunks attributable to the current task" in text
+    assert "Pushing, force-pushing, rebasing shared history" in text
     assert "focused code agent" not in text.lower()
 
 
