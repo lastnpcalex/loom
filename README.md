@@ -4,9 +4,9 @@
 
 # Ex Astris Umbra: A Shadow Loom
 
-![Python](https://img.shields.io/badge/python-3.12+-blue) ![License](https://img.shields.io/badge/license-MIT-green)
+![Python](https://img.shields.io/badge/python-3.12+-blue)
 
-A self-hosted web interface for branching AI conversations across Claude Code, ChatGPT Codex, Antigravity (agy), Hermes Agent, and local llama.cpp models — and for handing off between them mid-conversation. Every conversation is a tree: branch, fork, regenerate, and full-text search across every path without losing anything.
+A self-hosted web interface for branching AI conversations across Claude Code, ChatGPT Codex, Antigravity (`agy`), Goose ACP, Hermes Agent, direct OpenRouter, Dream, and local llama.cpp models — and for handing off between them mid-conversation. Every conversation is a tree: branch, fork, regenerate, and full-text search across every path without losing anything.
 
 ## Project status and implementation model
 
@@ -21,8 +21,11 @@ terminal, not official application SDKs:
 - **Claude** uses the Claude Code CLI as a subprocess.
 - **Codex** uses the ChatGPT Codex CLI/app-server flow.
 - **Antigravity/Gemini** uses the `agy` CLI.
+- **Goose** uses Goose over ACP and can target OpenRouter, llama-server, or Dream.
+- **OpenRouter** can also be used directly through the Claude Code-compatible shim.
 - **Braid/Weave** use local `llama.cpp` / `llama-server`.
 - **Hermes** uses Hermes Agent over ACP.
+- **Dream Space** uses Hermes ACP against a DiffusionGemma sidecar.
 - **NROL-AO** is operated through its typed MCP facade, with the engine repo as
   the authority boundary.
 
@@ -30,6 +33,12 @@ That design is deliberate: Loom is a branching UI, state store, permission
 bridge, and orchestration layer around active agent tools. It does not replace
 those tools' own auth/session behavior, and it does not guarantee that
 experimental provider CLI behavior will remain stable.
+
+The repository is the source-code boundary, not a backup of a running Loom
+installation. A clone contains the server, UI, provider adapters, schema
+migrations, tests, and default content. Git deliberately excludes credentials,
+`config.json`, SQLite databases, uploads, generated workspaces, certificates,
+local model binaries, provider home directories, and recovery artifacts.
 
 ## What is a loom?
 
@@ -43,7 +52,7 @@ Different work wants different engines. Frontier Claude for hard problems, a loc
 
 A Shadow Loom runs them all on one branching infrastructure: one database, one tree UI, one search index, one set of chat habits. Start a refactor on a frontier model, branch the conversation, rerun the branch on a local model, compare. Search across months of agent sessions regardless of which engine produced them. The loom is the constant; the engines are interchangeable shuttles.
 
-## Five modes, one loom
+## Six spaces, multiple provider lanes
 
 ### Loom — Claude Code in the browser
 
@@ -53,11 +62,12 @@ Connects to the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code
 - Edit tool diff rendering (red/green inline diffs)
 - Collapsible extended thinking display
 - Permission proxying — tool approvals appear in the browser UI
-- Model selection across **three provider groups in one dropdown**: Anthropic (auto aliases plus pinned versions, refreshed live from `/v1/models`), Antigravity/Gemini, and ChatGPT Codex — changeable mid-conversation
+- A shared model picker for Anthropic, Antigravity/Gemini, ChatGPT Codex, Goose ACP, direct OpenRouter, Dream, and enabled compatibility providers — changeable mid-conversation
+- Per-turn model attestation — the UI records the harness, requested model, launch model, effective model, evidence source, and verification level when the provider exposes them; configured-only and mismatch states remain visibly distinct from verified runtime evidence
 - Thinking effort control for Anthropic and Codex models (`max` is Opus-only, `xhigh` is Opus/Codex)
 - Plan/Act mode toggle
 - Immutable session snapshots — every turn forks the CC session, enabling clean branching at any point
-- Progressive draft saving — generation survives navigation, reconnects, and server restarts
+- Progressive draft saving — partial output survives navigation and reconnects; after a Loom host restart, an interrupted turn is retained or marked orphaned rather than silently resumed
 - Per-turn and cumulative cost tracking
 - Slash commands — Claude Code skills are scanned and exposed with autocomplete
 
@@ -68,11 +78,19 @@ The full Claude Code harness running against a local llama.cpp `llama-server`. S
 - Full Claude Code tool suite (Bash, Read, Write, Edit, Grep, etc.)
 - Web search and page fetch via the bundled DuckDuckGo/trafilatura MCP server
 - Permission prompts proxied through the browser UI
-- Works with any GGUF with sufficient context (64k+ recommended)
+- Works with compatible tool-capable GGUFs and chat templates; 64k+ context is recommended
 
 ### Hermes — ACP agent on local models
 
 [Hermes Agent](https://github.com/NousResearch) over the Agent Client Protocol, powered by the same local llama-server. A different agent architecture on the same loom: ACP session management, its own slash commands, permission requests bridged into the browser like CC's. Enable with `LOOM_ENABLE_HERMES=1`.
+
+### Dream Space — Hermes ACP on DiffusionGemma
+
+An opt-in Hermes space backed by Loom's Dream sidecar rather than llama-server.
+It has separate model, context, diffusion-step, GPU, and idle-unload settings.
+Enable the UI with `LOOM_ENABLE_DREAM=1` and configure the `DREAM_*` paths for
+the local DiffusionGemma installation. The repository does not include that
+sidecar or its model weights.
 
 ### Weave — structured roleplay and creative writing
 
@@ -119,12 +137,30 @@ A locked-down Claude Code profile for operating the NROL-AO forecasting engine. 
 The modes are different engines, but the loom around them is shared — which is what makes mid-conversation handoff work:
 
 - **One tree, one store.** Every mode writes the same message-tree schema in SQLite. Branching, bookmarks, search, import/export, and the tree visualization don't care which engine produced a node.
-- **Cross-provider switching.** A Loom conversation can move between Anthropic, Gemini, Codex, and local models mid-conversation. Session resume is skipped across providers (their session formats are incompatible); the conversation falls back to a full history rebuild from the database whenever the nearest ancestor came from a different provider, so no context is lost. Each message records the model that generated it, and labels shift accordingly.
+- **Cross-provider switching.** A Loom conversation can move between Anthropic, Gemini, Codex, Goose, OpenRouter, Dream, and local models mid-conversation. Provider-native resume is allowed only at a compatible nearest-assistant boundary. A provider or model boundary forces a bounded rebuild from Loom's message tree instead of searching farther back for a stale native session.
+- **Per-turn provenance.** Each assistant turn stores its harness/model attestation alongside the message. A green verified badge means Loom received runtime evidence from the harness or provider response; a configured or unverified badge is not presented as proof, and a mismatch is surfaced explicitly.
 - **One chat surface.** Highlight-to-reply (select text in any message, quote it in your next send), attachments, image paste, message queuing, and slash commands work identically in every mode, because the excerpt and the attachments ride in the message itself rather than in provider-specific plumbing.
-- **One permission system.** CC, Codex, and Hermes tool approvals all bridge into the same browser prompt UI and notification bell.
+- **One permission surface.** Claude Code, Codex, Goose, and Hermes approvals are bridged into Loom's browser UI. Antigravity runs with provider-native approvals skipped so Loom remains the approval layer where the adapter supports it.
 - **One canvas.** Any mode can drive the Interactive Canvas; the AI writes files, the iframe live-refreshes.
 
 > **Note:** `AskUserQuestion` is disabled in CC modes. CC's headless `-p` mode has no mechanism to send user responses back to an active `AskUserQuestion` call — stdin is closed after the initial prompt ([open feature request](https://github.com/anthropics/claude-code/issues/16712)). Until then, CC proceeds with its best judgment instead of asking.
+
+## Parallel agents and workspace integrity
+
+Agent conversations with a working directory can opt into **Parallel agents in
+same checkout**. This is shared-checkout concurrency, not automatic Git
+worktrees: independent generations can run at the same time against the live
+files, and each launch is tied to an explicit message-tree parent. The option
+is off by default and is unavailable to Weave and NROL-AO operator
+conversations.
+
+Before each tool-capable provider turn, Loom takes a recovery snapshot of the
+workspace outside the checkout and reports post-turn changes back to the UI.
+Set `LOOM_WORKSPACE_RECOVERY_DIR` to choose that external storage location.
+Snapshots preserve recovery blobs and expose churn; they do not serialize
+agents, automatically merge conflicts, or authorize overwriting another
+agent's work. Destructive Git operations still go through Loom's permission
+flow.
 
 ## Search
 
@@ -180,20 +216,21 @@ All modes share the same conversation infrastructure:
 - **Tree visualization** — interactive pan/zoom canvas, horizontal or vertical layout.
 - **Bookmarks** — bookmark any message or branch.
 - **Streaming generation** — real-time token streaming over WebSocket with live token rate and tool indicators.
-- **Background generation** — navigate away mid-generation and come back; responses save progressively and survive reconnects, tab switches, and server restarts.
+- **Background generation** — navigate away mid-generation and come back; responses save progressively and survive reconnects and tab switches. A host restart terminates the provider process, but persisted partial work is retained or marked as an orphaned generation.
 - **Notifications** — bell dropdown for landed branches and permission requests; browser push when the tab is in the background.
 - **Cron jobs** — schedule a script against a conversation on an interval; manage jobs from the admin dashboard.
 - **Image handling** — clipboard paste, attachments, vision-model description for local modes, inline display of images the agent generates.
 - **Message queuing** — send your next message while the model is still responding.
 - **Per-tab state** — each browser tab remembers its own conversation and view.
-- **HTTPS / Tailscale** — serves on `0.0.0.0` over HTTPS with auto-detected SSL certs for access across your tailnet.
+- **HTTP or HTTPS / Tailscale** — binds `0.0.0.0`; HTTPS is enabled only when both configured certificate files exist, otherwise Loom starts over plain HTTP.
 - **WebGL black hole** — Schwarzschild raytracer background with procedural galaxy texture and glassmorphism UI.
 
-## Session management (CC modes)
+## Provider sessions and streaming recovery
 
-- **Fork-every-turn** — every generation uses `--resume <parent_session> --fork-session`. Each assistant message gets its own immutable session snapshot, so branching, editing, and regenerating all work from any point.
-- **Progressive drafts** — a draft message is created immediately when generation starts, updated as tools execute, finalized on stream end.
-- **History rebuild fallback** — when no session exists to resume (first message, or after a provider switch), the full history is rebuilt from the database and sent as a single prompt, tool calls included.
+- **Claude fork-every-turn** — Claude Code generations use `--resume <parent_session> --fork-session`. Each assistant message gets its own immutable native session snapshot.
+- **Shared resume contract** — every provider stops at the nearest prior assistant boundary. Foreign, legacy-unscoped, errored, empty, or model-incompatible boundaries rebuild from bounded Loom history instead of reviving an older session.
+- **Progressive drafts** — a draft message is created immediately, updated as text, thinking, tools, usage, and model attestation arrive, then finalized on stream end.
+- **Reconnect recovery** — active in-memory generation snapshots rebuild the visible stream after WebSocket reconnects. Persisted database drafts preserve completed partial output across process failure, but the terminated provider process itself is not resumed after a host restart.
 
 ## Admin dashboard
 
@@ -207,39 +244,79 @@ A separate admin server (`admin_server.py`, port 3002) runs a single-page dashbo
 
 llama-server is managed like a service: per-model context size, GPU layers, KV-cache quantization, flash attention, and mmproj are stored per GGUF and applied on launch, restartable from the Loom settings panel or the dashboard.
 
-## Quick start
+## Fresh-machine setup
 
-```bash
+The current deployment is developed and tested primarily on Windows with
+Python 3.14. Python 3.12+ is the intended baseline. `requirements.txt` uses
+minimum compatible versions; it is not an exact dependency lock file.
+
+```powershell
 # Clone
 git clone https://github.com/lastnpcalex/a-shadow-loom.git
 cd a-shadow-loom
 
-# Install dependencies
-pip install -r requirements.txt
+# Create an isolated environment and install dependencies
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-# Run
-python server.py
+# Run the main server
+.\.venv\Scripts\python.exe server.py
 ```
 
-Open `https://localhost:3000` in your browser.
+On POSIX systems, use `.venv/bin/python` in place of
+`.\.venv\Scripts\python.exe`; the admin tooling and current deployment remain
+Windows-oriented.
 
-**Loom mode** needs the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) on PATH with an active subscription or API key. Codex and Antigravity models additionally need their CLIs (`codex`, `agy`) authenticated.
+Open the URL printed at startup. With no certificate files, the default is
+`http://localhost:3000`; when both configured certificate files exist, it is
+`https://localhost:3000`.
 
-**Braid / Weave / Hermes modes** need [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `llama-server` and a GGUF model. Point `llama_server_exe` and `llama_models_dir` at your install (Settings → Advanced, or `config.json`), pick a model, and Apply & Restart — the server is launched and managed for you. Hermes additionally needs the [Hermes Agent](https://github.com/NousResearch) installed and `LOOM_ENABLE_HERMES=1`.
+The base web application can start without every provider installed. Each
+provider lane has its own runtime prerequisite:
 
-**Web search for local models** — register the bundled MCP server once:
+| Lane or space | Runtime requirement |
+|---------------|---------------------|
+| Claude Code | Authenticated `claude` CLI on `PATH` |
+| ChatGPT Codex | Authenticated `codex` CLI; Loom uses its app-server protocol |
+| Antigravity | Authenticated `agy` CLI |
+| Goose ACP | Goose installed (`goose` on `PATH` or `GOOSE_EXE`); enabled by default with `LOOM_ENABLE_GOOSE` |
+| Direct OpenRouter | `OPENROUTER_API_KEY`; the optional management key enables usage/key-management features |
+| Braid / Weave | `llama-server`, a compatible GGUF, and the appropriate chat template |
+| Hermes | Hermes Agent plus `LOOM_ENABLE_HERMES=1`; optionally set `HERMES_HOME` or `HERMES_EXE` |
+| Dream Space | DiffusionGemma sidecar/model plus `LOOM_ENABLE_DREAM=1` and the relevant `DREAM_*` paths |
+| NROL-AO | A compatible engine checkout selected with `NROL_AO_REPO` |
 
-```bash
-claude mcp add --scope user --transport stdio web-tools -- python /absolute/path/to/mcp_web_tools.py
+For Braid, Weave, and local Hermes targets, point `llama_server_exe` and
+`llama_models_dir` at the local installation in Settings → Advanced or
+`config.json`, select a model, and launch llama-server from Loom or the admin
+dashboard.
+
+Loom injects the bundled `mcp_web_tools.py` server into supported local,
+Goose, Hermes, and operator sessions. A global `claude mcp add` registration is
+not required.
+
+The optional admin dashboard runs separately:
+
+```powershell
+.\.venv\Scripts\python.exe admin_server.py
 ```
 
-This gives local models `web_search` (DuckDuckGo) and `web_fetch` (trafilatura) as CC tools.
+It prints either `http://localhost:3002` or `https://localhost:3002` depending
+on whether the certificate files exist.
 
-**Admin dashboard** (optional):
+### What a clone does not reproduce
 
-```bash
-python admin_server.py  # dashboard on https://localhost:3002
-```
+A fresh clone represents the tracked Loom code, but not the exact operational
+state of an existing machine. Provision these separately when moving an
+installation:
+
+- `.env`, API credentials, provider authentication, and provider home/config directories
+- `config.json` and machine-specific executable/model paths
+- Loom SQLite databases, uploads, generated canvases, characters, personas, and lore
+- SSL certificates, GGUF/model weights, llama-server, Dream, Hermes, Goose, Codex, Claude, and `agy` installations
+- external repositories such as the `NROL_AO_REPO` engine checkout
+
+Copy secrets through an appropriate secure channel, not through Git.
 
 ## Project structure
 
@@ -255,8 +332,14 @@ llama_client.py        -- llama-server client (OpenAI-compatible chat + vision)
 claude_client.py       -- Claude Code CLI subprocess wrapper, NDJSON stream parser
 codex_client.py        -- ChatGPT Codex app-server wrapper
 gemini_client.py       -- Antigravity (agy) subprocess wrapper
+goose_client.py        -- Goose ACP client and permission bridge
 hermes_client.py       -- Hermes Agent ACP client and permission bridge
+dream_client.py        -- Dream sidecar client
+openrouter_client.py   -- Direct OpenRouter client, secrets, usage, and limits
+provider_contract.py   -- Cross-provider native-session boundary rules
+workspace_safety.py    -- External recovery snapshots and post-turn change reports
 cc_permission_hook.py  -- PreToolUse hook for browser-based permission prompts
+mcp_loom_workspace.py  -- Loom-gated file, shell, and sensitive-read MCP tools
 mcp_web_tools.py       -- MCP stdio server: web_search + web_fetch for local models
 mcp_servers/nrol_ao/   -- NROL-AO MCP server: typed transitions, proposals, scans
 admin_server.py        -- Admin dashboard: instances, llama-server, ttyd, cron
@@ -277,24 +360,44 @@ certs/                 -- SSL certificates (auto-detected, gitignored)
 
 ## Configuration
 
-Settings are adjustable from the UI (gear icon) or by editing `config.json`:
+Persisted settings are adjustable from the UI (gear icon) or by editing the
+gitignored `config.json`. Important source defaults include:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `llama_host` | `http://localhost:8000` | llama-server address |
-| `llama_model` | (your GGUF) | Default local model |
+| `llama_model` | `Qwen3.6-27B-NVFP4.gguf` | Source fallback; select a model installed on your machine |
 | `llama_server_exe` | `llama-server` | Path to the llama-server binary |
 | `llama_models_dir` | `C:\LlamaServer\models` | Directory scanned for .gguf files |
 | `max_context_tokens` | `32768` | Context window budget |
 | `verbatim_window` | `6` | Recent messages kept verbatim |
 | `temperature` | `0.8` | Generation temperature |
 | `top_p` | `0.9` | Nucleus sampling |
-| `max_tokens` | `1024` | Max generation length |
+| `max_tokens` | `16384` | Default output cap for direct local/helper calls |
+| `weave_max_tokens` | `2048` | Weave output cap |
 | `repeat_penalty` | `1.08` | Repetition penalty |
-| `ssl_certfile` | `certs/cert.pem` | SSL certificate path |
-| `ssl_keyfile` | `certs/key.pem` | SSL key path |
+| `goose_model` | `goose:openrouter:z-ai/glm-5.2` | Default Goose selector |
+| `dream_host` | `http://127.0.0.1:8787` | Dream sidecar endpoint |
+| `db_path` | `loom.db` | SQLite database path |
 
 Per-model llama-server tuning (context size, GPU layers, KV-cache quant, threads, batch sizes, mmproj, extra args) lives in `models_config.json` and is editable from Settings → Advanced.
+
+Machine-specific and secret settings are environment variables rather than
+tracked configuration:
+
+| Environment variable | Purpose / default |
+|----------------------|-------------------|
+| `LOOM_PORT` | Main server port, default `3000` |
+| `ADMIN_PORT` | Admin server port, default `3002` |
+| `LOOM_DB` | Initial database path override |
+| `LOOM_SSL_CERT`, `LOOM_SSL_KEY` | HTTPS certificate and key; both must exist to enable HTTPS |
+| `LLAMA_HOST`, `LLAMA_MODEL`, `LLAMA_SERVER_EXE`, `LLAMA_MODELS_DIR` | Local llama-server connection and installation |
+| `LOOM_ENABLE_GOOSE`, `GOOSE_EXE` | Goose visibility and executable override |
+| `LOOM_ENABLE_HERMES`, `HERMES_HOME`, `HERMES_EXE` | Hermes enablement and installation |
+| `LOOM_ENABLE_DREAM`, `DREAM_*` | Dream Space enablement and sidecar/model tuning |
+| `OPENROUTER_API_KEY`, `OPENROUTER_MANAGEMENT_KEY` | Direct OpenRouter inference and optional account management |
+| `NROL_AO_REPO` | External NROL-AO engine checkout |
+| `LOOM_WORKSPACE_RECOVERY_DIR` | External workspace snapshot store |
 
 ## Character file format
 
@@ -327,7 +430,30 @@ Characters, personas, and lore can also be created, edited, and imported/exporte
 
 - **SQLite WAL mode** — Write-Ahead Logging for crash resilience
 - **WAL checkpoint on shutdown** — the `/shutdown` endpoint checkpoints the WAL before closing
-- **Graceful restart** — the admin server uses `/shutdown` rather than force-killing the process
+- **Graceful host lifecycle** — the admin dashboard requests `/shutdown` before starting a replacement instance; agents running inside Loom should leave host restart to the human/operator
+- **Workspace recovery snapshots** — tool-capable agent turns preserve before/after file blobs outside the checkout and report deletions, large removals, and changes to files that were already dirty
+- **Live workspace is canonical** — tracked-but-uncommitted and untracked files are real workspace state; snapshots are a recovery mechanism, not permission to restore from `HEAD`
+- **Git excludes runtime state** — credentials, local config, databases, logs, uploads, certificates, provider settings, generated workspaces, and recovery outputs are ignored
+
+## Validation
+
+Run the complete test suite with:
+
+```bash
+python -m pytest
+```
+
+JavaScript files have no build step and can be syntax-checked directly:
+
+```bash
+node --check static/app.js
+node --check static/chat.js
+node --check static/tree.js
+```
+
+The NROL-AO integration and synthetic replay tests require a compatible,
+syntactically valid external engine checkout at `NROL_AO_REPO`; failures in
+that repository are not repaired by reinstalling Loom.
 
 ## Credits
 
